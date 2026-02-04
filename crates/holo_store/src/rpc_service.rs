@@ -1,3 +1,8 @@
+//! gRPC service handlers that adapt network requests into Accord operations.
+//!
+//! This module is the server-side counterpart to `transport.rs`, translating
+//! protobuf messages into local Accord types and returning responses.
+
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -7,12 +12,14 @@ use crate::kv::Version;
 use crate::volo_gen::holo_store::rpc;
 use crate::NodeState;
 
+/// gRPC service implementation backed by a shared `NodeState`.
 #[derive(Clone)]
 pub struct RpcService {
     pub state: Arc<NodeState>,
 }
 
 impl rpc::HoloRpc for RpcService {
+    /// Handle a single pre-accept RPC request.
     async fn pre_accept(
         &self,
         req: volo_grpc::Request<rpc::PreAcceptRequest>,
@@ -81,6 +88,7 @@ impl rpc::HoloRpc for RpcService {
         }))
     }
 
+    /// Handle a batched pre-accept RPC request.
     async fn pre_accept_batch(
         &self,
         req: volo_grpc::Request<rpc::PreAcceptBatchRequest>,
@@ -156,6 +164,7 @@ impl rpc::HoloRpc for RpcService {
         Ok(resp)
     }
 
+    /// Handle a single accept RPC request.
     async fn accept(
         &self,
         req: volo_grpc::Request<rpc::AcceptRequest>,
@@ -184,6 +193,7 @@ impl rpc::HoloRpc for RpcService {
                 counter: d.counter,
             })
             .collect();
+        // Decide whether a command payload is present.
         let has_command = req.has_command || !req.command.is_empty();
         let command_digest = parse_command_digest(req.command_digest)?;
         let command = if has_command {
@@ -223,6 +233,7 @@ impl rpc::HoloRpc for RpcService {
         Ok(resp)
     }
 
+    /// Handle a batched accept RPC request.
     async fn accept_batch(
         &self,
         req: volo_grpc::Request<rpc::AcceptBatchRequest>,
@@ -254,6 +265,7 @@ impl rpc::HoloRpc for RpcService {
                     counter: d.counter,
                 })
                 .collect();
+            // Decide whether a command payload is present.
             let has_command = item.has_command || !item.command.is_empty();
             let command_digest = parse_command_digest(item.command_digest)?;
             let command = if has_command {
@@ -296,6 +308,7 @@ impl rpc::HoloRpc for RpcService {
         Ok(resp)
     }
 
+    /// Handle a single commit RPC request.
     async fn commit(
         &self,
         req: volo_grpc::Request<rpc::CommitRequest>,
@@ -324,6 +337,7 @@ impl rpc::HoloRpc for RpcService {
                 counter: d.counter,
             })
             .collect();
+        // Decide whether a command payload is present.
         let has_command = req.has_command || !req.command.is_empty();
         let command_digest = parse_command_digest(req.command_digest)?;
         let command = if has_command {
@@ -357,6 +371,7 @@ impl rpc::HoloRpc for RpcService {
         Ok(resp)
     }
 
+    /// Handle a batched commit RPC request.
     async fn commit_batch(
         &self,
         req: volo_grpc::Request<rpc::CommitBatchRequest>,
@@ -388,6 +403,7 @@ impl rpc::HoloRpc for RpcService {
                     counter: d.counter,
                 })
                 .collect();
+            // Decide whether a command payload is present.
             let has_command = item.has_command || !item.command.is_empty();
             let command_digest = parse_command_digest(item.command_digest)?;
             let command = if has_command {
@@ -424,6 +440,7 @@ impl rpc::HoloRpc for RpcService {
         Ok(resp)
     }
 
+    /// Handle a single recover RPC request.
     async fn recover(
         &self,
         req: volo_grpc::Request<rpc::RecoverRequest>,
@@ -466,6 +483,7 @@ impl rpc::HoloRpc for RpcService {
             .collect();
 
         let status = match resp.status {
+            // Map local status into the wire enum.
             accord::TxnStatus::Unknown => rpc::TxnStatus::TXN_STATUS_UNKNOWN,
             accord::TxnStatus::PreAccepted => rpc::TxnStatus::TXN_STATUS_PREACCEPTED,
             accord::TxnStatus::Accepted => rpc::TxnStatus::TXN_STATUS_ACCEPTED,
@@ -492,6 +510,7 @@ impl rpc::HoloRpc for RpcService {
         }))
     }
 
+    /// Handle a batched recover RPC request.
     async fn recover_batch(
         &self,
         req: volo_grpc::Request<rpc::RecoverBatchRequest>,
@@ -537,6 +556,7 @@ impl rpc::HoloRpc for RpcService {
                 .collect();
 
             let status = match resp.status {
+                // Map local status into the wire enum.
                 accord::TxnStatus::Unknown => rpc::TxnStatus::TXN_STATUS_UNKNOWN,
                 accord::TxnStatus::PreAccepted => rpc::TxnStatus::TXN_STATUS_PREACCEPTED,
                 accord::TxnStatus::Accepted => rpc::TxnStatus::TXN_STATUS_ACCEPTED,
@@ -568,6 +588,7 @@ impl rpc::HoloRpc for RpcService {
         }))
     }
 
+    /// Handle a fetch_command RPC request.
     async fn fetch_command(
         &self,
         req: volo_grpc::Request<rpc::FetchCommandRequest>,
@@ -586,6 +607,7 @@ impl rpc::HoloRpc for RpcService {
                 counter: txn_id.counter,
             })
             .await;
+        // Return a "has_command" flag so callers can distinguish empty payloads.
         let (has_command, command) = match command {
             Some(cmd) => (true, cmd.into()),
             None => (false, Bytes::new()),
@@ -596,6 +618,7 @@ impl rpc::HoloRpc for RpcService {
         }))
     }
 
+    /// Handle a report_executed RPC request.
     async fn report_executed(
         &self,
         req: volo_grpc::Request<rpc::ReportExecutedRequest>,
@@ -628,6 +651,7 @@ impl rpc::HoloRpc for RpcService {
         }))
     }
 
+    /// Handle a last_committed RPC request.
     async fn last_committed(
         &self,
         req: volo_grpc::Request<rpc::LastCommittedRequest>,
@@ -653,6 +677,7 @@ impl rpc::HoloRpc for RpcService {
                     seq,
                 });
             } else {
+                // Encode missing values explicitly.
                 items.push(rpc::LastCommittedItem {
                     key: key.into(),
                     present: false,
@@ -667,6 +692,7 @@ impl rpc::HoloRpc for RpcService {
         }))
     }
 
+    /// Handle a last_executed_prefix RPC request.
     async fn last_executed_prefix(
         &self,
         req: volo_grpc::Request<rpc::LastExecutedPrefixRequest>,
@@ -689,6 +715,7 @@ impl rpc::HoloRpc for RpcService {
         }))
     }
 
+    /// Handle an executed RPC request.
     async fn executed(
         &self,
         req: volo_grpc::Request<rpc::ExecutedRequest>,
@@ -712,6 +739,7 @@ impl rpc::HoloRpc for RpcService {
         }))
     }
 
+    /// Handle a mark_visible RPC request.
     async fn mark_visible(
         &self,
         req: volo_grpc::Request<rpc::MarkVisibleRequest>,
@@ -734,6 +762,7 @@ impl rpc::HoloRpc for RpcService {
         Ok(volo_grpc::Response::new(rpc::MarkVisibleResponse { ok }))
     }
 
+    /// Handle a local KV GET RPC (non-consensus, used for quorum reads).
     async fn kv_get(
         &self,
         req: volo_grpc::Request<rpc::KvGetRequest>,
@@ -754,6 +783,7 @@ impl rpc::HoloRpc for RpcService {
         Ok(volo_grpc::Response::new(resp))
     }
 
+    /// Handle a local KV batch GET RPC (non-consensus, used for quorum reads).
     async fn kv_batch_get(
         &self,
         req: volo_grpc::Request<rpc::KvBatchGetRequest>,
@@ -779,6 +809,7 @@ impl rpc::HoloRpc for RpcService {
         Ok(volo_grpc::Response::new(rpc::KvBatchGetResponse { responses }))
     }
 
+    /// Handle a join RPC, returning the initial membership string.
     async fn join(
         &self,
         _req: volo_grpc::Request<rpc::JoinRequest>,
@@ -789,6 +820,7 @@ impl rpc::HoloRpc for RpcService {
     }
 }
 
+/// Convert a local version into its RPC representation.
 fn to_rpc_version(version: Version) -> rpc::Version {
     rpc::Version {
         seq: version.seq,
@@ -799,8 +831,10 @@ fn to_rpc_version(version: Version) -> rpc::Version {
     }
 }
 
+/// Parse a 32-byte command digest from the wire format.
 fn parse_command_digest(bytes: Bytes) -> Result<[u8; 32], volo_grpc::Status> {
     if bytes.len() != 32 {
+        // Reject invalid sizes to prevent inconsistent digests.
         return Err(volo_grpc::Status::invalid_argument(
             "invalid command_digest length",
         ));

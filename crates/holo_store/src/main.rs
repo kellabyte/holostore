@@ -1,3 +1,9 @@
+//! HoloStore node binary entry point.
+//!
+//! This file wires together the Accord consensus groups, KV engine, WAL, gRPC
+//! transport, and Redis protocol server. It also hosts the CLI and runtime
+//! configuration, as well as performance/statistics logging.
+
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{BufWriter, IsTerminal, Write};
@@ -26,9 +32,12 @@ use kv::{FjallEngine, KvEngine};
 use rpc_service::RpcService;
 use transport::GrpcTransport;
 
+/// Group id used for the membership/control group.
 const GROUP_MEMBERSHIP: GroupId = 0;
+/// Base group id for data shards (shard index is added to this base).
 const GROUP_DATA_BASE: GroupId = 1;
 
+/// CLI entry point wrapper.
 #[derive(Parser, Debug)]
 #[command(name = "holo-store")]
 struct Args {
@@ -36,11 +45,13 @@ struct Args {
     cmd: Command,
 }
 
+/// Top-level CLI subcommands.
 #[derive(Subcommand, Debug)]
 enum Command {
     Node(NodeArgs),
 }
 
+/// CLI options for running a node.
 #[derive(Parser, Debug)]
 struct NodeArgs {
     #[arg(long)]
@@ -226,6 +237,7 @@ struct NodeArgs {
     rpc_inflight_low_queue: u64,
 }
 
+/// Shared state used by both RPC and Redis servers.
 #[derive(Clone)]
 struct NodeState {
     initial_members: String,
@@ -250,6 +262,7 @@ struct NodeState {
     client_set_batch_target: usize,
 }
 
+/// Read mode options for GETs.
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum ReadMode {
     Accord,
@@ -257,6 +270,7 @@ enum ReadMode {
     Local,
 }
 
+/// Classification of proposals for stats aggregation.
 #[derive(Clone, Copy, Debug)]
 #[allow(dead_code)]
 enum ProposalKind {
@@ -266,6 +280,7 @@ enum ProposalKind {
     BatchSet,
 }
 
+/// Aggregated proposal latency stats.
 #[derive(Default)]
 struct ProposalStats {
     get: OpStats,
@@ -274,6 +289,7 @@ struct ProposalStats {
     batch_set: OpStats,
 }
 
+/// Per-operation stats counters.
 #[derive(Default)]
 struct OpStats {
     count: AtomicU64,
@@ -282,6 +298,7 @@ struct OpStats {
     max_us: AtomicU64,
 }
 
+/// Snapshot of proposal stats.
 #[derive(Default, Debug, Clone)]
 struct ProposalStatsSnapshot {
     get: OpStatsSnapshot,
@@ -290,6 +307,7 @@ struct ProposalStatsSnapshot {
     batch_set: OpStatsSnapshot,
 }
 
+/// Server-side RPC handler latency counters.
 #[derive(Default)]
 struct RpcHandlerStats {
     pre_accept_count: AtomicU64,
@@ -318,6 +336,7 @@ struct RpcHandlerStats {
     commit_inflight_max: AtomicU64,
 }
 
+/// Snapshot of server-side RPC handler stats.
 #[derive(Default, Debug, Clone)]
 struct RpcHandlerStatsSnapshot {
     pre_accept_avg_ms: f64,
@@ -341,6 +360,7 @@ struct RpcHandlerStatsSnapshot {
 }
 
 impl RpcHandlerStats {
+    /// Track an inflight pre-accept handler invocation.
     fn track_pre_accept(&self) -> InflightGuard<'_> {
         let current = self.pre_accept_inflight.fetch_add(1, Ordering::Relaxed) + 1;
         self.pre_accept_inflight_max
@@ -350,18 +370,21 @@ impl RpcHandlerStats {
         }
     }
 
+    /// Record the latency of a pre-accept handler invocation.
     fn record_pre_accept(&self, us: u64) {
         self.pre_accept_count.fetch_add(1, Ordering::Relaxed);
         self.pre_accept_total_us.fetch_add(us, Ordering::Relaxed);
         self.pre_accept_max_us.fetch_max(us, Ordering::Relaxed);
     }
 
+    /// Record the latency of a pre-accept batch handler invocation.
     fn record_pre_accept_batch(&self, us: u64) {
         self.pre_accept_batch_count.fetch_add(1, Ordering::Relaxed);
         self.pre_accept_batch_total_us.fetch_add(us, Ordering::Relaxed);
         self.pre_accept_batch_max_us.fetch_max(us, Ordering::Relaxed);
     }
 
+    /// Track an inflight accept handler invocation.
     fn track_accept(&self) -> InflightGuard<'_> {
         let current = self.accept_inflight.fetch_add(1, Ordering::Relaxed) + 1;
         self.accept_inflight_max
@@ -371,18 +394,21 @@ impl RpcHandlerStats {
         }
     }
 
+    /// Record the latency of an accept handler invocation.
     fn record_accept(&self, us: u64) {
         self.accept_count.fetch_add(1, Ordering::Relaxed);
         self.accept_total_us.fetch_add(us, Ordering::Relaxed);
         self.accept_max_us.fetch_max(us, Ordering::Relaxed);
     }
 
+    /// Record the latency of an accept batch handler invocation.
     fn record_accept_batch(&self, us: u64) {
         self.accept_batch_count.fetch_add(1, Ordering::Relaxed);
         self.accept_batch_total_us.fetch_add(us, Ordering::Relaxed);
         self.accept_batch_max_us.fetch_max(us, Ordering::Relaxed);
     }
 
+    /// Track an inflight commit handler invocation.
     fn track_commit(&self) -> InflightGuard<'_> {
         let current = self.commit_inflight.fetch_add(1, Ordering::Relaxed) + 1;
         self.commit_inflight_max
@@ -392,18 +418,21 @@ impl RpcHandlerStats {
         }
     }
 
+    /// Record the latency of a commit handler invocation.
     fn record_commit(&self, us: u64) {
         self.commit_count.fetch_add(1, Ordering::Relaxed);
         self.commit_total_us.fetch_add(us, Ordering::Relaxed);
         self.commit_max_us.fetch_max(us, Ordering::Relaxed);
     }
 
+    /// Record the latency of a commit batch handler invocation.
     fn record_commit_batch(&self, us: u64) {
         self.commit_batch_count.fetch_add(1, Ordering::Relaxed);
         self.commit_batch_total_us.fetch_add(us, Ordering::Relaxed);
         self.commit_batch_max_us.fetch_max(us, Ordering::Relaxed);
     }
 
+    /// Snapshot and reset all handler stats.
     fn snapshot_and_reset(&self) -> RpcHandlerStatsSnapshot {
         let pre_cnt = self.pre_accept_count.swap(0, Ordering::Relaxed);
         let pre_tot = self.pre_accept_total_us.swap(0, Ordering::Relaxed);
@@ -455,16 +484,19 @@ impl RpcHandlerStats {
     }
 }
 
+/// RAII guard that decrements an inflight counter when dropped.
 struct InflightGuard<'a> {
     counter: &'a AtomicU64,
 }
 
 impl Drop for InflightGuard<'_> {
+    /// Decrement the inflight counter when the guard is dropped.
     fn drop(&mut self) {
         self.counter.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
+/// Snapshot of per-operation stats.
 #[derive(Default, Debug, Clone)]
 struct OpStatsSnapshot {
     count: u64,
@@ -473,6 +505,7 @@ struct OpStatsSnapshot {
     max_us: u64,
 }
 
+/// Client batcher statistics.
 #[derive(Default)]
 struct ClientBatchStats {
     set_batches: AtomicU64,
@@ -487,6 +520,7 @@ struct ClientBatchStats {
     get_wait_max_us: AtomicU64,
 }
 
+/// Snapshot of client batcher stats.
 #[derive(Default, Debug, Clone)]
 struct ClientBatchStatsSnapshot {
     set_batches: u64,
@@ -502,6 +536,7 @@ struct ClientBatchStatsSnapshot {
 }
 
 impl ClientBatchStats {
+    /// Record a completed SET batch with item count and queue wait time.
     fn record_set(&self, items: u64, wait_us: u64) {
         self.set_batches.fetch_add(1, Ordering::Relaxed);
         self.set_items.fetch_add(items, Ordering::Relaxed);
@@ -510,6 +545,7 @@ impl ClientBatchStats {
         self.set_wait_max_us.fetch_max(wait_us, Ordering::Relaxed);
     }
 
+    /// Record a completed GET batch with item count and queue wait time.
     fn record_get(&self, items: u64, wait_us: u64) {
         self.get_batches.fetch_add(1, Ordering::Relaxed);
         self.get_items.fetch_add(items, Ordering::Relaxed);
@@ -518,6 +554,7 @@ impl ClientBatchStats {
         self.get_wait_max_us.fetch_max(wait_us, Ordering::Relaxed);
     }
 
+    /// Snapshot and reset client batch stats.
     fn snapshot_and_reset(&self) -> ClientBatchStatsSnapshot {
         ClientBatchStatsSnapshot {
             set_batches: self.set_batches.swap(0, Ordering::Relaxed),
@@ -534,6 +571,7 @@ impl ClientBatchStats {
     }
 }
 
+/// Configuration for client request batching.
 #[derive(Clone, Copy)]
 struct ClientBatchConfig {
     set_max: usize,
@@ -542,12 +580,14 @@ struct ClientBatchConfig {
     inflight: usize,
 }
 
+/// Work item representing a batched SET request.
 struct BatchSetWork {
     items: Vec<(Vec<u8>, Vec<u8>)>,
     tx: oneshot::Sender<anyhow::Result<()>>,
     enqueued_at: Instant,
 }
 
+/// Work item representing a batched GET request.
 struct BatchGetWork {
     keys: Vec<Vec<u8>>,
     tx: oneshot::Sender<anyhow::Result<Vec<Option<Vec<u8>>>>>,
@@ -555,6 +595,7 @@ struct BatchGetWork {
 }
 
 impl ProposalStats {
+    /// Record latency for a proposal kind.
     fn record(&self, kind: ProposalKind, dur_us: u64, ok: bool) {
         match kind {
             ProposalKind::Get => self.get.record(dur_us, ok),
@@ -564,6 +605,7 @@ impl ProposalStats {
         }
     }
 
+    /// Snapshot and reset all proposal stats.
     fn snapshot_and_reset(&self) -> ProposalStatsSnapshot {
         ProposalStatsSnapshot {
             get: self.get.snapshot(),
@@ -575,15 +617,18 @@ impl ProposalStats {
 }
 
 impl OpStats {
+    /// Record a single operation's latency and success/failure.
     fn record(&self, dur_us: u64, ok: bool) {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.total_us.fetch_add(dur_us, Ordering::Relaxed);
         self.max_us.fetch_max(dur_us, Ordering::Relaxed);
         if !ok {
+            // Track failures separately from total count.
             self.errors.fetch_add(1, Ordering::Relaxed);
         }
     }
 
+    /// Snapshot and reset counters.
     fn snapshot(&self) -> OpStatsSnapshot {
         OpStatsSnapshot {
             count: self.count.swap(0, Ordering::Relaxed),
@@ -595,36 +640,45 @@ impl OpStats {
 }
 
 impl NodeState {
+    /// Return the Accord group for a given group id.
     fn group(&self, group_id: GroupId) -> Option<Arc<accord::Group>> {
         self.groups.get(&group_id).cloned()
     }
 
+    /// Map a key to a shard index.
     fn shard_for_key(&self, key: &[u8]) -> usize {
         if self.data_shards <= 1 {
+            // Fast path when there is only one shard.
             return 0;
         }
         (kv::hash_key(key) as usize) % self.data_shards
     }
 
+    /// Resolve the Accord handle for a shard index.
     fn handle_for_shard(&self, shard: usize) -> accord::Handle {
         let idx = shard.min(self.data_handles.len().saturating_sub(1));
         self.data_handles[idx].clone()
     }
 
+    /// Read the latest visible value for a key from the local KV engine.
     fn kv_latest(&self, key: &[u8]) -> Option<(Vec<u8>, kv::Version)> {
         self.kv_engine.get_latest(key)
     }
 
+    /// Batch read latest visible values from the local KV engine.
     fn kv_latest_batch(&self, keys: &[Vec<u8>]) -> Vec<Option<(Vec<u8>, kv::Version)>> {
         self.kv_engine.get_latest_batch(keys)
     }
 
+    /// Snapshot and reset client batch stats.
     fn client_batch_stats_snapshot(&self) -> ClientBatchStatsSnapshot {
         self.client_batch_stats.snapshot_and_reset()
     }
 
+    /// Enqueue a batch SET request to the client batcher.
     async fn execute_batch_set(&self, items: Vec<(Vec<u8>, Vec<u8>)>) -> anyhow::Result<()> {
         if items.is_empty() {
+            // Nothing to do.
             return Ok(());
         }
         let (tx, rx) = oneshot::channel();
@@ -640,11 +694,13 @@ impl NodeState {
         rx.await.context("set batch response dropped")?
     }
 
+    /// Execute a batch SET directly against Accord without client batching.
     async fn execute_batch_set_direct(
         &self,
         items: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> anyhow::Result<()> {
         if items.is_empty() {
+            // Nothing to do.
             return Ok(());
         }
         let mut by_shard: Vec<Vec<(Vec<u8>, Vec<u8>)>> = vec![Vec::new(); self.data_shards];
@@ -657,10 +713,12 @@ impl NodeState {
         let mut futs = FuturesUnordered::new();
         for (shard, batch) in by_shard.into_iter().enumerate() {
             if batch.is_empty() {
+                // Skip shards with no work.
                 continue;
             }
             let handle = self.handle_for_shard(shard);
             for chunk in batch.chunks(target) {
+                // Split large batches into target-sized chunks for bounded proposal size.
                 let cmd = kv::encode_batch_set(chunk);
                 let handle = handle.clone();
                 futs.push(self.propose_timed_on(handle, ProposalKind::BatchSet, cmd));
@@ -673,8 +731,10 @@ impl NodeState {
         Ok(())
     }
 
+    /// Enqueue a batch GET request to the client batcher.
     async fn execute_batch_get(&self, keys: Vec<Vec<u8>>) -> anyhow::Result<Vec<Option<Vec<u8>>>> {
         if keys.is_empty() {
+            // Nothing to do.
             return Ok(Vec::new());
         }
 
@@ -691,11 +751,13 @@ impl NodeState {
         rx.await.context("get batch response dropped")?
     }
 
+    /// Execute a batch GET directly with the selected read mode.
     async fn execute_batch_get_direct(
         &self,
         keys: Vec<Vec<u8>>,
     ) -> anyhow::Result<Vec<Option<Vec<u8>>>> {
         if keys.is_empty() {
+            // Nothing to do.
             return Ok(Vec::new());
         }
         let mut by_shard: Vec<Vec<(usize, Vec<u8>)>> = vec![Vec::new(); self.data_shards];
@@ -709,6 +771,7 @@ impl NodeState {
 
         for (shard, entries) in by_shard.into_iter().enumerate() {
             if entries.is_empty() {
+                // Skip shards with no work.
                 continue;
             }
             let mut shard_keys = Vec::with_capacity(entries.len());
@@ -725,12 +788,14 @@ impl NodeState {
             futs.push(async move {
                 let values = match read_mode {
                     ReadMode::Accord => {
+                        // Accord reads: enforce read barriers before reading.
                         let deps = match this
                             .ensure_read_barrier_shard(GROUP_DATA_BASE + shard as u64, &shard_keys)
                             .await
                         {
                             Ok(versions) => versions,
                             Err(err) => {
+                                // Optionally fall back to quorum reads on barrier failures.
                                 if fallback {
                                     tracing::warn!(
                                         error = ?err,
@@ -759,12 +824,14 @@ impl NodeState {
                         );
                         decoded
                     }
+                    // Local reads use the local KV engine without barriers.
                     ReadMode::Local => this
                         .kv_engine
                         .get_latest_batch(&shard_keys)
                         .into_iter()
                         .map(|item| item.map(|(v, _)| v))
                         .collect(),
+                    // Quorum reads consult a quorum of peers and pick latest values.
                     ReadMode::Quorum => this.quorum_batch_get_shard(shard_keys).await?,
                 };
                 Ok::<_, anyhow::Error>((shard_indices, values))
@@ -785,6 +852,7 @@ impl NodeState {
         Ok(out)
     }
 
+    /// Execute a single Redis operation by delegating to batching helpers.
     async fn execute(&self, op: redis_server::KvOp) -> anyhow::Result<redis_server::KvResult> {
         match op {
             redis_server::KvOp::HoloStats => {
@@ -802,6 +870,7 @@ impl NodeState {
         }
     }
 
+    /// Propose a command and record timing stats when enabled.
     async fn propose_timed_on(
         &self,
         handle: accord::Handle,
@@ -811,18 +880,21 @@ impl NodeState {
         let start = Instant::now();
         let res = handle.propose(command).await;
         if self.proposal_stats_enabled {
+            // Record duration even on error to capture tail latencies.
             let dur_us = start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
             self.proposal_stats.record(kind, dur_us, res.is_ok());
         }
         res
     }
 
+    /// Ensure read barriers for the keys in a shard by waiting for latest commits.
     async fn ensure_read_barrier_shard(
         &self,
         group_id: GroupId,
         keys: &[Vec<u8>],
     ) -> anyhow::Result<Vec<(TxnId, u64)>> {
         if keys.is_empty() {
+            // No keys means no barrier required.
             return Ok(Vec::new());
         }
         let responses = self.quorum_last_committed_shard(group_id, keys).await?;
@@ -831,11 +903,13 @@ impl NodeState {
         for replica in responses {
             for item in replica {
                 if let Some((txn_id, _)) = item {
+                    // Track each unique transaction observed in responses.
                     unique.entry(txn_id).or_insert(0);
                 }
             }
         }
         if unique.is_empty() {
+            // No outstanding commits to wait for.
             return Ok(Vec::new());
         }
         let group = self
@@ -844,6 +918,7 @@ impl NodeState {
         group.observe_last_committed(keys, &max_by_key).await;
         for item in &max_by_key {
             if let Some((txn_id, seq)) = item {
+                // Update sequences to the max observed per key.
                 unique.insert(*txn_id, *seq);
             }
         }
@@ -852,9 +927,12 @@ impl NodeState {
             match tokio::time::timeout(self.read_barrier_timeout, group.wait_executed(*txn_id))
                 .await
             {
+                // Success path: the txn has executed.
                 Ok(Ok(())) => {}
+                // Propagate execution errors.
                 Ok(Err(err)) => return Err(err),
                 Err(_) => {
+                    // Timeout waiting for execution.
                     anyhow::bail!("read barrier timed out waiting for {:?}", txn_id);
                 }
             }
@@ -862,6 +940,7 @@ impl NodeState {
         Ok(unique.into_iter().collect())
     }
 
+    /// Fetch last-committed info from a quorum (or all peers if configured).
     async fn quorum_last_committed_shard(
         &self,
         group_id: GroupId,
@@ -876,6 +955,7 @@ impl NodeState {
         let quorum = (self.member_ids.len() / 2) + 1;
         let mut ok = 1usize;
         if ok >= quorum && !self.read_barrier_all_peers {
+            // Local response is enough for quorum when all-peers isn't required.
             return Ok(results);
         }
 
@@ -904,11 +984,13 @@ impl NodeState {
                     ok += 1;
                 }
                 Err(err) => {
+                    // Log and ignore failed peers; quorum will decide success.
                     tracing::debug!(error = ?err, "last_committed rpc failed");
                 }
             }
         }
 
+        // Enforce all-peers or quorum based on configuration.
         if self.read_barrier_all_peers {
             let expected = self.member_ids.len();
             anyhow::ensure!(ok >= expected, "last_committed all-peers failed (ok={ok}, expected={expected})");
@@ -918,6 +1000,7 @@ impl NodeState {
         Ok(results)
     }
 
+    /// Perform a quorum GET and return the latest value.
     async fn quorum_get(&self, key: Vec<u8>) -> anyhow::Result<Option<Vec<u8>>> {
         let mut results: Vec<Option<(Vec<u8>, kv::Version)>> = Vec::new();
         results.push(self.kv_engine.get_latest(&key));
@@ -926,6 +1009,7 @@ impl NodeState {
         let mut ok = 1usize;
 
         if ok >= quorum {
+            // Local read already satisfies quorum.
             return Ok(pick_latest(results));
         }
 
@@ -943,6 +1027,7 @@ impl NodeState {
         };
 
         let needed = (quorum - ok).min(peers.len());
+        // Only compute and log debug output when enabled.
         if tracing::enabled!(tracing::Level::DEBUG) {
             tracing::debug!(
                 op = "quorum_get",
@@ -961,14 +1046,17 @@ impl NodeState {
 
         while let Some(res) = futs.next().await {
             if let Ok(value) = res {
+                // Only count successful responses toward quorum.
                 results.push(value);
                 ok += 1;
                 if ok >= quorum {
+                    // Stop once quorum responses have been collected.
                     break;
                 }
             }
 
             if ok < quorum && next_idx < peers.len() {
+                // Continue sending requests to additional peers if needed.
                 let peer = peers[next_idx];
                 next_idx += 1;
                 launch_next(&mut futs, peer, &key, &self.transport);
@@ -979,6 +1067,7 @@ impl NodeState {
         Ok(pick_latest(results))
     }
 
+    /// Perform a quorum batch GET for a shard and merge latest results.
     async fn quorum_batch_get_shard(
         &self,
         keys: Vec<Vec<u8>>,
@@ -990,6 +1079,7 @@ impl NodeState {
         results.push(self.kv_engine.get_latest_batch(&keys));
 
         if ok >= quorum {
+            // Local read already satisfies quorum.
             return Ok(merge_quorum_results(&results, keys.len()));
         }
 
@@ -1008,6 +1098,7 @@ impl NodeState {
         };
 
         let needed = (quorum - ok).min(peers.len());
+        // Only compute and log debug output when enabled.
         if tracing::enabled!(tracing::Level::DEBUG) {
             tracing::debug!(
                 op = "quorum_batch_get",
@@ -1026,14 +1117,17 @@ impl NodeState {
 
         while let Some(res) = futs.next().await {
             if let Ok(values) = res {
+                // Only count successful responses toward quorum.
                 results.push(values);
                 ok += 1;
                 if ok >= quorum {
+                    // Stop once quorum responses have been collected.
                     break;
                 }
             }
 
             if ok < quorum && next_idx < peers.len() {
+                // Continue sending requests to additional peers if needed.
                 let peer = peers[next_idx];
                 next_idx += 1;
                 launch_next(&mut futs, peer, &keys, &self.transport);
@@ -1044,6 +1138,7 @@ impl NodeState {
         Ok(merge_quorum_results(&results, keys.len()))
     }
 
+    /// Return a deterministic ordering of peers for a given seed.
     fn peers_for_seed(&self, seed: u64) -> Vec<NodeId> {
         let mut peers = self
             .member_ids
@@ -1052,6 +1147,7 @@ impl NodeState {
             .filter(|id| *id != self.node_id)
             .collect::<Vec<_>>();
         if peers.len() > 1 {
+            // Rotate to spread load across peers deterministically.
             let start = (seed as usize) % peers.len();
             peers.rotate_left(start);
         }
@@ -1059,6 +1155,7 @@ impl NodeState {
     }
 }
 
+/// Collect a batch of SET work items up to size/time limits.
 async fn collect_set_batch(
     first: BatchSetWork,
     rx: &mut mpsc::Receiver<BatchSetWork>,
@@ -1070,6 +1167,7 @@ async fn collect_set_batch(
     items += first.items.len();
     batch.push(first);
 
+    // Decide whether to wait for more items based on the configured wait time.
     let deadline = if wait.is_zero() {
         None
     } else {
@@ -1077,6 +1175,7 @@ async fn collect_set_batch(
     };
 
     'outer: loop {
+        // Stop when we hit the maximum batch size.
         if items >= max_items {
             break;
         }
@@ -1090,10 +1189,12 @@ async fn collect_set_batch(
             Err(mpsc::error::TryRecvError::Disconnected) => break,
         }
 
+        // No deadline means we are done collecting.
         let Some(deadline) = deadline else {
             break;
         };
         let now = Instant::now();
+        // Stop when the batching window expires.
         if now >= deadline {
             break;
         }
@@ -1117,6 +1218,7 @@ async fn collect_set_batch(
     batch
 }
 
+/// Collect a batch of GET work items up to size/time limits.
 async fn collect_get_batch(
     first: BatchGetWork,
     rx: &mut mpsc::Receiver<BatchGetWork>,
@@ -1128,6 +1230,7 @@ async fn collect_get_batch(
     items += first.keys.len();
     batch.push(first);
 
+    // Decide whether to wait for more items based on the configured wait time.
     let deadline = if wait.is_zero() {
         None
     } else {
@@ -1135,6 +1238,7 @@ async fn collect_get_batch(
     };
 
     'outer: loop {
+        // Stop when we hit the maximum batch size.
         if items >= max_items {
             break;
         }
@@ -1148,10 +1252,12 @@ async fn collect_get_batch(
             Err(mpsc::error::TryRecvError::Disconnected) => break,
         }
 
+        // No deadline means we are done collecting.
         let Some(deadline) = deadline else {
             break;
         };
         let now = Instant::now();
+        // Stop when the batching window expires.
         if now >= deadline {
             break;
         }
@@ -1175,6 +1281,7 @@ async fn collect_get_batch(
     batch
 }
 
+/// Spawn the SET batcher that coalesces client requests.
 fn spawn_set_batcher(
     state: Arc<NodeState>,
     mut rx: mpsc::Receiver<BatchSetWork>,
@@ -1211,6 +1318,7 @@ fn spawn_set_batcher(
                 }
 
                 if total_items == 0 {
+                    // Respond immediately to empty batches.
                     for tx in responders {
                         let _ = tx.send(Ok(()));
                     }
@@ -1228,6 +1336,7 @@ fn spawn_set_batcher(
                         }
                     }
                     Err(err) => {
+                        // Send the same error to all batch participants.
                         let msg = err.to_string();
                         for tx in responders {
                             let _ = tx.send(Err(anyhow!(msg.clone())));
@@ -1239,6 +1348,7 @@ fn spawn_set_batcher(
     });
 }
 
+/// Spawn the GET batcher that coalesces client requests.
 fn spawn_get_batcher(
     state: Arc<NodeState>,
     mut rx: mpsc::Receiver<BatchGetWork>,
@@ -1277,6 +1387,7 @@ fn spawn_get_batcher(
                 }
 
                 if total_items == 0 {
+                    // Respond immediately to empty batches.
                     for tx in responders {
                         let _ = tx.send(Ok(Vec::new()));
                     }
@@ -1290,6 +1401,7 @@ fn spawn_get_batcher(
                 match res {
                     Ok(values) => {
                         if values.len() != total_items {
+                            // Guard against mismatched batch sizing.
                             let msg = format!(
                                 "batch get result count mismatch (expected {total_items}, got {})",
                                 values.len()
@@ -1308,6 +1420,7 @@ fn spawn_get_batcher(
                         }
                     }
                     Err(err) => {
+                        // Send the same error to all batch participants.
                         let msg = err.to_string();
                         for tx in responders {
                             let _ = tx.send(Err(anyhow!(msg.clone())));
@@ -1319,6 +1432,7 @@ fn spawn_get_batcher(
     });
 }
 
+/// Pick the highest-version value from a list of optional versions.
 fn pick_latest(values: Vec<Option<(Vec<u8>, kv::Version)>>) -> Option<Vec<u8>> {
     let mut best: Option<(Vec<u8>, kv::Version)> = None;
     for item in values.into_iter().flatten() {
@@ -1327,12 +1441,14 @@ fn pick_latest(values: Vec<Option<(Vec<u8>, kv::Version)>>) -> Option<Vec<u8>> {
             Some((_, cur)) => item.1 > *cur,
         };
         if replace {
+            // Keep the highest-version value.
             best = Some(item);
         }
     }
     best.map(|(v, _)| v)
 }
 
+/// Merge per-replica latest values by choosing the highest version per key.
 fn merge_quorum_results(
     results: &[Vec<Option<(Vec<u8>, kv::Version)>>],
     key_count: usize,
@@ -1347,6 +1463,7 @@ fn merge_quorum_results(
                     Some((_, cur)) => *ver > *cur,
                 };
                 if replace {
+                    // Keep the highest-version value across replicas.
                     best = Some((v.clone(), *ver));
                 }
             }
@@ -1356,6 +1473,7 @@ fn merge_quorum_results(
     merged
 }
 
+/// Merge per-replica last-committed (txn_id, seq) by highest seq per key.
 fn merge_last_committed(
     results: &[Vec<Option<(TxnId, u64)>>],
     key_count: usize,
@@ -1370,6 +1488,7 @@ fn merge_last_committed(
                     Some((_, cur_seq)) => *seq > *cur_seq,
                 };
                 if replace {
+                    // Keep the highest sequence number across replicas.
                     best = Some((*txn_id, *seq));
                 }
             }
@@ -1379,6 +1498,7 @@ fn merge_last_committed(
     merged
 }
 
+/// Log aggregated RPC stats from the transport layer.
 fn log_rpc_stats(snap: &transport::RpcStatsSnapshot) {
     log_rpc_batch(
         "kv_get",
@@ -1391,6 +1511,7 @@ fn log_rpc_stats(snap: &transport::RpcStatsSnapshot) {
         snap.kv_get_errors,
     );
 
+    // Only log batch get stats if there was activity.
     if snap.kv_batch_get_calls > 0 || snap.kv_batch_get_errors > 0 {
         let avg_rpc_ms = avg_us_per(snap.kv_batch_get_rpc_us, snap.kv_batch_get_calls);
         tracing::info!(
@@ -1444,6 +1565,7 @@ fn log_rpc_stats(snap: &transport::RpcStatsSnapshot) {
     );
 }
 
+/// Log Accord consensus stats for a given group.
 fn log_accord_stats(group_id: GroupId, stats: &accord::DebugStats) {
     let exec_progress_avg_ms =
         avg_us_per(stats.exec_progress_total_us, stats.exec_progress_count);
@@ -1490,6 +1612,7 @@ fn log_accord_stats(group_id: GroupId, stats: &accord::DebugStats) {
     );
 }
 
+/// Log proposal stats by kind.
 fn log_proposal_stats(snap: &ProposalStatsSnapshot) {
     log_proposal_kind("get", &snap.get);
     log_proposal_kind("set", &snap.set);
@@ -1497,8 +1620,10 @@ fn log_proposal_stats(snap: &ProposalStatsSnapshot) {
     log_proposal_kind("batch_set", &snap.batch_set);
 }
 
+/// Log proposal stats for a specific proposal kind.
 fn log_proposal_kind(kind: &str, snap: &OpStatsSnapshot) {
     if snap.count == 0 && snap.errors == 0 {
+        // Skip logging empty stats.
         return;
     }
     let avg_ms = avg_us_per(snap.total_us, snap.count);
@@ -1513,6 +1638,7 @@ fn log_proposal_kind(kind: &str, snap: &OpStatsSnapshot) {
     );
 }
 
+/// Log per-peer RPC queue and latency stats.
 fn log_peer_queue_stats(peer_id: NodeId, snap: &transport::PeerStatsSnapshot) {
     let pre = &snap.pre_accept_latency;
     let acc = &snap.accept_latency;
@@ -1603,8 +1729,10 @@ fn log_peer_queue_stats(peer_id: NodeId, snap: &transport::PeerStatsSnapshot) {
     );
 }
 
+/// Log a short summary identifying the slowest peer.
 fn log_peer_summary(peers: &[(NodeId, transport::PeerStatsSnapshot)]) {
     if peers.is_empty() {
+        // Nothing to summarize.
         return;
     }
     let mut slow_peer = peers[0].0;
@@ -1613,6 +1741,7 @@ fn log_peer_summary(peers: &[(NodeId, transport::PeerStatsSnapshot)]) {
     for (peer_id, snap) in peers {
         let queue_total = snap.pre_accept_queue + snap.accept_queue + snap.commit_queue;
         if queue_total > slow_queue {
+            // Track the peer with the largest combined queue.
             slow_queue = queue_total;
             slow_peer = *peer_id;
             slow_sent = snap.pre_accept_sent + snap.accept_sent + snap.commit_sent;
@@ -1626,11 +1755,13 @@ fn log_peer_summary(peers: &[(NodeId, transport::PeerStatsSnapshot)]) {
     );
 }
 
+/// CSV writer for periodic peer RPC stats.
 struct PeerStatsCsv {
     writer: BufWriter<std::fs::File>,
 }
 
 impl PeerStatsCsv {
+    /// Open or create the CSV file, writing a header if the file is empty.
     fn open(path: &str) -> Option<Self> {
         let file = OpenOptions::new()
             .create(true)
@@ -1644,6 +1775,7 @@ impl PeerStatsCsv {
             .map(|m| m.len() == 0)
             .unwrap_or(false);
         if need_header {
+            // Write a header row so downstream tools can parse columns.
             let header = concat!(
                 "ts_ms,node_id,peer_id,queue_total,inflight_total,sent_total,",
                 "kv_get_queue,kv_get_inflight,kv_get_sent,kv_get_errors,kv_get_count,kv_get_avg_ms,kv_get_p95_ms,kv_get_p99_ms,kv_get_max_ms,",
@@ -1659,6 +1791,7 @@ impl PeerStatsCsv {
                 "rpc_inflight_limit\n",
             );
             if writer.write_all(header.as_bytes()).is_err() {
+                // Bail out if we cannot write the header.
                 return None;
             }
             let _ = writer.flush();
@@ -1666,6 +1799,7 @@ impl PeerStatsCsv {
         Some(Self { writer })
     }
 
+    /// Append a single per-peer snapshot row to the CSV file.
     fn write_snapshot(
         &mut self,
         ts_ms: u128,
@@ -1790,6 +1924,7 @@ impl PeerStatsCsv {
     }
 }
 
+/// Read RSS in kilobytes from `ps` for cross-checking sysinfo units.
 fn ps_rss_kb(pid: u32) -> Option<u64> {
     let output = std::process::Command::new("ps")
         .arg("-o")
@@ -1799,6 +1934,7 @@ fn ps_rss_kb(pid: u32) -> Option<u64> {
         .output()
         .ok()?;
     if !output.status.success() {
+        // `ps` failed; skip the cross-check.
         return None;
     }
     let text = String::from_utf8_lossy(&output.stdout);
@@ -1806,6 +1942,7 @@ fn ps_rss_kb(pid: u32) -> Option<u64> {
     value.parse::<u64>().ok()
 }
 
+/// Log a single RPC batch category summary.
 fn log_rpc_batch(
     kind: &str,
     batches: u64,
@@ -1817,11 +1954,14 @@ fn log_rpc_batch(
     errors: u64,
 ) {
     if batches == 0 && errors == 0 {
+        // Skip empty stats.
         return;
     }
     let avg_batch = if batches > 0 {
+        // Average items per batch when we have samples.
         items as f64 / batches as f64
     } else {
+        // No batches recorded.
         0.0
     };
     let avg_rpc_ms = avg_us_per(rpc_us, batches);
@@ -1842,15 +1982,19 @@ fn log_rpc_batch(
     );
 }
 
+/// Compute average duration in milliseconds from total microseconds and count.
 fn avg_us_per(total_us: u64, count: u64) -> f64 {
     if count == 0 {
+        // Avoid divide-by-zero.
         return 0.0;
     }
     (total_us as f64 / count as f64) / 1000.0
 }
 
 #[tokio::main]
+/// Parse CLI args, initialize logging, and run the requested subcommand.
 async fn main() -> anyhow::Result<()> {
+    // Enable ANSI colors only when stdout is a terminal and NO_COLOR is unset.
     let ansi = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     tracing_subscriber::fmt()
         .with_ansi(ansi)
@@ -1862,10 +2006,12 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     match args.cmd {
+        // Dispatch to the node runtime.
         Command::Node(args) => run_node(args).await,
     }
 }
 
+/// Initialize storage, transport, consensus groups, and servers for a node.
 async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
     let data_dir = PathBuf::from(&args.data_dir);
     fs::create_dir_all(&data_dir).context("create data dir")?;
@@ -1876,10 +2022,12 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
 
     let mut fjall_cfg = fjall::Config::new(&storage_dir);
     if args.fjall_manual_journal_persist {
+        // Allow WAL to be the durability source by disabling auto journal persistence.
         fjall_cfg = fjall_cfg.manual_journal_persist(true);
     }
     if let Some(ms) = args.fjall_fsync_ms {
         if ms > 0 {
+            // Configure periodic fsync if explicitly enabled.
             fjall_cfg = fjall_cfg.fsync_ms(Some(ms));
         }
     }
@@ -1889,11 +2037,13 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
     let kv_engine_impl = Arc::new(FjallEngine::open(keyspace.clone())?);
 
     if args.bootstrap == args.join.is_some() {
+        // Exactly one of --bootstrap or --join must be selected.
         anyhow::bail!("exactly one of --bootstrap or --join must be set");
     }
 
     let members = parse_members(&args.initial_members)?;
 
+    // Clamp timeouts to at least 1ms to avoid zero-duration timeouts.
     let rpc_timeout = Duration::from_millis(args.rpc_timeout_ms.max(1));
     let commit_timeout = Duration::from_millis(args.commit_timeout_ms.max(1));
     let propose_timeout = Duration::from_millis(args.propose_timeout_ms.max(1));
@@ -1916,6 +2066,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         Duration::from_micros(args.rpc_batch_wait_us),
     ));
     if args.rpc_stats_interval_ms > 0 {
+        // Periodically log transport-level RPC stats.
         let stats = transport.stats();
         let interval = Duration::from_millis(args.rpc_stats_interval_ms.max(1));
         tokio::spawn(async move {
@@ -1929,6 +2080,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
     }
 
     if args.rpc_queue_stats_interval_ms > 0 {
+        // Periodically log per-peer queue stats (and optionally CSV).
         let transport = transport.clone();
         let interval = Duration::from_millis(args.rpc_queue_stats_interval_ms.max(1));
         let node_id = args.node_id;
@@ -1941,6 +2093,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
             let mut csv = csv_path.and_then(|path| {
                 let writer = PeerStatsCsv::open(&path);
                 if writer.is_none() {
+                    // Warn if CSV output could not be initialized.
                     tracing::warn!(path = %path, "failed to open peer stats csv");
                 }
                 writer
@@ -1953,6 +2106,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
                 }
                 log_peer_summary(&snaps);
                 if let Some(writer) = csv.as_mut() {
+                    // Append per-peer stats to the CSV file when enabled.
                     let ts_ms = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap_or_default()
@@ -1970,6 +2124,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
     let proposal_stats = Arc::new(ProposalStats::default());
     let proposal_stats_enabled = args.proposal_stats_interval_ms > 0;
     if proposal_stats_enabled {
+        // Periodically log proposal stats.
         let stats = proposal_stats.clone();
         let interval = Duration::from_millis(args.proposal_stats_interval_ms.max(1));
         tokio::spawn(async move {
@@ -1983,6 +2138,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
     }
 
     if args.rpc_queue_stats_interval_ms > 0 {
+        // Periodically log server-side RPC handler stats.
         let stats = rpc_handler_stats.clone();
         let interval = Duration::from_millis(args.rpc_queue_stats_interval_ms.max(1));
         tokio::spawn(async move {
@@ -2016,6 +2172,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
     }
 
     if args.proc_stats_interval_ms > 0 {
+        // Periodically log process CPU and memory usage.
         let interval = Duration::from_millis(args.proc_stats_interval_ms.max(1));
         let node_id = args.node_id;
         let use_ps = args.proc_stats_use_ps;
@@ -2027,9 +2184,11 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
                 ticker.tick().await;
                 system.refresh_process(pid);
                 if let Some(proc) = system.process(pid) {
+                    // Only log stats when the process info is available.
                     let cpu = proc.cpu_usage();
                     let rss_raw = proc.memory();
                     let vmem_raw = proc.virtual_memory();
+                    // Optionally sample RSS via `ps` for unit cross-checking.
                     let ps_rss = if use_ps {
                         ps_rss_kb(std::process::id())
                     } else {
@@ -2043,6 +2202,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
                             rss_raw >= lower && rss_raw <= upper
                         })
                         .unwrap_or(false);
+                    // Normalize sysinfo units to bytes for consistent logging.
                     let rss_bytes = if sysinfo_is_bytes {
                         rss_raw
                     } else {
@@ -2078,16 +2238,20 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
     let data_shards = args.data_shards.max(1);
     let mut kv_shards: Vec<Arc<dyn KvEngine>> = Vec::with_capacity(data_shards);
     if data_shards == 1 {
+        // Single shard: reuse the default Fjall engine.
         kv_shards.push(kv_engine_impl.clone());
     } else {
+        // Multiple shards: open separate Fjall partitions per shard.
         for shard in 0..data_shards {
             let engine = Arc::new(FjallEngine::open_shard(keyspace.clone(), shard)?);
             kv_shards.push(engine);
         }
     }
     let kv_engine: Arc<dyn KvEngine> = if data_shards == 1 {
+        // Keep a direct engine when there is only one shard.
         kv_shards[0].clone()
     } else {
+        // Wrap in a sharded engine for multi-shard routing.
         Arc::new(kv::ShardedKvEngine::new(kv_shards.clone())?)
     };
     let noop_sm = Arc::new(kv::NoopStateMachine);
@@ -2138,6 +2302,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
             .await
             .context("replay commit log")?;
         if replayed > 0 {
+            // Log replay to help track startup recovery cost.
             tracing::info!(group_id = group_id, replayed = replayed, "replayed commit log entries");
         }
         data_group.spawn_executor();
@@ -2149,6 +2314,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
     membership_group.spawn_executor();
 
     if args.accord_stats_interval_ms > 0 {
+        // Periodically log Accord executor stats per data group.
         let data_groups = data_groups.clone();
         let interval = Duration::from_millis(args.accord_stats_interval_ms.max(1));
         tokio::spawn(async move {
@@ -2197,6 +2363,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         client_get_tx,
         client_batch_stats: client_batch_stats.clone(),
         client_set_batch_target: if args.client_single_key_txn {
+            // Force single-key proposals for debug or perf experiments.
             1
         } else {
             args.client_set_batch_target.max(1)
@@ -2222,6 +2389,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
                 .run(volo::net::Address::from(grpc_addr))
                 .await;
             if let Err(err) = result {
+                // Log server failures without crashing the node task.
                 tracing::error!(error = ?err, "gRPC server failed");
             }
         }
@@ -2232,12 +2400,14 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         let state = state.clone();
         async move {
             if let Err(err) = redis_server::run(redis_addr, state).await {
+                // Log server failures without crashing the node task.
                 tracing::error!(error = ?err, "redis server failed");
             }
         }
     });
 
     if let Some(seed) = args.join {
+        // Join an existing cluster by contacting the seed node.
         join_seed(args.node_id, seed, &args.initial_members).await?;
     }
 
@@ -2252,6 +2422,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Attempt to join a seed node, retrying for a fixed number of attempts.
 async fn join_seed(node_id: u64, seed: SocketAddr, expected_members: &str) -> anyhow::Result<()> {
     let client = volo_gen::holo_store::rpc::HoloRpcClientBuilder::new("holo_store.rpc.HoloRpc")
         .address(volo::net::Address::from(seed))
@@ -2265,6 +2436,7 @@ async fn join_seed(node_id: u64, seed: SocketAddr, expected_members: &str) -> an
             Ok(resp) => {
                 let members = resp.into_inner().initial_members;
                 if members.as_str() != expected_members {
+                    // Warn when seed membership differs from the expected config.
                     tracing::warn!(
                         seed = %seed,
                         expected = expected_members,
@@ -2274,6 +2446,7 @@ async fn join_seed(node_id: u64, seed: SocketAddr, expected_members: &str) -> an
                 }
                 return Ok(());
             }
+            // Retry after a short delay if the seed is not ready.
             Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
         }
     }
@@ -2281,6 +2454,7 @@ async fn join_seed(node_id: u64, seed: SocketAddr, expected_members: &str) -> an
     anyhow::bail!("failed to join seed {seed}");
 }
 
+/// Parse a comma-separated `id@host:port` membership string.
 fn parse_members(input: &str) -> anyhow::Result<HashMap<NodeId, SocketAddr>> {
     let mut out = HashMap::new();
     for part in input.split(',').filter(|s| !s.trim().is_empty()) {

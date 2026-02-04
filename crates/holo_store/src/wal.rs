@@ -1,3 +1,8 @@
+//! Write-ahead log (WAL) implementation for durable Accord commits.
+//!
+//! This module provides a file-backed `CommitLog` implementation that batches
+//! writes, optionally fsyncs, and supports compaction based on executed txns.
+
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -12,13 +17,19 @@ use anyhow::Context;
 use crc32fast::Hasher;
 use holo_accord::accord::{CommitLog, CommitLogEntry, TxnId};
 
+/// Default number of appended entries before forcing a sync.
 const WAL_PERSIST_EVERY: u64 = 256;
+/// Default max time between forced syncs (microseconds).
 const WAL_PERSIST_INTERVAL_US: u64 = 2_000;
+/// Default maximum number of commit entries to batch together.
 const WAL_COMMIT_BATCH_MAX: usize = 64;
+/// Default batching window for commits (microseconds).
 const WAL_COMMIT_BATCH_WAIT_US: u64 = 200;
 
+/// File name used for the WAL log within the WAL directory.
 const WAL_LOG_FILE: &str = "wal.log";
 
+/// Snapshot of WAL performance statistics for logging/monitoring.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct WalStatsSnapshot {
     pub fsync_count: u64,
@@ -31,6 +42,7 @@ pub struct WalStatsSnapshot {
     pub batch_max_bytes: u64,
 }
 
+/// Internal counters used to build `WalStatsSnapshot`.
 struct WalStats {
     fsync_count: AtomicU64,
     fsync_total_us: AtomicU64,
@@ -43,6 +55,7 @@ struct WalStats {
 }
 
 impl WalStats {
+    /// Initialize a zeroed statistics struct.
     const fn new() -> Self {
         Self {
             fsync_count: AtomicU64::new(0),
@@ -56,6 +69,7 @@ impl WalStats {
         }
     }
 
+    /// Record the cost of a single fsync.
     fn record_fsync(&self, dur: Duration) {
         let us = dur.as_micros().min(u128::from(u64::MAX)) as u64;
         self.fsync_count.fetch_add(1, Ordering::Relaxed);
@@ -63,6 +77,7 @@ impl WalStats {
         self.fsync_max_us.fetch_max(us, Ordering::Relaxed);
     }
 
+    /// Record batch sizing stats for a commit write.
     fn record_batch(&self, items: u64, bytes: u64) {
         self.batch_count.fetch_add(1, Ordering::Relaxed);
         self.batch_items.fetch_add(items, Ordering::Relaxed);
@@ -71,6 +86,7 @@ impl WalStats {
         self.batch_max_bytes.fetch_max(bytes, Ordering::Relaxed);
     }
 
+    /// Return the current snapshot and reset counters.
     fn snapshot_and_reset(&self) -> WalStatsSnapshot {
         WalStatsSnapshot {
             fsync_count: self.fsync_count.swap(0, Ordering::Relaxed),
@@ -85,22 +101,27 @@ impl WalStats {
     }
 }
 
+/// Global WAL statistics collector.
 static WAL_STATS: WalStats = WalStats::new();
 
+/// Fetch and reset WAL stats for logging/monitoring.
 pub fn stats_snapshot() -> WalStatsSnapshot {
     WAL_STATS.snapshot_and_reset()
 }
 
+/// Single commit append work item sent to the WAL worker.
 struct CommitWork {
     entry: CommitLogEntry,
     tx: mpsc::Sender<anyhow::Result<()>>,
 }
 
+/// Compaction request sent to the WAL worker.
 struct CompactWork {
     max_delete: usize,
     tx: mpsc::Sender<anyhow::Result<usize>>,
 }
 
+/// Commands supported by the WAL worker thread.
 enum WalCommand {
     Append(CommitWork),
     AppendBatch(Vec<CommitWork>),
@@ -108,6 +129,7 @@ enum WalCommand {
     Compact(CompactWork),
 }
 
+/// Sync strategy used when persisting WAL data.
 #[derive(Clone, Copy, Debug)]
 enum SyncMode {
     None,
@@ -115,6 +137,7 @@ enum SyncMode {
     All,
 }
 
+/// File-backed WAL implementation with a dedicated worker thread.
 pub struct FileWal {
     dir: PathBuf,
     log_path: PathBuf,
@@ -122,11 +145,15 @@ pub struct FileWal {
 }
 
 impl FileWal {
+    /// Open or create a WAL directory and spawn the worker thread.
+    ///
+    /// This configures batching and persistence based on env overrides.
     pub fn open_dir(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let dir = path.as_ref().to_path_buf();
         fs::create_dir_all(&dir).context("create wal dir")?;
         let log_path = dir.join(WAL_LOG_FILE);
 
+        // Read persistence and batching knobs from environment variables.
         let persist_every = read_env_u64("HOLO_WAL_PERSIST_EVERY", WAL_PERSIST_EVERY);
         let persist_interval_us =
             read_env_u64("HOLO_WAL_PERSIST_INTERVAL_US", WAL_PERSIST_INTERVAL_US);
@@ -142,6 +169,7 @@ impl FileWal {
         let commit_batch_wait_us =
             read_env_u64("HOLO_WAL_COMMIT_BATCH_WAIT_US", WAL_COMMIT_BATCH_WAIT_US);
 
+        // Decide whether to sync inline or via a background thread.
         let (persist_mode, persist_tx) = if persist_async {
             match persist_mode {
                 Some(mode) => {
@@ -151,11 +179,14 @@ impl FileWal {
                         .name("wal-persist".to_string())
                         .spawn(move || persist_loop(&path, mode, rx))
                         .context("spawn wal persist thread")?;
+                    // When async, the worker thread owns syncs and the writer skips them.
                     (SyncMode::None, Some(tx))
                 }
+                // Async requested but no persist mode provided means no syncing.
                 None => (SyncMode::None, None),
             }
         } else {
+            // Inline persistence in the commit worker thread.
             (persist_mode.unwrap_or(SyncMode::None), None)
         };
 
@@ -164,6 +195,7 @@ impl FileWal {
         thread::Builder::new()
             .name("wal-commit".to_string())
             .spawn(move || {
+                // Commit worker batches appends, handles fsyncs, and serves compaction.
                 wal_worker(
                     &worker_log_path,
                     rx,
@@ -180,12 +212,15 @@ impl FileWal {
         Ok(Self { dir, log_path, tx })
     }
 
+    /// Read all WAL entries for replay.
     fn load_entries(&self) -> anyhow::Result<Vec<CommitLogEntry>> {
         read_log_entries(&self.log_path)
     }
 
+    /// Append multiple commits using a single batch command to the worker.
     pub fn append_commits(&self, entries: Vec<CommitLogEntry>) -> anyhow::Result<()> {
         if entries.is_empty() {
+            // Nothing to append.
             return Ok(());
         }
         let (tx, rx) = mpsc::channel();
@@ -209,6 +244,7 @@ impl FileWal {
 }
 
 impl CommitLog for FileWal {
+    /// Append a single commit entry to the WAL.
     fn append_commit(&self, entry: CommitLogEntry) -> anyhow::Result<()> {
         let (tx, rx) = mpsc::channel();
         self.tx
@@ -217,21 +253,26 @@ impl CommitLog for FileWal {
         rx.recv().context("wal append response dropped")?
     }
 
+    /// Append multiple commits in one batch.
     fn append_commits(&self, entries: Vec<CommitLogEntry>) -> anyhow::Result<()> {
         FileWal::append_commits(self, entries)
     }
 
+    /// Record that a transaction has executed (for compaction eligibility).
     fn mark_executed(&self, txn_id: TxnId) -> anyhow::Result<()> {
         let _ = self.tx.send(WalCommand::MarkExecuted(txn_id));
         Ok(())
     }
 
+    /// Load all commit entries for replay.
     fn load(&self) -> anyhow::Result<Vec<CommitLogEntry>> {
         self.load_entries()
     }
 
+    /// Compact the WAL by removing up to `max_delete` executed entries.
     fn compact(&self, max_delete: usize) -> anyhow::Result<usize> {
         if max_delete == 0 {
+            // No compaction requested.
             return Ok(0);
         }
         let (tx, rx) = mpsc::channel();
@@ -242,6 +283,7 @@ impl CommitLog for FileWal {
     }
 }
 
+/// Worker loop that batches WAL commands and persists log entries.
 fn wal_worker(
     log_path: &Path,
     rx: mpsc::Receiver<WalCommand>,
@@ -275,6 +317,7 @@ fn wal_worker(
         commands.push(first);
 
         if batch_max > 1 {
+            // Try to coalesce multiple commands into a batch up to the limit or wait window.
             let deadline = if batch_wait.is_zero() {
                 None
             } else {
@@ -292,6 +335,7 @@ fn wal_worker(
                     }
                     Err(mpsc::TryRecvError::Empty) => {}
                     Err(mpsc::TryRecvError::Disconnected) => {
+                        // Stop after draining pending commands.
                         disconnected = true;
                         break;
                     }
@@ -302,6 +346,7 @@ fn wal_worker(
                 };
                 let now = Instant::now();
                 if now >= deadline {
+                    // Batching window expired.
                     break;
                 }
                 let remaining = deadline.saturating_duration_since(now);
@@ -309,6 +354,7 @@ fn wal_worker(
                     Ok(cmd) => commands.push(cmd),
                     Err(mpsc::RecvTimeoutError::Timeout) => break,
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        // Stop after draining pending commands.
                         disconnected = true;
                         break;
                     }
@@ -333,9 +379,11 @@ fn wal_worker(
                     }
                 }
                 WalCommand::MarkExecuted(txn_id) => {
+                    // Track executed txns so compaction can drop them later.
                     executed.insert(txn_id);
                 }
                 WalCommand::Compact(work) => {
+                    // Defer compaction until after current batch flush.
                     compact_req = Some(work);
                 }
             }
@@ -358,6 +406,7 @@ fn wal_worker(
             WAL_STATS.record_batch(batch_items, batch_bytes);
             pending_count = pending_count.saturating_add(append_batch.len() as u64);
             let now = epoch_micros();
+            // Decide whether to sync based on count or elapsed time thresholds.
             let hit_count = persist_every > 0 && pending_count >= persist_every;
             let hit_interval =
                 persist_interval_us > 0 && now.saturating_sub(last_persist_us) >= persist_interval_us;
@@ -365,8 +414,10 @@ fn wal_worker(
                 pending_count = 0;
                 last_persist_us = now;
                 if let Some(tx) = &persist_tx {
+                    // Signal the async persist thread.
                     let _ = tx.send(());
                 } else if let Err(err) = sync_file(&file, persist_mode) {
+                    // Capture sync errors so we can propagate to callers.
                     persist_error = Some(err.into());
                 }
             }
@@ -398,6 +449,7 @@ fn wal_worker(
     }
 }
 
+/// Append a sequence of commit entries to the WAL file.
 fn append_entries(file: &mut File, entries: &[CommitLogEntry]) -> std::io::Result<()> {
     for entry in entries {
         let payload = encode_entry(entry);
@@ -406,6 +458,7 @@ fn append_entries(file: &mut File, entries: &[CommitLogEntry]) -> std::io::Resul
     file.flush()
 }
 
+/// Write a single length-prefixed record with CRC32 checksum.
 fn write_record(file: &mut File, payload: &[u8]) -> std::io::Result<()> {
     let len = payload.len() as u32;
     let mut hasher = Hasher::new();
@@ -417,9 +470,11 @@ fn write_record(file: &mut File, payload: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Read and decode all WAL records from disk.
 fn read_log_entries(path: &Path) -> anyhow::Result<Vec<CommitLogEntry>> {
     let file = match File::open(path) {
         Ok(file) => file,
+        // Missing WAL means no entries to replay.
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => return Err(err.into()),
     };
@@ -429,6 +484,7 @@ fn read_log_entries(path: &Path) -> anyhow::Result<Vec<CommitLogEntry>> {
         let mut len_buf = [0u8; 4];
         match reader.read_exact(&mut len_buf) {
             Ok(()) => {}
+            // EOF means we have read all complete records.
             Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(err) => return Err(err.into()),
         }
@@ -441,26 +497,31 @@ fn read_log_entries(path: &Path) -> anyhow::Result<Vec<CommitLogEntry>> {
         let mut hasher = Hasher::new();
         hasher.update(&payload);
         let actual_crc = hasher.finalize();
+        // Detect partial/corrupted records.
         anyhow::ensure!(actual_crc == expected_crc, "wal checksum mismatch");
         entries.push(decode_entry(&payload)?);
     }
     Ok(entries)
 }
 
+/// Compact the WAL by removing up to `max_delete` entries whose txns executed.
 fn compact_log(
     log_path: &Path,
     executed: &mut HashSet<TxnId>,
     max_delete: usize,
 ) -> anyhow::Result<usize> {
     if max_delete == 0 {
+        // Nothing to delete.
         return Ok(0);
     }
 
     let entries = read_log_entries(log_path)?;
     if entries.is_empty() {
+        // No data to compact.
         return Ok(0);
     }
 
+    // Write a new temp log file containing retained entries.
     let tmp_path = log_path.with_extension("log.tmp");
     let mut out = OpenOptions::new()
         .create(true)
@@ -472,6 +533,7 @@ fn compact_log(
     let mut removed = 0usize;
     let mut retained = 0usize;
     for entry in &entries {
+        // Only remove entries that were executed, up to max_delete.
         let remove = removed < max_delete && executed.contains(&entry.txn_id);
         if remove {
             removed += 1;
@@ -487,6 +549,7 @@ fn compact_log(
     fs::rename(&tmp_path, log_path).context("replace wal log")?;
 
     if removed > 0 {
+        // Prune executed set so it does not grow unbounded.
         let mut pruned = 0usize;
         executed.retain(|txn_id| {
             if pruned >= removed {
@@ -508,6 +571,7 @@ fn compact_log(
     Ok(removed)
 }
 
+/// Open the WAL log file for appending.
 fn open_log_for_append(path: &Path) -> std::io::Result<File> {
     OpenOptions::new()
         .create(true)
@@ -515,8 +579,10 @@ fn open_log_for_append(path: &Path) -> std::io::Result<File> {
         .open(path)
 }
 
+/// Background thread that performs fsyncs on demand.
 fn persist_loop(path: &Path, mode: SyncMode, rx: mpsc::Receiver<()>) {
     while rx.recv().is_ok() {
+        // Drain any extra signals so we only sync once per burst.
         while rx.try_recv().is_ok() {}
         let Ok(file) = File::open(path) else {
             continue;
@@ -525,6 +591,7 @@ fn persist_loop(path: &Path, mode: SyncMode, rx: mpsc::Receiver<()>) {
     }
 }
 
+/// Perform the configured fsync mode on the WAL file.
 fn sync_file(file: &File, mode: SyncMode) -> std::io::Result<()> {
     match mode {
         SyncMode::None => Ok(()),
@@ -543,6 +610,7 @@ fn sync_file(file: &File, mode: SyncMode) -> std::io::Result<()> {
     }
 }
 
+/// Encode a commit log entry to a compact binary representation.
 fn encode_entry(entry: &CommitLogEntry) -> Vec<u8> {
     let mut out = Vec::with_capacity(
         8 + 8 + 8 + 4 + (entry.deps.len() * 16) + 4 + entry.command.len(),
@@ -560,10 +628,12 @@ fn encode_entry(entry: &CommitLogEntry) -> Vec<u8> {
     out
 }
 
+/// Return the encoded size for a commit entry.
 fn encoded_len(entry: &CommitLogEntry) -> usize {
     8 + 8 + 8 + 4 + (entry.deps.len() * 16) + 4 + entry.command.len()
 }
 
+/// Decode a commit entry from the WAL record payload.
 fn decode_entry(buf: &[u8]) -> anyhow::Result<CommitLogEntry> {
     let mut offset = 0usize;
     let node_id = read_u64_at(buf, &mut offset)?;
@@ -590,6 +660,7 @@ fn decode_entry(buf: &[u8]) -> anyhow::Result<CommitLogEntry> {
     })
 }
 
+/// Read an env var as u64 with a default.
 fn read_env_u64(name: &str, default: u64) -> u64 {
     env::var(name)
         .ok()
@@ -597,6 +668,7 @@ fn read_env_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// Read an env var as usize with a default.
 fn read_env_usize(name: &str, default: usize) -> usize {
     env::var(name)
         .ok()
@@ -604,6 +676,7 @@ fn read_env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// Read an env var as bool with a default, accepting common truthy values.
 fn read_env_bool(name: &str, default: bool) -> bool {
     env::var(name)
         .ok()
@@ -616,17 +689,25 @@ fn read_env_bool(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+/// Parse the requested persistence mode from a string.
 fn parse_persist_mode(value: Option<&str>) -> Option<SyncMode> {
     match value.map(|v| v.to_ascii_lowercase()) {
+        // "none" disables syncing entirely.
         Some(v) if v == "none" => None,
+        // "buffer" means rely on OS buffering (no explicit sync).
         Some(v) if v == "buffer" => Some(SyncMode::None),
+        // "sync_data" maps to `sync_data`.
         Some(v) if v == "sync_data" => Some(SyncMode::Data),
+        // "sync_all" maps to `sync_all`.
         Some(v) if v == "sync_all" => Some(SyncMode::All),
+        // Unknown strings default to safest sync mode.
         Some(_) => Some(SyncMode::All),
+        // Unset defaults to safest sync mode.
         None => Some(SyncMode::All),
     }
 }
 
+/// Return current epoch time in microseconds (saturating).
 fn epoch_micros() -> u64 {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -634,6 +715,7 @@ fn epoch_micros() -> u64 {
     now.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
+/// Read a u64 from a buffer at the current offset.
 fn read_u64_at(data: &[u8], offset: &mut usize) -> anyhow::Result<u64> {
     anyhow::ensure!(*offset + 8 <= data.len(), "wal entry short u64");
     let mut buf = [0u8; 8];
@@ -642,6 +724,7 @@ fn read_u64_at(data: &[u8], offset: &mut usize) -> anyhow::Result<u64> {
     Ok(u64::from_be_bytes(buf))
 }
 
+/// Read a u32 from a buffer at the current offset.
 fn read_u32_at(data: &[u8], offset: &mut usize) -> anyhow::Result<u32> {
     anyhow::ensure!(*offset + 4 <= data.len(), "wal entry short u32");
     let mut buf = [0u8; 4];

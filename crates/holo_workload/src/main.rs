@@ -1,3 +1,8 @@
+//! Workload generator for exercising HoloStore via the Redis protocol.
+//!
+//! This binary issues GET/SET operations across one or more nodes, records a
+//! Porcupine-compatible history, and can be used for linearizability checks.
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -14,6 +19,7 @@ use tokio::net::TcpStream;
 use tokio::time;
 use tokio_util::codec::Framed;
 
+/// CLI entry point wrapper.
 #[derive(Parser, Debug)]
 #[command(name = "holo-workload")]
 struct Args {
@@ -21,11 +27,13 @@ struct Args {
     cmd: Command,
 }
 
+/// Top-level CLI subcommands.
 #[derive(Subcommand, Debug)]
 enum Command {
     Run(RunArgs),
 }
 
+/// CLI options for running the workload.
 #[derive(Parser, Debug, Clone)]
 struct RunArgs {
     /// Comma-separated Redis endpoints (RESP), e.g. `127.0.0.1:16379,127.0.0.1:16380`
@@ -69,6 +77,7 @@ struct RunArgs {
     out: PathBuf,
 }
 
+/// Metadata embedded in the history file for reproducibility.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct HistoryMeta {
     nodes: Vec<String>,
@@ -80,12 +89,14 @@ struct HistoryMeta {
     seed: u64,
 }
 
+/// Full workload history serialized for Porcupine.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct History {
     meta: HistoryMeta,
     ops: Vec<OpRecord>,
 }
 
+/// Single operation record captured during the workload run.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct OpRecord {
     client: usize,
@@ -98,6 +109,7 @@ struct OpRecord {
     result: OpResult,
 }
 
+/// Operation kind (GET or SET).
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum OpKind {
@@ -105,6 +117,7 @@ enum OpKind {
     Set,
 }
 
+/// Result of an operation with structured error/value encoding.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum OpResult {
@@ -115,13 +128,16 @@ enum OpResult {
 }
 
 #[tokio::main]
+/// Parse CLI args and dispatch to the selected subcommand.
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     match args.cmd {
+        // Run the workload generator.
         Command::Run(args) => run(args).await,
     }
 }
 
+/// Run the workload and write a Porcupine history file.
 async fn run(args: RunArgs) -> anyhow::Result<()> {
     anyhow::ensure!(args.clients > 0, "--clients must be > 0");
     anyhow::ensure!(args.keys > 0, "--keys must be > 0");
@@ -131,6 +147,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     anyhow::ensure!(!nodes.is_empty(), "--nodes must not be empty");
 
     let duration: Duration = args.duration.into();
+    // Use a random seed when the user provides zero.
     let seed = if args.seed == 0 {
         rand::thread_rng().gen()
     } else {
@@ -146,12 +163,14 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
 
     let mut tasks = Vec::with_capacity(args.clients);
     for client_id in 0..args.clients {
+        // Distribute clients across nodes in a round-robin fashion.
         let node = nodes[client_id % nodes.len()];
         let node_str = node.to_string();
         let keyspace = keyspace.clone();
         let op_timeout: Duration = args.op_timeout.into();
         let fail_fast = args.fail_fast;
         let set_pct = args.set_pct;
+        // Mix the base seed with the client id for deterministic per-client RNG.
         let seed = seed ^ (client_id as u64).wrapping_mul(0x9e3779b97f4a7c15);
         tasks.push(tokio::spawn(async move {
             run_client(
@@ -168,6 +187,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         all_ops.append(&mut ops);
     }
 
+    // Sort ops for deterministic history ordering.
     all_ops.sort_by_key(|op| (op.call_us, op.client));
 
     let meta = HistoryMeta {
@@ -186,6 +206,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Run a single client connection until the deadline, returning its op history.
 async fn run_client(
     client_id: usize,
     node: SocketAddr,
@@ -213,6 +234,7 @@ async fn run_client(
         let key = keyspace[rng.gen_range(0..keyspace.len())].clone();
         let do_set = rng.gen_range(0..100) < (set_pct as u32);
 
+        // Decide whether this operation is a SET or GET.
         let (kind, value, req) = if do_set {
             let value = format!("c{client_id}:{seq}");
             (OpKind::Set, Some(value.clone()), make_set(&key, &value))
@@ -222,6 +244,7 @@ async fn run_client(
 
         let call_us = start.elapsed().as_micros() as u64;
 
+        // Enforce per-op timeouts for send.
         let send_result = time::timeout(op_timeout, framed.send(req)).await;
         let send_err = match send_result {
             Ok(Ok(())) => None,
@@ -244,11 +267,13 @@ async fn run_client(
                 },
             });
             if fail_fast {
+                // Abort immediately on send failure when fail-fast is enabled.
                 anyhow::bail!("client {client_id} send failed: {error}");
             }
             break;
         }
 
+        // Enforce per-op timeouts for receive.
         let recv = time::timeout(op_timeout, framed.next()).await;
         let resp = match recv {
             Ok(Some(Ok(frame))) => frame,
@@ -267,6 +292,7 @@ async fn run_client(
                     },
                 });
                 if fail_fast {
+                    // Abort immediately on receive failure when fail-fast is enabled.
                     anyhow::bail!("client {client_id} recv failed: {err}");
                 }
                 break;
@@ -286,6 +312,7 @@ async fn run_client(
                     },
                 });
                 if fail_fast {
+                    // Abort when the connection is closed if fail-fast is enabled.
                     anyhow::bail!("client {client_id} connection closed");
                 }
                 break;
@@ -305,6 +332,7 @@ async fn run_client(
                     },
                 });
                 if fail_fast {
+                    // Abort on timeout if fail-fast is enabled.
                     anyhow::bail!("client {client_id} recv timed out");
                 }
                 break;
@@ -312,6 +340,7 @@ async fn run_client(
         };
 
         let return_us = start.elapsed().as_micros() as u64;
+        // Parse the server response based on operation type.
         let result = match kind {
             OpKind::Set => parse_set_response(resp),
             OpKind::Get => parse_get_response(resp),
@@ -332,6 +361,7 @@ async fn run_client(
     Ok(ops)
 }
 
+/// Parse a comma-separated list of `host:port` addresses.
 fn parse_nodes(input: &str) -> anyhow::Result<Vec<SocketAddr>> {
     let mut out = Vec::new();
     for part in input.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -343,6 +373,7 @@ fn parse_nodes(input: &str) -> anyhow::Result<Vec<SocketAddr>> {
     Ok(out)
 }
 
+/// Build a RESP GET request frame.
 fn make_get(key: &str) -> BytesFrame {
     BytesFrame::Array(vec![
         BytesFrame::BulkString(Bytes::from_static(b"GET")),
@@ -350,6 +381,7 @@ fn make_get(key: &str) -> BytesFrame {
     ])
 }
 
+/// Build a RESP SET request frame.
 fn make_set(key: &str, value: &str) -> BytesFrame {
     BytesFrame::Array(vec![
         BytesFrame::BulkString(Bytes::from_static(b"SET")),
@@ -358,6 +390,7 @@ fn make_set(key: &str, value: &str) -> BytesFrame {
     ])
 }
 
+/// Interpret a RESP SET response as an `OpResult`.
 fn parse_set_response(resp: BytesFrame) -> OpResult {
     match resp {
         BytesFrame::SimpleString(s) if s.as_ref() == b"OK" => OpResult::Ok,
@@ -370,6 +403,7 @@ fn parse_set_response(resp: BytesFrame) -> OpResult {
     }
 }
 
+/// Interpret a RESP GET response as an `OpResult`.
 fn parse_get_response(resp: BytesFrame) -> OpResult {
     match resp {
         BytesFrame::Null => OpResult::Nil,
@@ -385,8 +419,10 @@ fn parse_get_response(resp: BytesFrame) -> OpResult {
     }
 }
 
+/// Serialize and write the workload history JSON.
 fn write_history(path: &PathBuf, history: &History) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
+        // Ensure the output directory exists before writing.
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create dir {}", parent.display()))?;
     }

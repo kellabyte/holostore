@@ -1,3 +1,8 @@
+//! Redis protocol server that exposes HoloStore as a RESP-compatible service.
+//!
+//! This module handles client connections, parses commands, batches GET/SET
+//! operations, and returns responses. It also exposes `HOLOSTATS` for metrics.
+
 use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -12,9 +17,12 @@ use tokio_util::codec::Framed;
 
 use crate::{wal, NodeState};
 
+/// Default maximum number of SET operations to batch per connection read loop.
 const MAX_BATCHED_SET_OPS: usize = 32;
+/// Default maximum number of GET operations to batch per connection read loop.
 const MAX_BATCHED_GET_OPS: usize = 128;
 
+/// Merge per-shard Accord debug stats into one aggregate view.
 fn merge_debug_stats(dst: &mut DebugStats, src: DebugStats) {
     dst.records_len += src.records_len;
     dst.records_capacity += src.records_capacity;
@@ -84,6 +92,7 @@ fn merge_debug_stats(dst: &mut DebugStats, src: DebugStats) {
     dst.slow_path_count += src.slow_path_count;
 }
 
+/// Logical key/value operation parsed from the Redis protocol.
 #[derive(Clone, Debug)]
 pub enum KvOp {
     Get { key: Vec<u8> },
@@ -91,12 +100,14 @@ pub enum KvOp {
     HoloStats,
 }
 
+/// Result of executing a KV operation.
 #[derive(Clone, Debug)]
 pub enum KvResult {
     Ok,
     Value(Option<Vec<u8>>),
 }
 
+/// Run the Redis-compatible server on the provided address.
 pub async fn run(addr: SocketAddr, state: Arc<NodeState>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     loop {
@@ -110,11 +121,13 @@ pub async fn run(addr: SocketAddr, state: Arc<NodeState>) -> anyhow::Result<()> 
     }
 }
 
+/// Handle a single client connection.
 async fn handle_conn(socket: TcpStream, state: Arc<NodeState>) -> anyhow::Result<()> {
     let mut framed = Framed::new(socket, Resp2::default());
     let max_batched_set_ops = read_env_usize("HOLO_REDIS_SET_BATCH_MAX", MAX_BATCHED_SET_OPS);
     let max_batched_get_ops = read_env_usize("HOLO_REDIS_GET_BATCH_MAX", MAX_BATCHED_GET_OPS);
 
+    /// Send a single RESP frame to the client.
     async fn feed_resp(
         framed: &mut Framed<TcpStream, Resp2>,
         resp: BytesFrame,
@@ -123,6 +136,7 @@ async fn handle_conn(socket: TcpStream, state: Arc<NodeState>) -> anyhow::Result
         Ok(())
     }
 
+    /// Flush pending RESP frames to the client.
     async fn flush_resp(framed: &mut Framed<TcpStream, Resp2>) -> anyhow::Result<()> {
         <Framed<TcpStream, Resp2> as SinkExt<BytesFrame>>::flush(framed).await?;
         Ok(())
@@ -134,6 +148,7 @@ async fn handle_conn(socket: TcpStream, state: Arc<NodeState>) -> anyhow::Result
 
     while !stream_closed || pending_op.is_some() || pending_resp.is_some() {
         if let Some(resp) = pending_resp.take() {
+            // Finish writing any pending response first.
             feed_resp(&mut framed, resp).await?;
             flush_resp(&mut framed).await?;
             continue;
@@ -143,14 +158,17 @@ async fn handle_conn(socket: TcpStream, state: Arc<NodeState>) -> anyhow::Result
             op
         } else {
             let Some(frame) = framed.next().await else {
+                // Client closed the stream.
                 stream_closed = true;
                 continue;
             };
             let frame = frame?;
             match parse_command(frame) {
                 Ok(Some(op)) => op,
+                // Ignore empty arrays.
                 Ok(None) => continue,
                 Err(err) => {
+                    // Parse error: respond immediately and continue.
                     feed_resp(&mut framed, BytesFrame::Error(format!("ERR {err}").into())).await?;
                     flush_resp(&mut framed).await?;
                     continue;
@@ -170,6 +188,7 @@ async fn handle_conn(socket: TcpStream, state: Arc<NodeState>) -> anyhow::Result
                         .ok_or_else(|| anyhow::anyhow!("missing data group {group_id}"))?;
                     let shard_stats = data_group.debug_stats().await;
                     match stats_opt.as_mut() {
+                        // Merge stats across shards.
                         Some(total) => merge_debug_stats(total, shard_stats),
                         None => stats_opt = Some(shard_stats),
                     }
@@ -178,52 +197,62 @@ async fn handle_conn(socket: TcpStream, state: Arc<NodeState>) -> anyhow::Result
                 let rpc_stats = state.transport.stats().snapshot_and_reset();
                 let client_batch = state.client_batch_stats_snapshot();
                 let pre_accept_avg_batch = if rpc_stats.pre_accept_batches == 0 {
+                    // Avoid divide-by-zero when there are no batches.
                     0.0
                 } else {
                     rpc_stats.pre_accept_items as f64 / rpc_stats.pre_accept_batches as f64
                 };
                 let accept_avg_batch = if rpc_stats.accept_batches == 0 {
+                    // Avoid divide-by-zero when there are no batches.
                     0.0
                 } else {
                     rpc_stats.accept_items as f64 / rpc_stats.accept_batches as f64
                 };
                 let commit_avg_batch = if rpc_stats.commit_batches == 0 {
+                    // Avoid divide-by-zero when there are no batches.
                     0.0
                 } else {
                     rpc_stats.commit_items as f64 / rpc_stats.commit_batches as f64
                 };
                 let client_set_avg_batch = if client_batch.set_batches == 0 {
+                    // Avoid divide-by-zero when there are no batches.
                     0.0
                 } else {
                     client_batch.set_items as f64 / client_batch.set_batches as f64
                 };
                 let client_set_avg_wait_us = if client_batch.set_batches == 0 {
+                    // Avoid divide-by-zero when there are no batches.
                     0.0
                 } else {
                     client_batch.set_wait_total_us as f64 / client_batch.set_batches as f64
                 };
                 let client_get_avg_batch = if client_batch.get_batches == 0 {
+                    // Avoid divide-by-zero when there are no batches.
                     0.0
                 } else {
                     client_batch.get_items as f64 / client_batch.get_batches as f64
                 };
                 let client_get_avg_wait_us = if client_batch.get_batches == 0 {
+                    // Avoid divide-by-zero when there are no batches.
                     0.0
                 } else {
                     client_batch.get_wait_total_us as f64 / client_batch.get_batches as f64
                 };
                 let wal_stats = wal::stats_snapshot();
                 let wal_fsync_avg_us = if wal_stats.fsync_count == 0 {
+                    // Avoid divide-by-zero when there are no fsyncs.
                     0.0
                 } else {
                     wal_stats.fsync_total_us as f64 / wal_stats.fsync_count as f64
                 };
                 let wal_batch_avg_items = if wal_stats.batch_count == 0 {
+                    // Avoid divide-by-zero when there are no batches.
                     0.0
                 } else {
                     wal_stats.batch_items as f64 / wal_stats.batch_count as f64
                 };
                 let wal_batch_avg_bytes = if wal_stats.batch_count == 0 {
+                    // Avoid divide-by-zero when there are no batches.
                     0.0
                 } else {
                     wal_stats.batch_total_bytes as f64 / wal_stats.batch_count as f64
@@ -347,17 +376,20 @@ async fn handle_conn(socket: TcpStream, state: Arc<NodeState>) -> anyhow::Result
                         Some(Some(Ok(frame))) => match parse_command(frame) {
                             Ok(Some(KvOp::Get { key })) => keys.push(key),
                             Ok(Some(other)) => {
+                                // Preserve the next non-GET op for the next loop.
                                 pending_op = Some(other);
                                 break;
                             }
                             Ok(None) => {}
                             Err(err) => {
+                                // Preserve an error to respond before reading more.
                                 pending_resp = Some(BytesFrame::Error(format!("ERR {err}").into()));
                                 break;
                             }
                         },
                         Some(Some(Err(err))) => anyhow::bail!("failed to read RESP frame: {err}"),
                         Some(None) => {
+                            // Client closed the stream.
                             stream_closed = true;
                             break;
                         }
@@ -367,6 +399,7 @@ async fn handle_conn(socket: TcpStream, state: Arc<NodeState>) -> anyhow::Result
 
                 let batch_len = keys.len();
                 if batch_len == 1 {
+                    // Single GET: execute immediately for lower latency.
                     let key = keys.pop().unwrap_or_default();
                     let result = state.execute(KvOp::Get { key }).await;
                     let resp = match result {
@@ -380,6 +413,7 @@ async fn handle_conn(socket: TcpStream, state: Arc<NodeState>) -> anyhow::Result
                     feed_resp(&mut framed, resp).await?;
                     flush_resp(&mut framed).await?;
                 } else {
+                    // Batched GET: issue as a single batch to the state layer.
                     match state.execute_batch_get(keys).await {
                         Ok(values) => {
                             for v in values {
@@ -394,6 +428,7 @@ async fn handle_conn(socket: TcpStream, state: Arc<NodeState>) -> anyhow::Result
                             flush_resp(&mut framed).await?;
                         }
                         Err(err) => {
+                            // Batch failed; return an error for every request in the batch.
                             let msg = format!("ERR {err}");
                             for _ in 0..batch_len {
                                 feed_resp(&mut framed, BytesFrame::Error(msg.clone().into()))
@@ -413,17 +448,20 @@ async fn handle_conn(socket: TcpStream, state: Arc<NodeState>) -> anyhow::Result
                         Some(Some(Ok(frame))) => match parse_command(frame) {
                             Ok(Some(KvOp::Set { key, value })) => batch.push((key, value)),
                             Ok(Some(other)) => {
+                                // Preserve the next non-SET op for the next loop.
                                 pending_op = Some(other);
                                 break;
                             }
                             Ok(None) => {}
                             Err(err) => {
+                                // Preserve an error to respond before reading more.
                                 pending_resp = Some(BytesFrame::Error(format!("ERR {err}").into()));
                                 break;
                             }
                         },
                         Some(Some(Err(err))) => anyhow::bail!("failed to read RESP frame: {err}"),
                         Some(None) => {
+                            // Client closed the stream.
                             stream_closed = true;
                             break;
                         }
@@ -433,6 +471,7 @@ async fn handle_conn(socket: TcpStream, state: Arc<NodeState>) -> anyhow::Result
 
                 let batch_len = batch.len();
                 if batch_len == 1 {
+                    // Single SET: execute immediately for lower latency.
                     let (key, value) = batch.pop().unwrap_or_default();
                     let result = state.execute(KvOp::Set { key, value }).await;
                     let resp = match result {
@@ -447,6 +486,7 @@ async fn handle_conn(socket: TcpStream, state: Arc<NodeState>) -> anyhow::Result
                     feed_resp(&mut framed, resp).await?;
                     flush_resp(&mut framed).await?;
                 } else {
+                    // Batched SET: issue as a single batch to the state layer.
                     match state.execute_batch_set(batch).await {
                         Ok(()) => {
                             for _ in 0..batch_len {
@@ -459,6 +499,7 @@ async fn handle_conn(socket: TcpStream, state: Arc<NodeState>) -> anyhow::Result
                             flush_resp(&mut framed).await?;
                         }
                         Err(err) => {
+                            // Batch failed; return an error for every request in the batch.
                             let msg = format!("ERR {err}");
                             for _ in 0..batch_len {
                                 feed_resp(&mut framed, BytesFrame::Error(msg.clone().into()))
@@ -472,16 +513,19 @@ async fn handle_conn(socket: TcpStream, state: Arc<NodeState>) -> anyhow::Result
         }
     }
 
+    // Final flush before ending the connection.
     flush_resp(&mut framed).await?;
     Ok(())
 }
 
+/// Parse a Redis RESP command into a `KvOp`.
 fn parse_command(frame: BytesFrame) -> anyhow::Result<Option<KvOp>> {
     let BytesFrame::Array(parts) = frame else {
         anyhow::bail!("expected array frame");
     };
 
     if parts.is_empty() {
+        // Empty array is treated as no-op.
         return Ok(None);
     }
 
@@ -502,14 +546,17 @@ fn parse_command(frame: BytesFrame) -> anyhow::Result<Option<KvOp>> {
             let value = frame_bytes(&parts[2]).ok_or_else(|| anyhow::anyhow!("invalid value"))?;
             Ok(Some(KvOp::Set { key, value }))
         }
+        // Unknown commands are rejected to keep the protocol surface minimal.
         other => anyhow::bail!("unknown command {other}"),
     }
 }
 
+/// Convert a RESP frame to uppercase command string.
 fn frame_str_upper(frame: &BytesFrame) -> Option<String> {
     frame.as_str().map(|s| s.to_ascii_uppercase())
 }
 
+/// Extract raw bytes from RESP string frames.
 fn frame_bytes(frame: &BytesFrame) -> Option<Vec<u8>> {
     match frame {
         BytesFrame::BulkString(b) | BytesFrame::SimpleString(b) => Some(b.to_vec()),
@@ -517,6 +564,7 @@ fn frame_bytes(frame: &BytesFrame) -> Option<Vec<u8>> {
     }
 }
 
+/// Read an env var as usize with a default.
 fn read_env_usize(name: &str, default: usize) -> usize {
     env::var(name)
         .ok()

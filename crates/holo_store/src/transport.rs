@@ -1,3 +1,8 @@
+//! gRPC transport layer used by the Accord consensus engine.
+//!
+//! This module builds per-peer RPC batching pipelines, exposes a `Transport`
+//! implementation for Accord, and surfaces rich per-peer latency/queue stats.
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -17,8 +22,10 @@ use tokio::time;
 use crate::kv::Version;
 use crate::volo_gen::holo_store::rpc;
 
+/// Capacity for each per-peer RPC queue.
 const RPC_QUEUE_CAPACITY: usize = 4096;
 
+/// Histogram bucket boundaries for latency metrics (microseconds).
 const LATENCY_BUCKETS_US: [u64; 12] = [
     100,     // 0.1ms
     250,     // 0.25ms
@@ -34,6 +41,7 @@ const LATENCY_BUCKETS_US: [u64; 12] = [
     500_000, // 500ms
 ];
 
+/// gRPC-based transport that implements Accord's `Transport` trait.
 #[derive(Clone)]
 pub struct GrpcTransport {
     peers: HashMap<NodeId, Peer>,
@@ -42,6 +50,7 @@ pub struct GrpcTransport {
     inflight_tuning: InflightTuning,
 }
 
+/// Collect a batch of items from a channel with a size/time bound.
 async fn collect_batch<T>(
     first: T,
     rx: &mut mpsc::Receiver<T>,
@@ -54,6 +63,7 @@ async fn collect_batch<T>(
         return items;
     }
 
+    // Decide whether to use a batching deadline based on the configured wait.
     let deadline = if batch_wait.is_zero() {
         None
     } else {
@@ -61,6 +71,7 @@ async fn collect_batch<T>(
     };
 
     'outer: loop {
+        // Stop when we hit the batch size limit.
         if items.len() >= batch_max {
             break;
         }
@@ -73,10 +84,12 @@ async fn collect_batch<T>(
             Err(mpsc::error::TryRecvError::Disconnected) => break,
         }
 
+        // No deadline means we are done collecting.
         let Some(deadline) = deadline else {
             break;
         };
         let now = time::Instant::now();
+        // Stop when the batching deadline expires.
         if now >= deadline {
             break;
         }
@@ -97,6 +110,7 @@ async fn collect_batch<T>(
     items
 }
 
+/// Per-peer RPC state and queues.
 #[derive(Clone)]
 struct Peer {
     client: rpc::HoloRpcClient,
@@ -114,29 +128,34 @@ struct Peer {
     recover_limiter: Arc<InflightLimiter>,
 }
 
+/// Work item for pre-accept RPCs.
 struct PreAcceptWork {
     req: PreAcceptRequest,
     tx: oneshot::Sender<anyhow::Result<PreAcceptResponse>>,
     enqueued_at: std::time::Instant,
 }
 
+/// Work item for accept RPCs.
 struct AcceptWork {
     req: AcceptRequest,
     tx: oneshot::Sender<anyhow::Result<AcceptResponse>>,
     enqueued_at: std::time::Instant,
 }
 
+/// Work item for commit RPCs.
 struct CommitWork {
     req: CommitRequest,
     tx: oneshot::Sender<anyhow::Result<CommitResponse>>,
     enqueued_at: std::time::Instant,
 }
 
+/// Work item for recover RPCs (no response channel; coalescer handles fan-out).
 struct RecoverWork {
     req: RecoverRequest,
     enqueued_at: std::time::Instant,
 }
 
+/// Return current epoch time in microseconds (saturating).
 fn epoch_micros() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -145,17 +164,20 @@ fn epoch_micros() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
+/// Work item for per-key GET RPCs.
 struct KvGetWork {
     key: Vec<u8>,
     tx: oneshot::Sender<anyhow::Result<Option<(Vec<u8>, Version)>>>,
     enqueued_at: std::time::Instant,
 }
 
+/// Coalesced recovery entry with a maximal ballot and waiting responders.
 struct RecoverEntry {
     ballot: Ballot,
     waiters: Vec<oneshot::Sender<anyhow::Result<RecoverResponse>>>,
 }
 
+/// Tuning knobs for adaptive in-flight limits based on queue depth and wait time.
 #[derive(Clone, Copy)]
 pub struct InflightTuning {
     pub min: usize,
@@ -166,6 +188,7 @@ pub struct InflightTuning {
     pub low_queue: u64,
 }
 
+/// Adaptive limiter that caps concurrent in-flight RPCs.
 struct InflightLimiter {
     limit: AtomicUsize,
     in_flight: AtomicUsize,
@@ -175,6 +198,7 @@ struct InflightLimiter {
 }
 
 impl InflightLimiter {
+    /// Create a limiter with an initial limit clamped within min/max.
     fn new(initial: usize, min: usize, max: usize) -> Self {
         let min = min.max(1);
         let max = max.max(min);
@@ -188,6 +212,7 @@ impl InflightLimiter {
         }
     }
 
+    /// Acquire a permit, waiting until in-flight count is below the limit.
     async fn acquire(self: &Arc<Self>) -> InflightPermit {
         loop {
             let limit = self.limit.load(Ordering::Relaxed).max(1);
@@ -205,25 +230,30 @@ impl InflightLimiter {
                 {
                     return InflightPermit { limiter: self.clone() };
                 }
+                // CAS failed, retry with updated counters.
                 continue;
             }
             self.notify.notified().await;
         }
     }
 
+    /// Release a permit and wake one waiter.
     fn release(&self) {
         self.in_flight.fetch_sub(1, Ordering::Relaxed);
         self.notify.notify_one();
     }
 
+    /// Return the current in-flight limit.
     fn current(&self) -> usize {
         self.limit.load(Ordering::Relaxed)
     }
 
+    /// Adjust the in-flight limit, clamped to min/max.
     fn adjust(&self, desired: usize) -> bool {
         let desired = desired.clamp(self.min, self.max);
         let prev = self.limit.swap(desired, Ordering::Relaxed);
         if desired != prev {
+            // Notify waiters so they can proceed under the new limit.
             self.notify.notify_waiters();
             true
         } else {
@@ -232,16 +262,19 @@ impl InflightLimiter {
     }
 }
 
+/// Guard that releases the in-flight permit on drop.
 struct InflightPermit {
     limiter: Arc<InflightLimiter>,
 }
 
 impl Drop for InflightPermit {
+    /// Release the permit when the guard is dropped.
     fn drop(&mut self) {
         self.limiter.release();
     }
 }
 
+/// Decision returned by the recover coalescer when a request arrives.
 enum RecoverEnqueueDecision {
     Enqueue,
     Coalesced {
@@ -251,6 +284,7 @@ enum RecoverEnqueueDecision {
     },
 }
 
+/// Snapshot of coalescer metrics.
 struct RecoverCoalescerSnapshot {
     inflight: u64,
     inflight_peak: u64,
@@ -260,6 +294,7 @@ struct RecoverCoalescerSnapshot {
     waiters_avg: f64,
 }
 
+/// Coalesces concurrent recover requests for the same transaction.
 #[derive(Default)]
 struct RecoverCoalescer {
     inner: Mutex<HashMap<TxnId, RecoverEntry>>,
@@ -272,6 +307,7 @@ struct RecoverCoalescer {
 }
 
 impl RecoverCoalescer {
+    /// Insert a recover request or coalesce it with an existing one.
     async fn add_or_coalesce(
         &self,
         txn_id: TxnId,
@@ -280,6 +316,7 @@ impl RecoverCoalescer {
     ) -> RecoverEnqueueDecision {
         let mut map = self.inner.lock().await;
         if let Some(entry) = map.get_mut(&txn_id) {
+            // Track the highest ballot among coalesced requests.
             if ballot > entry.ballot {
                 entry.ballot = ballot;
             }
@@ -297,6 +334,7 @@ impl RecoverCoalescer {
                 ballot: entry.ballot,
             };
         }
+        // First request for this txn id: store it as inflight.
         map.insert(
             txn_id,
             RecoverEntry {
@@ -311,6 +349,7 @@ impl RecoverCoalescer {
         RecoverEnqueueDecision::Enqueue
     }
 
+    /// Complete a recover request successfully and fan out the response.
     async fn complete_ok(&self, txn_id: TxnId, resp: RecoverResponse) {
         let waiters = {
             let mut map = self.inner.lock().await;
@@ -323,6 +362,7 @@ impl RecoverCoalescer {
         }
     }
 
+    /// Complete a recover request with an error and fan out the failure.
     async fn complete_err(&self, txn_id: TxnId, err: &anyhow::Error) {
         let waiters = {
             let mut map = self.inner.lock().await;
@@ -336,6 +376,7 @@ impl RecoverCoalescer {
         }
     }
 
+    /// Snapshot and reset coalescer statistics.
     async fn snapshot_and_reset(&self) -> RecoverCoalescerSnapshot {
         let inflight = self.inner.lock().await.len() as u64;
         let inflight_peak = self.inflight_peak.swap(0, Ordering::Relaxed);
@@ -361,6 +402,8 @@ impl RecoverCoalescer {
 }
 
 impl GrpcTransport {
+    /// Build a transport for the given membership set, wiring per-peer queues
+    /// and batchers for each RPC type.
     pub fn new(
         members: &HashMap<NodeId, SocketAddr>,
         rpc_timeout: Duration,
@@ -376,6 +419,7 @@ impl GrpcTransport {
         let stats = Arc::new(RpcStats::default());
         let inflight_limit = rpc_inflight_limit.max(1);
         for (node_id, addr) in members {
+            // Build gRPC clients for consensus and read-only calls.
             let consensus_client = rpc::HoloRpcClientBuilder::new("holo_store.rpc.HoloRpc")
                 .address(volo::net::Address::from(*addr))
                 .build();
@@ -391,6 +435,7 @@ impl GrpcTransport {
 
             let peer_stats = Arc::new(PeerStats::default());
             let recover_coalescer = Arc::new(RecoverCoalescer::default());
+            // Start each limiter at the configured inflight limit.
             let pre_accept_limiter =
                 Arc::new(InflightLimiter::new(inflight_limit, inflight_tuning.min, inflight_tuning.max));
             let accept_limiter =
@@ -478,10 +523,12 @@ impl GrpcTransport {
         }
     }
 
+    /// Return the shared RPC statistics collector.
     pub fn stats(&self) -> Arc<RpcStats> {
         self.stats.clone()
     }
 
+    /// Collect and reset per-peer stats snapshots, applying inflight tuning.
     pub async fn peer_stats_snapshots(&self) -> Vec<(NodeId, PeerStatsSnapshot)> {
         let now_us = epoch_micros();
         let mut out = Vec::with_capacity(self.peers.len());
@@ -494,6 +541,7 @@ impl GrpcTransport {
             snap.recover_enqueued = coalescer.enqueued;
             snap.recover_waiters_peak = coalescer.waiters_peak;
             snap.recover_waiters_avg = coalescer.waiters_avg;
+            // Evaluate tuning signals based on queue depth and wait time.
             let wait_max_ms = snap
                 .pre_accept_wait_max_ms
                 .max(snap.accept_wait_max_ms)
@@ -503,10 +551,12 @@ impl GrpcTransport {
             if queue_total > self.inflight_tuning.high_queue
                 || wait_max_ms > self.inflight_tuning.high_wait_ms
             {
+                // Back off when queues are deep or latency is high.
                 limit = limit.saturating_sub(1).max(self.inflight_tuning.min);
             } else if queue_total < self.inflight_tuning.low_queue
                 && wait_max_ms < self.inflight_tuning.low_wait_ms
             {
+                // Increase concurrency when queues are short and latency is low.
                 limit = (limit + 1).min(self.inflight_tuning.max);
             }
             let changed = peer.pre_accept_limiter.adjust(limit);
@@ -528,6 +578,7 @@ impl GrpcTransport {
         out
     }
 
+    /// Perform a batched KV GET via the peer's queue-based pipeline.
     pub async fn kv_get(
         &self,
         target: NodeId,
@@ -550,6 +601,7 @@ impl GrpcTransport {
             })
             .await
         {
+            // If the queue is closed, return a clear error.
             peer.stats.kv_get_queue.fetch_sub(1, Ordering::Relaxed);
             return Err(anyhow::anyhow!("kv_get queue closed"));
         }
@@ -561,6 +613,7 @@ impl GrpcTransport {
         }
     }
 
+    /// Perform a direct batch get RPC against a peer (no coalescing queue).
     pub async fn kv_batch_get(
         &self,
         target: NodeId,
@@ -606,6 +659,7 @@ impl GrpcTransport {
         }
     }
 
+    /// Fetch last committed (txn_id, seq) for a set of keys from a peer.
     pub async fn last_committed(
         &self,
         target: NodeId,
@@ -646,6 +700,7 @@ impl GrpcTransport {
         }
     }
 
+    /// Fetch the last executed prefix vector for a group from a peer.
     pub async fn last_executed_prefix(
         &self,
         target: NodeId,
@@ -673,6 +728,7 @@ impl GrpcTransport {
         }
     }
 
+    /// Fetch a command payload for a specific transaction from a peer.
     pub async fn fetch_command(
         &self,
         target: NodeId,
@@ -705,6 +761,7 @@ impl GrpcTransport {
         }
     }
 
+    /// Ask a peer whether a transaction has executed.
     pub async fn executed(
         &self,
         target: NodeId,
@@ -730,6 +787,7 @@ impl GrpcTransport {
         }
     }
 
+    /// Tell a peer to mark a transaction as visible to readers.
     pub async fn mark_visible(
         &self,
         target: NodeId,
@@ -756,6 +814,7 @@ impl GrpcTransport {
     }
 }
 
+/// Spawn a task that batches KV GET requests per peer.
 fn spawn_kv_get_batcher(
     client: rpc::HoloRpcClient,
     mut rx: mpsc::Receiver<KvGetWork>,
@@ -784,6 +843,7 @@ fn spawn_kv_get_batcher(
                 enqueued_at,
             } in items
             {
+                // Track queue wait time for each request in the batch.
                 let wait_us = batch_start
                     .duration_since(enqueued_at)
                     .as_micros()
@@ -810,6 +870,7 @@ fn spawn_kv_get_batcher(
                 Ok(Ok(resp)) => {
                     let resp = resp.into_inner();
                     if resp.responses.len() != txs.len() {
+                        // Reject if server returned a mismatched response count.
                         let err = anyhow::anyhow!(
                             "kv_batch_get response count mismatch (expected {}, got {})",
                             txs.len(),
@@ -832,6 +893,7 @@ fn spawn_kv_get_batcher(
                     }
                 }
                 Ok(Err(err)) => {
+                    // RPC error: notify all waiters.
                     stats.record_kv_get_error();
                     peer_stats.kv_get_errors.fetch_add(1, Ordering::Relaxed);
                     let err = anyhow::anyhow!("kv_batch_get rpc failed: {err}");
@@ -840,6 +902,7 @@ fn spawn_kv_get_batcher(
                     }
                 }
                 Err(_) => {
+                    // Timeout: notify all waiters.
                     stats.record_kv_get_error();
                     peer_stats.kv_get_errors.fetch_add(1, Ordering::Relaxed);
                     let err = anyhow::anyhow!("kv_batch_get rpc timed out");
@@ -852,6 +915,7 @@ fn spawn_kv_get_batcher(
     });
 }
 
+/// Spawn a task that batches pre-accept RPCs per peer.
 fn spawn_pre_accept_batcher(
     client: rpc::HoloRpcClient,
     mut rx: mpsc::Receiver<PreAcceptWork>,
@@ -881,6 +945,7 @@ fn spawn_pre_accept_batcher(
                 enqueued_at,
             } in items
             {
+                // Track queue wait time for each request in the batch.
                 let wait_us = batch_start
                     .duration_since(enqueued_at)
                     .as_micros()
@@ -935,6 +1000,7 @@ fn spawn_pre_accept_batcher(
                     Ok(Ok(resp)) => {
                         let resp = resp.into_inner();
                         if resp.responses.len() != txs.len() {
+                            // Reject if server returned a mismatched response count.
                             let err = anyhow::anyhow!(
                                 "pre_accept_batch response count mismatch (expected {}, got {})",
                                 txs.len(),
@@ -952,6 +1018,7 @@ fn spawn_pre_accept_batcher(
                         }
                     }
                     Ok(Err(err)) => {
+                        // RPC error: notify all waiters.
                         stats.record_pre_accept_error();
                         peer_stats.pre_accept_errors.fetch_add(1, Ordering::Relaxed);
                         let err = anyhow::anyhow!("pre_accept_batch rpc failed: {err}");
@@ -960,6 +1027,7 @@ fn spawn_pre_accept_batcher(
                         }
                     }
                     Err(_) => {
+                        // Timeout: notify all waiters.
                         stats.record_pre_accept_error();
                         peer_stats
                             .pre_accept_timeouts
@@ -976,6 +1044,7 @@ fn spawn_pre_accept_batcher(
     });
 }
 
+/// Spawn a task that batches accept RPCs per peer.
 fn spawn_accept_batcher(
     client: rpc::HoloRpcClient,
     mut rx: mpsc::Receiver<AcceptWork>,
@@ -1005,6 +1074,7 @@ fn spawn_accept_batcher(
                 enqueued_at,
             } in items
             {
+                // Track queue wait time for each request in the batch.
                 let wait_us = batch_start
                     .duration_since(enqueued_at)
                     .as_micros()
@@ -1052,6 +1122,7 @@ fn spawn_accept_batcher(
                     Ok(Ok(resp)) => {
                         let resp = resp.into_inner();
                         if resp.responses.len() != txs.len() {
+                            // Reject if server returned a mismatched response count.
                             let err = anyhow::anyhow!(
                                 "accept_batch response count mismatch (expected {}, got {})",
                                 txs.len(),
@@ -1069,6 +1140,7 @@ fn spawn_accept_batcher(
                         }
                     }
                     Ok(Err(err)) => {
+                        // RPC error: notify all waiters.
                         stats.record_accept_error();
                         peer_stats.accept_errors.fetch_add(1, Ordering::Relaxed);
                         let err = anyhow::anyhow!("accept_batch rpc failed: {err}");
@@ -1077,6 +1149,7 @@ fn spawn_accept_batcher(
                         }
                     }
                     Err(_) => {
+                        // Timeout: notify all waiters.
                         stats.record_accept_error();
                         peer_stats
                             .accept_timeouts
@@ -1093,6 +1166,7 @@ fn spawn_accept_batcher(
     });
 }
 
+/// Spawn a task that batches commit RPCs per peer.
 fn spawn_commit_batcher(
     client: rpc::HoloRpcClient,
     mut rx: mpsc::Receiver<CommitWork>,
@@ -1122,6 +1196,7 @@ fn spawn_commit_batcher(
                 enqueued_at,
             } in items
             {
+                // Track queue wait time for each request in the batch.
                 let wait_us = batch_start
                     .duration_since(enqueued_at)
                     .as_micros()
@@ -1169,6 +1244,7 @@ fn spawn_commit_batcher(
                     Ok(Ok(resp)) => {
                         let resp = resp.into_inner();
                         if resp.responses.len() != txs.len() {
+                            // Reject if server returned a mismatched response count.
                             let err = anyhow::anyhow!(
                                 "commit_batch response count mismatch (expected {}, got {})",
                                 txs.len(),
@@ -1186,6 +1262,7 @@ fn spawn_commit_batcher(
                         }
                     }
                     Ok(Err(err)) => {
+                        // RPC error: notify all waiters.
                         stats.record_commit_error();
                         peer_stats.commit_errors.fetch_add(1, Ordering::Relaxed);
                         let err = anyhow::anyhow!("commit_batch rpc failed: {err}");
@@ -1194,6 +1271,7 @@ fn spawn_commit_batcher(
                         }
                     }
                     Err(_) => {
+                        // Timeout: notify all waiters.
                         stats.record_commit_error();
                         peer_stats
                             .commit_timeouts
@@ -1210,6 +1288,7 @@ fn spawn_commit_batcher(
     });
 }
 
+/// Spawn a task that batches recover RPCs per peer.
 fn spawn_recover_batcher(
     client: rpc::HoloRpcClient,
     mut rx: mpsc::Receiver<RecoverWork>,
@@ -1239,6 +1318,7 @@ fn spawn_recover_batcher(
                 enqueued_at,
             } in items
             {
+                // Track queue wait time for each request in the batch.
                 let wait_us = batch_start
                     .duration_since(enqueued_at)
                     .as_micros()
@@ -1289,6 +1369,7 @@ fn spawn_recover_batcher(
                     Ok(Ok(resp)) => {
                         let resp = resp.into_inner();
                         if resp.responses.len() != txn_ids.len() {
+                            // Reject if server returned a mismatched response count.
                             let err = anyhow::anyhow!(
                                 "recover_batch response count mismatch (expected {}, got {})",
                                 txn_ids.len(),
@@ -1308,6 +1389,7 @@ fn spawn_recover_batcher(
                         }
                     }
                     Ok(Err(err)) => {
+                        // RPC error: notify all waiters.
                         stats.record_recover_error();
                         peer_stats.recover_errors.fetch_add(1, Ordering::Relaxed);
                         let err = anyhow::anyhow!("recover_batch rpc failed: {err}");
@@ -1316,6 +1398,7 @@ fn spawn_recover_batcher(
                         }
                     }
                     Err(_) => {
+                        // Timeout: notify all waiters.
                         stats.record_recover_error();
                         peer_stats.recover_errors.fetch_add(1, Ordering::Relaxed);
                         let err = anyhow::anyhow!("recover_batch rpc timed out");
@@ -1329,6 +1412,7 @@ fn spawn_recover_batcher(
     });
 }
 
+/// Aggregated RPC stats across all peers.
 #[derive(Default)]
 pub struct RpcStats {
     kv_get_batches: AtomicU64,
@@ -1376,6 +1460,7 @@ pub struct RpcStats {
     recover_errors: AtomicU64,
 }
 
+/// Snapshot of `RpcStats` for logging, with counters reset on read.
 #[derive(Default, Debug, Clone)]
 pub struct RpcStatsSnapshot {
     pub kv_get_batches: u64,
@@ -1423,6 +1508,7 @@ pub struct RpcStatsSnapshot {
     pub recover_errors: u64,
 }
 
+/// Simple fixed-bucket histogram for latency tracking.
 struct LatencyHistogram {
     counts: [AtomicU64; LATENCY_BUCKETS_US.len() + 1],
     count: AtomicU64,
@@ -1430,6 +1516,7 @@ struct LatencyHistogram {
     max_us: AtomicU64,
 }
 
+/// Snapshot of latency distribution.
 #[derive(Default, Debug, Clone)]
 pub struct LatencySnapshot {
     pub count: u64,
@@ -1442,6 +1529,7 @@ pub struct LatencySnapshot {
 }
 
 impl Default for LatencyHistogram {
+    /// Initialize a histogram with empty buckets.
     fn default() -> Self {
         Self {
             counts: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -1453,6 +1541,7 @@ impl Default for LatencyHistogram {
 }
 
 impl LatencyHistogram {
+    /// Record a single latency observation.
     fn record(&self, us: u64) {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.total_us.fetch_add(us, Ordering::Relaxed);
@@ -1467,6 +1556,7 @@ impl LatencyHistogram {
         self.counts[idx].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Snapshot and reset the histogram, computing percentiles.
     fn snapshot_and_reset(&self) -> LatencySnapshot {
         let count = self.count.swap(0, Ordering::Relaxed);
         let total_us = self.total_us.swap(0, Ordering::Relaxed);
@@ -1484,6 +1574,7 @@ impl LatencyHistogram {
         LatencySnapshot {
             count,
             avg_ms: if count == 0 {
+                // Avoid divide-by-zero.
                 0.0
             } else {
                 (total_us as f64 / count as f64) / 1000.0
@@ -1496,9 +1587,11 @@ impl LatencyHistogram {
     }
 }
 
+/// Compute a percentile value from bucketed counts.
 fn percentile_us(counts: &[u64; LATENCY_BUCKETS_US.len() + 1], p: f64, max_us: u64) -> u64 {
     let total: u64 = counts.iter().sum();
     if total == 0 {
+        // No samples recorded.
         return 0;
     }
     let target = (total as f64 * (p / 100.0)).ceil() as u64;
@@ -1509,12 +1602,14 @@ fn percentile_us(counts: &[u64; LATENCY_BUCKETS_US.len() + 1], p: f64, max_us: u
             if i < LATENCY_BUCKETS_US.len() {
                 return LATENCY_BUCKETS_US[i];
             }
+            // Overflow bucket: return max observed or last boundary.
             return max_us.max(LATENCY_BUCKETS_US[LATENCY_BUCKETS_US.len() - 1]);
         }
     }
     max_us
 }
 
+/// Per-peer counters and histograms used to build `PeerStatsSnapshot`.
 #[derive(Default)]
 struct PeerStats {
     kv_get_queue: AtomicU64,
@@ -1572,6 +1667,7 @@ struct PeerStats {
     recover_queue_full: AtomicU64,
 }
 
+/// Snapshot of per-peer stats for logging and tuning.
 #[derive(Default, Debug, Clone)]
 pub struct PeerStatsSnapshot {
     pub kv_get_queue: u64,
@@ -1637,6 +1733,7 @@ pub struct PeerStatsSnapshot {
 }
 
 impl PeerStats {
+    /// Snapshot and reset counters, computing averages and ages.
     fn snapshot_and_reset(&self, now_us: u64) -> PeerStatsSnapshot {
         let pre_accept_last_enqueue_us = self.pre_accept_last_enqueue_us.load(Ordering::Relaxed);
         let accept_last_enqueue_us = self.accept_last_enqueue_us.load(Ordering::Relaxed);
@@ -1649,17 +1746,20 @@ impl PeerStats {
         let pre_accept_wait_total_us = self.pre_accept_wait_total_us.swap(0, Ordering::Relaxed);
         let pre_accept_wait_max_us = self.pre_accept_wait_max_us.swap(0, Ordering::Relaxed);
         let pre_accept_wait_avg_ms = if pre_accept_wait_count == 0 {
+            // No samples recorded.
             0.0
         } else {
             (pre_accept_wait_total_us as f64 / pre_accept_wait_count as f64) / 1000.0
         };
         let pre_accept_wait_max_ms = pre_accept_wait_max_us as f64 / 1000.0;
         let pre_accept_last_enqueue_age_ms = if pre_accept_last_enqueue_us == 0 {
+            // No enqueue has happened yet.
             0.0
         } else {
             now_us.saturating_sub(pre_accept_last_enqueue_us) as f64 / 1000.0
         };
         let pre_accept_last_dequeue_age_ms = if pre_accept_last_dequeue_us == 0 {
+            // No dequeue has happened yet.
             0.0
         } else {
             now_us.saturating_sub(pre_accept_last_dequeue_us) as f64 / 1000.0
@@ -1669,17 +1769,20 @@ impl PeerStats {
         let accept_wait_total_us = self.accept_wait_total_us.swap(0, Ordering::Relaxed);
         let accept_wait_max_us = self.accept_wait_max_us.swap(0, Ordering::Relaxed);
         let accept_wait_avg_ms = if accept_wait_count == 0 {
+            // No samples recorded.
             0.0
         } else {
             (accept_wait_total_us as f64 / accept_wait_count as f64) / 1000.0
         };
         let accept_wait_max_ms = accept_wait_max_us as f64 / 1000.0;
         let accept_last_enqueue_age_ms = if accept_last_enqueue_us == 0 {
+            // No enqueue has happened yet.
             0.0
         } else {
             now_us.saturating_sub(accept_last_enqueue_us) as f64 / 1000.0
         };
         let accept_last_dequeue_age_ms = if accept_last_dequeue_us == 0 {
+            // No dequeue has happened yet.
             0.0
         } else {
             now_us.saturating_sub(accept_last_dequeue_us) as f64 / 1000.0
@@ -1689,17 +1792,20 @@ impl PeerStats {
         let commit_wait_total_us = self.commit_wait_total_us.swap(0, Ordering::Relaxed);
         let commit_wait_max_us = self.commit_wait_max_us.swap(0, Ordering::Relaxed);
         let commit_wait_avg_ms = if commit_wait_count == 0 {
+            // No samples recorded.
             0.0
         } else {
             (commit_wait_total_us as f64 / commit_wait_count as f64) / 1000.0
         };
         let commit_wait_max_ms = commit_wait_max_us as f64 / 1000.0;
         let commit_last_enqueue_age_ms = if commit_last_enqueue_us == 0 {
+            // No enqueue has happened yet.
             0.0
         } else {
             now_us.saturating_sub(commit_last_enqueue_us) as f64 / 1000.0
         };
         let commit_last_dequeue_age_ms = if commit_last_dequeue_us == 0 {
+            // No dequeue has happened yet.
             0.0
         } else {
             now_us.saturating_sub(commit_last_dequeue_us) as f64 / 1000.0
@@ -1711,17 +1817,20 @@ impl PeerStats {
         let recover_wait_total_us = self.recover_wait_total_us.swap(0, Ordering::Relaxed);
         let recover_wait_max_us = self.recover_wait_max_us.swap(0, Ordering::Relaxed);
         let recover_wait_avg_ms = if recover_wait_count == 0 {
+            // No samples recorded.
             0.0
         } else {
             (recover_wait_total_us as f64 / recover_wait_count as f64) / 1000.0
         };
         let recover_wait_max_ms = recover_wait_max_us as f64 / 1000.0;
         let recover_last_enqueue_age_ms = if recover_last_enqueue_us == 0 {
+            // No enqueue has happened yet.
             0.0
         } else {
             now_us.saturating_sub(recover_last_enqueue_us) as f64 / 1000.0
         };
         let recover_last_dequeue_age_ms = if recover_last_dequeue_us == 0 {
+            // No dequeue has happened yet.
             0.0
         } else {
             now_us.saturating_sub(recover_last_dequeue_us) as f64 / 1000.0
@@ -1793,6 +1902,7 @@ impl PeerStats {
 }
 
 impl RpcStats {
+    /// Record a batched KV GET request.
     fn record_kv_get_batch(
         &self,
         items: u64,
@@ -1810,10 +1920,12 @@ impl RpcStats {
             .fetch_max(wait_us_max, Ordering::Relaxed);
     }
 
+    /// Record an error for KV GET batching.
     fn record_kv_get_error(&self) {
         self.kv_get_errors.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a direct batch GET RPC call.
     fn record_kv_batch_get(&self, rpc_us: u64, error: bool) {
         self.kv_batch_get_calls.fetch_add(1, Ordering::Relaxed);
         self.kv_batch_get_rpc_us
@@ -1823,6 +1935,7 @@ impl RpcStats {
         }
     }
 
+    /// Record a batched pre-accept RPC call.
     fn record_pre_accept_batch(
         &self,
         items: u64,
@@ -1841,10 +1954,12 @@ impl RpcStats {
             .fetch_max(wait_us_max, Ordering::Relaxed);
     }
 
+    /// Record a pre-accept RPC error.
     fn record_pre_accept_error(&self) {
         self.pre_accept_errors.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a batched accept RPC call.
     fn record_accept_batch(
         &self,
         items: u64,
@@ -1862,10 +1977,12 @@ impl RpcStats {
             .fetch_max(wait_us_max, Ordering::Relaxed);
     }
 
+    /// Record an accept RPC error.
     fn record_accept_error(&self) {
         self.accept_errors.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a batched commit RPC call.
     fn record_commit_batch(
         &self,
         items: u64,
@@ -1883,10 +2000,12 @@ impl RpcStats {
             .fetch_max(wait_us_max, Ordering::Relaxed);
     }
 
+    /// Record a commit RPC error.
     fn record_commit_error(&self) {
         self.commit_errors.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a batched recover RPC call.
     fn record_recover_batch(
         &self,
         items: u64,
@@ -1905,10 +2024,12 @@ impl RpcStats {
             .fetch_max(wait_us_max, Ordering::Relaxed);
     }
 
+    /// Record a recover RPC error.
     fn record_recover_error(&self) {
         self.recover_errors.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Snapshot and reset aggregated stats.
     pub fn snapshot_and_reset(&self) -> RpcStatsSnapshot {
         RpcStatsSnapshot {
             kv_get_batches: self.kv_get_batches.swap(0, Ordering::Relaxed),
@@ -1958,6 +2079,7 @@ impl RpcStats {
     }
 }
 
+/// Convert a local txn id to its RPC representation.
 fn to_rpc_txn_id(txn_id: TxnId) -> rpc::TxnId {
     rpc::TxnId {
         node_id: txn_id.node_id,
@@ -1965,6 +2087,7 @@ fn to_rpc_txn_id(txn_id: TxnId) -> rpc::TxnId {
     }
 }
 
+/// Convert a local ballot to its RPC representation.
 fn to_rpc_ballot(ballot: Ballot) -> rpc::Ballot {
     rpc::Ballot {
         counter: ballot.counter,
@@ -1972,6 +2095,7 @@ fn to_rpc_ballot(ballot: Ballot) -> rpc::Ballot {
     }
 }
 
+/// Decode an RPC version into a local `Version`, supplying defaults if missing.
 fn from_rpc_version(version: Option<rpc::Version>) -> Version {
     let version = version.unwrap_or(rpc::Version {
         seq: 0,
@@ -1987,6 +2111,7 @@ fn from_rpc_version(version: Option<rpc::Version>) -> Version {
     }
 }
 
+/// Convert an RPC txn id into a local representation.
 fn from_rpc_txn_id(txn_id: rpc::TxnId) -> TxnId {
     TxnId {
         node_id: txn_id.node_id,
@@ -1994,6 +2119,7 @@ fn from_rpc_txn_id(txn_id: rpc::TxnId) -> TxnId {
     }
 }
 
+/// Decode an optional RPC ballot into a local ballot.
 fn from_rpc_ballot(ballot: Option<rpc::Ballot>) -> Ballot {
     let ballot = ballot.unwrap_or(rpc::Ballot {
         counter: 0,
@@ -2005,6 +2131,7 @@ fn from_rpc_ballot(ballot: Option<rpc::Ballot>) -> Ballot {
     }
 }
 
+/// Convert a pre-accept request into its RPC representation.
 fn to_rpc_pre_accept(req: PreAcceptRequest) -> rpc::PreAcceptRequest {
     let deps = req.deps.into_iter().map(to_rpc_txn_id).collect();
     rpc::PreAcceptRequest {
@@ -2017,6 +2144,7 @@ fn to_rpc_pre_accept(req: PreAcceptRequest) -> rpc::PreAcceptRequest {
     }
 }
 
+/// Convert an RPC pre-accept response into a local response.
 fn from_rpc_pre_accept(resp: rpc::PreAcceptResponse) -> PreAcceptResponse {
     let deps = resp
         .deps
@@ -2034,6 +2162,7 @@ fn from_rpc_pre_accept(resp: rpc::PreAcceptResponse) -> PreAcceptResponse {
     }
 }
 
+/// Convert an accept request into its RPC representation.
 fn to_rpc_accept(req: AcceptRequest) -> rpc::AcceptRequest {
     let deps = req.deps.into_iter().map(to_rpc_txn_id).collect();
     rpc::AcceptRequest {
@@ -2048,6 +2177,7 @@ fn to_rpc_accept(req: AcceptRequest) -> rpc::AcceptRequest {
     }
 }
 
+/// Convert an RPC accept response into a local response.
 fn from_rpc_accept(resp: rpc::AcceptResponse) -> AcceptResponse {
     AcceptResponse {
         ok: resp.ok,
@@ -2055,6 +2185,7 @@ fn from_rpc_accept(resp: rpc::AcceptResponse) -> AcceptResponse {
     }
 }
 
+/// Convert a commit request into its RPC representation.
 fn to_rpc_commit(req: CommitRequest) -> rpc::CommitRequest {
     let deps = req.deps.into_iter().map(to_rpc_txn_id).collect();
     rpc::CommitRequest {
@@ -2069,10 +2200,12 @@ fn to_rpc_commit(req: CommitRequest) -> rpc::CommitRequest {
     }
 }
 
+/// Convert an RPC commit response into a local response.
 fn from_rpc_commit(resp: rpc::CommitResponse) -> CommitResponse {
     CommitResponse { ok: resp.ok }
 }
 
+/// Convert a recover request into its RPC representation.
 fn to_rpc_recover(req: RecoverRequest) -> rpc::RecoverRequest {
     rpc::RecoverRequest {
         group_id: req.group_id,
@@ -2081,6 +2214,7 @@ fn to_rpc_recover(req: RecoverRequest) -> rpc::RecoverRequest {
     }
 }
 
+/// Convert an RPC recover response into a local response.
 fn from_rpc_recover(resp: rpc::RecoverResponse) -> RecoverResponse {
     let promised = from_rpc_ballot(resp.promised);
     let accepted_ballot = resp.accepted_ballot.map(|b| Ballot {
@@ -2101,6 +2235,7 @@ fn from_rpc_recover(resp: rpc::RecoverResponse) -> RecoverResponse {
         ok: resp.ok,
         promised,
         status: match resp.status {
+            // Map wire status values to the local enum.
             s if s == rpc::TxnStatus::TXN_STATUS_UNKNOWN => TxnStatus::Unknown,
             s if s == rpc::TxnStatus::TXN_STATUS_PREACCEPTED => TxnStatus::PreAccepted,
             s if s == rpc::TxnStatus::TXN_STATUS_ACCEPTED => TxnStatus::Accepted,
@@ -2115,6 +2250,7 @@ fn from_rpc_recover(resp: rpc::RecoverResponse) -> RecoverResponse {
     }
 }
 
+/// Convert a local executed prefix to its RPC representation.
 fn to_rpc_executed_prefix(item: holo_accord::accord::ExecutedPrefix) -> rpc::ExecutedPrefix {
     rpc::ExecutedPrefix {
         node_id: item.node_id,
@@ -2122,6 +2258,7 @@ fn to_rpc_executed_prefix(item: holo_accord::accord::ExecutedPrefix) -> rpc::Exe
     }
 }
 
+/// Convert an RPC executed prefix into a local representation.
 fn from_rpc_executed_prefix(item: rpc::ExecutedPrefix) -> ExecutedPrefix {
     ExecutedPrefix {
         node_id: item.node_id,
@@ -2129,6 +2266,7 @@ fn from_rpc_executed_prefix(item: rpc::ExecutedPrefix) -> ExecutedPrefix {
     }
 }
 
+/// Convert a report executed request into its RPC representation.
 fn to_rpc_report_executed(req: ReportExecutedRequest) -> rpc::ReportExecutedRequest {
     rpc::ReportExecutedRequest {
         group_id: req.group_id,
@@ -2141,12 +2279,14 @@ fn to_rpc_report_executed(req: ReportExecutedRequest) -> rpc::ReportExecutedRequ
     }
 }
 
+/// Convert an RPC report executed response into a local response.
 fn from_rpc_report_executed(resp: rpc::ReportExecutedResponse) -> ReportExecutedResponse {
     ReportExecutedResponse { ok: resp.ok }
 }
 
 #[async_trait]
 impl Transport for GrpcTransport {
+    /// Send a pre-accept RPC via the peer's batching queue.
     async fn pre_accept(
         &self,
         target: NodeId,
@@ -2172,16 +2312,19 @@ impl Transport for GrpcTransport {
                 peer.stats.pre_accept_queue.fetch_add(1, Ordering::Relaxed);
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                // Backpressure: queue is full.
                 peer.stats.pre_accept_queue_full.fetch_add(1, Ordering::Relaxed);
                 return Err(anyhow::anyhow!("pre_accept queue full"));
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                // Transport is shutting down.
                 return Err(anyhow::anyhow!("pre_accept queue closed"));
             }
         }
         rx.await.context("pre_accept response dropped")?
     }
 
+    /// Send an accept RPC via the peer's batching queue.
     async fn accept(&self, target: NodeId, req: AcceptRequest) -> anyhow::Result<AcceptResponse> {
         let peer = self
             .peers
@@ -2203,16 +2346,19 @@ impl Transport for GrpcTransport {
                 peer.stats.accept_queue.fetch_add(1, Ordering::Relaxed);
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                // Backpressure: queue is full.
                 peer.stats.accept_queue_full.fetch_add(1, Ordering::Relaxed);
                 return Err(anyhow::anyhow!("accept queue full"));
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                // Transport is shutting down.
                 return Err(anyhow::anyhow!("accept queue closed"));
             }
         }
         rx.await.context("accept response dropped")?
     }
 
+    /// Send a commit RPC via the peer's batching queue.
     async fn commit(&self, target: NodeId, req: CommitRequest) -> anyhow::Result<CommitResponse> {
         let peer = self
             .peers
@@ -2234,16 +2380,19 @@ impl Transport for GrpcTransport {
                 peer.stats.commit_queue.fetch_add(1, Ordering::Relaxed);
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                // Backpressure: queue is full.
                 peer.stats.commit_queue_full.fetch_add(1, Ordering::Relaxed);
                 return Err(anyhow::anyhow!("commit queue full"));
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                // Transport is shutting down.
                 return Err(anyhow::anyhow!("commit queue closed"));
             }
         }
         rx.await.context("commit response dropped")?
     }
 
+    /// Send a recover RPC, coalescing concurrent requests for the same txn.
     async fn recover(
         &self,
         target: NodeId,
@@ -2262,6 +2411,7 @@ impl Transport for GrpcTransport {
             .await;
         match decision {
             RecoverEnqueueDecision::Enqueue => {
+                // First request for this txn id: enqueue to peer worker.
                 let work = RecoverWork {
                     req,
                     enqueued_at: std::time::Instant::now(),
@@ -2280,6 +2430,7 @@ impl Transport for GrpcTransport {
                             .fetch_max(new_queue, Ordering::Relaxed);
                     }
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        // Backpressure: queue is full, propagate error to waiters.
                         peer.stats
                             .recover_queue_full
                             .fetch_add(1, Ordering::Relaxed);
@@ -2290,6 +2441,7 @@ impl Transport for GrpcTransport {
                         return Err(err);
                     }
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        // Transport is shutting down, propagate error to waiters.
                         let err = anyhow::anyhow!("recover queue closed");
                         peer.recover_coalescer
                             .complete_err(txn_id, &err)
@@ -2303,6 +2455,7 @@ impl Transport for GrpcTransport {
                 coalesced_count,
                 ballot,
             } => {
+                // Periodically log coalescing to avoid noisy logs on hot keys.
                 if coalesced_count % 1000 == 0 {
                     tracing::info!(
                         peer = target,
@@ -2318,6 +2471,7 @@ impl Transport for GrpcTransport {
         rx.await.context("recover response dropped")?
     }
 
+    /// Forward to the peer's direct fetch_command RPC.
     async fn fetch_command(
         &self,
         target: NodeId,
@@ -2327,6 +2481,7 @@ impl Transport for GrpcTransport {
         GrpcTransport::fetch_command(self, target, group_id, txn_id).await
     }
 
+    /// Send a report_executed RPC via the direct client.
     async fn report_executed(
         &self,
         target: NodeId,
@@ -2350,6 +2505,7 @@ impl Transport for GrpcTransport {
         }
     }
 
+    /// Forward to the peer's direct last_executed_prefix RPC.
     async fn last_executed_prefix(
         &self,
         target: NodeId,
@@ -2358,6 +2514,7 @@ impl Transport for GrpcTransport {
         GrpcTransport::last_executed_prefix(self, target, group_id).await
     }
 
+    /// Forward to the peer's direct executed RPC.
     async fn executed(
         &self,
         target: NodeId,
@@ -2367,6 +2524,7 @@ impl Transport for GrpcTransport {
         GrpcTransport::executed(self, target, group_id, txn_id).await
     }
 
+    /// Forward to the peer's direct mark_visible RPC.
     async fn mark_visible(
         &self,
         target: NodeId,

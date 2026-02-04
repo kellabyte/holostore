@@ -20,7 +20,7 @@ to make writes correct and crash-safe.
   proceed in parallel without a single global leader.
 
 In this repository we implement:
-- A per-shard Accord group with batched consensus RPCs.
+- A per-partition Accord group with batched consensus RPCs.
 - A commit log (WAL) that persists committed entries and replays on restart.
 - An execution loop that applies committed commands to a state machine.
 - A Redis protocol surface for easy benchmarking.
@@ -59,14 +59,6 @@ Summary:
   latency summary (msec):
           avg       min       p50       p95       p99       max
         8.721     4.504     7.271    13.479    39.615    52.735
-```
-
-**Benchmarks (full run)**
-```bash
-make build-release
-./scripts/cleanup_cluster.sh
-./scripts/start_cluster.sh
-redis-benchmark -h localhost -p 16379 -c 50 -n 100000 -r 100000 -P 100 -t set
 ```
 
 **Porcupine linearizability check**
