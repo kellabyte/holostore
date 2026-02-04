@@ -4,11 +4,15 @@
 //! writes, optionally fsyncs, and supports compaction based on executed txns.
 
 use std::collections::HashSet;
+#[cfg(feature = "raft-engine")]
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
+#[cfg(feature = "raft-engine")]
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 use std::{env, str::FromStr};
@@ -16,6 +20,11 @@ use std::{env, str::FromStr};
 use anyhow::Context;
 use crc32fast::Hasher;
 use holo_accord::accord::{CommitLog, CommitLogEntry, TxnId};
+#[cfg(feature = "raft-engine")]
+use holo_accord::accord::{txn_group_id, GroupId};
+
+#[cfg(feature = "raft-engine")]
+use raft_engine::{Config as RaftConfig, Engine as RaftEngine, LogBatch};
 
 /// Default number of appended entries before forcing a sync.
 const WAL_PERSIST_EVERY: u64 = 256;
@@ -280,6 +289,271 @@ impl CommitLog for FileWal {
             .send(WalCommand::Compact(CompactWork { max_delete, tx }))
             .map_err(|_| anyhow::anyhow!("wal worker closed"))?;
         rx.recv().context("wal compact response dropped")?
+    }
+}
+
+#[cfg(feature = "raft-engine")]
+const WAL_META_REGION_ID: GroupId = 0;
+#[cfg(feature = "raft-engine")]
+const WAL_META_GROUPS_KEY: &[u8] = b"meta/groups";
+#[cfg(feature = "raft-engine")]
+const WAL_META_LAST_INDEX_KEY: &[u8] = b"meta/last_index";
+#[cfg(feature = "raft-engine")]
+const WAL_ENTRY_PREFIX: u8 = b'e';
+
+#[cfg(feature = "raft-engine")]
+#[derive(Debug)]
+struct RaftWalState {
+    last_index: HashMap<GroupId, u64>,
+    groups: HashSet<GroupId>,
+    txn_index: HashMap<TxnId, u64>,
+    executed: HashSet<TxnId>,
+    pending_count: u64,
+    last_persist_us: u64,
+}
+
+#[cfg(feature = "raft-engine")]
+impl RaftWalState {
+    fn new() -> Self {
+        Self {
+            last_index: HashMap::new(),
+            groups: HashSet::new(),
+            txn_index: HashMap::new(),
+            executed: HashSet::new(),
+            pending_count: 0,
+            last_persist_us: epoch_micros(),
+        }
+    }
+}
+
+/// Raft-engine backed WAL implementation (optional).
+#[cfg(feature = "raft-engine")]
+pub struct RaftEngineWal {
+    engine: RaftEngine,
+    state: Mutex<RaftWalState>,
+    persist_every: u64,
+    persist_interval_us: u64,
+    persist_mode: SyncMode,
+}
+
+#[cfg(feature = "raft-engine")]
+impl RaftEngineWal {
+    /// Open or create a raft-engine WAL directory.
+    pub fn open_dir(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let dir = path.as_ref().to_path_buf();
+        fs::create_dir_all(&dir).context("create raft wal dir")?;
+
+        let mut cfg = RaftConfig::default();
+        cfg.dir = dir.to_string_lossy().to_string();
+        let engine = RaftEngine::open(cfg).context("open raft-engine")?;
+
+        let persist_every = read_env_u64("HOLO_WAL_PERSIST_EVERY", WAL_PERSIST_EVERY);
+        let persist_interval_us =
+            read_env_u64("HOLO_WAL_PERSIST_INTERVAL_US", WAL_PERSIST_INTERVAL_US);
+        let persist_mode = parse_persist_mode(
+            env::var("HOLO_WAL_PERSIST_MODE")
+                .ok()
+                .as_deref(),
+        )
+        .unwrap_or(SyncMode::None);
+
+        let mut state = RaftWalState::new();
+        if let Some(buf) = engine.get(WAL_META_REGION_ID, WAL_META_GROUPS_KEY) {
+            let groups = decode_groups(&buf)?;
+            for group_id in groups {
+                state.groups.insert(group_id);
+                if let Some(last) = read_last_index(&engine, group_id)? {
+                    state.last_index.insert(group_id, last);
+                }
+            }
+        }
+
+        Ok(Self {
+            engine,
+            state: Mutex::new(state),
+            persist_every,
+            persist_interval_us,
+            persist_mode,
+        })
+    }
+
+    fn persist_should_sync(&self, state: &RaftWalState, batch_len: usize, now: u64) -> (bool, u64, u64) {
+        if matches!(self.persist_mode, SyncMode::None) {
+            return (false, state.pending_count, state.last_persist_us);
+        }
+        let mut pending = state.pending_count.saturating_add(batch_len as u64);
+        let mut last_persist_us = state.last_persist_us;
+        let hit_count = self.persist_every > 0 && pending >= self.persist_every;
+        let hit_interval = self.persist_interval_us > 0
+            && now.saturating_sub(state.last_persist_us) >= self.persist_interval_us;
+        let sync = hit_count || hit_interval;
+        if sync {
+            pending = 0;
+            last_persist_us = now;
+        }
+        (sync, pending, last_persist_us)
+    }
+}
+
+#[cfg(feature = "raft-engine")]
+impl CommitLog for RaftEngineWal {
+    fn append_commit(&self, entry: CommitLogEntry) -> anyhow::Result<()> {
+        self.append_commits(vec![entry])
+    }
+
+    fn append_commits(&self, entries: Vec<CommitLogEntry>) -> anyhow::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let mut state = self.state.lock().expect("raft wal state lock");
+        let now = epoch_micros();
+
+        let mut assigned = Vec::with_capacity(entries.len());
+        let mut per_group_last = HashMap::<GroupId, u64>::new();
+        let mut new_groups = Vec::new();
+        let mut prev_last = HashMap::<GroupId, u64>::new();
+
+        for entry in entries {
+            let group_id = txn_group_id(entry.txn_id);
+            let base_last = match state.last_index.get(&group_id).copied() {
+                Some(last) => last,
+                None => read_last_index(&self.engine, group_id)?.unwrap_or(0),
+            };
+            prev_last.entry(group_id).or_insert(base_last);
+            let next_index = base_last.saturating_add(1);
+            state.last_index.insert(group_id, next_index);
+            per_group_last.insert(group_id, next_index);
+            if state.groups.insert(group_id) {
+                new_groups.push(group_id);
+            }
+            assigned.push((group_id, next_index, entry));
+        }
+
+        let (sync, pending_count, last_persist_us) =
+            self.persist_should_sync(&state, assigned.len(), now);
+
+        let mut batch = LogBatch::with_capacity(assigned.len() + per_group_last.len() + 1);
+        for (group_id, index, entry) in &assigned {
+            let key = entry_key(*index);
+            let payload = encode_entry(entry);
+            batch
+                .put(*group_id, key.to_vec(), payload)
+                .context("raft wal batch put entry")?;
+        }
+        for (group_id, last_index) in &per_group_last {
+            let payload = last_index.to_be_bytes();
+            batch
+                .put(*group_id, WAL_META_LAST_INDEX_KEY.to_vec(), payload.to_vec())
+                .context("raft wal batch put last index")?;
+        }
+        if !new_groups.is_empty() {
+            let payload = encode_groups(&state.groups);
+            batch
+                .put(WAL_META_REGION_ID, WAL_META_GROUPS_KEY.to_vec(), payload)
+                .context("raft wal batch put group list")?;
+        }
+
+        if let Err(err) = self.engine.write(&mut batch, sync) {
+            for (group_id, last) in prev_last {
+                state.last_index.insert(group_id, last);
+            }
+            for group_id in new_groups {
+                state.groups.remove(&group_id);
+            }
+            return Err(err).context("raft wal write batch");
+        }
+
+        for (_, index, entry) in assigned {
+            state.txn_index.insert(entry.txn_id, index);
+        }
+        state.pending_count = pending_count;
+        state.last_persist_us = last_persist_us;
+        Ok(())
+    }
+
+    fn mark_executed(&self, txn_id: TxnId) -> anyhow::Result<()> {
+        let mut state = self.state.lock().expect("raft wal state lock");
+        state.executed.insert(txn_id);
+        Ok(())
+    }
+
+    fn load(&self) -> anyhow::Result<Vec<CommitLogEntry>> {
+        let mut state = self.state.lock().expect("raft wal state lock");
+        if state.groups.is_empty() {
+            if let Some(buf) = self.engine.get(WAL_META_REGION_ID, WAL_META_GROUPS_KEY) {
+                for group_id in decode_groups(&buf)? {
+                    state.groups.insert(group_id);
+                }
+            }
+        }
+
+        let mut entries = Vec::new();
+        let groups: Vec<GroupId> = state.groups.iter().copied().collect();
+        for group_id in groups {
+            let last_index = match state.last_index.get(&group_id).copied() {
+                Some(last) => last,
+                None => {
+                    let last = read_last_index(&self.engine, group_id)?.unwrap_or(0);
+                    state.last_index.insert(group_id, last);
+                    last
+                }
+            };
+            if last_index == 0 {
+                continue;
+            }
+            for index in 1..=last_index {
+                let key = entry_key(index);
+                let Some(payload) = self.engine.get(group_id, &key) else {
+                    continue;
+                };
+                let entry = decode_entry(&payload)?;
+                state.txn_index.insert(entry.txn_id, index);
+                entries.push(entry);
+            }
+        }
+        Ok(entries)
+    }
+
+    fn compact(&self, max_delete: usize) -> anyhow::Result<usize> {
+        if max_delete == 0 {
+            return Ok(0);
+        }
+
+        let mut state = self.state.lock().expect("raft wal state lock");
+        if state.executed.is_empty() {
+            return Ok(0);
+        }
+
+        let mut candidates = Vec::new();
+        for txn_id in &state.executed {
+            if let Some(index) = state.txn_index.get(txn_id).copied() {
+                candidates.push((index, *txn_id));
+            }
+        }
+        candidates.sort_by_key(|(index, _)| *index);
+        let to_remove: Vec<(u64, TxnId)> = candidates.into_iter().take(max_delete).collect();
+        if to_remove.is_empty() {
+            return Ok(0);
+        }
+
+        let mut batch = LogBatch::with_capacity(to_remove.len());
+        for (index, txn_id) in &to_remove {
+            let group_id = txn_group_id(*txn_id);
+            let key = entry_key(*index);
+            batch.delete(group_id, key.to_vec());
+        }
+
+        self.engine
+            .write(&mut batch, false)
+            .context("raft wal compact write")?;
+
+        for (_, txn_id) in &to_remove {
+            state.executed.remove(txn_id);
+            state.txn_index.remove(txn_id);
+        }
+
+        Ok(to_remove.len())
     }
 }
 
@@ -658,6 +932,51 @@ fn decode_entry(buf: &[u8]) -> anyhow::Result<CommitLogEntry> {
         deps,
         command,
     })
+}
+
+#[cfg(feature = "raft-engine")]
+fn entry_key(index: u64) -> [u8; 9] {
+    let mut out = [0u8; 9];
+    out[0] = WAL_ENTRY_PREFIX;
+    out[1..].copy_from_slice(&index.to_be_bytes());
+    out
+}
+
+#[cfg(feature = "raft-engine")]
+fn decode_u64(buf: &[u8]) -> anyhow::Result<u64> {
+    anyhow::ensure!(buf.len() == 8, "raft wal short u64");
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(buf);
+    Ok(u64::from_be_bytes(raw))
+}
+
+#[cfg(feature = "raft-engine")]
+fn encode_groups(groups: &HashSet<GroupId>) -> Vec<u8> {
+    let mut ids: Vec<GroupId> = groups.iter().copied().collect();
+    ids.sort_unstable();
+    let mut out = Vec::with_capacity(ids.len() * 8);
+    for id in ids {
+        out.extend_from_slice(&id.to_be_bytes());
+    }
+    out
+}
+
+#[cfg(feature = "raft-engine")]
+fn decode_groups(buf: &[u8]) -> anyhow::Result<Vec<GroupId>> {
+    anyhow::ensure!(buf.len() % 8 == 0, "raft wal group list length");
+    let mut groups = Vec::with_capacity(buf.len() / 8);
+    for chunk in buf.chunks_exact(8) {
+        groups.push(decode_u64(chunk)?);
+    }
+    Ok(groups)
+}
+
+#[cfg(feature = "raft-engine")]
+fn read_last_index(engine: &RaftEngine, group_id: GroupId) -> anyhow::Result<Option<u64>> {
+    let Some(buf) = engine.get(group_id, WAL_META_LAST_INDEX_KEY) else {
+        return Ok(None);
+    };
+    Ok(Some(decode_u64(&buf)?))
 }
 
 /// Read an env var as u64 with a default.

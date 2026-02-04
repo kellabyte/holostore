@@ -76,6 +76,10 @@ struct NodeArgs {
     #[arg(long)]
     data_dir: String,
 
+    /// WAL engine: file (default) or raft-engine.
+    #[arg(long, env = "HOLO_WAL_ENGINE", default_value = "file")]
+    wal_engine: WalEngine,
+
     /// Number of data shards (creates one Accord group per shard).
     #[arg(long, env = "HOLO_DATA_SHARDS", default_value_t = 1)]
     data_shards: usize,
@@ -268,6 +272,13 @@ enum ReadMode {
     Accord,
     Quorum,
     Local,
+}
+
+/// WAL engine options.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum WalEngine {
+    File,
+    RaftEngine,
 }
 
 /// Classification of proposals for stats aggregation.
@@ -2032,8 +2043,25 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         }
     }
     let keyspace = Arc::new(fjall_cfg.open().context("open fjall keyspace")?);
-    let shared_wal_dir = wal_dir.join("commitlog");
-    let shared_wal = Arc::new(wal::FileWal::open_dir(&shared_wal_dir)?);
+    let shared_wal_dir = match args.wal_engine {
+        WalEngine::File => wal_dir.join("commitlog"),
+        WalEngine::RaftEngine => wal_dir.join("raft-engine"),
+    };
+    let shared_wal: Arc<dyn accord::CommitLog> = match args.wal_engine {
+        WalEngine::File => Arc::new(wal::FileWal::open_dir(&shared_wal_dir)?),
+        WalEngine::RaftEngine => {
+            #[cfg(feature = "raft-engine")]
+            {
+                Arc::new(wal::RaftEngineWal::open_dir(&shared_wal_dir)?)
+            }
+            #[cfg(not(feature = "raft-engine"))]
+            {
+                anyhow::bail!(
+                    "raft-engine WAL selected but feature is not enabled (build with --features raft-engine)"
+                );
+            }
+        }
+    };
     let kv_engine_impl = Arc::new(FjallEngine::open(keyspace.clone())?);
 
     if args.bootstrap == args.join.is_some() {

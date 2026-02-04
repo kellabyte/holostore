@@ -20,26 +20,17 @@ use super::state::{
     is_monotonic_update, status_to_txn_status, ExecutedLogEntry, Record, State, Status,
 };
 use super::types::{
-    AcceptRequest, AcceptResponse, Ballot, CommandKeys, CommitLog, CommitLogEntry, CommitRequest,
-    CommitResponse, Config, ExecMeta, ExecutedPrefix, NodeId, PreAcceptRequest, PreAcceptResponse,
-    RecoverRequest, RecoverResponse, ReportExecutedRequest, ReportExecutedResponse, StateMachine,
-    Transport, TxnId, TxnStatus,
+    txn_group_id, AcceptRequest, AcceptResponse, Ballot, CommandKeys, CommitLog, CommitLogEntry,
+    CommitRequest, CommitResponse, Config, ExecMeta, ExecutedPrefix, NodeId, PreAcceptRequest,
+    PreAcceptResponse, RecoverRequest, RecoverResponse, ReportExecutedRequest,
+    ReportExecutedResponse, StateMachine, Transport, TxnId, TxnStatus,
+    TXN_COUNTER_SHARD_SHIFT,
 };
 
 const COMPACT_EVERY_APPLIED: u64 = 1024;
 const COMPACT_MAX_DELETE: usize = 4096;
-const TXN_COUNTER_SHARD_SHIFT: u32 = 48;
-
 fn command_digest(command: &[u8]) -> [u8; 32] {
     *blake3::hash(command).as_bytes()
-}
-
-fn txn_group_id(txn_id: TxnId) -> u64 {
-    if TXN_COUNTER_SHARD_SHIFT >= 64 {
-        0
-    } else {
-        txn_id.counter >> TXN_COUNTER_SHARD_SHIFT
-    }
 }
 
 /// Lightweight handle used by callers to submit proposals.

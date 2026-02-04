@@ -20,6 +20,35 @@ NODE1_ID="${NODE1_ID:-1}"
 NODE2_ID="${NODE2_ID:-2}"
 NODE3_ID="${NODE3_ID:-3}"
 
+# Defaults for cleanup/build (override via env).
+CLUSTER_CLEANUP="${HOLO_CLUSTER_CLEANUP:-1}"
+CLUSTER_BUILD="${HOLO_BUILD:-1}"
+BUILD_PROFILE="${HOLO_BUILD_PROFILE:-debug}"
+
+declare -a FEATURES=()
+add_feature() {
+  local feat="$1"
+  [[ -z "$feat" ]] && return
+  if [[ " ${FEATURES[*]-} " == *" ${feat} "* ]]; then
+    return
+  fi
+  FEATURES+=("$feat")
+}
+
+add_features_list() {
+  local list="$1"
+  [[ -z "$list" ]] && return
+  IFS=',' read -r -a parts <<<"$list"
+  for part in "${parts[@]}"; do
+    add_feature "$part"
+  done
+}
+
+add_features_list "${HOLO_BUILD_FEATURES:-}"
+if [[ "${HOLO_WAL_ENGINE:-}" == "raft-engine" ]]; then
+  add_feature "raft-engine"
+fi
+
 # Swap node IDs (node2 <-> node3) to test ID-based skew.
 if [[ "${SWAP_NODE_IDS:-0}" == "1" ]]; then
   tmp="$NODE2_ID"
@@ -49,11 +78,26 @@ fi
 # Override with HOLO_BIN to point at a built binary:
 #   HOLO_BIN=./target/release/holo-store ./scripts/start_cluster.sh
 if [[ -z "${HOLO_BIN:-}" ]]; then
-  if [[ -x "$ROOT_DIR/target/release/holo-store" ]]; then
+  if [[ "$BUILD_PROFILE" == "release" ]]; then
     HOLO_BIN="$ROOT_DIR/target/release/holo-store"
   else
     HOLO_BIN="$ROOT_DIR/target/debug/holo-store"
   fi
+fi
+
+if [[ "$CLUSTER_CLEANUP" != "0" ]]; then
+  "$ROOT_DIR/scripts/cleanup_cluster.sh" >/dev/null 2>&1 || true
+fi
+
+if [[ "$CLUSTER_BUILD" != "0" ]]; then
+  build_args=(-p holo_store)
+  if [[ "$BUILD_PROFILE" == "release" ]]; then
+    build_args+=(--release)
+  fi
+  if [[ ${#FEATURES[@]} -gt 0 ]]; then
+    build_args+=(--features "$(IFS=,; echo "${FEATURES[*]}")")
+  fi
+  cargo build "${build_args[@]}"
 fi
 
 if [[ ! -x "$HOLO_BIN" ]]; then
