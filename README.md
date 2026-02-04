@@ -1,9 +1,9 @@
 # HoloStore
 
 ```
- _     _  _____          _____       _______ _______  _____   ______ _______
- |_____| |     | |      |     |      |______    |    |     | |_____/ |______
- |     | |_____| |_____ |_____|      ______|    |    |_____| |    \_ |______
+ _     _  _____          _____  _______ _______  _____   ______ _______
+ |_____| |     | |      |     | |______    |    |     | |_____/ |______
+ |     | |_____| |_____ |_____| ______|    |    |_____| |    \_ |______
                                                                             
 ```
 
@@ -24,6 +24,13 @@ In this repository we implement:
 - A commit log (WAL) that persists committed entries and replays on restart.
 - An execution loop that applies committed commands to a state machine.
 - A Redis protocol surface for easy benchmarking.
+
+**Documentation**
+- [Design overview](docs/DESIGN.md)
+- [Storage engine](docs/STORAGE.md)
+- [Read modes](docs/READ_MODES.md)
+- [Linearizability testing](docs/LINEARIZABILITY.md)
+- [Testing TODOs](docs/TESTING_TODO.md)
 
 **Build**
 ```bash

@@ -60,7 +60,7 @@ type regState struct {
 func main() {
 	var historyPath string
 	var allowErrors bool
-	flag.StringVar(&historyPath, "history", ".tmp/porcupine/history.json", "path to history JSON")
+	flag.StringVar(&historyPath, "history", defaultHistoryPath(), "path to history JSON")
 	flag.BoolVar(&allowErrors, "allow-errors", false, "ignore errored operations (still checks successful ops)")
 	flag.Parse()
 
@@ -267,4 +267,29 @@ func deref(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+func defaultHistoryPath() string {
+	if root := findRepoRoot(); root != "" {
+		return filepath.Join(root, ".tmp", "porcupine", "history.json")
+	}
+	return filepath.Join(".tmp", "porcupine", "history.json")
+}
+
+func findRepoRoot() string {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	dir := cwd
+	for {
+		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+		dir = parent
+	}
 }
