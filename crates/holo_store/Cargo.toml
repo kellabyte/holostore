@@ -18,6 +18,7 @@ fjall = "2.11"
 holo_accord = { path = "../holo_accord" }
 pilota = "0.13"
 prost = "0.13"
+raft-engine = { version = "0.4", optional = true }
 redis-protocol = { version = "6", features = ["codec"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
@@ -34,3 +35,4 @@ volo-build = "0.12"
 
 [features]
 mimalloc = ["dep:mimalloc"]
+raft-engine = ["dep:raft-engine"]

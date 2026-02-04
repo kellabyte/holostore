@@ -11,12 +11,23 @@ use async_trait::async_trait;
 pub type GroupId = u64;
 /// Logical node identifier within a group.
 pub type NodeId = u64;
+/// Bit shift used to encode shard/group id in transaction counters.
+pub const TXN_COUNTER_SHARD_SHIFT: u32 = 48;
 
 /// Unique transaction identifier scoped by node and a monotonically increasing counter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TxnId {
     pub node_id: NodeId,
     pub counter: u64,
+}
+
+/// Derive the Accord group id from a transaction id.
+pub fn txn_group_id(txn_id: TxnId) -> GroupId {
+    if TXN_COUNTER_SHARD_SHIFT >= 64 {
+        0
+    } else {
+        txn_id.counter >> TXN_COUNTER_SHARD_SHIFT
+    }
 }
 
 /// Ballot used to resolve conflicts between competing proposals.
