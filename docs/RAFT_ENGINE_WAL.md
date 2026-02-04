@@ -1,6 +1,6 @@
 # Raft-Engine WAL Integration
 
-This document describes how HoloStore integrates `raft-engine` as an optional WAL backend, and how `raft-engine` features are mapped to HoloStore’s existing WAL semantics.
+This document describes how HoloStore integrates `raft-engine` as the default WAL backend, and how `raft-engine` features are mapped to HoloStore’s existing WAL semantics.
 
 ## Enablement
 
@@ -16,17 +16,17 @@ Run (CLI or env):
 HOLO_WAL_ENGINE=raft-engine ./scripts/start_cluster.sh
 ```
 
-If `HOLO_WAL_ENGINE=raft-engine` is set without the feature enabled, startup fails with a clear error.
+If `HOLO_WAL_ENGINE=raft-engine` is set without the feature enabled (e.g., built with `--no-default-features`), startup fails with a clear error.
 
 ## Architecture Overview
 
 The integration lives in `crates/holo_store/src/wal.rs` as an additional `CommitLog` implementation:
-- `FileWal`: existing DIY file-backed WAL (default).
+- `FileWal`: existing DIY file-backed WAL (legacy option).
 - `RaftEngineWal`: new optional backend using `raft-engine`.
 
 At runtime, the node chooses the WAL with:
 - `--wal-engine file|raft-engine`
-- or `HOLO_WAL_ENGINE=file|raft-engine`
+- or `HOLO_WAL_ENGINE=raft-engine|file`
 
 Both backends implement the same `CommitLog` trait and are used through a `dyn CommitLog` handle in `main.rs`.
 
@@ -121,4 +121,4 @@ This mimics the file WAL’s “drop executed commits” behavior.
 - same `CommitLog` trait,
 - same entry encoding,
 - same replay/compaction workflow,
-- optional runtime selection for A/B comparison against the existing file WAL.
+- runtime selection for A/B comparison against the existing file WAL.

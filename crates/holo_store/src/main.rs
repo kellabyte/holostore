@@ -76,8 +76,8 @@ struct NodeArgs {
     #[arg(long)]
     data_dir: String,
 
-    /// WAL engine: file (default) or raft-engine.
-    #[arg(long, env = "HOLO_WAL_ENGINE", default_value = "file")]
+    /// WAL engine: raft-engine (default) or file.
+    #[arg(long, env = "HOLO_WAL_ENGINE", default_value = "raft-engine")]
     wal_engine: WalEngine,
 
     /// Number of data shards (creates one Accord group per shard).

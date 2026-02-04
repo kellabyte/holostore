@@ -34,5 +34,6 @@ volo-grpc = "0.12"
 volo-build = "0.12"
 
 [features]
+default = ["raft-engine"]
 mimalloc = ["dep:mimalloc"]
 raft-engine = ["dep:raft-engine"]
