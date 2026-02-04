@@ -1,0 +1,234 @@
+syntax = "proto3";
+
+package holo_store.rpc;
+
+service HoloRpc {
+  rpc PreAccept(PreAcceptRequest) returns (PreAcceptResponse);
+  rpc PreAcceptBatch(PreAcceptBatchRequest) returns (PreAcceptBatchResponse);
+  rpc Accept(AcceptRequest) returns (AcceptResponse);
+  rpc AcceptBatch(AcceptBatchRequest) returns (AcceptBatchResponse);
+  rpc Commit(CommitRequest) returns (CommitResponse);
+  rpc CommitBatch(CommitBatchRequest) returns (CommitBatchResponse);
+  rpc Recover(RecoverRequest) returns (RecoverResponse);
+  rpc RecoverBatch(RecoverBatchRequest) returns (RecoverBatchResponse);
+  rpc FetchCommand(FetchCommandRequest) returns (FetchCommandResponse);
+  rpc ReportExecuted(ReportExecutedRequest) returns (ReportExecutedResponse);
+  rpc LastCommitted(LastCommittedRequest) returns (LastCommittedResponse);
+  rpc LastExecutedPrefix(LastExecutedPrefixRequest) returns (LastExecutedPrefixResponse);
+  rpc Executed(ExecutedRequest) returns (ExecutedResponse);
+  rpc MarkVisible(MarkVisibleRequest) returns (MarkVisibleResponse);
+  rpc KvGet(KvGetRequest) returns (KvGetResponse);
+  rpc KvBatchGet(KvBatchGetRequest) returns (KvBatchGetResponse);
+  rpc Join(JoinRequest) returns (JoinResponse);
+}
+
+message TxnId {
+  uint64 node_id = 1;
+  uint64 counter = 2;
+}
+
+message Ballot {
+  uint64 counter = 1;
+  uint64 node_id = 2;
+}
+
+message Version {
+  uint64 seq = 1;
+  TxnId txn_id = 2;
+}
+
+message KvGetRequest {
+  bytes key = 1;
+}
+
+message KvGetResponse {
+  bool has_value = 1;
+  bytes value = 2;
+  Version version = 3;
+}
+
+message KvBatchGetRequest {
+  repeated bytes keys = 1;
+}
+
+message KvBatchGetResponse {
+  repeated KvGetResponse responses = 1;
+}
+
+enum TxnStatus {
+  TXN_STATUS_UNKNOWN = 0;
+  TXN_STATUS_PREACCEPTED = 1;
+  TXN_STATUS_ACCEPTED = 2;
+  TXN_STATUS_COMMITTED = 3;
+  TXN_STATUS_EXECUTED = 4;
+}
+
+message PreAcceptRequest {
+  uint64 group_id = 1;
+  TxnId txn_id = 2;
+  bytes command = 3;
+  uint64 seq = 4;
+  repeated TxnId deps = 5;
+  Ballot ballot = 6;
+}
+
+message PreAcceptResponse {
+  bool ok = 1;
+  uint64 seq = 2;
+  repeated TxnId deps = 3;
+  Ballot promised = 4;
+}
+
+message PreAcceptBatchRequest {
+  repeated PreAcceptRequest requests = 1;
+}
+
+message PreAcceptBatchResponse {
+  repeated PreAcceptResponse responses = 1;
+}
+
+message AcceptRequest {
+  uint64 group_id = 1;
+  TxnId txn_id = 2;
+  bytes command = 3;
+  uint64 seq = 4;
+  repeated TxnId deps = 5;
+  Ballot ballot = 6;
+  bytes command_digest = 7;
+  bool has_command = 8;
+}
+
+message AcceptResponse {
+  bool ok = 1;
+  Ballot promised = 2;
+}
+
+message AcceptBatchRequest {
+  repeated AcceptRequest requests = 1;
+}
+
+message AcceptBatchResponse {
+  repeated AcceptResponse responses = 1;
+}
+
+message CommitRequest {
+  uint64 group_id = 1;
+  TxnId txn_id = 2;
+  bytes command = 3;
+  uint64 seq = 4;
+  repeated TxnId deps = 5;
+  Ballot ballot = 6;
+  bytes command_digest = 7;
+  bool has_command = 8;
+}
+
+message CommitResponse {
+  bool ok = 1;
+}
+
+message CommitBatchRequest {
+  repeated CommitRequest requests = 1;
+}
+
+message CommitBatchResponse {
+  repeated CommitResponse responses = 1;
+}
+
+message RecoverRequest {
+  uint64 group_id = 1;
+  TxnId txn_id = 2;
+  Ballot ballot = 3;
+}
+
+message RecoverResponse {
+  bool ok = 1;
+  Ballot promised = 2;
+  TxnStatus status = 3;
+  Ballot accepted_ballot = 4;
+  bytes command = 5;
+  uint64 seq = 6;
+  repeated TxnId deps = 7;
+}
+
+message RecoverBatchRequest {
+  repeated RecoverRequest requests = 1;
+}
+
+message RecoverBatchResponse {
+  repeated RecoverResponse responses = 1;
+}
+
+message FetchCommandRequest {
+  uint64 group_id = 1;
+  TxnId txn_id = 2;
+}
+
+message FetchCommandResponse {
+  bool has_command = 1;
+  bytes command = 2;
+}
+
+message ExecutedPrefix {
+  uint64 node_id = 1;
+  uint64 counter = 2;
+}
+
+message ReportExecutedRequest {
+  uint64 group_id = 1;
+  uint64 from_node_id = 2;
+  repeated ExecutedPrefix prefixes = 3;
+}
+
+message ReportExecutedResponse {
+  bool ok = 1;
+}
+
+message LastCommittedRequest {
+  uint64 group_id = 1;
+  repeated bytes keys = 2;
+}
+
+message LastCommittedItem {
+  bytes key = 1;
+  bool present = 2;
+  TxnId txn_id = 3;
+  uint64 seq = 4;
+}
+
+message LastCommittedResponse {
+  repeated LastCommittedItem items = 1;
+}
+
+message LastExecutedPrefixRequest {
+  uint64 group_id = 1;
+}
+
+message LastExecutedPrefixResponse {
+  repeated ExecutedPrefix prefixes = 1;
+}
+
+message ExecutedRequest {
+  uint64 group_id = 1;
+  TxnId txn_id = 2;
+}
+
+message ExecutedResponse {
+  bool executed = 1;
+}
+
+message MarkVisibleRequest {
+  uint64 group_id = 1;
+  TxnId txn_id = 2;
+}
+
+message MarkVisibleResponse {
+  bool ok = 1;
+}
+
+message JoinRequest {
+  uint64 node_id = 1;
+}
+
+message JoinResponse {
+  string initial_members = 1;
+}

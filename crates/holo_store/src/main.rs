@@ -1,0 +1,2299 @@
+use std::collections::HashMap;
+use std::fs::{self, OpenOptions};
+use std::io::{BufWriter, IsTerminal, Write};
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use anyhow::{anyhow, Context};
+use clap::{Parser, Subcommand};
+use futures_util::stream::{FuturesUnordered, StreamExt};
+use holo_accord::accord::{self, GroupId, NodeId, TxnId};
+use sysinfo::{Pid, System};
+use tokio::sync::{mpsc, oneshot, Semaphore};
+
+include!(concat!(env!("OUT_DIR"), "/volo_gen.rs"));
+
+mod kv;
+mod redis_server;
+mod rpc_service;
+mod transport;
+mod wal;
+
+use kv::{FjallEngine, KvEngine};
+use rpc_service::RpcService;
+use transport::GrpcTransport;
+
+const GROUP_MEMBERSHIP: GroupId = 0;
+const GROUP_DATA_BASE: GroupId = 1;
+
+#[derive(Parser, Debug)]
+#[command(name = "holo-store")]
+struct Args {
+    #[command(subcommand)]
+    cmd: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    Node(NodeArgs),
+}
+
+#[derive(Parser, Debug)]
+struct NodeArgs {
+    #[arg(long)]
+    node_id: u64,
+
+    #[arg(long)]
+    listen_redis: SocketAddr,
+
+    #[arg(long)]
+    listen_grpc: SocketAddr,
+
+    #[arg(long)]
+    bootstrap: bool,
+
+    #[arg(long)]
+    join: Option<SocketAddr>,
+
+    /// Comma-separated list like: `1@127.0.0.1:50051,2@127.0.0.1:50052,3@127.0.0.1:50053`
+    #[arg(long)]
+    initial_members: String,
+
+    #[arg(long)]
+    data_dir: String,
+
+    /// Number of data shards (creates one Accord group per shard).
+    #[arg(long, env = "HOLO_DATA_SHARDS", default_value_t = 1)]
+    data_shards: usize,
+
+    /// Disable automatic Fjall journal persistence (commit log is the durability source).
+    #[arg(
+        long,
+        env = "HOLO_FJALL_MANUAL_JOURNAL_PERSIST",
+        default_value_t = true
+    )]
+    fjall_manual_journal_persist: bool,
+
+    /// Periodic Fjall journal fsync (ms). Omit or 0 to disable.
+    #[arg(long, env = "HOLO_FJALL_FSYNC_MS")]
+    fjall_fsync_ms: Option<u16>,
+
+    /// RPC timeout for pre-accept/accept/recover (milliseconds).
+    #[arg(long, env = "HOLO_RPC_TIMEOUT_MS", default_value_t = 2000)]
+    rpc_timeout_ms: u64,
+
+    /// Commit RPC timeout (milliseconds).
+    #[arg(long, env = "HOLO_COMMIT_TIMEOUT_MS", default_value_t = 4000)]
+    commit_timeout_ms: u64,
+
+    /// End-to-end propose timeout (milliseconds).
+    #[arg(long, env = "HOLO_PROPOSE_TIMEOUT_MS", default_value_t = 10000)]
+    propose_timeout_ms: u64,
+
+    /// Read mode: accord (default), quorum, or local.
+    #[arg(long, env = "HOLO_READ_MODE", default_value = "accord")]
+    read_mode: ReadMode,
+
+    /// Read barrier timeout for accord reads (milliseconds).
+    #[arg(long, env = "HOLO_READ_BARRIER_TIMEOUT_MS", default_value_t = 2000)]
+    read_barrier_timeout_ms: u64,
+
+    /// Fall back to quorum reads if read barrier times out.
+    #[arg(long, env = "HOLO_READ_BARRIER_FALLBACK_QUORUM", default_value_t = false)]
+    read_barrier_fallback_quorum: bool,
+
+    /// Require last-committed responses from all peers (stronger read barrier).
+    #[arg(long, env = "HOLO_READ_BARRIER_ALL_PEERS", default_value_t = true)]
+    read_barrier_all_peers: bool,
+
+    /// Log RPC batching stats every N milliseconds (0 disables).
+    #[arg(long, env = "HOLO_RPC_STATS_INTERVAL_MS", default_value_t = 0)]
+    rpc_stats_interval_ms: u64,
+
+    /// Log per-peer RPC queue/inflight gauges every N milliseconds (0 disables).
+    #[arg(long, env = "HOLO_RPC_QUEUE_STATS_INTERVAL_MS", default_value_t = 0)]
+    rpc_queue_stats_interval_ms: u64,
+
+    /// Log Accord executor stats every N milliseconds (0 disables).
+    #[arg(long, env = "HOLO_ACCORD_STATS_INTERVAL_MS", default_value_t = 0)]
+    accord_stats_interval_ms: u64,
+
+    /// Log proposal timing stats every N milliseconds (0 disables).
+    #[arg(long, env = "HOLO_PROPOSAL_STATS_INTERVAL_MS", default_value_t = 0)]
+    proposal_stats_interval_ms: u64,
+
+    /// Consecutive execute-stall hits on a PreAccepted blocker before triggering recovery.
+    #[arg(long, env = "HOLO_PREACCEPT_STALL_HITS", default_value_t = 3)]
+    preaccept_stall_hits: u32,
+
+    /// Max number of committed txns to apply in one executor batch.
+    #[arg(long, env = "HOLO_ACCORD_EXECUTE_BATCH_MAX", default_value_t = 32)]
+    accord_execute_batch_max: usize,
+
+    /// Inline commands in accept/commit RPCs (disabling reduces payload size).
+    #[arg(
+        long,
+        env = "HOLO_ACCORD_INLINE_COMMAND_IN_ACCEPT_COMMIT",
+        default_value_t = false
+    )]
+    accord_inline_command_in_accept_commit: bool,
+
+    /// Log process CPU/RSS stats every N milliseconds (0 disables).
+    #[arg(long, env = "HOLO_PROC_STATS_INTERVAL_MS", default_value_t = 0)]
+    proc_stats_interval_ms: u64,
+
+    /// Also sample RSS via `ps` for unit cross-checking.
+    #[arg(long, env = "HOLO_PROC_STATS_USE_PS", default_value_t = false)]
+    proc_stats_use_ps: bool,
+
+    /// Write per-peer RPC queue/sent/latency stats to CSV (appends).
+    #[arg(long, env = "HOLO_PEER_STATS_CSV")]
+    peer_stats_csv: Option<String>,
+
+    /// Max in-flight RPC batches per peer (pre/accept/commit/recover).
+    #[arg(long, env = "HOLO_RPC_INFLIGHT_LIMIT", default_value_t = 4)]
+    rpc_inflight_limit: usize,
+
+    /// Max number of consensus RPCs to coalesce into a batch.
+    #[arg(long, env = "HOLO_RPC_BATCH_MAX", default_value_t = 64)]
+    rpc_batch_max: usize,
+
+    /// How long to wait to coalesce consensus RPCs into a batch (microseconds).
+    #[arg(long, env = "HOLO_RPC_BATCH_WAIT_US", default_value_t = 200)]
+    rpc_batch_wait_us: u64,
+
+    /// Max number of SET operations to coalesce into one proposal.
+    #[arg(long, env = "HOLO_CLIENT_SET_BATCH_MAX", default_value_t = 256)]
+    client_set_batch_max: usize,
+
+    /// Target max SET operations per proposal (used to split large batches).
+    #[arg(long, env = "HOLO_CLIENT_SET_BATCH_TARGET", default_value_t = 128)]
+    client_set_batch_target: usize,
+
+    /// Force single-key proposals for SET (debug perf mode).
+    #[arg(long, env = "HOLO_CLIENT_SINGLE_KEY_TXN", default_value_t = false)]
+    client_single_key_txn: bool,
+
+    /// Max number of commit-log entries to batch per write.
+    #[arg(long, env = "HOLO_COMMIT_LOG_BATCH_MAX", default_value_t = 256)]
+    commit_log_batch_max: usize,
+
+    /// How long to wait to coalesce commit-log entries (microseconds).
+    #[arg(long, env = "HOLO_COMMIT_LOG_BATCH_WAIT_US", default_value_t = 200)]
+    commit_log_batch_wait_us: u64,
+
+    /// Max number of GET keys to coalesce into one read batch.
+    #[arg(long, env = "HOLO_CLIENT_GET_BATCH_MAX", default_value_t = 256)]
+    client_get_batch_max: usize,
+
+    /// How long to wait to coalesce client ops into a batch (microseconds).
+    #[arg(long, env = "HOLO_CLIENT_BATCH_WAIT_US", default_value_t = 200)]
+    client_batch_wait_us: u64,
+
+    /// Max in-flight client batches.
+    #[arg(long, env = "HOLO_CLIENT_BATCH_INFLIGHT", default_value_t = 4)]
+    client_batch_inflight: usize,
+
+    /// Queue depth for client batchers.
+    #[arg(long, env = "HOLO_CLIENT_BATCH_QUEUE", default_value_t = 8192)]
+    client_batch_queue: usize,
+
+    /// Min adaptive in-flight limit.
+    #[arg(long, env = "HOLO_RPC_INFLIGHT_MIN", default_value_t = 1)]
+    rpc_inflight_min: usize,
+
+    /// Max adaptive in-flight limit.
+    #[arg(long, env = "HOLO_RPC_INFLIGHT_MAX", default_value_t = 16)]
+    rpc_inflight_max: usize,
+
+    /// Decrease inflight limit when wait max exceeds this (ms).
+    #[arg(long, env = "HOLO_RPC_INFLIGHT_HIGH_WAIT_MS", default_value_t = 100.0)]
+    rpc_inflight_high_wait_ms: f64,
+
+    /// Increase inflight limit when wait max is below this (ms).
+    #[arg(long, env = "HOLO_RPC_INFLIGHT_LOW_WAIT_MS", default_value_t = 5.0)]
+    rpc_inflight_low_wait_ms: f64,
+
+    /// Decrease inflight limit when queue exceeds this.
+    #[arg(long, env = "HOLO_RPC_INFLIGHT_HIGH_QUEUE", default_value_t = 1024)]
+    rpc_inflight_high_queue: u64,
+
+    /// Increase inflight limit when queue is below this.
+    #[arg(long, env = "HOLO_RPC_INFLIGHT_LOW_QUEUE", default_value_t = 64)]
+    rpc_inflight_low_queue: u64,
+}
+
+#[derive(Clone)]
+struct NodeState {
+    initial_members: String,
+
+    groups: HashMap<GroupId, Arc<accord::Group>>,
+    data_handles: Vec<accord::Handle>,
+    data_shards: usize,
+    node_id: NodeId,
+    kv_engine: Arc<dyn KvEngine>,
+    transport: Arc<GrpcTransport>,
+    member_ids: Vec<NodeId>,
+    read_mode: ReadMode,
+    read_barrier_timeout: Duration,
+    read_barrier_fallback_quorum: bool,
+    read_barrier_all_peers: bool,
+    proposal_stats: Arc<ProposalStats>,
+    proposal_stats_enabled: bool,
+    rpc_handler_stats: Arc<RpcHandlerStats>,
+    client_set_tx: mpsc::Sender<BatchSetWork>,
+    client_get_tx: mpsc::Sender<BatchGetWork>,
+    client_batch_stats: Arc<ClientBatchStats>,
+    client_set_batch_target: usize,
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum ReadMode {
+    Accord,
+    Quorum,
+    Local,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
+enum ProposalKind {
+    Get,
+    Set,
+    BatchGet,
+    BatchSet,
+}
+
+#[derive(Default)]
+struct ProposalStats {
+    get: OpStats,
+    set: OpStats,
+    batch_get: OpStats,
+    batch_set: OpStats,
+}
+
+#[derive(Default)]
+struct OpStats {
+    count: AtomicU64,
+    errors: AtomicU64,
+    total_us: AtomicU64,
+    max_us: AtomicU64,
+}
+
+#[derive(Default, Debug, Clone)]
+struct ProposalStatsSnapshot {
+    get: OpStatsSnapshot,
+    set: OpStatsSnapshot,
+    batch_get: OpStatsSnapshot,
+    batch_set: OpStatsSnapshot,
+}
+
+#[derive(Default)]
+struct RpcHandlerStats {
+    pre_accept_count: AtomicU64,
+    pre_accept_total_us: AtomicU64,
+    pre_accept_max_us: AtomicU64,
+    pre_accept_batch_count: AtomicU64,
+    pre_accept_batch_total_us: AtomicU64,
+    pre_accept_batch_max_us: AtomicU64,
+    pre_accept_inflight: AtomicU64,
+    pre_accept_inflight_max: AtomicU64,
+    accept_count: AtomicU64,
+    accept_total_us: AtomicU64,
+    accept_max_us: AtomicU64,
+    accept_batch_count: AtomicU64,
+    accept_batch_total_us: AtomicU64,
+    accept_batch_max_us: AtomicU64,
+    accept_inflight: AtomicU64,
+    accept_inflight_max: AtomicU64,
+    commit_count: AtomicU64,
+    commit_total_us: AtomicU64,
+    commit_max_us: AtomicU64,
+    commit_batch_count: AtomicU64,
+    commit_batch_total_us: AtomicU64,
+    commit_batch_max_us: AtomicU64,
+    commit_inflight: AtomicU64,
+    commit_inflight_max: AtomicU64,
+}
+
+#[derive(Default, Debug, Clone)]
+struct RpcHandlerStatsSnapshot {
+    pre_accept_avg_ms: f64,
+    pre_accept_p99_ms: f64,
+    pre_accept_batch_avg_ms: f64,
+    pre_accept_batch_p99_ms: f64,
+    pre_accept_inflight: u64,
+    pre_accept_inflight_peak: u64,
+    accept_avg_ms: f64,
+    accept_p99_ms: f64,
+    accept_batch_avg_ms: f64,
+    accept_batch_p99_ms: f64,
+    accept_inflight: u64,
+    accept_inflight_peak: u64,
+    commit_avg_ms: f64,
+    commit_p99_ms: f64,
+    commit_batch_avg_ms: f64,
+    commit_batch_p99_ms: f64,
+    commit_inflight: u64,
+    commit_inflight_peak: u64,
+}
+
+impl RpcHandlerStats {
+    fn track_pre_accept(&self) -> InflightGuard<'_> {
+        let current = self.pre_accept_inflight.fetch_add(1, Ordering::Relaxed) + 1;
+        self.pre_accept_inflight_max
+            .fetch_max(current, Ordering::Relaxed);
+        InflightGuard {
+            counter: &self.pre_accept_inflight,
+        }
+    }
+
+    fn record_pre_accept(&self, us: u64) {
+        self.pre_accept_count.fetch_add(1, Ordering::Relaxed);
+        self.pre_accept_total_us.fetch_add(us, Ordering::Relaxed);
+        self.pre_accept_max_us.fetch_max(us, Ordering::Relaxed);
+    }
+
+    fn record_pre_accept_batch(&self, us: u64) {
+        self.pre_accept_batch_count.fetch_add(1, Ordering::Relaxed);
+        self.pre_accept_batch_total_us.fetch_add(us, Ordering::Relaxed);
+        self.pre_accept_batch_max_us.fetch_max(us, Ordering::Relaxed);
+    }
+
+    fn track_accept(&self) -> InflightGuard<'_> {
+        let current = self.accept_inflight.fetch_add(1, Ordering::Relaxed) + 1;
+        self.accept_inflight_max
+            .fetch_max(current, Ordering::Relaxed);
+        InflightGuard {
+            counter: &self.accept_inflight,
+        }
+    }
+
+    fn record_accept(&self, us: u64) {
+        self.accept_count.fetch_add(1, Ordering::Relaxed);
+        self.accept_total_us.fetch_add(us, Ordering::Relaxed);
+        self.accept_max_us.fetch_max(us, Ordering::Relaxed);
+    }
+
+    fn record_accept_batch(&self, us: u64) {
+        self.accept_batch_count.fetch_add(1, Ordering::Relaxed);
+        self.accept_batch_total_us.fetch_add(us, Ordering::Relaxed);
+        self.accept_batch_max_us.fetch_max(us, Ordering::Relaxed);
+    }
+
+    fn track_commit(&self) -> InflightGuard<'_> {
+        let current = self.commit_inflight.fetch_add(1, Ordering::Relaxed) + 1;
+        self.commit_inflight_max
+            .fetch_max(current, Ordering::Relaxed);
+        InflightGuard {
+            counter: &self.commit_inflight,
+        }
+    }
+
+    fn record_commit(&self, us: u64) {
+        self.commit_count.fetch_add(1, Ordering::Relaxed);
+        self.commit_total_us.fetch_add(us, Ordering::Relaxed);
+        self.commit_max_us.fetch_max(us, Ordering::Relaxed);
+    }
+
+    fn record_commit_batch(&self, us: u64) {
+        self.commit_batch_count.fetch_add(1, Ordering::Relaxed);
+        self.commit_batch_total_us.fetch_add(us, Ordering::Relaxed);
+        self.commit_batch_max_us.fetch_max(us, Ordering::Relaxed);
+    }
+
+    fn snapshot_and_reset(&self) -> RpcHandlerStatsSnapshot {
+        let pre_cnt = self.pre_accept_count.swap(0, Ordering::Relaxed);
+        let pre_tot = self.pre_accept_total_us.swap(0, Ordering::Relaxed);
+        let pre_max = self.pre_accept_max_us.swap(0, Ordering::Relaxed);
+        let pre_batch_cnt = self.pre_accept_batch_count.swap(0, Ordering::Relaxed);
+        let pre_batch_tot = self.pre_accept_batch_total_us.swap(0, Ordering::Relaxed);
+        let pre_batch_max = self.pre_accept_batch_max_us.swap(0, Ordering::Relaxed);
+        let pre_inflight = self.pre_accept_inflight.load(Ordering::Relaxed);
+        let pre_inflight_peak = self.pre_accept_inflight_max.swap(0, Ordering::Relaxed);
+
+        let acc_cnt = self.accept_count.swap(0, Ordering::Relaxed);
+        let acc_tot = self.accept_total_us.swap(0, Ordering::Relaxed);
+        let acc_max = self.accept_max_us.swap(0, Ordering::Relaxed);
+        let acc_batch_cnt = self.accept_batch_count.swap(0, Ordering::Relaxed);
+        let acc_batch_tot = self.accept_batch_total_us.swap(0, Ordering::Relaxed);
+        let acc_batch_max = self.accept_batch_max_us.swap(0, Ordering::Relaxed);
+        let acc_inflight = self.accept_inflight.load(Ordering::Relaxed);
+        let acc_inflight_peak = self.accept_inflight_max.swap(0, Ordering::Relaxed);
+
+        let com_cnt = self.commit_count.swap(0, Ordering::Relaxed);
+        let com_tot = self.commit_total_us.swap(0, Ordering::Relaxed);
+        let com_max = self.commit_max_us.swap(0, Ordering::Relaxed);
+        let com_batch_cnt = self.commit_batch_count.swap(0, Ordering::Relaxed);
+        let com_batch_tot = self.commit_batch_total_us.swap(0, Ordering::Relaxed);
+        let com_batch_max = self.commit_batch_max_us.swap(0, Ordering::Relaxed);
+        let com_inflight = self.commit_inflight.load(Ordering::Relaxed);
+        let com_inflight_peak = self.commit_inflight_max.swap(0, Ordering::Relaxed);
+
+        RpcHandlerStatsSnapshot {
+            pre_accept_avg_ms: avg_us_per(pre_tot, pre_cnt),
+            pre_accept_p99_ms: pre_max as f64 / 1000.0,
+            pre_accept_batch_avg_ms: avg_us_per(pre_batch_tot, pre_batch_cnt),
+            pre_accept_batch_p99_ms: pre_batch_max as f64 / 1000.0,
+            pre_accept_inflight: pre_inflight,
+            pre_accept_inflight_peak: pre_inflight_peak,
+            accept_avg_ms: avg_us_per(acc_tot, acc_cnt),
+            accept_p99_ms: acc_max as f64 / 1000.0,
+            accept_batch_avg_ms: avg_us_per(acc_batch_tot, acc_batch_cnt),
+            accept_batch_p99_ms: acc_batch_max as f64 / 1000.0,
+            accept_inflight: acc_inflight,
+            accept_inflight_peak: acc_inflight_peak,
+            commit_avg_ms: avg_us_per(com_tot, com_cnt),
+            commit_p99_ms: com_max as f64 / 1000.0,
+            commit_batch_avg_ms: avg_us_per(com_batch_tot, com_batch_cnt),
+            commit_batch_p99_ms: com_batch_max as f64 / 1000.0,
+            commit_inflight: com_inflight,
+            commit_inflight_peak: com_inflight_peak,
+        }
+    }
+}
+
+struct InflightGuard<'a> {
+    counter: &'a AtomicU64,
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Default, Debug, Clone)]
+struct OpStatsSnapshot {
+    count: u64,
+    errors: u64,
+    total_us: u64,
+    max_us: u64,
+}
+
+#[derive(Default)]
+struct ClientBatchStats {
+    set_batches: AtomicU64,
+    set_items: AtomicU64,
+    set_max_items: AtomicU64,
+    set_wait_total_us: AtomicU64,
+    set_wait_max_us: AtomicU64,
+    get_batches: AtomicU64,
+    get_items: AtomicU64,
+    get_max_items: AtomicU64,
+    get_wait_total_us: AtomicU64,
+    get_wait_max_us: AtomicU64,
+}
+
+#[derive(Default, Debug, Clone)]
+struct ClientBatchStatsSnapshot {
+    set_batches: u64,
+    set_items: u64,
+    set_max_items: u64,
+    set_wait_total_us: u64,
+    set_wait_max_us: u64,
+    get_batches: u64,
+    get_items: u64,
+    get_max_items: u64,
+    get_wait_total_us: u64,
+    get_wait_max_us: u64,
+}
+
+impl ClientBatchStats {
+    fn record_set(&self, items: u64, wait_us: u64) {
+        self.set_batches.fetch_add(1, Ordering::Relaxed);
+        self.set_items.fetch_add(items, Ordering::Relaxed);
+        self.set_max_items.fetch_max(items, Ordering::Relaxed);
+        self.set_wait_total_us.fetch_add(wait_us, Ordering::Relaxed);
+        self.set_wait_max_us.fetch_max(wait_us, Ordering::Relaxed);
+    }
+
+    fn record_get(&self, items: u64, wait_us: u64) {
+        self.get_batches.fetch_add(1, Ordering::Relaxed);
+        self.get_items.fetch_add(items, Ordering::Relaxed);
+        self.get_max_items.fetch_max(items, Ordering::Relaxed);
+        self.get_wait_total_us.fetch_add(wait_us, Ordering::Relaxed);
+        self.get_wait_max_us.fetch_max(wait_us, Ordering::Relaxed);
+    }
+
+    fn snapshot_and_reset(&self) -> ClientBatchStatsSnapshot {
+        ClientBatchStatsSnapshot {
+            set_batches: self.set_batches.swap(0, Ordering::Relaxed),
+            set_items: self.set_items.swap(0, Ordering::Relaxed),
+            set_max_items: self.set_max_items.swap(0, Ordering::Relaxed),
+            set_wait_total_us: self.set_wait_total_us.swap(0, Ordering::Relaxed),
+            set_wait_max_us: self.set_wait_max_us.swap(0, Ordering::Relaxed),
+            get_batches: self.get_batches.swap(0, Ordering::Relaxed),
+            get_items: self.get_items.swap(0, Ordering::Relaxed),
+            get_max_items: self.get_max_items.swap(0, Ordering::Relaxed),
+            get_wait_total_us: self.get_wait_total_us.swap(0, Ordering::Relaxed),
+            get_wait_max_us: self.get_wait_max_us.swap(0, Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ClientBatchConfig {
+    set_max: usize,
+    get_max: usize,
+    wait: Duration,
+    inflight: usize,
+}
+
+struct BatchSetWork {
+    items: Vec<(Vec<u8>, Vec<u8>)>,
+    tx: oneshot::Sender<anyhow::Result<()>>,
+    enqueued_at: Instant,
+}
+
+struct BatchGetWork {
+    keys: Vec<Vec<u8>>,
+    tx: oneshot::Sender<anyhow::Result<Vec<Option<Vec<u8>>>>>,
+    enqueued_at: Instant,
+}
+
+impl ProposalStats {
+    fn record(&self, kind: ProposalKind, dur_us: u64, ok: bool) {
+        match kind {
+            ProposalKind::Get => self.get.record(dur_us, ok),
+            ProposalKind::Set => self.set.record(dur_us, ok),
+            ProposalKind::BatchGet => self.batch_get.record(dur_us, ok),
+            ProposalKind::BatchSet => self.batch_set.record(dur_us, ok),
+        }
+    }
+
+    fn snapshot_and_reset(&self) -> ProposalStatsSnapshot {
+        ProposalStatsSnapshot {
+            get: self.get.snapshot(),
+            set: self.set.snapshot(),
+            batch_get: self.batch_get.snapshot(),
+            batch_set: self.batch_set.snapshot(),
+        }
+    }
+}
+
+impl OpStats {
+    fn record(&self, dur_us: u64, ok: bool) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.total_us.fetch_add(dur_us, Ordering::Relaxed);
+        self.max_us.fetch_max(dur_us, Ordering::Relaxed);
+        if !ok {
+            self.errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn snapshot(&self) -> OpStatsSnapshot {
+        OpStatsSnapshot {
+            count: self.count.swap(0, Ordering::Relaxed),
+            errors: self.errors.swap(0, Ordering::Relaxed),
+            total_us: self.total_us.swap(0, Ordering::Relaxed),
+            max_us: self.max_us.swap(0, Ordering::Relaxed),
+        }
+    }
+}
+
+impl NodeState {
+    fn group(&self, group_id: GroupId) -> Option<Arc<accord::Group>> {
+        self.groups.get(&group_id).cloned()
+    }
+
+    fn shard_for_key(&self, key: &[u8]) -> usize {
+        if self.data_shards <= 1 {
+            return 0;
+        }
+        (kv::hash_key(key) as usize) % self.data_shards
+    }
+
+    fn handle_for_shard(&self, shard: usize) -> accord::Handle {
+        let idx = shard.min(self.data_handles.len().saturating_sub(1));
+        self.data_handles[idx].clone()
+    }
+
+    fn kv_latest(&self, key: &[u8]) -> Option<(Vec<u8>, kv::Version)> {
+        self.kv_engine.get_latest(key)
+    }
+
+    fn kv_latest_batch(&self, keys: &[Vec<u8>]) -> Vec<Option<(Vec<u8>, kv::Version)>> {
+        self.kv_engine.get_latest_batch(keys)
+    }
+
+    fn client_batch_stats_snapshot(&self) -> ClientBatchStatsSnapshot {
+        self.client_batch_stats.snapshot_and_reset()
+    }
+
+    async fn execute_batch_set(&self, items: Vec<(Vec<u8>, Vec<u8>)>) -> anyhow::Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let (tx, rx) = oneshot::channel();
+        let work = BatchSetWork {
+            items,
+            tx,
+            enqueued_at: Instant::now(),
+        };
+        self.client_set_tx
+            .send(work)
+            .await
+            .map_err(|_| anyhow!("set batch queue closed"))?;
+        rx.await.context("set batch response dropped")?
+    }
+
+    async fn execute_batch_set_direct(
+        &self,
+        items: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> anyhow::Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let mut by_shard: Vec<Vec<(Vec<u8>, Vec<u8>)>> = vec![Vec::new(); self.data_shards];
+        for (key, value) in items {
+            let shard = self.shard_for_key(&key);
+            by_shard[shard].push((key, value));
+        }
+
+        let target = self.client_set_batch_target.max(1);
+        let mut futs = FuturesUnordered::new();
+        for (shard, batch) in by_shard.into_iter().enumerate() {
+            if batch.is_empty() {
+                continue;
+            }
+            let handle = self.handle_for_shard(shard);
+            for chunk in batch.chunks(target) {
+                let cmd = kv::encode_batch_set(chunk);
+                let handle = handle.clone();
+                futs.push(self.propose_timed_on(handle, ProposalKind::BatchSet, cmd));
+            }
+        }
+
+        while let Some(res) = futs.next().await {
+            res?;
+        }
+        Ok(())
+    }
+
+    async fn execute_batch_get(&self, keys: Vec<Vec<u8>>) -> anyhow::Result<Vec<Option<Vec<u8>>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let (tx, rx) = oneshot::channel();
+        let work = BatchGetWork {
+            keys,
+            tx,
+            enqueued_at: Instant::now(),
+        };
+        self.client_get_tx
+            .send(work)
+            .await
+            .map_err(|_| anyhow!("get batch queue closed"))?;
+        rx.await.context("get batch response dropped")?
+    }
+
+    async fn execute_batch_get_direct(
+        &self,
+        keys: Vec<Vec<u8>>,
+    ) -> anyhow::Result<Vec<Option<Vec<u8>>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut by_shard: Vec<Vec<(usize, Vec<u8>)>> = vec![Vec::new(); self.data_shards];
+        for (idx, key) in keys.iter().enumerate() {
+            let shard = self.shard_for_key(key);
+            by_shard[shard].push((idx, key.clone()));
+        }
+
+        let mut out = vec![None; keys.len()];
+        let mut futs = FuturesUnordered::new();
+
+        for (shard, entries) in by_shard.into_iter().enumerate() {
+            if entries.is_empty() {
+                continue;
+            }
+            let mut shard_keys = Vec::with_capacity(entries.len());
+            let mut shard_indices = Vec::with_capacity(entries.len());
+            for (idx, key) in entries {
+                shard_indices.push(idx);
+                shard_keys.push(key);
+            }
+
+            let handle = self.handle_for_shard(shard);
+            let read_mode = self.read_mode;
+            let fallback = self.read_barrier_fallback_quorum;
+            let this = self.clone();
+            futs.push(async move {
+                let values = match read_mode {
+                    ReadMode::Accord => {
+                        let deps = match this
+                            .ensure_read_barrier_shard(GROUP_DATA_BASE + shard as u64, &shard_keys)
+                            .await
+                        {
+                            Ok(versions) => versions,
+                            Err(err) => {
+                                if fallback {
+                                    tracing::warn!(
+                                        error = ?err,
+                                        "read barrier failed; falling back to quorum batch get"
+                                    );
+                                    return this
+                                        .quorum_batch_get_shard(shard_keys)
+                                        .await
+                                        .map(|vals| (shard_indices, vals));
+                                }
+                                return Err(err);
+                            }
+                        };
+                        let expected = shard_keys.len();
+                        let cmd = kv::encode_batch_get(&shard_keys);
+                        let res = handle.propose_read_with_deps(cmd, deps).await?;
+                        let accord::ProposalResult::Read(value) = res else {
+                            anyhow::bail!("BATCH_GET expected read result, got {res:?}");
+                        };
+                        let value = value.unwrap_or_default();
+                        let decoded = kv::decode_batch_get_result(&value)?;
+                        anyhow::ensure!(
+                            decoded.len() == expected,
+                            "batch get result count mismatch (expected {expected}, got {})",
+                            decoded.len()
+                        );
+                        decoded
+                    }
+                    ReadMode::Local => this
+                        .kv_engine
+                        .get_latest_batch(&shard_keys)
+                        .into_iter()
+                        .map(|item| item.map(|(v, _)| v))
+                        .collect(),
+                    ReadMode::Quorum => this.quorum_batch_get_shard(shard_keys).await?,
+                };
+                Ok::<_, anyhow::Error>((shard_indices, values))
+            });
+        }
+
+        while let Some(res) = futs.next().await {
+            let (indices, values) = res?;
+            anyhow::ensure!(
+                indices.len() == values.len(),
+                "batch get shard result mismatch"
+            );
+            for (idx, value) in indices.into_iter().zip(values.into_iter()) {
+                out[idx] = value;
+            }
+        }
+
+        Ok(out)
+    }
+
+    async fn execute(&self, op: redis_server::KvOp) -> anyhow::Result<redis_server::KvResult> {
+        match op {
+            redis_server::KvOp::HoloStats => {
+                anyhow::bail!("HOLOSTATS is handled at the Redis layer")
+            }
+            redis_server::KvOp::Get { key } => {
+                let mut values = self.execute_batch_get(vec![key]).await?;
+                let value = values.pop().unwrap_or(None);
+                Ok(redis_server::KvResult::Value(value))
+            }
+            redis_server::KvOp::Set { key, value } => {
+                self.execute_batch_set(vec![(key, value)]).await?;
+                Ok(redis_server::KvResult::Ok)
+            }
+        }
+    }
+
+    async fn propose_timed_on(
+        &self,
+        handle: accord::Handle,
+        kind: ProposalKind,
+        command: Vec<u8>,
+    ) -> anyhow::Result<accord::ProposalResult> {
+        let start = Instant::now();
+        let res = handle.propose(command).await;
+        if self.proposal_stats_enabled {
+            let dur_us = start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+            self.proposal_stats.record(kind, dur_us, res.is_ok());
+        }
+        res
+    }
+
+    async fn ensure_read_barrier_shard(
+        &self,
+        group_id: GroupId,
+        keys: &[Vec<u8>],
+    ) -> anyhow::Result<Vec<(TxnId, u64)>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let responses = self.quorum_last_committed_shard(group_id, keys).await?;
+        let max_by_key = merge_last_committed(&responses, keys.len());
+        let mut unique = std::collections::HashMap::<TxnId, u64>::new();
+        for replica in responses {
+            for item in replica {
+                if let Some((txn_id, _)) = item {
+                    unique.entry(txn_id).or_insert(0);
+                }
+            }
+        }
+        if unique.is_empty() {
+            return Ok(Vec::new());
+        }
+        let group = self
+            .group(group_id)
+            .ok_or_else(|| anyhow::anyhow!("data group missing"))?;
+        group.observe_last_committed(keys, &max_by_key).await;
+        for item in &max_by_key {
+            if let Some((txn_id, seq)) = item {
+                unique.insert(*txn_id, *seq);
+            }
+        }
+        for (txn_id, seq) in unique.iter() {
+            let _ = seq;
+            match tokio::time::timeout(self.read_barrier_timeout, group.wait_executed(*txn_id))
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => return Err(err),
+                Err(_) => {
+                    anyhow::bail!("read barrier timed out waiting for {:?}", txn_id);
+                }
+            }
+        }
+        Ok(unique.into_iter().collect())
+    }
+
+    async fn quorum_last_committed_shard(
+        &self,
+        group_id: GroupId,
+        keys: &[Vec<u8>],
+    ) -> anyhow::Result<Vec<Vec<Option<(TxnId, u64)>>>> {
+        let group = self
+            .group(group_id)
+            .ok_or_else(|| anyhow::anyhow!("data group missing"))?;
+        let mut results: Vec<Vec<Option<(TxnId, u64)>>> = Vec::new();
+        results.push(group.last_committed_for_keys(keys).await);
+
+        let quorum = (self.member_ids.len() / 2) + 1;
+        let mut ok = 1usize;
+        if ok >= quorum && !self.read_barrier_all_peers {
+            return Ok(results);
+        }
+
+        let seed = keys.first().map(|k| kv::hash_key(k)).unwrap_or(0);
+        let peers = self.peers_for_seed(seed);
+        let mut futs = FuturesUnordered::new();
+
+        let launch_next = |futs: &mut FuturesUnordered<_>,
+                           peer: NodeId,
+                           keys: &[Vec<u8>],
+                           transport: &Arc<GrpcTransport>| {
+            let transport = transport.clone();
+            let keys = keys.to_vec();
+            let group_id = group_id;
+            futs.push(async move { transport.last_committed(peer, group_id, keys).await });
+        };
+
+        for peer in &peers {
+            launch_next(&mut futs, *peer, keys, &self.transport);
+        }
+
+        while let Some(resp) = futs.next().await {
+            match resp {
+                Ok(values) => {
+                    results.push(values);
+                    ok += 1;
+                }
+                Err(err) => {
+                    tracing::debug!(error = ?err, "last_committed rpc failed");
+                }
+            }
+        }
+
+        if self.read_barrier_all_peers {
+            let expected = self.member_ids.len();
+            anyhow::ensure!(ok >= expected, "last_committed all-peers failed (ok={ok}, expected={expected})");
+        } else {
+            anyhow::ensure!(ok >= quorum, "last_committed quorum failed (ok={ok}, quorum={quorum})");
+        }
+        Ok(results)
+    }
+
+    async fn quorum_get(&self, key: Vec<u8>) -> anyhow::Result<Option<Vec<u8>>> {
+        let mut results: Vec<Option<(Vec<u8>, kv::Version)>> = Vec::new();
+        results.push(self.kv_engine.get_latest(&key));
+
+        let quorum = (self.member_ids.len() / 2) + 1;
+        let mut ok = 1usize;
+
+        if ok >= quorum {
+            return Ok(pick_latest(results));
+        }
+
+        let peers = self.peers_for_seed(kv::hash_key(&key));
+        let mut next_idx = 0usize;
+
+        let mut futs = FuturesUnordered::new();
+        let launch_next = |futs: &mut FuturesUnordered<_>,
+                           peer: NodeId,
+                           key: &Vec<u8>,
+                           transport: &Arc<GrpcTransport>| {
+            let transport = transport.clone();
+            let key = key.clone();
+            futs.push(async move { transport.kv_get(peer, key).await });
+        };
+
+        let needed = (quorum - ok).min(peers.len());
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            tracing::debug!(
+                op = "quorum_get",
+                node_id = self.node_id,
+                quorum = quorum,
+                needed = needed,
+                peers = ?peers,
+                "quorum read peers"
+            );
+        }
+        while next_idx < needed {
+            let peer = peers[next_idx];
+            next_idx += 1;
+            launch_next(&mut futs, peer, &key, &self.transport);
+        }
+
+        while let Some(res) = futs.next().await {
+            if let Ok(value) = res {
+                results.push(value);
+                ok += 1;
+                if ok >= quorum {
+                    break;
+                }
+            }
+
+            if ok < quorum && next_idx < peers.len() {
+                let peer = peers[next_idx];
+                next_idx += 1;
+                launch_next(&mut futs, peer, &key, &self.transport);
+            }
+        }
+
+        anyhow::ensure!(ok >= quorum, "quorum read failed (ok={ok}, quorum={quorum})");
+        Ok(pick_latest(results))
+    }
+
+    async fn quorum_batch_get_shard(
+        &self,
+        keys: Vec<Vec<u8>>,
+    ) -> anyhow::Result<Vec<Option<Vec<u8>>>> {
+        let quorum = (self.member_ids.len() / 2) + 1;
+        let mut ok = 1usize;
+
+        let mut results: Vec<Vec<Option<(Vec<u8>, kv::Version)>>> = Vec::new();
+        results.push(self.kv_engine.get_latest_batch(&keys));
+
+        if ok >= quorum {
+            return Ok(merge_quorum_results(&results, keys.len()));
+        }
+
+        let seed = keys.first().map(|k| kv::hash_key(k)).unwrap_or(0);
+        let peers = self.peers_for_seed(seed);
+        let mut next_idx = 0usize;
+
+        let mut futs = FuturesUnordered::new();
+        let launch_next = |futs: &mut FuturesUnordered<_>,
+                           peer: NodeId,
+                           keys: &Vec<Vec<u8>>,
+                           transport: &Arc<GrpcTransport>| {
+            let transport = transport.clone();
+            let keys = keys.clone();
+            futs.push(async move { transport.kv_batch_get(peer, keys).await });
+        };
+
+        let needed = (quorum - ok).min(peers.len());
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            tracing::debug!(
+                op = "quorum_batch_get",
+                node_id = self.node_id,
+                quorum = quorum,
+                needed = needed,
+                peers = ?peers,
+                "quorum read peers"
+            );
+        }
+        while next_idx < needed {
+            let peer = peers[next_idx];
+            next_idx += 1;
+            launch_next(&mut futs, peer, &keys, &self.transport);
+        }
+
+        while let Some(res) = futs.next().await {
+            if let Ok(values) = res {
+                results.push(values);
+                ok += 1;
+                if ok >= quorum {
+                    break;
+                }
+            }
+
+            if ok < quorum && next_idx < peers.len() {
+                let peer = peers[next_idx];
+                next_idx += 1;
+                launch_next(&mut futs, peer, &keys, &self.transport);
+            }
+        }
+
+        anyhow::ensure!(ok >= quorum, "quorum read failed (ok={ok}, quorum={quorum})");
+        Ok(merge_quorum_results(&results, keys.len()))
+    }
+
+    fn peers_for_seed(&self, seed: u64) -> Vec<NodeId> {
+        let mut peers = self
+            .member_ids
+            .iter()
+            .copied()
+            .filter(|id| *id != self.node_id)
+            .collect::<Vec<_>>();
+        if peers.len() > 1 {
+            let start = (seed as usize) % peers.len();
+            peers.rotate_left(start);
+        }
+        peers
+    }
+}
+
+async fn collect_set_batch(
+    first: BatchSetWork,
+    rx: &mut mpsc::Receiver<BatchSetWork>,
+    max_items: usize,
+    wait: Duration,
+) -> Vec<BatchSetWork> {
+    let mut batch = Vec::with_capacity(max_items.max(1));
+    let mut items = 0usize;
+    items += first.items.len();
+    batch.push(first);
+
+    let deadline = if wait.is_zero() {
+        None
+    } else {
+        Some(Instant::now() + wait)
+    };
+
+    'outer: loop {
+        if items >= max_items {
+            break;
+        }
+        match rx.try_recv() {
+            Ok(work) => {
+                items += work.items.len();
+                batch.push(work);
+                continue;
+            }
+            Err(mpsc::error::TryRecvError::Empty) => {}
+            Err(mpsc::error::TryRecvError::Disconnected) => break,
+        }
+
+        let Some(deadline) = deadline else {
+            break;
+        };
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        tokio::select! {
+            maybe = rx.recv() => {
+                match maybe {
+                    Some(work) => {
+                        items += work.items.len();
+                        batch.push(work);
+                    }
+                    None => break 'outer,
+                }
+            }
+            _ = tokio::time::sleep(remaining) => {
+                break;
+            }
+        }
+    }
+
+    batch
+}
+
+async fn collect_get_batch(
+    first: BatchGetWork,
+    rx: &mut mpsc::Receiver<BatchGetWork>,
+    max_items: usize,
+    wait: Duration,
+) -> Vec<BatchGetWork> {
+    let mut batch = Vec::with_capacity(max_items.max(1));
+    let mut items = 0usize;
+    items += first.keys.len();
+    batch.push(first);
+
+    let deadline = if wait.is_zero() {
+        None
+    } else {
+        Some(Instant::now() + wait)
+    };
+
+    'outer: loop {
+        if items >= max_items {
+            break;
+        }
+        match rx.try_recv() {
+            Ok(work) => {
+                items += work.keys.len();
+                batch.push(work);
+                continue;
+            }
+            Err(mpsc::error::TryRecvError::Empty) => {}
+            Err(mpsc::error::TryRecvError::Disconnected) => break,
+        }
+
+        let Some(deadline) = deadline else {
+            break;
+        };
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        tokio::select! {
+            maybe = rx.recv() => {
+                match maybe {
+                    Some(work) => {
+                        items += work.keys.len();
+                        batch.push(work);
+                    }
+                    None => break 'outer,
+                }
+            }
+            _ = tokio::time::sleep(remaining) => {
+                break;
+            }
+        }
+    }
+
+    batch
+}
+
+fn spawn_set_batcher(
+    state: Arc<NodeState>,
+    mut rx: mpsc::Receiver<BatchSetWork>,
+    cfg: ClientBatchConfig,
+) {
+    let max_items = cfg.set_max.max(1);
+    let wait = cfg.wait;
+    let inflight = Arc::new(Semaphore::new(cfg.inflight.max(1)));
+    tokio::spawn(async move {
+        while let Some(first) = rx.recv().await {
+            let batch = collect_set_batch(first, &mut rx, max_items, wait).await;
+            let permit = match inflight.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => return,
+            };
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                let wait_us = batch
+                    .first()
+                    .map(|w| {
+                        w.enqueued_at
+                            .elapsed()
+                            .as_micros()
+                            .min(u128::from(u64::MAX)) as u64
+                    })
+                    .unwrap_or(0);
+                let total_items: usize = batch.iter().map(|w| w.items.len()).sum();
+                let mut responders = Vec::with_capacity(batch.len());
+                let mut items = Vec::with_capacity(total_items);
+                for work in batch {
+                    items.extend(work.items);
+                    responders.push(work.tx);
+                }
+
+                if total_items == 0 {
+                    for tx in responders {
+                        let _ = tx.send(Ok(()));
+                    }
+                    return;
+                }
+
+                state
+                    .client_batch_stats
+                    .record_set(total_items as u64, wait_us);
+                let res = state.execute_batch_set_direct(items).await;
+                match res {
+                    Ok(()) => {
+                        for tx in responders {
+                            let _ = tx.send(Ok(()));
+                        }
+                    }
+                    Err(err) => {
+                        let msg = err.to_string();
+                        for tx in responders {
+                            let _ = tx.send(Err(anyhow!(msg.clone())));
+                        }
+                    }
+                }
+            });
+        }
+    });
+}
+
+fn spawn_get_batcher(
+    state: Arc<NodeState>,
+    mut rx: mpsc::Receiver<BatchGetWork>,
+    cfg: ClientBatchConfig,
+) {
+    let max_items = cfg.get_max.max(1);
+    let wait = cfg.wait;
+    let inflight = Arc::new(Semaphore::new(cfg.inflight.max(1)));
+    tokio::spawn(async move {
+        while let Some(first) = rx.recv().await {
+            let batch = collect_get_batch(first, &mut rx, max_items, wait).await;
+            let permit = match inflight.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => return,
+            };
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                let wait_us = batch
+                    .first()
+                    .map(|w| {
+                        w.enqueued_at
+                            .elapsed()
+                            .as_micros()
+                            .min(u128::from(u64::MAX)) as u64
+                    })
+                    .unwrap_or(0);
+                let total_items: usize = batch.iter().map(|w| w.keys.len()).sum();
+                let mut responders = Vec::with_capacity(batch.len());
+                let mut splits = Vec::with_capacity(batch.len());
+                let mut keys = Vec::with_capacity(total_items);
+                for work in batch {
+                    splits.push(work.keys.len());
+                    keys.extend(work.keys);
+                    responders.push(work.tx);
+                }
+
+                if total_items == 0 {
+                    for tx in responders {
+                        let _ = tx.send(Ok(Vec::new()));
+                    }
+                    return;
+                }
+
+                state
+                    .client_batch_stats
+                    .record_get(total_items as u64, wait_us);
+                let res = state.execute_batch_get_direct(keys).await;
+                match res {
+                    Ok(values) => {
+                        if values.len() != total_items {
+                            let msg = format!(
+                                "batch get result count mismatch (expected {total_items}, got {})",
+                                values.len()
+                            );
+                            for tx in responders {
+                                let _ = tx.send(Err(anyhow!(msg.clone())));
+                            }
+                            return;
+                        }
+                        let mut offset = 0usize;
+                        for (tx, count) in responders.into_iter().zip(splits) {
+                            let end = offset + count;
+                            let slice = values[offset..end].to_vec();
+                            offset = end;
+                            let _ = tx.send(Ok(slice));
+                        }
+                    }
+                    Err(err) => {
+                        let msg = err.to_string();
+                        for tx in responders {
+                            let _ = tx.send(Err(anyhow!(msg.clone())));
+                        }
+                    }
+                }
+            });
+        }
+    });
+}
+
+fn pick_latest(values: Vec<Option<(Vec<u8>, kv::Version)>>) -> Option<Vec<u8>> {
+    let mut best: Option<(Vec<u8>, kv::Version)> = None;
+    for item in values.into_iter().flatten() {
+        let replace = match &best {
+            None => true,
+            Some((_, cur)) => item.1 > *cur,
+        };
+        if replace {
+            best = Some(item);
+        }
+    }
+    best.map(|(v, _)| v)
+}
+
+fn merge_quorum_results(
+    results: &[Vec<Option<(Vec<u8>, kv::Version)>>],
+    key_count: usize,
+) -> Vec<Option<Vec<u8>>> {
+    let mut merged = Vec::with_capacity(key_count);
+    for idx in 0..key_count {
+        let mut best: Option<(Vec<u8>, kv::Version)> = None;
+        for replica in results {
+            if let Some((v, ver)) = replica.get(idx).and_then(|o| o.as_ref()) {
+                let replace = match &best {
+                    None => true,
+                    Some((_, cur)) => *ver > *cur,
+                };
+                if replace {
+                    best = Some((v.clone(), *ver));
+                }
+            }
+        }
+        merged.push(best.map(|(v, _)| v));
+    }
+    merged
+}
+
+fn merge_last_committed(
+    results: &[Vec<Option<(TxnId, u64)>>],
+    key_count: usize,
+) -> Vec<Option<(TxnId, u64)>> {
+    let mut merged = Vec::with_capacity(key_count);
+    for idx in 0..key_count {
+        let mut best: Option<(TxnId, u64)> = None;
+        for replica in results {
+            if let Some((txn_id, seq)) = replica.get(idx).and_then(|o| o.as_ref()) {
+                let replace = match &best {
+                    None => true,
+                    Some((_, cur_seq)) => *seq > *cur_seq,
+                };
+                if replace {
+                    best = Some((*txn_id, *seq));
+                }
+            }
+        }
+        merged.push(best);
+    }
+    merged
+}
+
+fn log_rpc_stats(snap: &transport::RpcStatsSnapshot) {
+    log_rpc_batch(
+        "kv_get",
+        snap.kv_get_batches,
+        snap.kv_get_items,
+        snap.kv_get_rpc_us,
+        snap.kv_get_wait_us,
+        snap.kv_get_max_batch,
+        snap.kv_get_max_wait_us,
+        snap.kv_get_errors,
+    );
+
+    if snap.kv_batch_get_calls > 0 || snap.kv_batch_get_errors > 0 {
+        let avg_rpc_ms = avg_us_per(snap.kv_batch_get_rpc_us, snap.kv_batch_get_calls);
+        tracing::info!(
+            rpc = "kv_batch_get",
+            calls = snap.kv_batch_get_calls,
+            avg_rpc_ms = avg_rpc_ms,
+            errors = snap.kv_batch_get_errors,
+            "rpc stats"
+        );
+    }
+
+    log_rpc_batch(
+        "pre_accept",
+        snap.pre_accept_batches,
+        snap.pre_accept_items,
+        snap.pre_accept_rpc_us,
+        snap.pre_accept_wait_us,
+        snap.pre_accept_max_batch,
+        snap.pre_accept_max_wait_us,
+        snap.pre_accept_errors,
+    );
+    log_rpc_batch(
+        "accept",
+        snap.accept_batches,
+        snap.accept_items,
+        snap.accept_rpc_us,
+        snap.accept_wait_us,
+        snap.accept_max_batch,
+        snap.accept_max_wait_us,
+        snap.accept_errors,
+    );
+    log_rpc_batch(
+        "commit",
+        snap.commit_batches,
+        snap.commit_items,
+        snap.commit_rpc_us,
+        snap.commit_wait_us,
+        snap.commit_max_batch,
+        snap.commit_max_wait_us,
+        snap.commit_errors,
+    );
+    log_rpc_batch(
+        "recover",
+        snap.recover_batches,
+        snap.recover_items,
+        snap.recover_rpc_us,
+        snap.recover_wait_us,
+        snap.recover_max_batch,
+        snap.recover_max_wait_us,
+        snap.recover_errors,
+    );
+}
+
+fn log_accord_stats(group_id: GroupId, stats: &accord::DebugStats) {
+    let exec_progress_avg_ms =
+        avg_us_per(stats.exec_progress_total_us, stats.exec_progress_count);
+    let exec_recover_avg_ms = avg_us_per(stats.exec_recover_total_us, stats.exec_recover_count);
+    let apply_write_avg_ms = avg_us_per(stats.apply_write_total_us, stats.apply_write_count);
+    let apply_read_avg_ms = avg_us_per(stats.apply_read_total_us, stats.apply_read_count);
+    let apply_batch_avg_ms = avg_us_per(stats.apply_batch_total_us, stats.apply_batch_count);
+    let mark_visible_avg_ms = avg_us_per(stats.mark_visible_total_us, stats.mark_visible_count);
+    let state_update_avg_ms = avg_us_per(stats.state_update_total_us, stats.state_update_count);
+    tracing::info!(
+        group_id = group_id,
+        records = stats.records_len,
+        records_committed = stats.records_status_committed_len,
+        records_executing = stats.records_status_executing_len,
+        records_executed = stats.records_status_executed_len,
+        committed_queue = stats.committed_queue_len,
+        committed_queue_ghost = stats.committed_queue_ghost_len,
+        executed_out_of_order = stats.executed_out_of_order_len,
+        read_waiters = stats.read_waiters_len,
+        proposal_timeouts = stats.proposal_timeouts,
+        execute_timeouts = stats.execute_timeouts,
+        recovery_attempts = stats.recovery_attempts,
+        recovery_failures = stats.recovery_failures,
+        recovery_timeouts = stats.recovery_timeouts,
+        exec_progress_avg_ms = exec_progress_avg_ms,
+        exec_progress_max_ms = stats.exec_progress_max_us as f64 / 1000.0,
+        exec_progress_errors = stats.exec_progress_errors,
+        exec_recover_avg_ms = exec_recover_avg_ms,
+        exec_recover_max_ms = stats.exec_recover_max_us as f64 / 1000.0,
+        exec_recover_errors = stats.exec_recover_errors,
+        apply_write_avg_ms = apply_write_avg_ms,
+        apply_write_max_ms = stats.apply_write_max_us as f64 / 1000.0,
+        apply_read_avg_ms = apply_read_avg_ms,
+        apply_read_max_ms = stats.apply_read_max_us as f64 / 1000.0,
+        apply_batch_avg_ms = apply_batch_avg_ms,
+        apply_batch_max_ms = stats.apply_batch_max_us as f64 / 1000.0,
+        mark_visible_avg_ms = mark_visible_avg_ms,
+        mark_visible_max_ms = stats.mark_visible_max_us as f64 / 1000.0,
+        state_update_avg_ms = state_update_avg_ms,
+        state_update_max_ms = stats.state_update_max_us as f64 / 1000.0,
+        fast_path = stats.fast_path_count,
+        slow_path = stats.slow_path_count,
+        "accord stats"
+    );
+}
+
+fn log_proposal_stats(snap: &ProposalStatsSnapshot) {
+    log_proposal_kind("get", &snap.get);
+    log_proposal_kind("set", &snap.set);
+    log_proposal_kind("batch_get", &snap.batch_get);
+    log_proposal_kind("batch_set", &snap.batch_set);
+}
+
+fn log_proposal_kind(kind: &str, snap: &OpStatsSnapshot) {
+    if snap.count == 0 && snap.errors == 0 {
+        return;
+    }
+    let avg_ms = avg_us_per(snap.total_us, snap.count);
+    let max_ms = snap.max_us as f64 / 1000.0;
+    tracing::info!(
+        proposal = kind,
+        count = snap.count,
+        avg_ms = avg_ms,
+        max_ms = max_ms,
+        errors = snap.errors,
+        "proposal stats"
+    );
+}
+
+fn log_peer_queue_stats(peer_id: NodeId, snap: &transport::PeerStatsSnapshot) {
+    let pre = &snap.pre_accept_latency;
+    let acc = &snap.accept_latency;
+    let com = &snap.commit_latency;
+    let kv = &snap.kv_get_latency;
+    tracing::info!(
+        peer = peer_id,
+        kv_get_queue = snap.kv_get_queue,
+        kv_get_inflight = snap.kv_get_inflight,
+        kv_get_sent = snap.kv_get_sent,
+        kv_get_errors = snap.kv_get_errors,
+        kv_get_count = kv.count,
+        kv_get_avg_ms = kv.avg_ms,
+        kv_get_p95_ms = kv.p95_ms,
+        kv_get_p99_ms = kv.p99_ms,
+        pre_accept_queue = snap.pre_accept_queue,
+        pre_accept_inflight = snap.pre_accept_inflight,
+        pre_accept_sent = snap.pre_accept_sent,
+        pre_accept_errors = snap.pre_accept_errors,
+        pre_accept_timeouts = snap.pre_accept_timeouts,
+        pre_accept_queue_full = snap.pre_accept_queue_full,
+        pre_accept_count = pre.count,
+        pre_accept_avg_ms = pre.avg_ms,
+        pre_accept_p95_ms = pre.p95_ms,
+        pre_accept_p99_ms = pre.p99_ms,
+        pre_accept_max_ms = pre.max_ms,
+        pre_accept_wait_count = snap.pre_accept_wait_count,
+        pre_accept_wait_avg_ms = snap.pre_accept_wait_avg_ms,
+        pre_accept_wait_max_ms = snap.pre_accept_wait_max_ms,
+        pre_accept_last_enqueue_age_ms = snap.pre_accept_last_enqueue_age_ms,
+        pre_accept_last_dequeue_age_ms = snap.pre_accept_last_dequeue_age_ms,
+        accept_queue = snap.accept_queue,
+        accept_inflight = snap.accept_inflight,
+        accept_sent = snap.accept_sent,
+        accept_errors = snap.accept_errors,
+        accept_timeouts = snap.accept_timeouts,
+        accept_queue_full = snap.accept_queue_full,
+        accept_count = acc.count,
+        accept_avg_ms = acc.avg_ms,
+        accept_p95_ms = acc.p95_ms,
+        accept_p99_ms = acc.p99_ms,
+        accept_max_ms = acc.max_ms,
+        accept_wait_count = snap.accept_wait_count,
+        accept_wait_avg_ms = snap.accept_wait_avg_ms,
+        accept_wait_max_ms = snap.accept_wait_max_ms,
+        accept_last_enqueue_age_ms = snap.accept_last_enqueue_age_ms,
+        accept_last_dequeue_age_ms = snap.accept_last_dequeue_age_ms,
+        commit_queue = snap.commit_queue,
+        commit_inflight = snap.commit_inflight,
+        commit_sent = snap.commit_sent,
+        commit_errors = snap.commit_errors,
+        commit_timeouts = snap.commit_timeouts,
+        commit_queue_full = snap.commit_queue_full,
+        commit_count = com.count,
+        commit_avg_ms = com.avg_ms,
+        commit_p95_ms = com.p95_ms,
+        commit_p99_ms = com.p99_ms,
+        commit_max_ms = com.max_ms,
+        commit_wait_count = snap.commit_wait_count,
+        commit_wait_avg_ms = snap.commit_wait_avg_ms,
+        commit_wait_max_ms = snap.commit_wait_max_ms,
+        commit_last_enqueue_age_ms = snap.commit_last_enqueue_age_ms,
+        commit_last_dequeue_age_ms = snap.commit_last_dequeue_age_ms,
+        recover_queue = snap.recover_queue,
+        recover_queue_peak = snap.recover_queue_peak,
+        recover_inflight = snap.recover_inflight,
+        recover_sent = snap.recover_sent,
+        recover_errors = snap.recover_errors,
+        recover_queue_full = snap.recover_queue_full,
+        recover_count = snap.recover_latency.count,
+        recover_avg_ms = snap.recover_latency.avg_ms,
+        recover_p95_ms = snap.recover_latency.p95_ms,
+        recover_p99_ms = snap.recover_latency.p99_ms,
+        recover_max_ms = snap.recover_latency.max_ms,
+        recover_wait_count = snap.recover_wait_count,
+        recover_wait_avg_ms = snap.recover_wait_avg_ms,
+        recover_wait_max_ms = snap.recover_wait_max_ms,
+        recover_last_enqueue_age_ms = snap.recover_last_enqueue_age_ms,
+        recover_last_dequeue_age_ms = snap.recover_last_dequeue_age_ms,
+        recover_inflight_txns = snap.recover_inflight_txns,
+        recover_inflight_peak = snap.recover_inflight_peak,
+        recover_coalesced = snap.recover_coalesced,
+        recover_enqueued = snap.recover_enqueued,
+        recover_waiters_peak = snap.recover_waiters_peak,
+        recover_waiters_avg = snap.recover_waiters_avg,
+        rpc_inflight_limit = snap.rpc_inflight_limit,
+        "rpc peer queues"
+    );
+}
+
+fn log_peer_summary(peers: &[(NodeId, transport::PeerStatsSnapshot)]) {
+    if peers.is_empty() {
+        return;
+    }
+    let mut slow_peer = peers[0].0;
+    let mut slow_queue = 0u64;
+    let mut slow_sent = 0u64;
+    for (peer_id, snap) in peers {
+        let queue_total = snap.pre_accept_queue + snap.accept_queue + snap.commit_queue;
+        if queue_total > slow_queue {
+            slow_queue = queue_total;
+            slow_peer = *peer_id;
+            slow_sent = snap.pre_accept_sent + snap.accept_sent + snap.commit_sent;
+        }
+    }
+    tracing::info!(
+        slow_peer = slow_peer,
+        slow_queue_total = slow_queue,
+        slow_sent_total = slow_sent,
+        "rpc peer summary"
+    );
+}
+
+struct PeerStatsCsv {
+    writer: BufWriter<std::fs::File>,
+}
+
+impl PeerStatsCsv {
+    fn open(path: &str) -> Option<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()?;
+        let mut writer = BufWriter::new(file);
+        let need_header = writer
+            .get_ref()
+            .metadata()
+            .map(|m| m.len() == 0)
+            .unwrap_or(false);
+        if need_header {
+            let header = concat!(
+                "ts_ms,node_id,peer_id,queue_total,inflight_total,sent_total,",
+                "kv_get_queue,kv_get_inflight,kv_get_sent,kv_get_errors,kv_get_count,kv_get_avg_ms,kv_get_p95_ms,kv_get_p99_ms,kv_get_max_ms,",
+                "pre_accept_queue,pre_accept_inflight,pre_accept_sent,pre_accept_errors,pre_accept_timeouts,pre_accept_queue_full,pre_accept_count,pre_accept_avg_ms,pre_accept_p95_ms,pre_accept_p99_ms,pre_accept_max_ms,pre_accept_wait_count,pre_accept_wait_avg_ms,pre_accept_wait_max_ms,pre_accept_last_enqueue_age_ms,pre_accept_last_dequeue_age_ms,",
+                "accept_queue,accept_inflight,accept_sent,accept_errors,accept_timeouts,accept_queue_full,accept_count,accept_avg_ms,accept_p95_ms,accept_p99_ms,accept_max_ms,accept_wait_count,accept_wait_avg_ms,accept_wait_max_ms,accept_last_enqueue_age_ms,accept_last_dequeue_age_ms,",
+                "commit_queue,commit_inflight,commit_sent,commit_errors,commit_timeouts,commit_queue_full,commit_count,commit_avg_ms,commit_p95_ms,commit_p99_ms,commit_max_ms,commit_wait_count,commit_wait_avg_ms,commit_wait_max_ms,commit_last_enqueue_age_ms,commit_last_dequeue_age_ms,",
+                "recover_queue,recover_queue_peak,recover_inflight,recover_sent,recover_errors,recover_queue_full,",
+                "recover_count,recover_avg_ms,recover_p95_ms,recover_p99_ms,recover_max_ms,",
+                "recover_wait_count,recover_wait_avg_ms,recover_wait_max_ms,",
+                "recover_last_enqueue_age_ms,recover_last_dequeue_age_ms,",
+                "recover_inflight_txns,recover_inflight_peak,recover_coalesced,recover_enqueued,",
+                "recover_waiters_peak,recover_waiters_avg,",
+                "rpc_inflight_limit\n",
+            );
+            if writer.write_all(header.as_bytes()).is_err() {
+                return None;
+            }
+            let _ = writer.flush();
+        }
+        Some(Self { writer })
+    }
+
+    fn write_snapshot(
+        &mut self,
+        ts_ms: u128,
+        node_id: NodeId,
+        peer_id: NodeId,
+        snap: &transport::PeerStatsSnapshot,
+    ) {
+        let queue_total = snap.kv_get_queue
+            + snap.pre_accept_queue
+            + snap.accept_queue
+            + snap.commit_queue
+            + snap.recover_queue;
+        let inflight_total = snap.kv_get_inflight
+            + snap.pre_accept_inflight
+            + snap.accept_inflight
+            + snap.commit_inflight
+            + snap.recover_inflight;
+        let sent_total = snap.kv_get_sent
+            + snap.pre_accept_sent
+            + snap.accept_sent
+            + snap.commit_sent
+            + snap.recover_sent;
+
+        let kv = &snap.kv_get_latency;
+        let pre = &snap.pre_accept_latency;
+        let acc = &snap.accept_latency;
+        let com = &snap.commit_latency;
+        let rec = &snap.recover_latency;
+
+        let _ = writeln!(
+            self.writer,
+            "{ts_ms},{node_id},{peer_id},{queue_total},{inflight_total},{sent_total},\
+{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},\
+{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},\
+{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},\
+{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},\
+{},{},{},{},{},{},\
+{},{:.3},{:.3},{:.3},{:.3},\
+{},{:.3},{:.3},{:.3},{:.3},\
+{},{},{},{},{},{:.3},{}",
+            snap.kv_get_queue,
+            snap.kv_get_inflight,
+            snap.kv_get_sent,
+            snap.kv_get_errors,
+            kv.count,
+            kv.avg_ms,
+            kv.p95_ms,
+            kv.p99_ms,
+            kv.max_ms,
+            snap.pre_accept_queue,
+            snap.pre_accept_inflight,
+            snap.pre_accept_sent,
+            snap.pre_accept_errors,
+            snap.pre_accept_timeouts,
+            snap.pre_accept_queue_full,
+            pre.count,
+            pre.avg_ms,
+            pre.p95_ms,
+            pre.p99_ms,
+            pre.max_ms,
+            snap.pre_accept_wait_count,
+            snap.pre_accept_wait_avg_ms,
+            snap.pre_accept_wait_max_ms,
+            snap.pre_accept_last_enqueue_age_ms,
+            snap.pre_accept_last_dequeue_age_ms,
+            snap.accept_queue,
+            snap.accept_inflight,
+            snap.accept_sent,
+            snap.accept_errors,
+            snap.accept_timeouts,
+            snap.accept_queue_full,
+            acc.count,
+            acc.avg_ms,
+            acc.p95_ms,
+            acc.p99_ms,
+            acc.max_ms,
+            snap.accept_wait_count,
+            snap.accept_wait_avg_ms,
+            snap.accept_wait_max_ms,
+            snap.accept_last_enqueue_age_ms,
+            snap.accept_last_dequeue_age_ms,
+            snap.commit_queue,
+            snap.commit_inflight,
+            snap.commit_sent,
+            snap.commit_errors,
+            snap.commit_timeouts,
+            snap.commit_queue_full,
+            com.count,
+            com.avg_ms,
+            com.p95_ms,
+            com.p99_ms,
+            com.max_ms,
+            snap.commit_wait_count,
+            snap.commit_wait_avg_ms,
+            snap.commit_wait_max_ms,
+            snap.commit_last_enqueue_age_ms,
+            snap.commit_last_dequeue_age_ms,
+            snap.recover_queue,
+            snap.recover_queue_peak,
+            snap.recover_inflight,
+            snap.recover_sent,
+            snap.recover_errors,
+            snap.recover_queue_full,
+            rec.count,
+            rec.avg_ms,
+            rec.p95_ms,
+            rec.p99_ms,
+            rec.max_ms,
+            snap.recover_wait_count,
+            snap.recover_wait_avg_ms,
+            snap.recover_wait_max_ms,
+            snap.recover_last_enqueue_age_ms,
+            snap.recover_last_dequeue_age_ms,
+            snap.recover_inflight_txns,
+            snap.recover_inflight_peak,
+            snap.recover_coalesced,
+            snap.recover_enqueued,
+            snap.recover_waiters_peak,
+            snap.recover_waiters_avg,
+            snap.rpc_inflight_limit,
+        );
+    }
+}
+
+fn ps_rss_kb(pid: u32) -> Option<u64> {
+    let output = std::process::Command::new("ps")
+        .arg("-o")
+        .arg("rss=")
+        .arg("-p")
+        .arg(pid.to_string())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let value = text.split_whitespace().next()?;
+    value.parse::<u64>().ok()
+}
+
+fn log_rpc_batch(
+    kind: &str,
+    batches: u64,
+    items: u64,
+    rpc_us: u64,
+    wait_us: u64,
+    max_batch: u64,
+    max_wait_us: u64,
+    errors: u64,
+) {
+    if batches == 0 && errors == 0 {
+        return;
+    }
+    let avg_batch = if batches > 0 {
+        items as f64 / batches as f64
+    } else {
+        0.0
+    };
+    let avg_rpc_ms = avg_us_per(rpc_us, batches);
+    let avg_wait_ms = avg_us_per(wait_us, items);
+    let max_wait_ms = max_wait_us as f64 / 1000.0;
+
+    tracing::info!(
+        rpc = kind,
+        batches = batches,
+        items = items,
+        avg_batch = avg_batch,
+        avg_rpc_ms = avg_rpc_ms,
+        avg_wait_ms = avg_wait_ms,
+        max_batch = max_batch,
+        max_wait_ms = max_wait_ms,
+        errors = errors,
+        "rpc stats"
+    );
+}
+
+fn avg_us_per(total_us: u64, count: u64) -> f64 {
+    if count == 0 {
+        return 0.0;
+    }
+    (total_us as f64 / count as f64) / 1000.0
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let ansi = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    tracing_subscriber::fmt()
+        .with_ansi(ansi)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,h2=warn,hyper=warn".into()),
+        )
+        .init();
+
+    let args = Args::parse();
+    match args.cmd {
+        Command::Node(args) => run_node(args).await,
+    }
+}
+
+async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
+    let data_dir = PathBuf::from(&args.data_dir);
+    fs::create_dir_all(&data_dir).context("create data dir")?;
+    let storage_dir = data_dir.join("storage");
+    fs::create_dir_all(&storage_dir).context("create storage dir")?;
+    let wal_dir = data_dir.join("wal");
+    fs::create_dir_all(&wal_dir).context("create wal dir")?;
+
+    let mut fjall_cfg = fjall::Config::new(&storage_dir);
+    if args.fjall_manual_journal_persist {
+        fjall_cfg = fjall_cfg.manual_journal_persist(true);
+    }
+    if let Some(ms) = args.fjall_fsync_ms {
+        if ms > 0 {
+            fjall_cfg = fjall_cfg.fsync_ms(Some(ms));
+        }
+    }
+    let keyspace = Arc::new(fjall_cfg.open().context("open fjall keyspace")?);
+    let shared_wal_dir = wal_dir.join("commitlog");
+    let shared_wal = Arc::new(wal::FileWal::open_dir(&shared_wal_dir)?);
+    let kv_engine_impl = Arc::new(FjallEngine::open(keyspace.clone())?);
+
+    if args.bootstrap == args.join.is_some() {
+        anyhow::bail!("exactly one of --bootstrap or --join must be set");
+    }
+
+    let members = parse_members(&args.initial_members)?;
+
+    let rpc_timeout = Duration::from_millis(args.rpc_timeout_ms.max(1));
+    let commit_timeout = Duration::from_millis(args.commit_timeout_ms.max(1));
+    let propose_timeout = Duration::from_millis(args.propose_timeout_ms.max(1));
+
+    let inflight_tuning = transport::InflightTuning {
+        min: args.rpc_inflight_min,
+        max: args.rpc_inflight_max,
+        high_wait_ms: args.rpc_inflight_high_wait_ms,
+        low_wait_ms: args.rpc_inflight_low_wait_ms,
+        high_queue: args.rpc_inflight_high_queue,
+        low_queue: args.rpc_inflight_low_queue,
+    };
+    let transport = Arc::new(GrpcTransport::new(
+        &members,
+        rpc_timeout,
+        commit_timeout,
+        args.rpc_inflight_limit,
+        inflight_tuning,
+        args.rpc_batch_max,
+        Duration::from_micros(args.rpc_batch_wait_us),
+    ));
+    if args.rpc_stats_interval_ms > 0 {
+        let stats = transport.stats();
+        let interval = Duration::from_millis(args.rpc_stats_interval_ms.max(1));
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                let snap = stats.snapshot_and_reset();
+                log_rpc_stats(&snap);
+            }
+        });
+    }
+
+    if args.rpc_queue_stats_interval_ms > 0 {
+        let transport = transport.clone();
+        let interval = Duration::from_millis(args.rpc_queue_stats_interval_ms.max(1));
+        let node_id = args.node_id;
+        let csv_path = args
+            .peer_stats_csv
+            .clone()
+            .map(|path| path.replace("{node_id}", &args.node_id.to_string()));
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            let mut csv = csv_path.and_then(|path| {
+                let writer = PeerStatsCsv::open(&path);
+                if writer.is_none() {
+                    tracing::warn!(path = %path, "failed to open peer stats csv");
+                }
+                writer
+            });
+            loop {
+                ticker.tick().await;
+                let snaps = transport.peer_stats_snapshots().await;
+                for (peer_id, snap) in &snaps {
+                    log_peer_queue_stats(*peer_id, snap);
+                }
+                log_peer_summary(&snaps);
+                if let Some(writer) = csv.as_mut() {
+                    let ts_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis();
+                    for (peer_id, snap) in &snaps {
+                        writer.write_snapshot(ts_ms, node_id, *peer_id, snap);
+                    }
+                    let _ = writer.writer.flush();
+                }
+            }
+        });
+    }
+
+    let rpc_handler_stats = Arc::new(RpcHandlerStats::default());
+    let proposal_stats = Arc::new(ProposalStats::default());
+    let proposal_stats_enabled = args.proposal_stats_interval_ms > 0;
+    if proposal_stats_enabled {
+        let stats = proposal_stats.clone();
+        let interval = Duration::from_millis(args.proposal_stats_interval_ms.max(1));
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                let snap = stats.snapshot_and_reset();
+                log_proposal_stats(&snap);
+            }
+        });
+    }
+
+    if args.rpc_queue_stats_interval_ms > 0 {
+        let stats = rpc_handler_stats.clone();
+        let interval = Duration::from_millis(args.rpc_queue_stats_interval_ms.max(1));
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                let snap = stats.snapshot_and_reset();
+                tracing::info!(
+                    pre_accept_avg_ms = snap.pre_accept_avg_ms,
+                    pre_accept_p99_ms = snap.pre_accept_p99_ms,
+                    pre_accept_batch_avg_ms = snap.pre_accept_batch_avg_ms,
+                    pre_accept_batch_p99_ms = snap.pre_accept_batch_p99_ms,
+                    pre_accept_inflight = snap.pre_accept_inflight,
+                    pre_accept_inflight_peak = snap.pre_accept_inflight_peak,
+                    accept_avg_ms = snap.accept_avg_ms,
+                    accept_p99_ms = snap.accept_p99_ms,
+                    accept_batch_avg_ms = snap.accept_batch_avg_ms,
+                    accept_batch_p99_ms = snap.accept_batch_p99_ms,
+                    accept_inflight = snap.accept_inflight,
+                    accept_inflight_peak = snap.accept_inflight_peak,
+                    commit_avg_ms = snap.commit_avg_ms,
+                    commit_p99_ms = snap.commit_p99_ms,
+                    commit_batch_avg_ms = snap.commit_batch_avg_ms,
+                    commit_batch_p99_ms = snap.commit_batch_p99_ms,
+                    commit_inflight = snap.commit_inflight,
+                    commit_inflight_peak = snap.commit_inflight_peak,
+                    "rpc handler stats"
+                );
+            }
+        });
+    }
+
+    if args.proc_stats_interval_ms > 0 {
+        let interval = Duration::from_millis(args.proc_stats_interval_ms.max(1));
+        let node_id = args.node_id;
+        let use_ps = args.proc_stats_use_ps;
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            let mut system = System::new();
+            let pid = Pid::from(std::process::id() as usize);
+            loop {
+                ticker.tick().await;
+                system.refresh_process(pid);
+                if let Some(proc) = system.process(pid) {
+                    let cpu = proc.cpu_usage();
+                    let rss_raw = proc.memory();
+                    let vmem_raw = proc.virtual_memory();
+                    let ps_rss = if use_ps {
+                        ps_rss_kb(std::process::id())
+                    } else {
+                        None
+                    };
+                    let sysinfo_is_bytes = ps_rss
+                        .map(|ps_kb| {
+                            let ps_bytes = ps_kb.saturating_mul(1024);
+                            let lower = ps_bytes / 2;
+                            let upper = ps_bytes.saturating_mul(2);
+                            rss_raw >= lower && rss_raw <= upper
+                        })
+                        .unwrap_or(false);
+                    let rss_bytes = if sysinfo_is_bytes {
+                        rss_raw
+                    } else {
+                        rss_raw.saturating_mul(1024)
+                    };
+                    let vmem_bytes = if sysinfo_is_bytes {
+                        vmem_raw
+                    } else {
+                        vmem_raw.saturating_mul(1024)
+                    };
+                    let rss_mb = rss_bytes as f64 / (1024.0 * 1024.0);
+                    let vmem_mb = vmem_bytes as f64 / (1024.0 * 1024.0);
+                    let run_s = proc.run_time();
+                    tracing::info!(
+                        node_id = node_id,
+                        cpu_pct = cpu,
+                        rss_raw = rss_raw,
+                        vmem_raw = vmem_raw,
+                        sysinfo_units = if sysinfo_is_bytes { "bytes" } else { "kb" },
+                        rss_bytes = rss_bytes,
+                        rss_mb = rss_mb,
+                        vmem_bytes = vmem_bytes,
+                        vmem_mb = vmem_mb,
+                        ps_rss_kb = ps_rss,
+                        run_s = run_s,
+                        "proc stats"
+                    );
+                }
+            }
+        });
+    }
+
+    let data_shards = args.data_shards.max(1);
+    let mut kv_shards: Vec<Arc<dyn KvEngine>> = Vec::with_capacity(data_shards);
+    if data_shards == 1 {
+        kv_shards.push(kv_engine_impl.clone());
+    } else {
+        for shard in 0..data_shards {
+            let engine = Arc::new(FjallEngine::open_shard(keyspace.clone(), shard)?);
+            kv_shards.push(engine);
+        }
+    }
+    let kv_engine: Arc<dyn KvEngine> = if data_shards == 1 {
+        kv_shards[0].clone()
+    } else {
+        Arc::new(kv::ShardedKvEngine::new(kv_shards.clone())?)
+    };
+    let noop_sm = Arc::new(kv::NoopStateMachine);
+
+    let accord_members = members
+        .keys()
+        .copied()
+        .map(|id| accord::Member { id })
+        .collect::<Vec<_>>();
+
+    let mk_cfg = |group_id: GroupId| accord::Config {
+        group_id,
+        node_id: args.node_id,
+        members: accord_members.clone(),
+        rpc_timeout,
+        propose_timeout,
+        preaccept_stall_hits: args.preaccept_stall_hits.max(1),
+        execute_batch_max: args.accord_execute_batch_max.max(1),
+        inline_command_in_accept_commit: args.accord_inline_command_in_accept_commit,
+        commit_log_batch_max: args.commit_log_batch_max.max(1),
+        commit_log_batch_wait: Duration::from_micros(args.commit_log_batch_wait_us),
+    };
+
+    let membership_group = Arc::new(accord::Group::new(
+        mk_cfg(GROUP_MEMBERSHIP),
+        transport.clone(),
+        noop_sm.clone(),
+        None,
+    ));
+
+    let mut data_groups: Vec<Arc<accord::Group>> = Vec::with_capacity(data_shards);
+    let mut data_handles: Vec<accord::Handle> = Vec::with_capacity(data_shards);
+    let mut groups = HashMap::new();
+    groups.insert(GROUP_MEMBERSHIP, membership_group.clone());
+
+    for shard in 0..data_shards {
+        let group_id = GROUP_DATA_BASE + shard as u64;
+        let wal = shared_wal.clone();
+        let kv_sm = Arc::new(kv::KvStateMachine::new(kv_shards[shard].clone()));
+        let data_group = Arc::new(accord::Group::new(
+            mk_cfg(group_id),
+            transport.clone(),
+            kv_sm,
+            Some(wal),
+        ));
+        let replayed = data_group
+            .replay_commits()
+            .await
+            .context("replay commit log")?;
+        if replayed > 0 {
+            tracing::info!(group_id = group_id, replayed = replayed, "replayed commit log entries");
+        }
+        data_group.spawn_executor();
+        groups.insert(group_id, data_group.clone());
+        data_handles.push(data_group.handle());
+        data_groups.push(data_group);
+    }
+
+    membership_group.spawn_executor();
+
+    if args.accord_stats_interval_ms > 0 {
+        let data_groups = data_groups.clone();
+        let interval = Duration::from_millis(args.accord_stats_interval_ms.max(1));
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                for (idx, group) in data_groups.iter().enumerate() {
+                    let stats = group.debug_stats().await;
+                    let group_id = GROUP_DATA_BASE + idx as u64;
+                    log_accord_stats(group_id, &stats);
+                }
+            }
+        });
+    }
+
+    let member_ids = members.keys().copied().collect::<Vec<_>>();
+
+    let client_batch_stats = Arc::new(ClientBatchStats::default());
+    let client_batch_queue = args.client_batch_queue.max(1);
+    let (client_set_tx, client_set_rx) = mpsc::channel(client_batch_queue);
+    let (client_get_tx, client_get_rx) = mpsc::channel(client_batch_queue);
+    let client_batch_cfg = ClientBatchConfig {
+        set_max: args.client_set_batch_max.max(1),
+        get_max: args.client_get_batch_max.max(1),
+        wait: Duration::from_micros(args.client_batch_wait_us),
+        inflight: args.client_batch_inflight.max(1),
+    };
+
+    let state = Arc::new(NodeState {
+        initial_members: args.initial_members.clone(),
+        groups,
+        data_handles,
+        data_shards,
+        node_id: args.node_id,
+        kv_engine,
+        transport: transport.clone(),
+        member_ids,
+        read_mode: args.read_mode,
+        read_barrier_timeout: Duration::from_millis(args.read_barrier_timeout_ms.max(1)),
+        read_barrier_fallback_quorum: args.read_barrier_fallback_quorum,
+        read_barrier_all_peers: args.read_barrier_all_peers,
+        proposal_stats,
+        proposal_stats_enabled,
+        rpc_handler_stats: rpc_handler_stats.clone(),
+        client_set_tx,
+        client_get_tx,
+        client_batch_stats: client_batch_stats.clone(),
+        client_set_batch_target: if args.client_single_key_txn {
+            1
+        } else {
+            args.client_set_batch_target.max(1)
+        },
+    });
+
+    spawn_set_batcher(state.clone(), client_set_rx, client_batch_cfg);
+    spawn_get_batcher(state.clone(), client_get_rx, client_batch_cfg);
+
+    let grpc_addr = args.listen_grpc;
+    tokio::spawn({
+        let service = RpcService {
+            state: state.clone(),
+        };
+        async move {
+            let svc = volo_gen::holo_store::rpc::HoloRpcServer::new(service);
+            let svc = volo_grpc::server::ServiceBuilder::new(svc).build::<
+                volo_gen::holo_store::rpc::HoloRpcRequestRecv,
+                volo_gen::holo_store::rpc::HoloRpcResponseSend,
+            >();
+            let result = volo_grpc::server::Server::new()
+                .add_service(svc)
+                .run(volo::net::Address::from(grpc_addr))
+                .await;
+            if let Err(err) = result {
+                tracing::error!(error = ?err, "gRPC server failed");
+            }
+        }
+    });
+
+    let redis_addr = args.listen_redis;
+    tokio::spawn({
+        let state = state.clone();
+        async move {
+            if let Err(err) = redis_server::run(redis_addr, state).await {
+                tracing::error!(error = ?err, "redis server failed");
+            }
+        }
+    });
+
+    if let Some(seed) = args.join {
+        join_seed(args.node_id, seed, &args.initial_members).await?;
+    }
+
+    tracing::info!(
+        node_id = args.node_id,
+        redis = %redis_addr,
+        grpc = %grpc_addr,
+        "node started"
+    );
+
+    tokio::signal::ctrl_c().await?;
+    Ok(())
+}
+
+async fn join_seed(node_id: u64, seed: SocketAddr, expected_members: &str) -> anyhow::Result<()> {
+    let client = volo_gen::holo_store::rpc::HoloRpcClientBuilder::new("holo_store.rpc.HoloRpc")
+        .address(volo::net::Address::from(seed))
+        .build();
+
+    for _ in 0..100 {
+        match client
+            .join(volo_gen::holo_store::rpc::JoinRequest { node_id })
+            .await
+        {
+            Ok(resp) => {
+                let members = resp.into_inner().initial_members;
+                if members.as_str() != expected_members {
+                    tracing::warn!(
+                        seed = %seed,
+                        expected = expected_members,
+                        got = %members,
+                        "seed returned different membership string"
+                    );
+                }
+                return Ok(());
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+
+    anyhow::bail!("failed to join seed {seed}");
+}
+
+fn parse_members(input: &str) -> anyhow::Result<HashMap<NodeId, SocketAddr>> {
+    let mut out = HashMap::new();
+    for part in input.split(',').filter(|s| !s.trim().is_empty()) {
+        let (id, addr) = part
+            .split_once('@')
+            .with_context(|| format!("invalid member entry (expected id@host:port): {part}"))?;
+        let id: NodeId = id.parse().context("invalid member id")?;
+        let addr: SocketAddr = addr.parse().context("invalid member addr")?;
+        out.insert(id, addr);
+    }
+    anyhow::ensure!(!out.is_empty(), "initial_members is empty");
+    Ok(out)
+}
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;

@@ -1,0 +1,21 @@
+[package]
+name = "holo_workload"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "holo-workload"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+futures-util = { version = "0.3", features = ["sink"] }
+humantime = "2"
+rand = { version = "0.8", features = ["small_rng"] }
+redis-protocol = { version = "6", features = ["codec"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }

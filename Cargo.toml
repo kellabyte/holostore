@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/holo_accord",
+  "crates/holo_store",
+  "crates/holo_workload",
+]
