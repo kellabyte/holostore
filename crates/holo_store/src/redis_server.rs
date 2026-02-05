@@ -98,6 +98,7 @@ pub enum KvOp {
     Get { key: Vec<u8> },
     Set { key: Vec<u8>, value: Vec<u8> },
     HoloStats,
+    Ping,
 }
 
 /// Result of executing a KV operation.
@@ -105,6 +106,7 @@ pub enum KvOp {
 pub enum KvResult {
     Ok,
     Value(Option<Vec<u8>>),
+    Pong,
 }
 
 /// Run the Redis-compatible server on the provided address.
@@ -177,6 +179,9 @@ async fn handle_conn(socket: TcpStream, state: Arc<NodeState>) -> anyhow::Result
         };
 
         match op {
+            KvOp::Ping => {
+                pending_resp = Some(BytesFrame::SimpleString("PONG".into()));
+            }
             KvOp::HoloStats => {
                 let mut stats_opt: Option<DebugStats> = None;
                 for shard in 0..state.data_shards {
@@ -404,6 +409,7 @@ async fn handle_conn(socket: TcpStream, state: Arc<NodeState>) -> anyhow::Result
                     let result = state.execute(KvOp::Get { key }).await;
                     let resp = match result {
                         Ok(KvResult::Ok) => BytesFrame::Error("ERR GET returned OK".into()),
+                        Ok(KvResult::Pong) => BytesFrame::SimpleString("PONG".into()),
                         Ok(KvResult::Value(None)) => BytesFrame::Null,
                         Ok(KvResult::Value(Some(v))) => {
                             BytesFrame::BulkString(bytes::Bytes::from(v))
@@ -478,6 +484,9 @@ async fn handle_conn(socket: TcpStream, state: Arc<NodeState>) -> anyhow::Result
                         Ok(KvResult::Ok) => {
                             BytesFrame::SimpleString(bytes::Bytes::from_static(b"OK"))
                         }
+                        Ok(KvResult::Pong) => {
+                            BytesFrame::SimpleString(bytes::Bytes::from_static(b"PONG"))
+                        }
                         Ok(KvResult::Value(_)) => {
                             BytesFrame::Error("ERR SET returned value".into())
                         }
@@ -534,6 +543,10 @@ fn parse_command(frame: BytesFrame) -> anyhow::Result<Option<KvOp>> {
         "HOLOSTATS" => {
             anyhow::ensure!(parts.len() == 1, "HOLOSTATS expects 0 arguments");
             Ok(Some(KvOp::HoloStats))
+        }
+        "PING" => {
+            anyhow::ensure!(parts.len() == 1, "PING expects 0 arguments");
+            Ok(Some(KvOp::Ping))
         }
         "GET" => {
             anyhow::ensure!(parts.len() == 2, "GET expects 1 argument");
