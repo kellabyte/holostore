@@ -18,12 +18,22 @@ pub struct RpcService {
     pub state: Arc<NodeState>,
 }
 
+impl RpcService {
+    async fn maybe_delay(&self) {
+        let delay = self.state.rpc_handler_delay;
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+    }
+}
+
 impl rpc::HoloRpc for RpcService {
     /// Handle a single pre-accept RPC request.
     async fn pre_accept(
         &self,
         req: volo_grpc::Request<rpc::PreAcceptRequest>,
     ) -> Result<volo_grpc::Response<rpc::PreAcceptResponse>, volo_grpc::Status> {
+        self.maybe_delay().await;
         let start = std::time::Instant::now();
         let _inflight = self.state.rpc_handler_stats.track_pre_accept();
         let req = req.into_inner();
@@ -93,6 +103,7 @@ impl rpc::HoloRpc for RpcService {
         &self,
         req: volo_grpc::Request<rpc::PreAcceptBatchRequest>,
     ) -> Result<volo_grpc::Response<rpc::PreAcceptBatchResponse>, volo_grpc::Status> {
+        self.maybe_delay().await;
         let start = std::time::Instant::now();
         let _inflight = self.state.rpc_handler_stats.track_pre_accept();
         let req = req.into_inner();
@@ -169,6 +180,7 @@ impl rpc::HoloRpc for RpcService {
         &self,
         req: volo_grpc::Request<rpc::AcceptRequest>,
     ) -> Result<volo_grpc::Response<rpc::AcceptResponse>, volo_grpc::Status> {
+        self.maybe_delay().await;
         let start = std::time::Instant::now();
         let _inflight = self.state.rpc_handler_stats.track_accept();
         let req = req.into_inner();
@@ -238,6 +250,7 @@ impl rpc::HoloRpc for RpcService {
         &self,
         req: volo_grpc::Request<rpc::AcceptBatchRequest>,
     ) -> Result<volo_grpc::Response<rpc::AcceptBatchResponse>, volo_grpc::Status> {
+        self.maybe_delay().await;
         let start = std::time::Instant::now();
         let _inflight = self.state.rpc_handler_stats.track_accept();
         let req = req.into_inner();
@@ -313,6 +326,7 @@ impl rpc::HoloRpc for RpcService {
         &self,
         req: volo_grpc::Request<rpc::CommitRequest>,
     ) -> Result<volo_grpc::Response<rpc::CommitResponse>, volo_grpc::Status> {
+        self.maybe_delay().await;
         let start = std::time::Instant::now();
         let _inflight = self.state.rpc_handler_stats.track_commit();
         let req = req.into_inner();
@@ -376,6 +390,7 @@ impl rpc::HoloRpc for RpcService {
         &self,
         req: volo_grpc::Request<rpc::CommitBatchRequest>,
     ) -> Result<volo_grpc::Response<rpc::CommitBatchResponse>, volo_grpc::Status> {
+        self.maybe_delay().await;
         let start = std::time::Instant::now();
         let _inflight = self.state.rpc_handler_stats.track_commit();
         let req = req.into_inner();
@@ -445,6 +460,7 @@ impl rpc::HoloRpc for RpcService {
         &self,
         req: volo_grpc::Request<rpc::RecoverRequest>,
     ) -> Result<volo_grpc::Response<rpc::RecoverResponse>, volo_grpc::Status> {
+        self.maybe_delay().await;
         let req = req.into_inner();
         let group = self
             .state
@@ -515,6 +531,7 @@ impl rpc::HoloRpc for RpcService {
         &self,
         req: volo_grpc::Request<rpc::RecoverBatchRequest>,
     ) -> Result<volo_grpc::Response<rpc::RecoverBatchResponse>, volo_grpc::Status> {
+        self.maybe_delay().await;
         let req = req.into_inner();
         let mut responses = Vec::with_capacity(req.requests.len());
 
@@ -593,6 +610,7 @@ impl rpc::HoloRpc for RpcService {
         &self,
         req: volo_grpc::Request<rpc::FetchCommandRequest>,
     ) -> Result<volo_grpc::Response<rpc::FetchCommandResponse>, volo_grpc::Status> {
+        self.maybe_delay().await;
         let req = req.into_inner();
         let group = self
             .state
@@ -623,6 +641,7 @@ impl rpc::HoloRpc for RpcService {
         &self,
         req: volo_grpc::Request<rpc::ReportExecutedRequest>,
     ) -> Result<volo_grpc::Response<rpc::ReportExecutedResponse>, volo_grpc::Status> {
+        self.maybe_delay().await;
         let req = req.into_inner();
         let group = self
             .state
@@ -656,6 +675,7 @@ impl rpc::HoloRpc for RpcService {
         &self,
         req: volo_grpc::Request<rpc::LastCommittedRequest>,
     ) -> Result<volo_grpc::Response<rpc::LastCommittedResponse>, volo_grpc::Status> {
+        self.maybe_delay().await;
         let req = req.into_inner();
         let group = self
             .state
@@ -697,6 +717,7 @@ impl rpc::HoloRpc for RpcService {
         &self,
         req: volo_grpc::Request<rpc::LastExecutedPrefixRequest>,
     ) -> Result<volo_grpc::Response<rpc::LastExecutedPrefixResponse>, volo_grpc::Status> {
+        self.maybe_delay().await;
         let req = req.into_inner();
         let group = self
             .state
@@ -720,6 +741,7 @@ impl rpc::HoloRpc for RpcService {
         &self,
         req: volo_grpc::Request<rpc::ExecutedRequest>,
     ) -> Result<volo_grpc::Response<rpc::ExecutedResponse>, volo_grpc::Status> {
+        self.maybe_delay().await;
         let req = req.into_inner();
         let group = self
             .state
@@ -744,6 +766,7 @@ impl rpc::HoloRpc for RpcService {
         &self,
         req: volo_grpc::Request<rpc::MarkVisibleRequest>,
     ) -> Result<volo_grpc::Response<rpc::MarkVisibleResponse>, volo_grpc::Status> {
+        self.maybe_delay().await;
         let req = req.into_inner();
         let group = self
             .state
@@ -767,6 +790,7 @@ impl rpc::HoloRpc for RpcService {
         &self,
         req: volo_grpc::Request<rpc::KvGetRequest>,
     ) -> Result<volo_grpc::Response<rpc::KvGetResponse>, volo_grpc::Status> {
+        self.maybe_delay().await;
         let req = req.into_inner();
         let resp = match self.state.kv_latest(&req.key) {
             Some((value, version)) => rpc::KvGetResponse {
@@ -788,6 +812,7 @@ impl rpc::HoloRpc for RpcService {
         &self,
         req: volo_grpc::Request<rpc::KvBatchGetRequest>,
     ) -> Result<volo_grpc::Response<rpc::KvBatchGetResponse>, volo_grpc::Status> {
+        self.maybe_delay().await;
         let req = req.into_inner();
         let keys = req.keys.into_iter().map(|k| k.to_vec()).collect::<Vec<_>>();
         let values = self.state.kv_latest_batch(&keys);
@@ -814,6 +839,7 @@ impl rpc::HoloRpc for RpcService {
         &self,
         _req: volo_grpc::Request<rpc::JoinRequest>,
     ) -> Result<volo_grpc::Response<rpc::JoinResponse>, volo_grpc::Status> {
+        self.maybe_delay().await;
         Ok(volo_grpc::Response::new(rpc::JoinResponse {
             initial_members: self.state.initial_members.clone().into(),
         }))

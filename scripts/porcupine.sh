@@ -14,6 +14,8 @@ OP_TIMEOUT="${OP_TIMEOUT:-10s}"
 FAIL_FAST="${FAIL_FAST:-true}"
 FAULT_DISCONNECT_PCT="${FAULT_DISCONNECT_PCT:-0}"
 ALLOW_ERRORS="${ALLOW_ERRORS:-0}"
+
+FAILURE_GRACE="${FAILURE_GRACE:-0s}"
 FAIL_INJECT="${FAIL_INJECT:-0}"
 FAIL_KILL_INTERVAL="${FAIL_KILL_INTERVAL:-2s}"
 FAIL_KILL_SIGNAL="${FAIL_KILL_SIGNAL:-KILL}"
@@ -95,6 +97,11 @@ make -C "$ROOT_DIR" build-release
 echo "==> starting cluster"
 HOLO_BIN="${HOLO_BIN:-$ROOT_DIR/target/release/holo-store}" \
   "$ROOT_DIR/scripts/start_cluster.sh"
+
+if [[ "$FAILURE_GRACE" != "0" && "$FAILURE_GRACE" != "0s" ]]; then
+  echo "==> failure grace period: $FAILURE_GRACE"
+  sleep "$FAILURE_GRACE"
+fi
 
 wait_port() {
   local host="$1"

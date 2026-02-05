@@ -18,7 +18,7 @@ to make writes correct and crash-safe.
 - A **fast path** is possible when dependencies converge without conflicts.
 - Transactions are ordered per key via dependency sets, so unrelated writes can
   proceed in parallel without a single global leader.
-- [Accord consensus protocol paper (CEP-15 draft whitepaper)](https://cwiki.apache.org/confluence/download/attachments/188744725/Accord.pdf).
+- [Accord consensus protocol paper (CEP-15 draft whitepaper)](https://github.com/eatonphil/accord-protocol).
 
 In this repository we implement:
 - A per-partition Accord group with batched consensus RPCs.

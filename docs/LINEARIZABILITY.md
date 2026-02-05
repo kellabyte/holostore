@@ -34,11 +34,12 @@ By default, if any operation errored, the checker fails early; you can allow err
 - `make check-linearizability`
 - `./scripts/porcupine.sh` (single scenario)
 - `./scripts/check_linearizability.sh` (suite)
+- `./scripts/check_read_minority.sh` (manual: read-only minority routing)
 
 ## Suite scenarios
 
 The suite (`scripts/check_linearizability.sh`) runs multiple scenarios. Each scenario issues the same
-GET/SET workload, but changes routing, read mode, or failure injection to stress different correctness paths.
+GET/SET workload, but changes routing or failure injection to stress different correctness paths.
 
 ### Baseline
 
@@ -47,27 +48,19 @@ GET/SET workload, but changes routing, read mode, or failure injection to stress
 - **Failures injected:** none.
 - **Expected result:** linearizability should hold with no errors or lost writes.
 
-### Read mode: accord
+### Slow replica
 
 - **Operations:** mixed GET/SET against the cluster.
-- **Read mode:** explicitly forces `accord` on all nodes.
+- **Read mode:** uses the server’s configured read mode (default `accord`).
+- **Failures injected:** artificial RPC handler delay on one node (e.g. node3).
+- **Expected result:** linearizability should hold for successful operations despite a slow replica.
+
+### Hot-key contention
+
+- **Operations:** single key (`KEYS=1`) with a high write rate (`SET_PCT=90`).
+- **Read mode:** uses the server’s configured read mode (default `accord`).
 - **Failures injected:** none.
-- **Expected result:** linearizability holds under the default read semantics.
-
-### Read mode: quorum
-
-- **Operations:** mixed GET/SET against the cluster.
-- **Read mode:** explicitly forces `quorum` on all nodes.
-- **Failures injected:** none.
-- **Expected result:** linearizability should hold, with reads served after quorum agreement.
-
-### Read mode: local
-
-- **Operations:** mixed GET/SET against the cluster.
-- **Read mode:** explicitly forces `local` on all nodes.
-- **Failures injected:** none.
-- **Expected result:** reads may be stale during failures, but successful operations must still satisfy
-  the Porcupine model for observed histories.
+- **Expected result:** linearizability should hold under heavy contention and ordering pressure.
 
 ### Mixed read/write nodes
 
@@ -103,4 +96,12 @@ GET/SET workload, but changes routing, read mode, or failure injection to stress
   successful operations. Failures are acceptable while nodes are down, but recovered nodes must replay
   committed writes without data loss (suite enables `ALLOW_ERRORS=1`).
 
-You can control the workload with environment variables (examples: `CLIENTS`, `KEYS`, `SET_PCT`, `DURATION`, `OP_TIMEOUT`, `FAIL_FAST`, `OUT`, `READ_NODES`, `WRITE_NODES`, `FAULT_DISCONNECT_PCT`, `FAIL_INJECT`, `FAIL_KILL_INTERVAL`, `FAIL_KILL_SIGNAL`, `FAIL_KILL_RESTART`, `ALLOW_ERRORS`).
+You can control the workload with environment variables (examples: `CLIENTS`, `KEYS`, `SET_PCT`, `DURATION`, `OP_TIMEOUT`, `FAIL_FAST`, `OUT`, `READ_NODES`, `WRITE_NODES`, `FAULT_DISCONNECT_PCT`, `FAIL_INJECT`, `FAIL_KILL_INTERVAL`, `FAIL_KILL_SIGNAL`, `FAIL_KILL_RESTART`, `ALLOW_ERRORS`, `FAILURE_GRACE`, `HOLO_NODE1_RPC_DELAY_MS`, `HOLO_NODE2_RPC_DELAY_MS`, `HOLO_NODE3_RPC_DELAY_MS`).
+
+## Manual scenarios
+
+### Read-only minority routing
+
+`scripts/check_read_minority.sh` routes GETs to a single node and writes to the other nodes. This
+can surface stale reads and is **not expected to be linearizable**; it is intended as a characterization
+test rather than a suite gate.

@@ -179,36 +179,41 @@ start_node() {
   local grpc_addr="$3"
   local mode="$4"
   local arg="$5"
-  local read_mode_args=()
-
-  if [[ -n "${HOLO_READ_MODE:-}" ]]; then
-    read_mode_args+=(--read-mode "$HOLO_READ_MODE")
-  fi
+  local delay_ms=""
 
   local log_file="$CLUSTER_DIR/logs/node${node_id}.log"
   local data_dir="$CLUSTER_DIR/data/node${node_id}"
   mkdir -p "$data_dir"
 
+  case "$node_id" in
+    "$NODE1_ID") delay_ms="${HOLO_NODE1_RPC_DELAY_MS:-}" ;;
+    "$NODE2_ID") delay_ms="${HOLO_NODE2_RPC_DELAY_MS:-}" ;;
+    "$NODE3_ID") delay_ms="${HOLO_NODE3_RPC_DELAY_MS:-}" ;;
+  esac
+
+  local -a cmd=(
+    "$HOLO_BIN" node
+    --node-id "$node_id"
+    --listen-redis "$redis_addr"
+    --listen-grpc "$grpc_addr"
+    --initial-members "$members"
+    --data-dir "$data_dir"
+  )
+
+  if [[ -n "${HOLO_READ_MODE:-}" ]]; then
+    cmd+=(--read-mode "$HOLO_READ_MODE")
+  fi
+
   if [[ "$mode" == "bootstrap" ]]; then
-    "$HOLO_BIN" node \
-      --node-id "$node_id" \
-      --listen-redis "$redis_addr" \
-      --listen-grpc "$grpc_addr" \
-      --bootstrap \
-      --initial-members "$members" \
-      "${read_mode_args[@]}" \
-      --data-dir "$data_dir" \
-      >"$log_file" 2>&1 &
+    cmd+=(--bootstrap)
   else
-    "$HOLO_BIN" node \
-      --node-id "$node_id" \
-      --listen-redis "$redis_addr" \
-      --listen-grpc "$grpc_addr" \
-      --join "$arg" \
-      --initial-members "$members" \
-      "${read_mode_args[@]}" \
-      --data-dir "$data_dir" \
-      >"$log_file" 2>&1 &
+    cmd+=(--join "$arg")
+  fi
+
+  if [[ -n "$delay_ms" ]]; then
+    HOLO_RPC_HANDLER_DELAY_MS="$delay_ms" "${cmd[@]}" >"$log_file" 2>&1 &
+  else
+    "${cmd[@]}" >"$log_file" 2>&1 &
   fi
 
   echo "$!" >>"$PIDS_FILE"
