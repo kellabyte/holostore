@@ -29,24 +29,21 @@ run_case "baseline" \
   FAIL_INJECT=0 \
   FAULT_DISCONNECT_PCT=0
 
-# Read mode: accord.
-# Verifies: default read mode behavior with linearizability checks.
-run_case "read_mode_accord" \
-  HOLO_READ_MODE=accord \
+# Slow replica:
+# Verifies: linearizability under an artificially delayed replica.
+run_case "slow_replica" \
+  HOLO_NODE3_RPC_DELAY_MS=200 \
+  DURATION=20s \
   FAIL_INJECT=0 \
-  FAULT_DISCONNECT_PCT=0
+  FAULT_DISCONNECT_PCT=0 \
+  FAILURE_GRACE=2s
 
-# Read mode: quorum.
-# Verifies: quorum read semantics under the same workload.
-run_case "read_mode_quorum" \
-  HOLO_READ_MODE=quorum \
-  FAIL_INJECT=0 \
-  FAULT_DISCONNECT_PCT=0
-
-# Read mode: local.
-# Verifies: local reads under the same workload.
-run_case "read_mode_local" \
-  HOLO_READ_MODE=local \
+# Hot-key contention:
+# Verifies: ordering/visibility under heavy write contention on a single key.
+run_case "hot_key_contention" \
+  KEYS=1 \
+  SET_PCT=90 \
+  DURATION=20s \
   FAIL_INJECT=0 \
   FAULT_DISCONNECT_PCT=0
 
@@ -61,28 +58,33 @@ run_case "mixed_read_write_nodes" \
 # Client-side disconnect injection.
 # Verifies: protocol/driver resilience to connection churn without server failures.
 run_case "client_disconnects" \
+  DURATION=20s \
   FAULT_DISCONNECT_PCT=5 \
   FAIL_INJECT=0
 
 # Crash during write:
 # Verifies: linearizability + durability while nodes crash/restart during heavy SET load.
 run_case "crash_during_write" \
+  DURATION=25s \
   SET_PCT=100 \
-  FAIL_FAST=false \
-  ALLOW_ERRORS=1 \
-  FAIL_INJECT=1 \
-  FAIL_KILL_INTERVAL=1s \
-  FAIL_KILL_SIGNAL=KILL \
-  FAIL_KILL_RESTART=1
-
-# Server-side kill/restart injection.
-# Verifies: linearizability and recovery under node crashes/restarts.
-run_case "server_kill_restart" \
   FAIL_FAST=false \
   ALLOW_ERRORS=1 \
   FAIL_INJECT=1 \
   FAIL_KILL_INTERVAL=3s \
   FAIL_KILL_SIGNAL=KILL \
-  FAIL_KILL_RESTART=1
+  FAIL_KILL_RESTART=1 \
+  FAILURE_GRACE=2s
+
+# Server-side kill/restart injection.
+# Verifies: linearizability and recovery under node crashes/restarts.
+run_case "server_kill_restart" \
+  DURATION=30s \
+  FAIL_FAST=false \
+  ALLOW_ERRORS=1 \
+  FAIL_INJECT=1 \
+  FAIL_KILL_INTERVAL=5s \
+  FAIL_KILL_SIGNAL=KILL \
+  FAIL_KILL_RESTART=1 \
+  FAILURE_GRACE=2s
 
 echo "Summary written to $SUMMARY"

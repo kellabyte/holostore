@@ -140,6 +140,10 @@ struct NodeArgs {
     #[arg(long, env = "HOLO_PROPOSAL_STATS_INTERVAL_MS", default_value_t = 0)]
     proposal_stats_interval_ms: u64,
 
+    /// Artificial delay injected into RPC handlers (milliseconds).
+    #[arg(long, env = "HOLO_RPC_HANDLER_DELAY_MS", default_value_t = 0)]
+    rpc_handler_delay_ms: u64,
+
     /// Consecutive execute-stall hits on a PreAccepted blocker before triggering recovery.
     #[arg(long, env = "HOLO_PREACCEPT_STALL_HITS", default_value_t = 3)]
     preaccept_stall_hits: u32,
@@ -260,6 +264,7 @@ struct NodeState {
     proposal_stats: Arc<ProposalStats>,
     proposal_stats_enabled: bool,
     rpc_handler_stats: Arc<RpcHandlerStats>,
+    rpc_handler_delay: Duration,
     client_set_tx: mpsc::Sender<BatchSetWork>,
     client_get_tx: mpsc::Sender<BatchGetWork>,
     client_batch_stats: Arc<ClientBatchStats>,
@@ -2388,6 +2393,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         proposal_stats,
         proposal_stats_enabled,
         rpc_handler_stats: rpc_handler_stats.clone(),
+        rpc_handler_delay: Duration::from_millis(args.rpc_handler_delay_ms),
         client_set_tx,
         client_get_tx,
         client_batch_stats: client_batch_stats.clone(),
