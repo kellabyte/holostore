@@ -179,6 +179,11 @@ start_node() {
   local grpc_addr="$3"
   local mode="$4"
   local arg="$5"
+  local read_mode_args=()
+
+  if [[ -n "${HOLO_READ_MODE:-}" ]]; then
+    read_mode_args+=(--read-mode "$HOLO_READ_MODE")
+  fi
 
   local log_file="$CLUSTER_DIR/logs/node${node_id}.log"
   local data_dir="$CLUSTER_DIR/data/node${node_id}"
@@ -191,6 +196,7 @@ start_node() {
       --listen-grpc "$grpc_addr" \
       --bootstrap \
       --initial-members "$members" \
+      "${read_mode_args[@]}" \
       --data-dir "$data_dir" \
       >"$log_file" 2>&1 &
   else
@@ -200,6 +206,7 @@ start_node() {
       --listen-grpc "$grpc_addr" \
       --join "$arg" \
       --initial-members "$members" \
+      "${read_mode_args[@]}" \
       --data-dir "$data_dir" \
       >"$log_file" 2>&1 &
   fi

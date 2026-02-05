@@ -61,6 +61,30 @@ pub fn spawn_node_with_read_mode(
     grpc_addr: SocketAddr,
     read_mode: &str,
 ) -> NodeProcess {
+    spawn_node_custom(
+        1,
+        data_dir,
+        redis_addr,
+        grpc_addr,
+        true,
+        None,
+        format!("1@{}", grpc_addr),
+        read_mode,
+        2,
+    )
+}
+
+pub fn spawn_node_custom(
+    node_id: u64,
+    data_dir: &PathBuf,
+    redis_addr: SocketAddr,
+    grpc_addr: SocketAddr,
+    bootstrap: bool,
+    join: Option<SocketAddr>,
+    initial_members: String,
+    read_mode: &str,
+    data_shards: usize,
+) -> NodeProcess {
     let bin = holo_store_bin();
     let log_dir = data_dir.join("logs");
     let _ = std::fs::create_dir_all(&log_dir);
@@ -77,27 +101,32 @@ pub fn spawn_node_with_read_mode(
         .open(&stderr_path)
         .expect("open stderr log");
 
-    let child = Command::new(bin)
-        .arg("node")
+    let mut cmd = Command::new(bin);
+    cmd.arg("node")
         .arg("--node-id")
-        .arg("1")
+        .arg(node_id.to_string())
         .arg("--listen-redis")
         .arg(redis_addr.to_string())
         .arg("--listen-grpc")
         .arg(grpc_addr.to_string())
-        .arg("--bootstrap")
         .arg("--initial-members")
-        .arg(format!("1@{}", grpc_addr))
+        .arg(initial_members)
         .arg("--read-mode")
         .arg(read_mode)
         .arg("--data-dir")
         .arg(data_dir.to_string_lossy().to_string())
         .arg("--data-shards")
-        .arg("2")
+        .arg(data_shards.to_string())
         .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(stderr_file))
-        .spawn()
-        .expect("failed to spawn holo-store");
+        .stderr(Stdio::from(stderr_file));
+
+    if bootstrap {
+        cmd.arg("--bootstrap");
+    } else if let Some(join_addr) = join {
+        cmd.arg("--join").arg(join_addr.to_string());
+    }
+
+    let child = cmd.spawn().expect("failed to spawn holo-store");
 
     NodeProcess {
         child,

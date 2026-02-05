@@ -5,7 +5,7 @@ This repo uses the Porcupine linearizability checker to validate client-visible 
 ## Tooling
 
 - Checker: [Porcupine](https://github.com/anishathalye/porcupine) (Go)
-- Harness: `scripts/check_linearizability.sh` (wired to `make check-linearizability`)
+- Harness: `scripts/porcupine.sh` (single scenario) and `scripts/check_linearizability.sh` (suite, wired to `make check-linearizability`)
 - History format: JSON written by `holo-workload`
 
 ## What we test
@@ -27,11 +27,80 @@ The recorded operations include:
 - timestamps for call/return times (used by Porcupine)
 - results (`ok`, `value`, `nil`, `err`)
 
-By default, if any operation errored, the checker fails early; you can allow errors with `--allow-errors` when running the checker directly.
+By default, if any operation errored, the checker fails early; you can allow errors with `--allow-errors` (or `ALLOW_ERRORS=1` when running `scripts/porcupine.sh`).
 
 ## Running
 
 - `make check-linearizability`
-- `./scripts/check_linearizability.sh`
+- `./scripts/porcupine.sh` (single scenario)
+- `./scripts/check_linearizability.sh` (suite)
 
-You can control the workload with environment variables (examples: `CLIENTS`, `KEYS`, `SET_PCT`, `DURATION`, `OP_TIMEOUT`, `FAIL_FAST`, `OUT`).
+## Suite scenarios
+
+The suite (`scripts/check_linearizability.sh`) runs multiple scenarios. Each scenario issues the same
+GET/SET workload, but changes routing, read mode, or failure injection to stress different correctness paths.
+
+### Baseline
+
+- **Operations:** mixed GET/SET against the cluster (`SET` returns `OK`, `GET` returns a value or `nil`).
+- **Read mode:** uses the server’s configured read mode (default `accord`).
+- **Failures injected:** none.
+- **Expected result:** linearizability should hold with no errors or lost writes.
+
+### Read mode: accord
+
+- **Operations:** mixed GET/SET against the cluster.
+- **Read mode:** explicitly forces `accord` on all nodes.
+- **Failures injected:** none.
+- **Expected result:** linearizability holds under the default read semantics.
+
+### Read mode: quorum
+
+- **Operations:** mixed GET/SET against the cluster.
+- **Read mode:** explicitly forces `quorum` on all nodes.
+- **Failures injected:** none.
+- **Expected result:** linearizability should hold, with reads served after quorum agreement.
+
+### Read mode: local
+
+- **Operations:** mixed GET/SET against the cluster.
+- **Read mode:** explicitly forces `local` on all nodes.
+- **Failures injected:** none.
+- **Expected result:** reads may be stale during failures, but successful operations must still satisfy
+  the Porcupine model for observed histories.
+
+### Mixed read/write nodes
+
+- **Operations:** GETs are routed to a single read node; SETs are sent to all nodes.
+- **Read mode:** uses the server’s configured read mode on the chosen read node (default `accord`).
+- **Failures injected:** none.
+- **Expected result:** linearizability should still hold even when reads are constrained to a subset of nodes.
+
+### Client disconnects
+
+- **Operations:** mixed GET/SET as usual.
+- **Read mode:** uses the server’s configured read mode (default `accord`).
+- **Failures injected:** client-side disconnect/reconnect before a percentage of operations
+  (`FAULT_DISCONNECT_PCT`, defaults to `5` in the suite).
+- **Expected result:** the workload may record transient errors, but successful operations must still
+  be linearizable and values must never appear out of thin air.
+
+### Crash during write
+
+- **Operations:** SET-heavy workload (`SET_PCT=100`).
+- **Read mode:** uses the server’s configured read mode (default `accord`).
+- **Failures injected:** aggressive kill/restart during writes (`FAIL_KILL_INTERVAL=1s`).
+- **Expected result:** no lost committed writes after restarts; linearizability should hold for
+  successful operations despite transient errors (suite enables `ALLOW_ERRORS=1`).
+
+### Server kill/restart
+
+- **Operations:** mixed GET/SET as usual.
+- **Read mode:** uses the server’s configured read mode (default `accord`).
+- **Failures injected:** random node process kill/restart during the workload
+  (`FAIL_INJECT=1`, `FAIL_KILL_INTERVAL=3s`, `FAIL_KILL_SIGNAL=KILL`, `FAIL_KILL_RESTART=1` in the suite).
+- **Expected result:** the system should recover after crashes and still satisfy linearizability for
+  successful operations. Failures are acceptable while nodes are down, but recovered nodes must replay
+  committed writes without data loss (suite enables `ALLOW_ERRORS=1`).
+
+You can control the workload with environment variables (examples: `CLIENTS`, `KEYS`, `SET_PCT`, `DURATION`, `OP_TIMEOUT`, `FAIL_FAST`, `OUT`, `READ_NODES`, `WRITE_NODES`, `FAULT_DISCONNECT_PCT`, `FAIL_INJECT`, `FAIL_KILL_INTERVAL`, `FAIL_KILL_SIGNAL`, `FAIL_KILL_RESTART`, `ALLOW_ERRORS`).

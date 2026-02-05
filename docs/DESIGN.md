@@ -100,7 +100,7 @@ These metrics are the primary tool for diagnosing stalls, batching behavior, and
 
 ## Running Linearizability Checks
 
-Porcupine tests live under `scripts/check_linearizability.sh` and are wired to `make check-linearizability`.
+Porcupine tests live under `scripts/porcupine.sh`; the suite is `scripts/check_linearizability.sh` and is wired to `make check-linearizability`.
 
 ## Partitioning
 
