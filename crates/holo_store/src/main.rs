@@ -869,6 +869,7 @@ impl NodeState {
             redis_server::KvOp::HoloStats => {
                 anyhow::bail!("HOLOSTATS is handled at the Redis layer")
             }
+            redis_server::KvOp::Ping => Ok(redis_server::KvResult::Pong),
             redis_server::KvOp::Get { key } => {
                 let mut values = self.execute_batch_get(vec![key]).await?;
                 let value = values.pop().unwrap_or(None);

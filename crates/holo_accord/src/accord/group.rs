@@ -1903,7 +1903,8 @@ impl Group {
             });
         }
 
-        let (tx, mut rx) = mpsc::channel::<anyhow::Result<PreAcceptResponse>>(peers.len());
+        let (tx, mut rx) =
+            mpsc::channel::<anyhow::Result<PreAcceptResponse>>(peers.len().max(1));
         for peer in peers.iter().copied() {
             let transport = self.transport.clone();
             let tx = tx.clone();
@@ -2267,7 +2268,15 @@ impl Group {
             return Ok(local);
         }
 
-        let (tx, mut rx) = mpsc::channel::<anyhow::Result<AcceptResponse>>(peers.len());
+        if quorum <= 1 {
+            return Ok(AcceptResponse {
+                ok: true,
+                promised: local.promised,
+            });
+        }
+
+        let (tx, mut rx) =
+            mpsc::channel::<anyhow::Result<AcceptResponse>>(peers.len().max(1));
         for peer in peers.iter().copied() {
             let transport = self.transport.clone();
             let tx = tx.clone();
@@ -2373,7 +2382,11 @@ impl Group {
             )));
         }
 
-        let (tx, mut rx) = mpsc::channel::<bool>(peers.len());
+        if quorum <= 1 {
+            return Ok(());
+        }
+
+        let (tx, mut rx) = mpsc::channel::<bool>(peers.len().max(1));
         for peer in peers.iter().copied() {
             let transport = self.transport.clone();
             let tx = tx.clone();
@@ -3305,7 +3318,8 @@ impl Group {
                 continue;
             }
 
-            let (tx, mut rx) = mpsc::channel::<anyhow::Result<RecoverResponse>>(peers.len());
+            let (tx, mut rx) =
+                mpsc::channel::<anyhow::Result<RecoverResponse>>(peers.len().max(1));
             for peer in peers.iter().copied() {
                 let transport = self.transport.clone();
                 let tx = tx.clone();
