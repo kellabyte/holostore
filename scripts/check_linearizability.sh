@@ -2,85 +2,87 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+OUT_DIR="${OUT_DIR:-$ROOT_DIR/.tmp/porcupine}"
+mkdir -p "$OUT_DIR"
 
-NODES="${NODES:-127.0.0.1:16379,127.0.0.1:16380,127.0.0.1:16381}"
-CLIENTS="${CLIENTS:-3}"
-KEYS="${KEYS:-5}"
-SET_PCT="${SET_PCT:-50}"
-DURATION="${DURATION:-10s}"
-OP_TIMEOUT="${OP_TIMEOUT:-10s}"
-FAIL_FAST="${FAIL_FAST:-true}"
+TS="$(date +"%Y%m%d_%H%M%S")"
+SUMMARY="$OUT_DIR/suite_${TS}.summary"
 
-OUT="${OUT:-$ROOT_DIR/.tmp/porcupine/history.json}"
-
-PYTHON_BIN="${PYTHON_BIN:-python3}"
-if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
-  PYTHON_BIN="python"
-fi
-
-OUT_ABS="$("$PYTHON_BIN" - "$OUT" <<'PY'
-import os
-import sys
-print(os.path.abspath(sys.argv[1]))
-PY
-)"
-
-cleanup() {
-  "$ROOT_DIR/scripts/cleanup_cluster.sh" >/dev/null 2>&1 || true
-}
-trap cleanup EXIT
-
-echo "==> cleaning cluster"
-"$ROOT_DIR/scripts/cleanup_cluster.sh"
-
-echo "==> building holo-store (release)"
-make -C "$ROOT_DIR" build-release
-
-echo "==> starting cluster"
-HOLO_BIN="${HOLO_BIN:-$ROOT_DIR/target/release/holo-store}" \
-  "$ROOT_DIR/scripts/start_cluster.sh"
-
-wait_port() {
-  local host="$1"
-  local port="$2"
-  local attempts="${3:-50}"
-  local delay="${4:-0.1}"
-
-  if ! command -v nc >/dev/null 2>&1; then
-    sleep 1
-    return 0
+run_case() {
+  local name="$1"
+  shift
+  local out="$OUT_DIR/${name}_${TS}.out"
+  echo "==> ${name}" | tee -a "$SUMMARY"
+  if env "$@" "$ROOT_DIR/scripts/porcupine.sh" >"$out" 2>&1; then
+    echo "PASS ${name}" | tee -a "$SUMMARY"
+  else
+    echo "FAIL ${name} (see $out)" | tee -a "$SUMMARY"
   fi
-
-  for _ in $(seq 1 "$attempts"); do
-    if nc -z "$host" "$port" >/dev/null 2>&1; then
-      return 0
-    fi
-    sleep "$delay"
-  done
-  return 1
+  echo | tee -a "$SUMMARY"
 }
 
-echo "==> waiting for redis port 16379"
-wait_port 127.0.0.1 16379 || { echo "error: redis port 16379 not ready" >&2; exit 1; }
+echo "Linearizability suite started at ${TS}" >"$SUMMARY"
 
-echo "==> building holo-workload (release)"
-cargo build -p holo_workload --release
+# Baseline: standard workload, no injected failures.
+# Verifies: basic linearizability under steady-state conditions.
+run_case "baseline" \
+  FAIL_INJECT=0 \
+  FAULT_DISCONNECT_PCT=0
 
-echo "==> running workload (history: $OUT_ABS)"
-"$ROOT_DIR/target/release/holo-workload" run \
-  --nodes "$NODES" \
-  --clients "$CLIENTS" \
-  --keys "$KEYS" \
-  --set-pct "$SET_PCT" \
-  --duration "$DURATION" \
-  --op-timeout "$OP_TIMEOUT" \
-  --fail-fast="$FAIL_FAST" \
-  --out "$OUT_ABS"
+# Read mode: accord.
+# Verifies: default read mode behavior with linearizability checks.
+run_case "read_mode_accord" \
+  HOLO_READ_MODE=accord \
+  FAIL_INJECT=0 \
+  FAULT_DISCONNECT_PCT=0
 
-echo "==> checking linearizability (porcupine)"
-(
-  cd "$ROOT_DIR/tools/porcupine_check"
-  go run . --history "$OUT_ABS"
-)
+# Read mode: quorum.
+# Verifies: quorum read semantics under the same workload.
+run_case "read_mode_quorum" \
+  HOLO_READ_MODE=quorum \
+  FAIL_INJECT=0 \
+  FAULT_DISCONNECT_PCT=0
 
-echo "OK"
+# Read mode: local.
+# Verifies: local reads under the same workload.
+run_case "read_mode_local" \
+  HOLO_READ_MODE=local \
+  FAIL_INJECT=0 \
+  FAULT_DISCONNECT_PCT=0
+
+# Mixed read/write nodes: single read node, all writes.
+# Verifies: correctness when GETs are routed to a subset of nodes.
+run_case "mixed_read_write_nodes" \
+  READ_NODES="127.0.0.1:16379" \
+  WRITE_NODES="127.0.0.1:16379,127.0.0.1:16380,127.0.0.1:16381" \
+  FAIL_INJECT=0 \
+  FAULT_DISCONNECT_PCT=0
+
+# Client-side disconnect injection.
+# Verifies: protocol/driver resilience to connection churn without server failures.
+run_case "client_disconnects" \
+  FAULT_DISCONNECT_PCT=5 \
+  FAIL_INJECT=0
+
+# Crash during write:
+# Verifies: linearizability + durability while nodes crash/restart during heavy SET load.
+run_case "crash_during_write" \
+  SET_PCT=100 \
+  FAIL_FAST=false \
+  ALLOW_ERRORS=1 \
+  FAIL_INJECT=1 \
+  FAIL_KILL_INTERVAL=1s \
+  FAIL_KILL_SIGNAL=KILL \
+  FAIL_KILL_RESTART=1
+
+# Server-side kill/restart injection.
+# Verifies: linearizability and recovery under node crashes/restarts.
+run_case "server_kill_restart" \
+  FAIL_FAST=false \
+  ALLOW_ERRORS=1 \
+  FAIL_INJECT=1 \
+  FAIL_KILL_INTERVAL=3s \
+  FAIL_KILL_SIGNAL=KILL \
+  FAIL_KILL_RESTART=1
+
+echo "Summary written to $SUMMARY"

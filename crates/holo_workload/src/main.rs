@@ -40,6 +40,14 @@ struct RunArgs {
     #[arg(long)]
     nodes: String,
 
+    /// Optional read nodes (GETs only). Defaults to --nodes when empty.
+    #[arg(long)]
+    read_nodes: Option<String>,
+
+    /// Optional write nodes (SETs only). Defaults to --nodes when empty.
+    #[arg(long)]
+    write_nodes: Option<String>,
+
     /// Number of concurrent clients (each client uses one TCP connection).
     #[arg(long, default_value_t = 10)]
     clients: usize,
@@ -72,6 +80,10 @@ struct RunArgs {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     fail_fast: bool,
 
+    /// Percentage of operations that force a client reconnect before issuing the op.
+    #[arg(long, default_value_t = 0)]
+    fault_disconnect_pct: u8,
+
     /// Write a JSON history to this path (Porcupine input).
     #[arg(long, default_value = ".tmp/porcupine/history.json")]
     out: PathBuf,
@@ -81,12 +93,15 @@ struct RunArgs {
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct HistoryMeta {
     nodes: Vec<String>,
+    read_nodes: Vec<String>,
+    write_nodes: Vec<String>,
     clients: usize,
     keys: usize,
     key_prefix: String,
     set_pct: u8,
     duration_ms: u64,
     seed: u64,
+    fault_disconnect_pct: u8,
 }
 
 /// Full workload history serialized for Porcupine.
@@ -142,9 +157,17 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     anyhow::ensure!(args.clients > 0, "--clients must be > 0");
     anyhow::ensure!(args.keys > 0, "--keys must be > 0");
     anyhow::ensure!(args.set_pct <= 100, "--set-pct must be <= 100");
+    anyhow::ensure!(
+        args.fault_disconnect_pct <= 100,
+        "--fault-disconnect-pct must be <= 100"
+    );
 
     let nodes = parse_nodes(&args.nodes)?;
     anyhow::ensure!(!nodes.is_empty(), "--nodes must not be empty");
+    let read_nodes = parse_nodes(args.read_nodes.as_deref().unwrap_or(&args.nodes))?;
+    anyhow::ensure!(!read_nodes.is_empty(), "--read-nodes must not be empty");
+    let write_nodes = parse_nodes(args.write_nodes.as_deref().unwrap_or(&args.nodes))?;
+    anyhow::ensure!(!write_nodes.is_empty(), "--write-nodes must not be empty");
 
     let duration: Duration = args.duration.into();
     // Use a random seed when the user provides zero.
@@ -163,19 +186,32 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
 
     let mut tasks = Vec::with_capacity(args.clients);
     for client_id in 0..args.clients {
-        // Distribute clients across nodes in a round-robin fashion.
-        let node = nodes[client_id % nodes.len()];
-        let node_str = node.to_string();
+        let read_node = read_nodes[client_id % read_nodes.len()];
+        let read_node_str = read_node.to_string();
+        let write_node = write_nodes[client_id % write_nodes.len()];
+        let write_node_str = write_node.to_string();
         let keyspace = keyspace.clone();
         let op_timeout: Duration = args.op_timeout.into();
         let fail_fast = args.fail_fast;
         let set_pct = args.set_pct;
+        let fault_disconnect_pct = args.fault_disconnect_pct;
         // Mix the base seed with the client id for deterministic per-client RNG.
         let seed = seed ^ (client_id as u64).wrapping_mul(0x9e3779b97f4a7c15);
         tasks.push(tokio::spawn(async move {
             run_client(
-                client_id, node, node_str, keyspace, set_pct, seed, start, deadline, op_timeout,
+                client_id,
+                read_node,
+                read_node_str,
+                write_node,
+                write_node_str,
+                keyspace,
+                set_pct,
+                seed,
+                start,
+                deadline,
+                op_timeout,
                 fail_fast,
+                fault_disconnect_pct,
             )
             .await
         }));
@@ -192,12 +228,15 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
 
     let meta = HistoryMeta {
         nodes: nodes.iter().map(|n| n.to_string()).collect(),
+        read_nodes: read_nodes.iter().map(|n| n.to_string()).collect(),
+        write_nodes: write_nodes.iter().map(|n| n.to_string()).collect(),
         clients: args.clients,
         keys: args.keys,
         key_prefix: args.key_prefix.clone(),
         set_pct: args.set_pct,
         duration_ms: duration.as_millis() as u64,
         seed,
+        fault_disconnect_pct: args.fault_disconnect_pct,
     };
 
     let history = History { meta, ops: all_ops };
@@ -209,8 +248,10 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
 /// Run a single client connection until the deadline, returning its op history.
 async fn run_client(
     client_id: usize,
-    node: SocketAddr,
-    node_str: String,
+    read_node: SocketAddr,
+    read_node_str: String,
+    write_node: SocketAddr,
+    write_node_str: String,
     keyspace: Vec<String>,
     set_pct: u8,
     seed: u64,
@@ -218,15 +259,13 @@ async fn run_client(
     deadline: time::Instant,
     op_timeout: Duration,
     fail_fast: bool,
+    fault_disconnect_pct: u8,
 ) -> anyhow::Result<Vec<OpRecord>> {
     let mut rng = SmallRng::seed_from_u64(seed);
     let mut ops = Vec::new();
 
-    let socket = TcpStream::connect(node)
-        .await
-        .with_context(|| format!("connect to {node}"))?;
-    socket.set_nodelay(true).ok();
-    let mut framed = Framed::new(socket, Resp2::default());
+    let mut read_conn = connect(read_node).await?;
+    let mut write_conn = connect(write_node).await?;
 
     let mut seq = 0u64;
     while time::Instant::now() < deadline {
@@ -243,9 +282,20 @@ async fn run_client(
         };
 
         let call_us = start.elapsed().as_micros() as u64;
+        let (conn, node_str) = if kind == OpKind::Set {
+            if should_inject_fault(&mut rng, fault_disconnect_pct) {
+                write_conn = connect(write_node).await?;
+            }
+            (&mut write_conn, write_node_str.clone())
+        } else {
+            if should_inject_fault(&mut rng, fault_disconnect_pct) {
+                read_conn = connect(read_node).await?;
+            }
+            (&mut read_conn, read_node_str.clone())
+        };
 
         // Enforce per-op timeouts for send.
-        let send_result = time::timeout(op_timeout, framed.send(req)).await;
+        let send_result = time::timeout(op_timeout, conn.send(req)).await;
         let send_err = match send_result {
             Ok(Ok(())) => None,
             Ok(Err(err)) => Some(format!("{err}")),
@@ -274,7 +324,7 @@ async fn run_client(
         }
 
         // Enforce per-op timeouts for receive.
-        let recv = time::timeout(op_timeout, framed.next()).await;
+        let recv = time::timeout(op_timeout, conn.next()).await;
         let resp = match recv {
             Ok(Some(Ok(frame))) => frame,
             Ok(Some(Err(err))) => {
@@ -348,7 +398,7 @@ async fn run_client(
 
         ops.push(OpRecord {
             client: client_id,
-            node: node_str.clone(),
+            node: node_str,
             op: kind,
             key,
             value,
@@ -359,6 +409,21 @@ async fn run_client(
     }
 
     Ok(ops)
+}
+
+async fn connect(node: SocketAddr) -> anyhow::Result<Framed<TcpStream, Resp2>> {
+    let socket = TcpStream::connect(node)
+        .await
+        .with_context(|| format!("connect to {node}"))?;
+    socket.set_nodelay(true).ok();
+    Ok(Framed::new(socket, Resp2::default()))
+}
+
+fn should_inject_fault(rng: &mut SmallRng, pct: u8) -> bool {
+    if pct == 0 {
+        return false;
+    }
+    rng.gen_range(0..100) < pct as u32
 }
 
 /// Parse a comma-separated list of `host:port` addresses.

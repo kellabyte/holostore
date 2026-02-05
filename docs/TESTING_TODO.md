@@ -56,9 +56,13 @@ Prioritize in this order: correctness → durability → integration → perform
 
 3. **Crash + restart recovery**
    - Kill one node mid-test; restart; ensure it replays WAL and catches up.
+   - Add explicit multi-node crash/restart integration test.
 
 4. **Leaderless availability**
    - Ensure proposals can be made from any node after startup.
+
+5. **Snapshot/compaction boundary**
+   - Add recovery test once snapshotting/compaction is implemented.
 
 ## 4) Performance Regression Tests
 
@@ -75,4 +79,3 @@ Prioritize in this order: correctness → durability → integration → perform
 - **Integration tests**: scripts or a `tests/` harness that spawns
   `holo-store` nodes and runs workloads.
 - **Perf tests**: simple CI job or local script that records baseline metrics.
-
