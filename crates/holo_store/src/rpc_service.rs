@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use holo_accord::accord;
+use serde_json;
 
 use crate::kv::Version;
 use crate::volo_gen::holo_store::rpc;
@@ -837,12 +838,170 @@ impl rpc::HoloRpc for RpcService {
     /// Handle a join RPC, returning the initial membership string.
     async fn join(
         &self,
-        _req: volo_grpc::Request<rpc::JoinRequest>,
+        req: volo_grpc::Request<rpc::JoinRequest>,
     ) -> Result<volo_grpc::Response<rpc::JoinResponse>, volo_grpc::Status> {
         self.maybe_delay().await;
+        let req = req.into_inner();
+        let cmd = crate::cluster::ClusterCommand::AddNode {
+            node_id: req.node_id,
+            grpc_addr: req.grpc_addr.to_string(),
+            redis_addr: req.redis_addr.to_string(),
+        };
+        let payload = crate::cluster::ClusterStateMachine::encode_command(&cmd)
+            .map_err(|e| volo_grpc::Status::internal(format!("encode command failed: {e}")))?;
+        self.state
+            .meta_handle
+            .propose(payload)
+            .await
+            .map_err(|e| volo_grpc::Status::internal(format!("meta propose failed: {e}")))?;
         Ok(volo_grpc::Response::new(rpc::JoinResponse {
-            initial_members: self.state.initial_members.clone().into(),
+            initial_members: self.state.cluster_store.members_string().into(),
         }))
+    }
+
+    async fn cluster_state(
+        &self,
+        _req: volo_grpc::Request<rpc::ClusterStateRequest>,
+    ) -> Result<volo_grpc::Response<rpc::ClusterStateResponse>, volo_grpc::Status> {
+        let state = self.state.cluster_store.state();
+        let json = serde_json::to_string_pretty(&state)
+            .map_err(|e| volo_grpc::Status::internal(format!("serialize state failed: {e}")))?;
+        Ok(volo_grpc::Response::new(rpc::ClusterStateResponse {
+            json: json.into(),
+        }))
+    }
+
+    async fn cluster_add_node(
+        &self,
+        req: volo_grpc::Request<rpc::ClusterAddNodeRequest>,
+    ) -> Result<volo_grpc::Response<rpc::ClusterAddNodeResponse>, volo_grpc::Status> {
+        let req = req.into_inner();
+        let cmd = crate::cluster::ClusterCommand::AddNode {
+            node_id: req.node_id,
+            grpc_addr: req.grpc_addr.to_string(),
+            redis_addr: req.redis_addr.to_string(),
+        };
+        let payload = crate::cluster::ClusterStateMachine::encode_command(&cmd)
+            .map_err(|e| volo_grpc::Status::internal(format!("encode command failed: {e}")))?;
+        self.state
+            .meta_handle
+            .propose(payload)
+            .await
+            .map_err(|e| volo_grpc::Status::internal(format!("meta propose failed: {e}")))?;
+        Ok(volo_grpc::Response::new(rpc::ClusterAddNodeResponse { ok: true }))
+    }
+
+    async fn cluster_remove_node(
+        &self,
+        req: volo_grpc::Request<rpc::ClusterRemoveNodeRequest>,
+    ) -> Result<volo_grpc::Response<rpc::ClusterRemoveNodeResponse>, volo_grpc::Status> {
+        let req = req.into_inner();
+        let cmd = crate::cluster::ClusterCommand::RemoveNode { node_id: req.node_id };
+        let payload = crate::cluster::ClusterStateMachine::encode_command(&cmd)
+            .map_err(|e| volo_grpc::Status::internal(format!("encode command failed: {e}")))?;
+        self.state
+            .meta_handle
+            .propose(payload)
+            .await
+            .map_err(|e| volo_grpc::Status::internal(format!("meta propose failed: {e}")))?;
+        Ok(volo_grpc::Response::new(rpc::ClusterRemoveNodeResponse { ok: true }))
+    }
+
+    async fn range_split(
+        &self,
+        req: volo_grpc::Request<rpc::RangeSplitRequest>,
+    ) -> Result<volo_grpc::Response<rpc::RangeSplitResponse>, volo_grpc::Status> {
+        let req = req.into_inner();
+        let split_key = req.split_key.to_vec();
+        let Some(target_shard_index) = self
+            .state
+            .cluster_store
+            .first_free_shard_index(self.state.data_shards.max(1))
+        else {
+            return Err(volo_grpc::Status::failed_precondition(
+                "no free data shard available for split",
+            ));
+        };
+        let cmd = crate::cluster::ClusterCommand::SplitRange {
+            split_key: split_key.clone(),
+            target_shard_index,
+        };
+        let payload = crate::cluster::ClusterStateMachine::encode_command(&cmd)
+            .map_err(|e| volo_grpc::Status::internal(format!("encode command failed: {e}")))?;
+        self.state
+            .meta_handle
+            .propose(payload)
+            .await
+            .map_err(|e| volo_grpc::Status::internal(format!("meta propose failed: {e}")))?;
+        let state = self.state.cluster_store.state();
+        let (left, right) = state
+            .shards
+            .windows(2)
+            .find(|pair| pair[0].end_key == split_key)
+            .map(|pair| (pair[0].shard_id, pair[1].shard_id))
+            .unwrap_or((0, 0));
+        Ok(volo_grpc::Response::new(rpc::RangeSplitResponse {
+            ok: true,
+            left_shard_id: left,
+            right_shard_id: right,
+        }))
+    }
+
+    async fn range_merge(
+        &self,
+        req: volo_grpc::Request<rpc::RangeMergeRequest>,
+    ) -> Result<volo_grpc::Response<rpc::RangeMergeResponse>, volo_grpc::Status> {
+        let req = req.into_inner();
+        let cmd = crate::cluster::ClusterCommand::MergeRange {
+            left_shard_id: req.left_shard_id,
+        };
+        let payload = crate::cluster::ClusterStateMachine::encode_command(&cmd)
+            .map_err(|e| volo_grpc::Status::internal(format!("encode command failed: {e}")))?;
+        self.state
+            .meta_handle
+            .propose(payload)
+            .await
+            .map_err(|e| volo_grpc::Status::internal(format!("meta propose failed: {e}")))?;
+        Ok(volo_grpc::Response::new(rpc::RangeMergeResponse {
+            ok: true,
+            merged_shard_id: req.left_shard_id,
+        }))
+    }
+
+    async fn range_rebalance(
+        &self,
+        req: volo_grpc::Request<rpc::RangeRebalanceRequest>,
+    ) -> Result<volo_grpc::Response<rpc::RangeRebalanceResponse>, volo_grpc::Status> {
+        let req = req.into_inner();
+        let cmd = crate::cluster::ClusterCommand::SetReplicas {
+            shard_id: req.shard_id,
+            replicas: req.replicas,
+            leaseholder: req.leaseholder,
+        };
+        let payload = crate::cluster::ClusterStateMachine::encode_command(&cmd)
+            .map_err(|e| volo_grpc::Status::internal(format!("encode command failed: {e}")))?;
+        self.state
+            .meta_handle
+            .propose(payload)
+            .await
+            .map_err(|e| volo_grpc::Status::internal(format!("meta propose failed: {e}")))?;
+        Ok(volo_grpc::Response::new(rpc::RangeRebalanceResponse { ok: true }))
+    }
+
+    async fn cluster_freeze(
+        &self,
+        req: volo_grpc::Request<rpc::ClusterFreezeRequest>,
+    ) -> Result<volo_grpc::Response<rpc::ClusterFreezeResponse>, volo_grpc::Status> {
+        let req = req.into_inner();
+        let cmd = crate::cluster::ClusterCommand::SetFrozen { frozen: req.frozen };
+        let payload = crate::cluster::ClusterStateMachine::encode_command(&cmd)
+            .map_err(|e| volo_grpc::Status::internal(format!("encode command failed: {e}")))?;
+        self.state
+            .meta_handle
+            .propose(payload)
+            .await
+            .map_err(|e| volo_grpc::Status::internal(format!("meta propose failed: {e}")))?;
+        Ok(volo_grpc::Response::new(rpc::ClusterFreezeResponse { ok: true }))
     }
 }
 

@@ -48,6 +48,14 @@ GET/SET workload, but changes routing or failure injection to stress different c
 - **Failures injected:** none.
 - **Expected result:** linearizability should hold with no errors or lost writes.
 
+### Range autosplit
+
+- **Operations:** mixed GET/SET as usual.
+- **Read mode:** uses the server’s configured read mode (default `accord`).
+- **Failures injected:** none, but the node's background range manager will split the keyspace
+  and migrate keys between shards during the run.
+- **Expected result:** linearizability should hold across splits (no lost or duplicated committed writes).
+
 ### Slow replica
 
 - **Operations:** mixed GET/SET against the cluster.

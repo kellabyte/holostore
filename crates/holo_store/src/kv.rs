@@ -36,6 +36,11 @@ pub trait KvEngine: Send + Sync + 'static {
     fn mark_visible(&self, key: &[u8], version: Version);
 }
 
+/// Routing policy for selecting a shard given a key.
+pub trait ShardRouter: Send + Sync + 'static {
+    fn shard_for_key(&self, key: &[u8]) -> usize;
+}
+
 #[allow(dead_code)]
 /// Simple in-memory key/value store with per-version visibility.
 pub struct KvStore {
@@ -303,6 +308,96 @@ impl KvEngine for FjallEngine {
 }
 
 /// Sharded wrapper that routes keys to per-shard `KvEngine` instances.
+pub struct RoutedKvEngine {
+    shards: Vec<Arc<dyn KvEngine>>,
+    router: Arc<dyn ShardRouter>,
+}
+
+impl RoutedKvEngine {
+    /// Create a routed engine from pre-built shard engines and a router.
+    pub fn new(
+        shards: Vec<Arc<dyn KvEngine>>,
+        router: Arc<dyn ShardRouter>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(!shards.is_empty(), "routed kv engine requires at least one shard");
+        Ok(Self { shards, router })
+    }
+
+    fn shard_for_key(&self, key: &[u8]) -> usize {
+        let idx = self.router.shard_for_key(key);
+        idx.min(self.shards.len().saturating_sub(1))
+    }
+}
+
+impl KvEngine for RoutedKvEngine {
+    fn get(&self, key: &[u8], version: Version) -> Option<Vec<u8>> {
+        let shard = self.shard_for_key(key);
+        self.shards[shard].get(key, version)
+    }
+
+    fn get_latest(&self, key: &[u8]) -> Option<(Vec<u8>, Version)> {
+        let shard = self.shard_for_key(key);
+        self.shards[shard].get_latest(key)
+    }
+
+    fn get_latest_batch(&self, keys: &[Vec<u8>]) -> Vec<Option<(Vec<u8>, Version)>> {
+        if keys.is_empty() {
+            return Vec::new();
+        }
+        let mut results = vec![None; keys.len()];
+        let mut by_shard: Vec<Vec<(usize, Vec<u8>)>> = vec![Vec::new(); self.shards.len()];
+        for (idx, key) in keys.iter().enumerate() {
+            let shard = self.shard_for_key(key);
+            by_shard[shard].push((idx, key.clone()));
+        }
+        for (shard, items) in by_shard.into_iter().enumerate() {
+            if items.is_empty() {
+                continue;
+            }
+            let mut shard_keys = Vec::with_capacity(items.len());
+            let mut indices = Vec::with_capacity(items.len());
+            for (idx, key) in items {
+                indices.push(idx);
+                shard_keys.push(key);
+            }
+            let shard_values = self.shards[shard].get_latest_batch(&shard_keys);
+            for (idx, value) in indices.into_iter().zip(shard_values.into_iter()) {
+                results[idx] = value;
+            }
+        }
+        results
+    }
+
+    fn set(&self, key: Vec<u8>, value: Vec<u8>, version: Version) {
+        let shard = self.shard_for_key(&key);
+        self.shards[shard].set(key, value, version);
+    }
+
+    fn set_batch(&self, items: &[(Vec<u8>, Vec<u8>, Version)]) {
+        if items.is_empty() {
+            return;
+        }
+        let mut by_shard: Vec<Vec<(Vec<u8>, Vec<u8>, Version)>> =
+            vec![Vec::new(); self.shards.len()];
+        for (key, value, version) in items {
+            let shard = self.shard_for_key(key);
+            by_shard[shard].push((key.clone(), value.clone(), *version));
+        }
+        for (shard, batch) in by_shard.into_iter().enumerate() {
+            if batch.is_empty() {
+                continue;
+            }
+            self.shards[shard].set_batch(&batch);
+        }
+    }
+
+    fn mark_visible(&self, key: &[u8], version: Version) {
+        let shard = self.shard_for_key(key);
+        self.shards[shard].mark_visible(key, version);
+    }
+}
+
+/// Sharded wrapper that routes keys to per-shard `KvEngine` instances.
 pub struct ShardedKvEngine {
     shards: Vec<Arc<dyn KvEngine>>,
 }
@@ -512,7 +607,7 @@ fn decode_versions(data: &[u8]) -> anyhow::Result<Vec<VersionedValue>> {
 }
 
 /// Encode the key prefix used for range scans in the versions partition.
-fn encode_key_prefix(key: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_key_prefix(key: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + key.len());
     out.extend_from_slice(&(key.len() as u32).to_be_bytes());
     out.extend_from_slice(key);
@@ -618,12 +713,13 @@ impl StateMachine for NoopStateMachine {
 /// State machine that applies KV commands to a `KvEngine`.
 pub struct KvStateMachine {
     kv: Arc<dyn KvEngine>,
+    split_lock: Option<Arc<std::sync::RwLock<()>>>,
 }
 
 impl KvStateMachine {
     /// Create a new state machine wrapper around a KV engine.
-    pub fn new(kv: Arc<dyn KvEngine>) -> Self {
-        Self { kv }
+    pub fn new(kv: Arc<dyn KvEngine>, split_lock: Option<Arc<std::sync::RwLock<()>>>) -> Self {
+        Self { kv, split_lock }
     }
 }
 
@@ -635,6 +731,7 @@ impl StateMachine for KvStateMachine {
 
     /// Apply a single command to the KV engine, logging on failure.
     fn apply(&self, data: &[u8], meta: ExecMeta) {
+        let _guard = self.split_lock.as_ref().map(|l| l.read().unwrap());
         if let Err(err) = apply_kv_command(self.kv.as_ref(), data, meta.into()) {
             tracing::warn!(error = ?err, "failed to apply kv command");
         }
@@ -642,6 +739,7 @@ impl StateMachine for KvStateMachine {
 
     /// Apply a batch of commands, coalescing SETs for efficiency.
     fn apply_batch(&self, items: &[(Vec<u8>, ExecMeta)]) {
+        let _guard = self.split_lock.as_ref().map(|l| l.read().unwrap());
         let mut sets: Vec<(Vec<u8>, Vec<u8>, Version)> = Vec::new();
         for (data, meta) in items {
             if data.is_empty() {
@@ -716,6 +814,7 @@ impl StateMachine for KvStateMachine {
 
     /// Execute a read command without mutating state.
     fn read(&self, data: &[u8], meta: ExecMeta) -> anyhow::Result<Option<Vec<u8>>> {
+        let _guard = self.split_lock.as_ref().map(|l| l.read().unwrap());
         anyhow::ensure!(!data.is_empty(), "empty command");
         let version = Version::from(meta);
         match data[0] {

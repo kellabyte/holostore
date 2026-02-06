@@ -1069,6 +1069,8 @@ dependencies = [
  "prost",
  "raft-engine",
  "redis-protocol",
+ "serde",
+ "serde_json",
  "sysinfo",
  "tokio",
  "tokio-util",

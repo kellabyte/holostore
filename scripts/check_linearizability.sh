@@ -26,6 +26,19 @@ echo "Linearizability suite started at ${TS}" >"$SUMMARY"
 # Baseline: standard workload, no injected failures.
 # Verifies: basic linearizability under steady-state conditions.
 run_case "baseline" \
+  HOLO_INITIAL_RANGES=4 \
+  HOLO_RANGE_SPLIT_MIN_KEYS=1000000 \
+  HOLO_RANGE_SPLIT_MIN_QPS=0 \
+  FAIL_INJECT=0 \
+  FAULT_DISCONNECT_PCT=0
+
+# Range autosplit:
+# Verifies: linearizability while ranges split and keys migrate between shards.
+run_case "range_autosplit" \
+  HOLO_INITIAL_RANGES=1 \
+  HOLO_RANGE_SPLIT_MIN_KEYS=2 \
+  HOLO_RANGE_SPLIT_MIN_QPS=0 \
+  DURATION=20s \
   FAIL_INJECT=0 \
   FAULT_DISCONNECT_PCT=0
 
@@ -33,6 +46,7 @@ run_case "baseline" \
 # Verifies: linearizability under an artificially delayed replica.
 run_case "slow_replica" \
   HOLO_NODE3_RPC_DELAY_MS=200 \
+  HOLO_RANGE_SPLIT_MIN_QPS=0 \
   DURATION=20s \
   FAIL_INJECT=0 \
   FAULT_DISCONNECT_PCT=0 \
@@ -43,6 +57,7 @@ run_case "slow_replica" \
 run_case "hot_key_contention" \
   KEYS=1 \
   SET_PCT=90 \
+  HOLO_RANGE_SPLIT_MIN_QPS=0 \
   DURATION=20s \
   FAIL_INJECT=0 \
   FAULT_DISCONNECT_PCT=0
@@ -52,6 +67,7 @@ run_case "hot_key_contention" \
 run_case "mixed_read_write_nodes" \
   READ_NODES="127.0.0.1:16379" \
   WRITE_NODES="127.0.0.1:16379,127.0.0.1:16380,127.0.0.1:16381" \
+  HOLO_RANGE_SPLIT_MIN_QPS=0 \
   FAIL_INJECT=0 \
   FAULT_DISCONNECT_PCT=0
 
@@ -59,6 +75,7 @@ run_case "mixed_read_write_nodes" \
 # Verifies: protocol/driver resilience to connection churn without server failures.
 run_case "client_disconnects" \
   DURATION=20s \
+  HOLO_RANGE_SPLIT_MIN_QPS=0 \
   FAULT_DISCONNECT_PCT=5 \
   FAIL_INJECT=0
 
@@ -67,6 +84,7 @@ run_case "client_disconnects" \
 run_case "crash_during_write" \
   DURATION=25s \
   SET_PCT=100 \
+  HOLO_RANGE_SPLIT_MIN_QPS=0 \
   FAIL_FAST=false \
   ALLOW_ERRORS=1 \
   FAIL_INJECT=1 \
@@ -79,6 +97,7 @@ run_case "crash_during_write" \
 # Verifies: linearizability and recovery under node crashes/restarts.
 run_case "server_kill_restart" \
   DURATION=30s \
+  HOLO_RANGE_SPLIT_MIN_QPS=0 \
   FAIL_FAST=false \
   ALLOW_ERRORS=1 \
   FAIL_INJECT=1 \

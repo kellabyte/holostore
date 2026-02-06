@@ -20,6 +20,13 @@ service HoloRpc {
   rpc KvGet(KvGetRequest) returns (KvGetResponse);
   rpc KvBatchGet(KvBatchGetRequest) returns (KvBatchGetResponse);
   rpc Join(JoinRequest) returns (JoinResponse);
+  rpc ClusterState(ClusterStateRequest) returns (ClusterStateResponse);
+  rpc ClusterAddNode(ClusterAddNodeRequest) returns (ClusterAddNodeResponse);
+  rpc ClusterRemoveNode(ClusterRemoveNodeRequest) returns (ClusterRemoveNodeResponse);
+  rpc RangeSplit(RangeSplitRequest) returns (RangeSplitResponse);
+  rpc RangeMerge(RangeMergeRequest) returns (RangeMergeResponse);
+  rpc RangeRebalance(RangeRebalanceRequest) returns (RangeRebalanceResponse);
+  rpc ClusterFreeze(ClusterFreezeRequest) returns (ClusterFreezeResponse);
 }
 
 message TxnId {
@@ -227,8 +234,71 @@ message MarkVisibleResponse {
 
 message JoinRequest {
   uint64 node_id = 1;
+  string grpc_addr = 2;
+  string redis_addr = 3;
 }
 
 message JoinResponse {
   string initial_members = 1;
+}
+
+message ClusterStateRequest {}
+
+message ClusterStateResponse {
+  string json = 1;
+}
+
+message ClusterAddNodeRequest {
+  uint64 node_id = 1;
+  string grpc_addr = 2;
+  string redis_addr = 3;
+}
+
+message ClusterAddNodeResponse {
+  bool ok = 1;
+}
+
+message ClusterRemoveNodeRequest {
+  uint64 node_id = 1;
+}
+
+message ClusterRemoveNodeResponse {
+  bool ok = 1;
+}
+
+message RangeSplitRequest {
+  bytes split_key = 1;
+}
+
+message RangeSplitResponse {
+  bool ok = 1;
+  uint64 left_shard_id = 2;
+  uint64 right_shard_id = 3;
+}
+
+message RangeMergeRequest {
+  uint64 left_shard_id = 1;
+}
+
+message RangeMergeResponse {
+  bool ok = 1;
+  uint64 merged_shard_id = 2;
+}
+
+message RangeRebalanceRequest {
+  uint64 shard_id = 1;
+  repeated uint64 replicas = 2;
+  uint64 leaseholder = 3;
+}
+
+message RangeRebalanceResponse {
+  bool ok = 1;
+}
+
+message ClusterFreezeRequest {
+  bool frozen = 1;
+}
+
+message ClusterFreezeResponse {
+  bool ok = 1;
 }

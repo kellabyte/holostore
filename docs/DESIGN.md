@@ -106,19 +106,15 @@ Porcupine tests live under `scripts/porcupine.sh`; the suite is `scripts/check_l
 
 HoloStore partitions data by **Accord group**. Each partition is a separate consensus group with its
 own log, execution queue, and state-machine application. At startup the node creates
-`HOLO_DATA_SHARDS` data groups (IDs starting at a fixed base), and the Redis front-end
+`HOLO_MAX_SHARDS` data group slots (IDs starting at a fixed base), and the Redis front-end
 routes each key to a shard.
 
 Current characteristics:
-- Shard count is static per node at startup (`HOLO_DATA_SHARDS`).
+- Range splitting is dynamic and can activate additional shard slots up to `HOLO_MAX_SHARDS`.
 - Each shard has its own commit log and executor.
 - Sharding reduces contention per group and improves parallelism.
 
-**Future direction:**
-The long-term goal is **dynamic sharding**, similar to CockroachDB’s range model. That means:
-- Smaller logical ranges that can split/merge based on load.
-- Rebalancing ranges across nodes without downtime.
-- Independent consensus groups per range with automated movement.
-
-This will allow the system to scale with workload hotspots and keep per-group queues small,
-while retaining Accord’s correctness and concurrency benefits.
+Remaining roadmap:
+- Rebalancing ranges and leaseholders across nodes automatically.
+- Range merge policy for shrinking/cold ranges.
+- Smoother live movement of data during reconfiguration.

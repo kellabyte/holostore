@@ -111,20 +111,28 @@ EOF
 fi
 
 # Default RPC inflight tuning (override via env).
-export HOLO_RPC_INFLIGHT_LIMIT="${HOLO_RPC_INFLIGHT_LIMIT:-32}"
-export HOLO_RPC_INFLIGHT_MIN="${HOLO_RPC_INFLIGHT_MIN:-16}"
-export HOLO_RPC_INFLIGHT_MAX="${HOLO_RPC_INFLIGHT_MAX:-32}"
-export HOLO_RPC_INFLIGHT_HIGH_WAIT_MS="${HOLO_RPC_INFLIGHT_HIGH_WAIT_MS:-20}"
+export HOLO_RPC_INFLIGHT_LIMIT="${HOLO_RPC_INFLIGHT_LIMIT:-128}"
+export HOLO_RPC_INFLIGHT_MIN="${HOLO_RPC_INFLIGHT_MIN:-32}"
+export HOLO_RPC_INFLIGHT_MAX="${HOLO_RPC_INFLIGHT_MAX:-128}"
+export HOLO_RPC_INFLIGHT_HIGH_WAIT_MS="${HOLO_RPC_INFLIGHT_HIGH_WAIT_MS:-50}"
 export HOLO_RPC_INFLIGHT_LOW_WAIT_MS="${HOLO_RPC_INFLIGHT_LOW_WAIT_MS:-5}"
-export HOLO_RPC_INFLIGHT_HIGH_QUEUE="${HOLO_RPC_INFLIGHT_HIGH_QUEUE:-256}"
-export HOLO_RPC_INFLIGHT_LOW_QUEUE="${HOLO_RPC_INFLIGHT_LOW_QUEUE:-32}"
+export HOLO_RPC_INFLIGHT_HIGH_QUEUE="${HOLO_RPC_INFLIGHT_HIGH_QUEUE:-2048}"
+export HOLO_RPC_INFLIGHT_LOW_QUEUE="${HOLO_RPC_INFLIGHT_LOW_QUEUE:-128}"
 
 # Default RPC batching (override via env).
 export HOLO_RPC_BATCH_MAX="${HOLO_RPC_BATCH_MAX:-128}"
 export HOLO_RPC_BATCH_WAIT_US="${HOLO_RPC_BATCH_WAIT_US:-200}"
 
-# Default shard count (override via env).
-export HOLO_DATA_SHARDS="${HOLO_DATA_SHARDS:-4}"
+# Default RPC handler delay injection (override via env).
+# Keep this explicit so stale shell exports are visible and easy to diagnose.
+export HOLO_RPC_HANDLER_DELAY_MS="${HOLO_RPC_HANDLER_DELAY_MS:-0}"
+NODE1_RPC_DELAY_MS="${HOLO_NODE1_RPC_DELAY_MS:-$HOLO_RPC_HANDLER_DELAY_MS}"
+NODE2_RPC_DELAY_MS="${HOLO_NODE2_RPC_DELAY_MS:-$HOLO_RPC_HANDLER_DELAY_MS}"
+NODE3_RPC_DELAY_MS="${HOLO_NODE3_RPC_DELAY_MS:-$HOLO_RPC_HANDLER_DELAY_MS}"
+
+# Default max shard slots (override via env).
+# `HOLO_DATA_SHARDS` is still accepted as a legacy alias for compatibility.
+export HOLO_MAX_SHARDS="${HOLO_MAX_SHARDS:-${HOLO_DATA_SHARDS:-4}}"
 
 # Default client batching (override via env).
 export HOLO_CLIENT_SET_BATCH_MAX="${HOLO_CLIENT_SET_BATCH_MAX:-128}"
@@ -180,15 +188,14 @@ start_node() {
   local mode="$4"
   local arg="$5"
   local delay_ms=""
-
   local log_file="$CLUSTER_DIR/logs/node${node_id}.log"
   local data_dir="$CLUSTER_DIR/data/node${node_id}"
   mkdir -p "$data_dir"
 
   case "$node_id" in
-    "$NODE1_ID") delay_ms="${HOLO_NODE1_RPC_DELAY_MS:-}" ;;
-    "$NODE2_ID") delay_ms="${HOLO_NODE2_RPC_DELAY_MS:-}" ;;
-    "$NODE3_ID") delay_ms="${HOLO_NODE3_RPC_DELAY_MS:-}" ;;
+    "$NODE1_ID") delay_ms="$NODE1_RPC_DELAY_MS" ;;
+    "$NODE2_ID") delay_ms="$NODE2_RPC_DELAY_MS" ;;
+    "$NODE3_ID") delay_ms="$NODE3_RPC_DELAY_MS" ;;
   esac
 
   local -a cmd=(
@@ -198,6 +205,7 @@ start_node() {
     --listen-grpc "$grpc_addr"
     --initial-members "$members"
     --data-dir "$data_dir"
+    --max-shards "$HOLO_MAX_SHARDS"
   )
 
   if [[ -n "${HOLO_READ_MODE:-}" ]]; then
@@ -210,7 +218,7 @@ start_node() {
     cmd+=(--join "$arg")
   fi
 
-  if [[ -n "$delay_ms" ]]; then
+  if [[ -n "$delay_ms" && "$delay_ms" != "0" ]]; then
     HOLO_RPC_HANDLER_DELAY_MS="$delay_ms" "${cmd[@]}" >"$log_file" 2>&1 &
   else
     "${cmd[@]}" >"$log_file" 2>&1 &
@@ -225,6 +233,18 @@ start_node "$NODE3_ID" "${REDIS_HOST}:${NODE3_REDIS_PORT}" "${GRPC_HOST}:${NODE3
 
 cat <<EOF
 cluster started (pids in $PIDS_FILE)
+
+rpc handler delay injection (ms):
+  node1: ${NODE1_RPC_DELAY_MS}
+  node2: ${NODE2_RPC_DELAY_MS}
+  node3: ${NODE3_RPC_DELAY_MS}
+
+runtime tuning:
+  HOLO_MAX_SHARDS=${HOLO_MAX_SHARDS}
+  HOLO_CLIENT_SET_BATCH_TARGET=${HOLO_CLIENT_SET_BATCH_TARGET}
+  HOLO_RPC_INFLIGHT_LIMIT=${HOLO_RPC_INFLIGHT_LIMIT}
+  HOLO_RPC_INFLIGHT_MIN=${HOLO_RPC_INFLIGHT_MIN}
+  HOLO_RPC_INFLIGHT_MAX=${HOLO_RPC_INFLIGHT_MAX}
 
 redis endpoints:
   node1: ${REDIS_HOST}:${NODE1_REDIS_PORT}
