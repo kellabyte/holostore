@@ -10,7 +10,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, RwLock};
 
 use fjall::{Keyspace, PartitionCreateOptions};
-use holo_accord::accord::{CommandKeys, ExecMeta, StateMachine, TxnId};
+use holo_accord::accord::{txn_group_id, CommandKeys, ExecMeta, StateMachine, TxnId};
 use tracing::warn;
 
 /// Storage engine API used by the Accord state machine.
@@ -296,8 +296,24 @@ impl KvEngine for FjallEngine {
             Ok(Some(bytes)) => decode_latest_value(&bytes).ok().map(|(cur, _)| cur),
             _ => None,
         };
-        // Only update the latest index if this version is newer or no latest exists.
-        if latest_update.map_or(true, |cur| version >= cur) {
+        // Only update the latest index if this version should supersede the
+        // current latest entry.
+        //
+        // `seq` is only ordered *within* an Accord group. During range splits a
+        // key can move to a different group, so comparing versions across
+        // groups using `(seq, txn_id)` is not meaningful and can pin stale
+        // entries in `kv_latest`.
+        //
+        // If group ids differ, treat the newly visible value as newer for the
+        // purpose of the latest index.
+        let should_update_latest = latest_update.map_or(true, |cur| {
+            if txn_group_id(cur.txn_id) != txn_group_id(version.txn_id) {
+                true
+            } else {
+                version >= cur
+            }
+        });
+        if should_update_latest {
             batch.insert(&self.latest, key.to_vec(), encode_latest_value(version, &value));
         }
 
@@ -816,23 +832,26 @@ impl StateMachine for KvStateMachine {
     fn read(&self, data: &[u8], meta: ExecMeta) -> anyhow::Result<Option<Vec<u8>>> {
         let _guard = self.split_lock.as_ref().map(|l| l.read().unwrap());
         anyhow::ensure!(!data.is_empty(), "empty command");
-        let version = Version::from(meta);
+        let _version = Version::from(meta);
         match data[0] {
             CMD_BATCH_GET => {
                 let mut offset = 1;
                 let count = read_u32(data, &mut offset)? as usize;
-                let mut out = Vec::with_capacity(4 + (count * 4));
-                out.extend_from_slice(&(count as u32).to_be_bytes());
+                let mut keys = Vec::with_capacity(count);
                 for _ in 0..count {
                     let key_len = read_u32(data, &mut offset)? as usize;
                     anyhow::ensure!(offset + key_len <= data.len(), "short key");
-                    let key = &data[offset..offset + key_len];
+                    keys.push(data[offset..offset + key_len].to_vec());
                     offset += key_len;
-
-                    match self.kv.get(key, version) {
+                }
+                let latest = self.kv.get_latest_batch(&keys);
+                let mut out = Vec::with_capacity(4 + (count * 4));
+                out.extend_from_slice(&(count as u32).to_be_bytes());
+                for item in latest {
+                    match item {
                         // Encode missing keys as sentinel lengths.
                         None => out.extend_from_slice(&u32::MAX.to_be_bytes()),
-                        Some(v) => {
+                        Some((v, _)) => {
                             out.extend_from_slice(&(v.len() as u32).to_be_bytes());
                             out.extend_from_slice(&v);
                         }
@@ -845,7 +864,15 @@ impl StateMachine for KvStateMachine {
                 let key_len = read_u32(data, &mut offset)? as usize;
                 anyhow::ensure!(offset + key_len <= data.len(), "short key");
                 let key = &data[offset..offset + key_len];
-                Ok(self.kv.get(key, version))
+                // Reads return the latest visible value.
+                //
+                // In range mode, keys can migrate between Accord groups during
+                // splits. Group-local seq values are not globally comparable
+                // across groups, so filtering by `<= read_seq` can hide newer
+                // migrated versions and surface stale values. The read barrier
+                // in the coordinator guarantees required writes are executed
+                // before this read runs, so reading latest-visible here is safe.
+                Ok(self.kv.get_latest(key).map(|(v, _)| v))
             }
             // Non-read commands are ignored by the read path.
             _ => Ok(None),
@@ -854,6 +881,7 @@ impl StateMachine for KvStateMachine {
 
     /// Mark all written keys in a command as visible.
     fn mark_visible(&self, data: &[u8], meta: ExecMeta) {
+        let _guard = self.split_lock.as_ref().map(|l| l.read().unwrap());
         if data.is_empty() {
             // Ignore empty commands to avoid parsing errors.
             return;

@@ -757,9 +757,7 @@ impl rpc::HoloRpc for RpcService {
                 counter: txn_id.counter,
             })
             .await;
-        Ok(volo_grpc::Response::new(rpc::ExecutedResponse {
-            executed,
-        }))
+        Ok(volo_grpc::Response::new(rpc::ExecutedResponse { executed }))
     }
 
     /// Handle a mark_visible RPC request.
@@ -832,7 +830,9 @@ impl rpc::HoloRpc for RpcService {
                 }),
             }
         }
-        Ok(volo_grpc::Response::new(rpc::KvBatchGetResponse { responses }))
+        Ok(volo_grpc::Response::new(rpc::KvBatchGetResponse {
+            responses,
+        }))
     }
 
     /// Handle a join RPC, returning the initial membership string.
@@ -888,7 +888,9 @@ impl rpc::HoloRpc for RpcService {
             .propose(payload)
             .await
             .map_err(|e| volo_grpc::Status::internal(format!("meta propose failed: {e}")))?;
-        Ok(volo_grpc::Response::new(rpc::ClusterAddNodeResponse { ok: true }))
+        Ok(volo_grpc::Response::new(rpc::ClusterAddNodeResponse {
+            ok: true,
+        }))
     }
 
     async fn cluster_remove_node(
@@ -896,7 +898,11 @@ impl rpc::HoloRpc for RpcService {
         req: volo_grpc::Request<rpc::ClusterRemoveNodeRequest>,
     ) -> Result<volo_grpc::Response<rpc::ClusterRemoveNodeResponse>, volo_grpc::Status> {
         let req = req.into_inner();
-        let cmd = crate::cluster::ClusterCommand::RemoveNode { node_id: req.node_id };
+        // This begins staged decommissioning; a background rebalancer drains
+        // replicas and later finalizes the member as Removed.
+        let cmd = crate::cluster::ClusterCommand::RemoveNode {
+            node_id: req.node_id,
+        };
         let payload = crate::cluster::ClusterStateMachine::encode_command(&cmd)
             .map_err(|e| volo_grpc::Status::internal(format!("encode command failed: {e}")))?;
         self.state
@@ -904,7 +910,9 @@ impl rpc::HoloRpc for RpcService {
             .propose(payload)
             .await
             .map_err(|e| volo_grpc::Status::internal(format!("meta propose failed: {e}")))?;
-        Ok(volo_grpc::Response::new(rpc::ClusterRemoveNodeResponse { ok: true }))
+        Ok(volo_grpc::Response::new(rpc::ClusterRemoveNodeResponse {
+            ok: true,
+        }))
     }
 
     async fn range_split(
@@ -973,10 +981,16 @@ impl rpc::HoloRpc for RpcService {
         req: volo_grpc::Request<rpc::RangeRebalanceRequest>,
     ) -> Result<volo_grpc::Response<rpc::RangeRebalanceResponse>, volo_grpc::Status> {
         let req = req.into_inner();
-        let cmd = crate::cluster::ClusterCommand::SetReplicas {
-            shard_id: req.shard_id,
-            replicas: req.replicas,
-            leaseholder: req.leaseholder,
+        let desired_leaseholder = (req.leaseholder != 0).then_some(req.leaseholder);
+        let planned = self
+            .state
+            .cluster_store
+            .plan_rebalance_command(req.shard_id, req.replicas, desired_leaseholder)
+            .map_err(|e| volo_grpc::Status::failed_precondition(e.to_string()))?;
+        let Some(cmd) = planned else {
+            return Ok(volo_grpc::Response::new(rpc::RangeRebalanceResponse {
+                ok: true,
+            }));
         };
         let payload = crate::cluster::ClusterStateMachine::encode_command(&cmd)
             .map_err(|e| volo_grpc::Status::internal(format!("encode command failed: {e}")))?;
@@ -985,7 +999,32 @@ impl rpc::HoloRpc for RpcService {
             .propose(payload)
             .await
             .map_err(|e| volo_grpc::Status::internal(format!("meta propose failed: {e}")))?;
-        Ok(volo_grpc::Response::new(rpc::RangeRebalanceResponse { ok: true }))
+        Ok(volo_grpc::Response::new(rpc::RangeRebalanceResponse {
+            ok: true,
+        }))
+    }
+
+    async fn range_stats(
+        &self,
+        _req: volo_grpc::Request<rpc::RangeStatsRequest>,
+    ) -> Result<volo_grpc::Response<rpc::RangeStatsResponse>, volo_grpc::Status> {
+        let local = self
+            .state
+            .local_range_stats()
+            .map_err(|e| volo_grpc::Status::internal(format!("range stats failed: {e}")))?;
+        let ranges = local
+            .into_iter()
+            .map(|item| rpc::RangeStat {
+                shard_id: item.shard_id,
+                shard_index: item.shard_index as u64,
+                record_count: item.record_count,
+                is_leaseholder: item.is_leaseholder,
+            })
+            .collect();
+        Ok(volo_grpc::Response::new(rpc::RangeStatsResponse {
+            node_id: self.state.node_id,
+            ranges,
+        }))
     }
 
     async fn cluster_freeze(
@@ -1001,7 +1040,9 @@ impl rpc::HoloRpc for RpcService {
             .propose(payload)
             .await
             .map_err(|e| volo_grpc::Status::internal(format!("meta propose failed: {e}")))?;
-        Ok(volo_grpc::Response::new(rpc::ClusterFreezeResponse { ok: true }))
+        Ok(volo_grpc::Response::new(rpc::ClusterFreezeResponse {
+            ok: true,
+        }))
     }
 }
 

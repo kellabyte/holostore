@@ -10,12 +10,15 @@
 //! in-flight writes during migration + descriptor updates.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fjall::{Keyspace, PartitionCreateOptions};
+use serde::Deserialize;
+use volo::net::Address;
 
-use crate::cluster::{ClusterCommand, ShardDesc};
+use crate::cluster::{ClusterCommand, MemberState, ShardDesc};
 use crate::load::ShardLoadSnapshot;
+use crate::volo_gen::holo_store::rpc;
 use crate::NodeState;
 
 /// Configuration for the range manager.
@@ -140,19 +143,73 @@ async fn maybe_split_once(
     );
 
     // Freeze traffic to avoid in-flight proposals during key migration + reroute.
+    let freeze_before_epoch = state.cluster_store.epoch();
     propose_meta(state.clone(), ClusterCommand::SetFrozen { frozen: true }).await?;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    propose_meta(
+    let freeze_epoch = wait_for_local_state(state.clone(), freeze_before_epoch, true, Duration::from_secs(5)).await?;
+    wait_for_cluster_converged(
         state.clone(),
-        ClusterCommand::SplitRange {
-            split_key,
-            target_shard_index: target_idx,
-        },
+        freeze_epoch,
+        true,
+        None,
+        Duration::from_secs(5),
     )
     .await?;
 
-    propose_meta(state, ClusterCommand::SetFrozen { frozen: false }).await?;
+    // While frozen, wait until the source group has drained all in-flight
+    // consensus work. This avoids migrating from a state that is still catching
+    // up committed writes.
+    let split_res = async {
+        // Drain any client operations that already passed the freeze check.
+        state
+            .wait_for_client_ops_drained(Duration::from_secs(5))
+            .await?;
+        wait_for_shard_quiesced(state.clone(), shard.shard_index, Duration::from_secs(5)).await?;
+        let split_before_epoch = state.cluster_store.epoch();
+        propose_meta(
+            state.clone(),
+            ClusterCommand::SplitRange {
+                split_key,
+                target_shard_index: target_idx,
+            },
+        )
+        .await?;
+        let split_epoch =
+            wait_for_local_epoch(state.clone(), split_before_epoch, Duration::from_secs(5)).await?;
+        let shard_count = state.cluster_store.state().shards.len();
+        wait_for_cluster_converged(
+            state.clone(),
+            split_epoch,
+            true,
+            Some(shard_count),
+            Duration::from_secs(8),
+        )
+        .await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    // Always unfreeze, even if split failed.
+    let unfreeze_before_epoch = state.cluster_store.epoch();
+    let unfreeze_res = propose_meta(state.clone(), ClusterCommand::SetFrozen { frozen: false }).await;
+    if let Err(err) = split_res {
+        if let Err(unfreeze_err) = unfreeze_res {
+            tracing::warn!(error = ?unfreeze_err, "failed to unfreeze after split failure");
+        }
+        return Err(err);
+    }
+    unfreeze_res?;
+    let unfreeze_epoch =
+        wait_for_local_state(state.clone(), unfreeze_before_epoch, false, Duration::from_secs(5))
+            .await?;
+    let shard_count = state.cluster_store.state().shards.len();
+    wait_for_cluster_converged(
+        state.clone(),
+        unfreeze_epoch,
+        false,
+        Some(shard_count),
+        Duration::from_secs(5),
+    )
+    .await?;
 
     // Apply cooldown to the *source* shard index to avoid rapid re-splitting.
     if let Some(slot) = cooldown_until.get_mut(shard.shard_index) {
@@ -173,6 +230,187 @@ async fn maybe_split_once(
         sustained[shard.shard_index] = 0;
     }
     Ok(())
+}
+
+async fn wait_for_shard_quiesced(
+    state: Arc<NodeState>,
+    shard_index: usize,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let group_id = crate::GROUP_DATA_BASE + shard_index as u64;
+    let group = state
+        .group(group_id)
+        .ok_or_else(|| anyhow::anyhow!("missing group for shard index {}", shard_index))?;
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        let stats = group.debug_stats().await;
+        let pending = stats.records_status_preaccepted_len
+            + stats.records_status_accepted_len
+            + stats.records_status_committed_len
+            + stats.records_status_executing_len
+            + stats.committed_queue_len
+            + stats.read_waiters_len;
+        if pending == 0 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for shard {} to quiesce (preaccepted={}, accepted={}, committed={}, executing={}, committed_queue={}, read_waiters={})",
+                shard_index,
+                stats.records_status_preaccepted_len,
+                stats.records_status_accepted_len,
+                stats.records_status_committed_len,
+                stats.records_status_executing_len,
+                stats.committed_queue_len,
+                stats.read_waiters_len
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ClusterProbe {
+    epoch: u64,
+    frozen: bool,
+    shards: Vec<serde_json::Value>,
+}
+
+async fn wait_for_local_epoch(
+    state: Arc<NodeState>,
+    min_epoch: u64,
+    timeout: Duration,
+) -> anyhow::Result<u64> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let local_epoch = state.cluster_store.epoch();
+        if local_epoch > min_epoch {
+            return Ok(local_epoch);
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for local cluster epoch to advance beyond {min_epoch} (now={local_epoch})"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_local_state(
+    state: Arc<NodeState>,
+    min_epoch: u64,
+    frozen: bool,
+    timeout: Duration,
+) -> anyhow::Result<u64> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let snapshot = state.cluster_store.state();
+        if snapshot.epoch > min_epoch && snapshot.frozen == frozen {
+            return Ok(snapshot.epoch);
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for local state (epoch>{min_epoch}, frozen={frozen}) (now_epoch={}, now_frozen={})",
+                snapshot.epoch,
+                snapshot.frozen
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_cluster_converged(
+    state: Arc<NodeState>,
+    min_epoch: u64,
+    frozen: bool,
+    min_shards: Option<usize>,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let members = state
+            .cluster_store
+            .state()
+            .members
+            .values()
+            .filter(|m| m.state != MemberState::Removed)
+            .map(|m| (m.node_id, m.grpc_addr.clone()))
+            .collect::<Vec<_>>();
+
+        let local = state.cluster_store.state();
+        let mut all_ok = true;
+        let mut last_err = String::new();
+        for (node_id, grpc_addr) in members {
+            if node_id == state.node_id {
+                let shard_ok = min_shards
+                    .map(|n| local.shards.len() >= n)
+                    .unwrap_or(true);
+                if !(local.epoch >= min_epoch && local.frozen == frozen && shard_ok) {
+                    all_ok = false;
+                    last_err = format!(
+                        "local node {} not converged (epoch={}, frozen={}, shards={})",
+                        node_id,
+                        local.epoch,
+                        local.frozen,
+                        local.shards.len()
+                    );
+                    break;
+                }
+                continue;
+            }
+
+            match fetch_remote_probe(&grpc_addr, Duration::from_secs(1)).await {
+                Ok(remote) => {
+                    let shard_ok = min_shards
+                        .map(|n| remote.shards.len() >= n)
+                        .unwrap_or(true);
+                    if !(remote.epoch >= min_epoch && remote.frozen == frozen && shard_ok) {
+                        all_ok = false;
+                        last_err = format!(
+                            "node {} not converged (epoch={}, frozen={}, shards={})",
+                            node_id,
+                            remote.epoch,
+                            remote.frozen,
+                            remote.shards.len()
+                        );
+                        break;
+                    }
+                }
+                Err(err) => {
+                    all_ok = false;
+                    last_err = format!("node {} probe failed: {err}", node_id);
+                    break;
+                }
+            }
+        }
+
+        if all_ok {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for cluster convergence (min_epoch={}, frozen={}, min_shards={:?}): {}",
+                min_epoch,
+                frozen,
+                min_shards,
+                last_err
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn fetch_remote_probe(addr: &str, timeout: Duration) -> anyhow::Result<ClusterProbe> {
+    let socket_addr: std::net::SocketAddr = addr.parse()?;
+    let client = rpc::HoloRpcClientBuilder::new("holo_store.rpc.HoloRpc")
+        .address(Address::from(socket_addr))
+        .build();
+    let resp = tokio::time::timeout(timeout, client.cluster_state(rpc::ClusterStateRequest {}))
+        .await
+        .map_err(|_| anyhow::anyhow!("timeout calling cluster_state"))??;
+    let json = resp.into_inner().json.to_string();
+    Ok(serde_json::from_str::<ClusterProbe>(&json)?)
 }
 
 async fn propose_meta(state: Arc<NodeState>, cmd: ClusterCommand) -> anyhow::Result<()> {

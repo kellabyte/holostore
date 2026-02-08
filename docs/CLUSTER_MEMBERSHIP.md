@@ -59,10 +59,18 @@ membership and Cockroach-style control-plane metadata.
 
 ### Phase 3: Rebalancing
 
-- [x] Replica add/remove workflow (metadata-only).
+- [x] Replica add/remove workflow with validation against active membership.
 - [x] Lease transfer metadata updates.
-- [ ] Rebalancer loop (simple even-distribution heuristic).
-- [ ] Lease transfer and decommissioning workflow.
+- [x] Rebalancer loop (simple even-distribution heuristic).
+- [x] Lease transfer and decommissioning workflow.
+- [x] Staged replica move workflow:
+  - [x] add learner
+  - [x] catch-up gate (`last_executed_prefix`)
+  - [x] promote to joint-config metadata phase
+  - [x] transfer lease
+  - [x] finalize cutover and remove outgoing replica
+- [x] Manual `RangeRebalance` now uses staged workflow (single replica replacement)
+  instead of immediate `SetReplicas` cutover.
 
 ### Phase 4: Meta Resilience (Cockroach-style)
 
@@ -71,9 +79,21 @@ membership and Cockroach-style control-plane metadata.
 
 ## Notes / Gaps
 
-- Range operations are metadata-only. They do not yet trigger data movement or
-  dynamic Accord group creation.
-- Rebalancing is explicit via admin RPCs; there is no background rebalancer yet.
+- Split includes local key movement (`FjallRangeMigrator`) before descriptor update.
+- Merge is still metadata-only and only allowed when both ranges share the same
+  `shard_index` (no cross-shard merge data movement).
+- Rebalancing now has a background loop:
+  - drains `Decommissioning` nodes shard-by-shard
+  - finalizes node removal once drained
+  - balances replica and leaseholder counts across active nodes
+- `ClusterRemoveNode` now means "begin decommissioning", not immediate hard removal.
+- Replica configuration is validated against active members and target RF.
+- Remaining major production gap:
+  - per-range `replicas` are now orchestrated through staged control-plane
+    reconfiguration, but Accord data-group members are still static at startup
+  - true production-grade per-range consensus membership changes still require
+    dynamic Accord group membership reconfiguration in the data plane
+
 - The node defaults to `--routing-mode range` (lexicographic key ranges).
   Prefix-heavy workloads can concentrate traffic into a single range until
   the keyspace is split. The range manager can split automatically based on:
@@ -96,6 +116,20 @@ admin RPCs with:
 This script prints the cluster state, splits the first range at key `m`, shows
 the updated state, merges the range back, applies a replica/leaseholder update,
 and prints the final state.
+
+For staged replica moves, `ClusterState` now exposes:
+- `shard_rebalances`: in-flight move metadata (`from_node`, `to_node`, phase)
+- `shard_replica_roles`: per-shard role map (`Learner`, `Voter`, `Outgoing`)
+
+`RangeRebalance` accepts only one replica replacement at a time (plus optional
+lease change). Multi-node replacement must be issued as sequential moves.
+
+`holoctl` also provides a topology table that shows each node, the ranges it
+serves, and local record counts per range:
+
+```bash
+cargo run -q -p holo_store --bin holoctl -- --target 127.0.0.1:15051 topology
+```
 
 ## Redis Benchmark Tip
 

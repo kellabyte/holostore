@@ -15,6 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
+use fjall::{Keyspace, PartitionCreateOptions};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use holo_accord::accord::{self, GroupId, NodeId, TxnId};
 use sysinfo::{Pid, System};
@@ -22,20 +23,22 @@ use tokio::sync::{mpsc, oneshot, Semaphore};
 
 include!(concat!(env!("OUT_DIR"), "/volo_gen.rs"));
 
-mod kv;
 mod cluster;
+mod kv;
 mod load;
+mod range_manager;
+mod rebalance_manager;
 mod redis_server;
 mod rpc_service;
-mod range_manager;
 mod transport;
 mod wal;
 
-use kv::{FjallEngine, KvEngine};
 use cluster::{ClusterStateMachine, ClusterStateStore, MemberInfo, MemberState, ShardDesc};
+use kv::{FjallEngine, KvEngine};
 use load::ShardLoadTracker;
+use range_manager::RangeManagerConfig;
+use rebalance_manager::RebalanceManagerConfig;
 use rpc_service::RpcService;
-use range_manager::{RangeManagerConfig};
 use transport::GrpcTransport;
 
 /// Group id used for the membership/control group.
@@ -129,6 +132,14 @@ struct NodeArgs {
     #[arg(long, env = "HOLO_RANGE_SPLIT_COOLDOWN_MS", default_value_t = 10_000)]
     range_split_cooldown_ms: u64,
 
+    /// Enable the background replica rebalancer and decommission drain workflow.
+    #[arg(long, env = "HOLO_REBALANCE_ENABLED", default_value_t = true)]
+    rebalance_enabled: bool,
+
+    /// Rebalance manager evaluation interval (ms).
+    #[arg(long, env = "HOLO_REBALANCE_INTERVAL_MS", default_value_t = 1000)]
+    rebalance_interval_ms: u64,
+
     /// How to map keys to data shards.
     ///
     /// `hash` preserves parallelism for workloads with common key prefixes
@@ -174,7 +185,11 @@ struct NodeArgs {
     read_barrier_timeout_ms: u64,
 
     /// Fall back to quorum reads if read barrier times out.
-    #[arg(long, env = "HOLO_READ_BARRIER_FALLBACK_QUORUM", default_value_t = false)]
+    #[arg(
+        long,
+        env = "HOLO_READ_BARRIER_FALLBACK_QUORUM",
+        default_value_t = false
+    )]
     read_barrier_fallback_quorum: bool,
 
     /// Require last-committed responses from all peers (stronger read barrier).
@@ -331,10 +346,70 @@ struct NodeState {
     client_get_tx: mpsc::Sender<BatchGetWork>,
     client_batch_stats: Arc<ClientBatchStats>,
     client_set_batch_target: usize,
+    client_inflight_ops: Arc<AtomicU64>,
     cluster_store: ClusterStateStore,
     meta_handle: accord::Handle,
     split_lock: Arc<std::sync::RwLock<()>>,
     shard_load: ShardLoadTracker,
+    range_stats: Arc<LocalRangeStats>,
+}
+
+#[derive(Clone, Debug)]
+struct LocalRangeStat {
+    shard_id: u64,
+    shard_index: usize,
+    record_count: u64,
+    is_leaseholder: bool,
+}
+
+/// Local range statistics provider backed by Fjall latest-index partitions.
+#[derive(Clone)]
+struct LocalRangeStats {
+    keyspace: Arc<Keyspace>,
+    max_shards: usize,
+}
+
+impl LocalRangeStats {
+    fn new(keyspace: Arc<Keyspace>, max_shards: usize) -> Self {
+        Self {
+            keyspace,
+            max_shards: max_shards.max(1),
+        }
+    }
+
+    fn latest_partition_name(&self, shard_index: usize) -> String {
+        if self.max_shards <= 1 {
+            "kv_latest".to_string()
+        } else {
+            format!("kv_latest_{shard_index}")
+        }
+    }
+
+    /// Count current visible records for a shard range from the latest index.
+    fn count_range(
+        &self,
+        shard_index: usize,
+        start_key: &[u8],
+        end_key: &[u8],
+    ) -> anyhow::Result<u64> {
+        let latest_name = self.latest_partition_name(shard_index);
+        let latest = self
+            .keyspace
+            .open_partition(&latest_name, PartitionCreateOptions::default())?;
+        let start = start_key.to_vec();
+        let mut iter: Box<dyn Iterator<Item = fjall::Result<fjall::KvPair>>> = if end_key.is_empty()
+        {
+            Box::new(latest.range(start..))
+        } else {
+            Box::new(latest.range(start..end_key.to_vec()))
+        };
+        let mut count = 0u64;
+        while let Some(item) = iter.next() {
+            let _ = item?;
+            count = count.saturating_add(1);
+        }
+        Ok(count)
+    }
 }
 
 /// Read mode options for GETs.
@@ -469,8 +544,10 @@ impl RpcHandlerStats {
     /// Record the latency of a pre-accept batch handler invocation.
     fn record_pre_accept_batch(&self, us: u64) {
         self.pre_accept_batch_count.fetch_add(1, Ordering::Relaxed);
-        self.pre_accept_batch_total_us.fetch_add(us, Ordering::Relaxed);
-        self.pre_accept_batch_max_us.fetch_max(us, Ordering::Relaxed);
+        self.pre_accept_batch_total_us
+            .fetch_add(us, Ordering::Relaxed);
+        self.pre_accept_batch_max_us
+            .fetch_max(us, Ordering::Relaxed);
     }
 
     /// Track an inflight accept handler invocation.
@@ -683,6 +760,17 @@ struct BatchGetWork {
     enqueued_at: Instant,
 }
 
+/// RAII guard for client ops currently executing through the batch-direct path.
+struct InflightClientOpGuard {
+    counter: Arc<AtomicU64>,
+}
+
+impl Drop for InflightClientOpGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 impl ProposalStats {
     /// Record latency for a proposal kind.
     fn record(&self, kind: ProposalKind, dur_us: u64, ok: bool) {
@@ -729,6 +817,27 @@ impl OpStats {
 }
 
 impl NodeState {
+    fn enter_client_op(&self) -> InflightClientOpGuard {
+        self.client_inflight_ops.fetch_add(1, Ordering::Relaxed);
+        InflightClientOpGuard {
+            counter: self.client_inflight_ops.clone(),
+        }
+    }
+
+    pub(crate) async fn wait_for_client_ops_drained(&self, timeout: Duration) -> anyhow::Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let inflight = self.client_inflight_ops.load(Ordering::Relaxed);
+            if inflight == 0 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("timed out waiting for client ops to drain (inflight={inflight})");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// Return the Accord group for a given group id.
     fn group(&self, group_id: GroupId) -> Option<Arc<accord::Group>> {
         self.groups.get(&group_id).cloned()
@@ -776,13 +885,42 @@ impl NodeState {
         self.kv_engine.get_latest_batch(keys)
     }
 
+    /// Collect local per-range record counts for ranges this node serves.
+    fn local_range_stats(&self) -> anyhow::Result<Vec<LocalRangeStat>> {
+        let shards = self.cluster_store.shards_snapshot();
+        let mut out = Vec::new();
+        for shard in shards {
+            if !shard.replicas.contains(&self.node_id) {
+                continue;
+            }
+            let record_count =
+                self.range_stats
+                    .count_range(shard.shard_index, &shard.start_key, &shard.end_key)?;
+            out.push(LocalRangeStat {
+                shard_id: shard.shard_id,
+                shard_index: shard.shard_index,
+                record_count,
+                is_leaseholder: shard.leaseholder == self.node_id,
+            });
+        }
+        Ok(out)
+    }
+
     /// Snapshot and reset client batch stats.
     fn client_batch_stats_snapshot(&self) -> ClientBatchStatsSnapshot {
         self.client_batch_stats.snapshot_and_reset()
     }
 
+    /// Block client request execution while range operations are in progress.
+    async fn wait_until_unfrozen(&self) {
+        while self.cluster_store.frozen() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// Enqueue a batch SET request to the client batcher.
     async fn execute_batch_set(&self, items: Vec<(Vec<u8>, Vec<u8>)>) -> anyhow::Result<()> {
+        self.wait_until_unfrozen().await;
         if items.is_empty() {
             // Nothing to do.
             return Ok(());
@@ -801,10 +939,9 @@ impl NodeState {
     }
 
     /// Execute a batch SET directly against Accord without client batching.
-    async fn execute_batch_set_direct(
-        &self,
-        items: Vec<(Vec<u8>, Vec<u8>)>,
-    ) -> anyhow::Result<()> {
+    async fn execute_batch_set_direct(&self, items: Vec<(Vec<u8>, Vec<u8>)>) -> anyhow::Result<()> {
+        self.wait_until_unfrozen().await;
+        let _inflight_guard = self.enter_client_op();
         if items.is_empty() {
             // Nothing to do.
             return Ok(());
@@ -851,6 +988,7 @@ impl NodeState {
 
     /// Enqueue a batch GET request to the client batcher.
     async fn execute_batch_get(&self, keys: Vec<Vec<u8>>) -> anyhow::Result<Vec<Option<Vec<u8>>>> {
+        self.wait_until_unfrozen().await;
         if keys.is_empty() {
             // Nothing to do.
             return Ok(Vec::new());
@@ -874,6 +1012,8 @@ impl NodeState {
         &self,
         keys: Vec<Vec<u8>>,
     ) -> anyhow::Result<Vec<Option<Vec<u8>>>> {
+        self.wait_until_unfrozen().await;
+        let _inflight_guard = self.enter_client_op();
         if keys.is_empty() {
             // Nothing to do.
             return Ok(Vec::new());
@@ -985,9 +1125,7 @@ impl NodeState {
     /// Execute a single Redis operation by delegating to batching helpers.
     async fn execute(&self, op: redis_server::KvOp) -> anyhow::Result<redis_server::KvResult> {
         // If a range operation is in progress, block client traffic until it completes.
-        while self.cluster_store.frozen() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        self.wait_until_unfrozen().await;
 
         match op {
             redis_server::KvOp::HoloStats => {
@@ -1129,9 +1267,15 @@ impl NodeState {
         // Enforce all-peers or quorum based on configuration.
         if self.read_barrier_all_peers {
             let expected = self.member_ids.len();
-            anyhow::ensure!(ok >= expected, "last_committed all-peers failed (ok={ok}, expected={expected})");
+            anyhow::ensure!(
+                ok >= expected,
+                "last_committed all-peers failed (ok={ok}, expected={expected})"
+            );
         } else {
-            anyhow::ensure!(ok >= quorum, "last_committed quorum failed (ok={ok}, quorum={quorum})");
+            anyhow::ensure!(
+                ok >= quorum,
+                "last_committed quorum failed (ok={ok}, quorum={quorum})"
+            );
         }
         Ok(results)
     }
@@ -1199,7 +1343,10 @@ impl NodeState {
             }
         }
 
-        anyhow::ensure!(ok >= quorum, "quorum read failed (ok={ok}, quorum={quorum})");
+        anyhow::ensure!(
+            ok >= quorum,
+            "quorum read failed (ok={ok}, quorum={quorum})"
+        );
         Ok(pick_latest(results))
     }
 
@@ -1270,7 +1417,10 @@ impl NodeState {
             }
         }
 
-        anyhow::ensure!(ok >= quorum, "quorum read failed (ok={ok}, quorum={quorum})");
+        anyhow::ensure!(
+            ok >= quorum,
+            "quorum read failed (ok={ok}, quorum={quorum})"
+        );
         Ok(merge_quorum_results(&results, keys.len()))
     }
 
@@ -1733,8 +1883,7 @@ fn log_rpc_stats(snap: &transport::RpcStatsSnapshot) {
 
 /// Log Accord consensus stats for a given group.
 fn log_accord_stats(group_id: GroupId, stats: &accord::DebugStats) {
-    let exec_progress_avg_ms =
-        avg_us_per(stats.exec_progress_total_us, stats.exec_progress_count);
+    let exec_progress_avg_ms = avg_us_per(stats.exec_progress_total_us, stats.exec_progress_count);
     let exec_recover_avg_ms = avg_us_per(stats.exec_recover_total_us, stats.exec_recover_count);
     let apply_write_avg_ms = avg_us_per(stats.apply_write_total_us, stats.apply_write_count);
     let apply_read_avg_ms = avg_us_per(stats.apply_read_total_us, stats.apply_read_count);
@@ -2250,9 +2399,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         cluster_state_path,
         member_infos,
         args.replication_factor.max(1),
-        args.initial_ranges
-            .max(1)
-            .min(args.data_shards.max(1)),
+        args.initial_ranges.max(1).min(args.data_shards.max(1)),
     )?;
 
     // Clamp timeouts to at least 1ms to avoid zero-duration timeouts.
@@ -2547,7 +2694,11 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
             .context("replay commit log")?;
         if replayed > 0 {
             // Log replay to help track startup recovery cost.
-            tracing::info!(group_id = group_id, replayed = replayed, "replayed commit log entries");
+            tracing::info!(
+                group_id = group_id,
+                replayed = replayed,
+                "replayed commit log entries"
+            );
         }
         data_group.spawn_executor();
         groups.insert(group_id, data_group.clone());
@@ -2592,6 +2743,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
     };
 
     let meta_handle = membership_group.handle();
+    let range_stats = Arc::new(LocalRangeStats::new(keyspace.clone(), data_shards));
     let state = Arc::new(NodeState {
         initial_members: args.initial_members.clone(),
         groups,
@@ -2619,10 +2771,12 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         } else {
             args.client_set_batch_target.max(1)
         },
+        client_inflight_ops: Arc::new(AtomicU64::new(0)),
         cluster_store,
         meta_handle,
         split_lock: split_lock.clone(),
         shard_load: ShardLoadTracker::new(data_shards),
+        range_stats,
     });
 
     let cluster_store = state.cluster_store.clone();
@@ -2661,6 +2815,15 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
             split_cooldown: Duration::from_millis(args.range_split_cooldown_ms.max(1)),
         },
     );
+
+    if args.rebalance_enabled {
+        rebalance_manager::spawn(
+            state.clone(),
+            RebalanceManagerConfig {
+                interval: Duration::from_millis(args.rebalance_interval_ms.max(100)),
+            },
+        );
+    }
 
     let grpc_addr = args.listen_grpc;
     tokio::spawn({
