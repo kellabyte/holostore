@@ -44,10 +44,14 @@ const LATENCY_BUCKETS_US: [u64; 12] = [
 /// gRPC-based transport that implements Accord's `Transport` trait.
 #[derive(Clone)]
 pub struct GrpcTransport {
-    peers: HashMap<NodeId, Peer>,
+    peers: Arc<std::sync::RwLock<HashMap<NodeId, Peer>>>,
     rpc_timeout: Duration,
+    commit_timeout: Duration,
     stats: Arc<RpcStats>,
     inflight_tuning: InflightTuning,
+    rpc_batch_max: usize,
+    rpc_batch_wait: Duration,
+    inflight_limit: usize,
 }
 
 /// Collect a batch of items from a channel with a size/time bound.
@@ -419,108 +423,161 @@ impl GrpcTransport {
         let stats = Arc::new(RpcStats::default());
         let inflight_limit = rpc_inflight_limit.max(1);
         for (node_id, addr) in members {
-            // Build gRPC clients for consensus and read-only calls.
-            let consensus_client = rpc::HoloRpcClientBuilder::new("holo_store.rpc.HoloRpc")
-                .address(volo::net::Address::from(*addr))
-                .build();
-            let read_client = rpc::HoloRpcClientBuilder::new("holo_store.rpc.HoloRpc")
-                .address(volo::net::Address::from(*addr))
-                .build();
-
-            let (kv_get_tx, kv_get_rx) = mpsc::channel(RPC_QUEUE_CAPACITY);
-            let (pre_accept_tx, pre_accept_rx) = mpsc::channel(RPC_QUEUE_CAPACITY);
-            let (accept_tx, accept_rx) = mpsc::channel(RPC_QUEUE_CAPACITY);
-            let (commit_tx, commit_rx) = mpsc::channel(RPC_QUEUE_CAPACITY);
-            let (recover_tx, recover_rx) = mpsc::channel(RPC_QUEUE_CAPACITY);
-
-            let peer_stats = Arc::new(PeerStats::default());
-            let recover_coalescer = Arc::new(RecoverCoalescer::default());
-            // Start each limiter at the configured inflight limit.
-            let pre_accept_limiter =
-                Arc::new(InflightLimiter::new(inflight_limit, inflight_tuning.min, inflight_tuning.max));
-            let accept_limiter =
-                Arc::new(InflightLimiter::new(inflight_limit, inflight_tuning.min, inflight_tuning.max));
-            let commit_limiter =
-                Arc::new(InflightLimiter::new(inflight_limit, inflight_tuning.min, inflight_tuning.max));
-            let recover_limiter =
-                Arc::new(InflightLimiter::new(inflight_limit, inflight_tuning.min, inflight_tuning.max));
-
-            spawn_kv_get_batcher(
-                read_client.clone(),
-                kv_get_rx,
+            let peer = Self::build_peer(
+                *addr,
                 rpc_timeout,
-                batch_max,
-                batch_wait,
-                stats.clone(),
-                peer_stats.clone(),
-            );
-            spawn_pre_accept_batcher(
-                consensus_client.clone(),
-                pre_accept_rx,
-                rpc_timeout,
-                batch_max,
-                batch_wait,
-                stats.clone(),
-                peer_stats.clone(),
-                pre_accept_limiter.clone(),
-            );
-            spawn_accept_batcher(
-                consensus_client.clone(),
-                accept_rx,
-                rpc_timeout,
-                batch_max,
-                batch_wait,
-                stats.clone(),
-                peer_stats.clone(),
-                accept_limiter.clone(),
-            );
-            spawn_commit_batcher(
-                consensus_client.clone(),
-                commit_rx,
                 commit_timeout,
                 batch_max,
                 batch_wait,
+                inflight_limit,
+                inflight_tuning,
                 stats.clone(),
-                peer_stats.clone(),
-                commit_limiter.clone(),
             );
-            spawn_recover_batcher(
-                consensus_client.clone(),
-                recover_rx,
-                rpc_timeout,
-                batch_max,
-                batch_wait,
-                stats.clone(),
-                peer_stats.clone(),
-                recover_coalescer.clone(),
-                recover_limiter.clone(),
-            );
-
-            peers.insert(
-                *node_id,
-                Peer {
-                    client: consensus_client,
-                    read_client,
-                    kv_get_tx,
-                    pre_accept_tx,
-                    accept_tx,
-                    commit_tx,
-                    recover_tx,
-                    stats: peer_stats,
-                    recover_coalescer,
-                    pre_accept_limiter,
-                    accept_limiter,
-                    commit_limiter,
-                    recover_limiter,
-                },
-            );
+            peers.insert(*node_id, peer);
         }
         Self {
-            peers,
+            peers: Arc::new(std::sync::RwLock::new(peers)),
             rpc_timeout,
+            commit_timeout,
             stats,
             inflight_tuning,
+            rpc_batch_max: batch_max,
+            rpc_batch_wait: batch_wait,
+            inflight_limit,
         }
+    }
+
+    fn build_peer(
+        addr: SocketAddr,
+        rpc_timeout: Duration,
+        commit_timeout: Duration,
+        batch_max: usize,
+        batch_wait: Duration,
+        inflight_limit: usize,
+        inflight_tuning: InflightTuning,
+        stats: Arc<RpcStats>,
+    ) -> Peer {
+        // Build gRPC clients for consensus and read-only calls.
+        let consensus_client = rpc::HoloRpcClientBuilder::new("holo_store.rpc.HoloRpc")
+            .address(volo::net::Address::from(addr))
+            .build();
+        let read_client = rpc::HoloRpcClientBuilder::new("holo_store.rpc.HoloRpc")
+            .address(volo::net::Address::from(addr))
+            .build();
+
+        let (kv_get_tx, kv_get_rx) = mpsc::channel(RPC_QUEUE_CAPACITY);
+        let (pre_accept_tx, pre_accept_rx) = mpsc::channel(RPC_QUEUE_CAPACITY);
+        let (accept_tx, accept_rx) = mpsc::channel(RPC_QUEUE_CAPACITY);
+        let (commit_tx, commit_rx) = mpsc::channel(RPC_QUEUE_CAPACITY);
+        let (recover_tx, recover_rx) = mpsc::channel(RPC_QUEUE_CAPACITY);
+
+        let peer_stats = Arc::new(PeerStats::default());
+        let recover_coalescer = Arc::new(RecoverCoalescer::default());
+        // Start each limiter at the configured inflight limit.
+        let pre_accept_limiter =
+            Arc::new(InflightLimiter::new(inflight_limit, inflight_tuning.min, inflight_tuning.max));
+        let accept_limiter =
+            Arc::new(InflightLimiter::new(inflight_limit, inflight_tuning.min, inflight_tuning.max));
+        let commit_limiter =
+            Arc::new(InflightLimiter::new(inflight_limit, inflight_tuning.min, inflight_tuning.max));
+        let recover_limiter =
+            Arc::new(InflightLimiter::new(inflight_limit, inflight_tuning.min, inflight_tuning.max));
+
+        spawn_kv_get_batcher(
+            read_client.clone(),
+            kv_get_rx,
+            rpc_timeout,
+            batch_max,
+            batch_wait,
+            stats.clone(),
+            peer_stats.clone(),
+        );
+        spawn_pre_accept_batcher(
+            consensus_client.clone(),
+            pre_accept_rx,
+            rpc_timeout,
+            batch_max,
+            batch_wait,
+            stats.clone(),
+            peer_stats.clone(),
+            pre_accept_limiter.clone(),
+        );
+        spawn_accept_batcher(
+            consensus_client.clone(),
+            accept_rx,
+            rpc_timeout,
+            batch_max,
+            batch_wait,
+            stats.clone(),
+            peer_stats.clone(),
+            accept_limiter.clone(),
+        );
+        spawn_commit_batcher(
+            consensus_client.clone(),
+            commit_rx,
+            commit_timeout,
+            batch_max,
+            batch_wait,
+            stats.clone(),
+            peer_stats.clone(),
+            commit_limiter.clone(),
+        );
+        spawn_recover_batcher(
+            consensus_client.clone(),
+            recover_rx,
+            rpc_timeout,
+            batch_max,
+            batch_wait,
+            stats.clone(),
+            peer_stats.clone(),
+            recover_coalescer.clone(),
+            recover_limiter.clone(),
+        );
+
+        Peer {
+            client: consensus_client,
+            read_client,
+            kv_get_tx,
+            pre_accept_tx,
+            accept_tx,
+            commit_tx,
+            recover_tx,
+            stats: peer_stats,
+            recover_coalescer,
+            pre_accept_limiter,
+            accept_limiter,
+            commit_limiter,
+            recover_limiter,
+        }
+    }
+
+    pub fn update_members(&self, members: &HashMap<NodeId, SocketAddr>) {
+        let mut peers = self.peers.write().unwrap();
+        peers.retain(|id, _| members.contains_key(id));
+        for (id, addr) in members {
+            if !peers.contains_key(id) {
+                let peer = Self::build_peer(
+                    *addr,
+                    self.rpc_timeout,
+                    self.commit_timeout,
+                    self.rpc_batch_max,
+                    self.rpc_batch_wait,
+                    self.inflight_limit,
+                    self.inflight_tuning,
+                    self.stats.clone(),
+                );
+                peers.insert(*id, peer);
+            }
+        }
+    }
+
+    fn peer(&self, target: NodeId) -> anyhow::Result<Peer> {
+        self.peers
+            .read()
+            .unwrap()
+            .get(&target)
+            .cloned()
+            .with_context(|| format!("unknown target node {target}"))
     }
 
     /// Return the shared RPC statistics collector.
@@ -531,8 +588,9 @@ impl GrpcTransport {
     /// Collect and reset per-peer stats snapshots, applying inflight tuning.
     pub async fn peer_stats_snapshots(&self) -> Vec<(NodeId, PeerStatsSnapshot)> {
         let now_us = epoch_micros();
-        let mut out = Vec::with_capacity(self.peers.len());
-        for (id, peer) in &self.peers {
+        let peers = self.peers.read().unwrap().clone();
+        let mut out = Vec::with_capacity(peers.len());
+        for (id, peer) in peers {
             let mut snap = peer.stats.snapshot_and_reset(now_us);
             let coalescer = peer.recover_coalescer.snapshot_and_reset().await;
             snap.recover_inflight_txns = coalescer.inflight;
@@ -566,14 +624,14 @@ impl GrpcTransport {
             snap.rpc_inflight_limit = limit as u64;
             if changed {
                 tracing::info!(
-                    peer = *id,
+                    peer = id,
                     inflight_limit = limit,
                     queue_total = queue_total,
                     wait_max_ms = wait_max_ms,
                     "rpc inflight tuned"
                 );
             }
-            out.push((*id, snap));
+            out.push((id, snap));
         }
         out
     }
@@ -584,10 +642,7 @@ impl GrpcTransport {
         target: NodeId,
         key: Vec<u8>,
     ) -> anyhow::Result<Option<(Vec<u8>, Version)>> {
-        let peer = self
-            .peers
-            .get(&target)
-            .with_context(|| format!("unknown target node {target}"))?;
+        let peer = self.peer(target)?;
 
         let (tx, rx) = oneshot::channel();
         peer.stats.kv_get_sent.fetch_add(1, Ordering::Relaxed);
@@ -619,10 +674,7 @@ impl GrpcTransport {
         target: NodeId,
         keys: Vec<Vec<u8>>,
     ) -> anyhow::Result<Vec<Option<(Vec<u8>, Version)>>> {
-        let peer = self
-            .peers
-            .get(&target)
-            .with_context(|| format!("unknown target node {target}"))?;
+        let peer = self.peer(target)?;
 
         let keys = keys.into_iter().map(Into::into).collect();
         let start = std::time::Instant::now();
@@ -666,10 +718,7 @@ impl GrpcTransport {
         group_id: u64,
         keys: Vec<Vec<u8>>,
     ) -> anyhow::Result<Vec<Option<(TxnId, u64)>>> {
-        let peer = self
-            .peers
-            .get(&target)
-            .ok_or_else(|| anyhow::anyhow!("unknown peer {target}"))?;
+        let peer = self.peer(target)?;
         let keys = keys.into_iter().map(|k| k.into()).collect::<Vec<_>>();
         let start = std::time::Instant::now();
         let resp = time::timeout(
@@ -706,10 +755,7 @@ impl GrpcTransport {
         target: NodeId,
         group_id: u64,
     ) -> anyhow::Result<Vec<ExecutedPrefix>> {
-        let peer = self
-            .peers
-            .get(&target)
-            .ok_or_else(|| anyhow::anyhow!("unknown peer {target}"))?;
+        let peer = self.peer(target)?;
         let resp = time::timeout(
             self.rpc_timeout,
             peer.read_client
@@ -735,10 +781,7 @@ impl GrpcTransport {
         group_id: u64,
         txn_id: TxnId,
     ) -> anyhow::Result<Option<Vec<u8>>> {
-        let peer = self
-            .peers
-            .get(&target)
-            .ok_or_else(|| anyhow::anyhow!("unknown peer {target}"))?;
+        let peer = self.peer(target)?;
         let resp = time::timeout(
             self.rpc_timeout,
             peer.read_client.fetch_command(rpc::FetchCommandRequest {
@@ -768,10 +811,7 @@ impl GrpcTransport {
         group_id: u64,
         txn_id: TxnId,
     ) -> anyhow::Result<bool> {
-        let peer = self
-            .peers
-            .get(&target)
-            .ok_or_else(|| anyhow::anyhow!("unknown peer {target}"))?;
+        let peer = self.peer(target)?;
         let resp = time::timeout(
             self.rpc_timeout,
             peer.read_client.executed(rpc::ExecutedRequest {
@@ -794,10 +834,7 @@ impl GrpcTransport {
         group_id: u64,
         txn_id: TxnId,
     ) -> anyhow::Result<bool> {
-        let peer = self
-            .peers
-            .get(&target)
-            .ok_or_else(|| anyhow::anyhow!("unknown peer {target}"))?;
+        let peer = self.peer(target)?;
         let resp = time::timeout(
             self.rpc_timeout,
             peer.client.mark_visible(rpc::MarkVisibleRequest {
@@ -2292,10 +2329,7 @@ impl Transport for GrpcTransport {
         target: NodeId,
         req: PreAcceptRequest,
     ) -> anyhow::Result<PreAcceptResponse> {
-        let peer = self
-            .peers
-            .get(&target)
-            .with_context(|| format!("unknown target node {target}"))?;
+        let peer = self.peer(target)?;
 
         let (tx, rx) = oneshot::channel();
         let work = PreAcceptWork {
@@ -2326,10 +2360,7 @@ impl Transport for GrpcTransport {
 
     /// Send an accept RPC via the peer's batching queue.
     async fn accept(&self, target: NodeId, req: AcceptRequest) -> anyhow::Result<AcceptResponse> {
-        let peer = self
-            .peers
-            .get(&target)
-            .with_context(|| format!("unknown target node {target}"))?;
+        let peer = self.peer(target)?;
 
         let (tx, rx) = oneshot::channel();
         let work = AcceptWork {
@@ -2360,10 +2391,7 @@ impl Transport for GrpcTransport {
 
     /// Send a commit RPC via the peer's batching queue.
     async fn commit(&self, target: NodeId, req: CommitRequest) -> anyhow::Result<CommitResponse> {
-        let peer = self
-            .peers
-            .get(&target)
-            .with_context(|| format!("unknown target node {target}"))?;
+        let peer = self.peer(target)?;
 
         let (tx, rx) = oneshot::channel();
         let work = CommitWork {
@@ -2398,10 +2426,7 @@ impl Transport for GrpcTransport {
         target: NodeId,
         req: RecoverRequest,
     ) -> anyhow::Result<RecoverResponse> {
-        let peer = self
-            .peers
-            .get(&target)
-            .with_context(|| format!("unknown target node {target}"))?;
+        let peer = self.peer(target)?;
 
         let (tx, rx) = oneshot::channel();
         let txn_id = req.txn_id;
@@ -2487,10 +2512,7 @@ impl Transport for GrpcTransport {
         target: NodeId,
         req: ReportExecutedRequest,
     ) -> anyhow::Result<ReportExecutedResponse> {
-        let peer = self
-            .peers
-            .get(&target)
-            .with_context(|| format!("unknown target node {target}"))?;
+        let peer = self.peer(target)?;
 
         let result = time::timeout(
             self.rpc_timeout,

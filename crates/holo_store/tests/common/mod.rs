@@ -85,6 +85,33 @@ pub fn spawn_node_custom(
     read_mode: &str,
     data_shards: usize,
 ) -> NodeProcess {
+    spawn_node_custom_env(
+        node_id,
+        data_dir,
+        redis_addr,
+        grpc_addr,
+        bootstrap,
+        join,
+        initial_members,
+        read_mode,
+        data_shards,
+        &[],
+    )
+}
+
+/// Spawn a holo-store node with additional environment variables.
+pub fn spawn_node_custom_env(
+    node_id: u64,
+    data_dir: &PathBuf,
+    redis_addr: SocketAddr,
+    grpc_addr: SocketAddr,
+    bootstrap: bool,
+    join: Option<SocketAddr>,
+    initial_members: String,
+    read_mode: &str,
+    data_shards: usize,
+    envs: &[(&str, &str)],
+) -> NodeProcess {
     let bin = holo_store_bin();
     let log_dir = data_dir.join("logs");
     let _ = std::fs::create_dir_all(&log_dir);
@@ -115,10 +142,14 @@ pub fn spawn_node_custom(
         .arg(read_mode)
         .arg("--data-dir")
         .arg(data_dir.to_string_lossy().to_string())
-        .arg("--data-shards")
+        .arg("--max-shards")
         .arg(data_shards.to_string())
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file));
+
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
 
     if bootstrap {
         cmd.arg("--bootstrap");

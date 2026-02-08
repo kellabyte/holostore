@@ -31,6 +31,7 @@ In this repository we implement:
 - [Storage engine](docs/STORAGE.md)
 - [Read modes](docs/READ_MODES.md)
 - [Linearizability testing](docs/LINEARIZABILITY.md)
+- [Cluster membership](docs/CLUSTER_MEMBERSHIP.md)
 - [Testing TODOs](docs/TESTING_TODO.md)
 
 **Build**

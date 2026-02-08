@@ -262,7 +262,7 @@ async fn handle_conn(socket: TcpStream, state: Arc<NodeState>) -> anyhow::Result
                 } else {
                     wal_stats.batch_total_bytes as f64 / wal_stats.batch_count as f64
                 };
-                let msg = format!(
+                let mut msg = format!(
                     "records.len={} records.cap={} records.status.none={} records.status.preaccepted={} records.status.accepted={} records.status.committed={} records.status.executing={} records.status.executed={} records.missing.command={} records.missing.keys={} records.committed_missing.command={} records.committed_missing.keys={} committed_queue.len={} committed_queue.ghost={} frontier.keys={} frontier.entries={} executed_prefix_nodes={} executed_out_of_order.len={} executed_log.len={} executed_log.cap={} executed_log_order.cap={} executed_log.command_bytes={} executed_log.max_command_bytes={} executed_log.deps_total={} executed_log.max_deps_len={} reported_executed_peers={} recovering.len={} read_waiters.len={} proposal_timeouts={} execute_timeouts={} recovery.attempts={} recovery.successes={} recovery.failures={} recovery.timeouts={} recovery.noops={} recovery.last_ms={} exec.progress.count={} exec.progress.total_us={} exec.progress.max_us={} exec.progress.true={} exec.progress.false={} exec.progress.errors={} exec.recover.count={} exec.recover.total_us={} exec.recover.max_us={} exec.recover.true={} exec.recover.false={} exec.recover.errors={} apply.write.count={} apply.write.total_us={} apply.write.max_us={} apply.read.count={} apply.read.total_us={} apply.read.max_us={} apply.batch.count={} apply.batch.total_us={} apply.batch.max_us={} apply.visible.count={} apply.visible.total_us={} apply.visible.max_us={} apply.state.count={} apply.state.total_us={} apply.state.max_us={} fast_path.count={} slow_path.count={} rpc.pre_accept.batches={} rpc.pre_accept.items={} rpc.pre_accept.avg_batch={:.2} rpc.pre_accept.max_batch={} rpc.accept.batches={} rpc.accept.items={} rpc.accept.avg_batch={:.2} rpc.accept.max_batch={} rpc.commit.batches={} rpc.commit.items={} rpc.commit.avg_batch={:.2} rpc.commit.max_batch={} client.set.batches={} client.set.items={} client.set.avg_batch={:.2} client.set.max_batch={} client.set.avg_wait_us={:.2} client.set.max_wait_us={} client.get.batches={} client.get.items={} client.get.avg_batch={:.2} client.get.max_batch={} client.get.avg_wait_us={:.2} client.get.max_wait_us={} wal.fsync.count={} wal.fsync.total_us={} wal.fsync.avg_us={:.2} wal.fsync.max_us={} wal.batch.count={} wal.batch.items={} wal.batch.avg_items={:.2} wal.batch.max_items={} wal.batch.total_bytes={} wal.batch.avg_bytes={:.2} wal.batch.max_bytes={}",
                     stats.records_len,
                     stats.records_capacity,
@@ -365,6 +365,27 @@ async fn handle_conn(socket: TcpStream, state: Arc<NodeState>) -> anyhow::Result
                     wal_batch_avg_bytes,
                     wal_stats.batch_max_bytes,
                 );
+                let shard_load = state.shard_load.snapshot();
+                let shard_set_ops = shard_load
+                    .set_ops
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, v)| format!("{idx}:{v}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let shard_get_ops = shard_load
+                    .get_ops
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, v)| format!("{idx}:{v}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                msg.push_str(&format!(
+                    " shard.load.shards={} shard.load.set_ops_by_index={} shard.load.get_ops_by_index={}",
+                    shard_load.set_ops.len(),
+                    shard_set_ops,
+                    shard_get_ops
+                ));
                 feed_resp(
                     &mut framed,
                     BytesFrame::BulkString(bytes::Bytes::from(msg.into_bytes())),

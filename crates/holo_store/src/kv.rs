@@ -10,7 +10,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, RwLock};
 
 use fjall::{Keyspace, PartitionCreateOptions};
-use holo_accord::accord::{CommandKeys, ExecMeta, StateMachine, TxnId};
+use holo_accord::accord::{txn_group_id, CommandKeys, ExecMeta, StateMachine, TxnId};
 use tracing::warn;
 
 /// Storage engine API used by the Accord state machine.
@@ -34,6 +34,11 @@ pub trait KvEngine: Send + Sync + 'static {
     }
     /// Mark a previously written `(key, version)` as visible to readers.
     fn mark_visible(&self, key: &[u8], version: Version);
+}
+
+/// Routing policy for selecting a shard given a key.
+pub trait ShardRouter: Send + Sync + 'static {
+    fn shard_for_key(&self, key: &[u8]) -> usize;
 }
 
 #[allow(dead_code)]
@@ -291,14 +296,120 @@ impl KvEngine for FjallEngine {
             Ok(Some(bytes)) => decode_latest_value(&bytes).ok().map(|(cur, _)| cur),
             _ => None,
         };
-        // Only update the latest index if this version is newer or no latest exists.
-        if latest_update.map_or(true, |cur| version >= cur) {
+        // Only update the latest index if this version should supersede the
+        // current latest entry.
+        //
+        // `seq` is only ordered *within* an Accord group. During range splits a
+        // key can move to a different group, so comparing versions across
+        // groups using `(seq, txn_id)` is not meaningful and can pin stale
+        // entries in `kv_latest`.
+        //
+        // If group ids differ, treat the newly visible value as newer for the
+        // purpose of the latest index.
+        let should_update_latest = latest_update.map_or(true, |cur| {
+            if txn_group_id(cur.txn_id) != txn_group_id(version.txn_id) {
+                true
+            } else {
+                version >= cur
+            }
+        });
+        if should_update_latest {
             batch.insert(&self.latest, key.to_vec(), encode_latest_value(version, &value));
         }
 
         if let Err(err) = batch.commit() {
             warn!(error = ?err, "fjall kv mark visible failed");
         }
+    }
+}
+
+/// Sharded wrapper that routes keys to per-shard `KvEngine` instances.
+pub struct RoutedKvEngine {
+    shards: Vec<Arc<dyn KvEngine>>,
+    router: Arc<dyn ShardRouter>,
+}
+
+impl RoutedKvEngine {
+    /// Create a routed engine from pre-built shard engines and a router.
+    pub fn new(
+        shards: Vec<Arc<dyn KvEngine>>,
+        router: Arc<dyn ShardRouter>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(!shards.is_empty(), "routed kv engine requires at least one shard");
+        Ok(Self { shards, router })
+    }
+
+    fn shard_for_key(&self, key: &[u8]) -> usize {
+        let idx = self.router.shard_for_key(key);
+        idx.min(self.shards.len().saturating_sub(1))
+    }
+}
+
+impl KvEngine for RoutedKvEngine {
+    fn get(&self, key: &[u8], version: Version) -> Option<Vec<u8>> {
+        let shard = self.shard_for_key(key);
+        self.shards[shard].get(key, version)
+    }
+
+    fn get_latest(&self, key: &[u8]) -> Option<(Vec<u8>, Version)> {
+        let shard = self.shard_for_key(key);
+        self.shards[shard].get_latest(key)
+    }
+
+    fn get_latest_batch(&self, keys: &[Vec<u8>]) -> Vec<Option<(Vec<u8>, Version)>> {
+        if keys.is_empty() {
+            return Vec::new();
+        }
+        let mut results = vec![None; keys.len()];
+        let mut by_shard: Vec<Vec<(usize, Vec<u8>)>> = vec![Vec::new(); self.shards.len()];
+        for (idx, key) in keys.iter().enumerate() {
+            let shard = self.shard_for_key(key);
+            by_shard[shard].push((idx, key.clone()));
+        }
+        for (shard, items) in by_shard.into_iter().enumerate() {
+            if items.is_empty() {
+                continue;
+            }
+            let mut shard_keys = Vec::with_capacity(items.len());
+            let mut indices = Vec::with_capacity(items.len());
+            for (idx, key) in items {
+                indices.push(idx);
+                shard_keys.push(key);
+            }
+            let shard_values = self.shards[shard].get_latest_batch(&shard_keys);
+            for (idx, value) in indices.into_iter().zip(shard_values.into_iter()) {
+                results[idx] = value;
+            }
+        }
+        results
+    }
+
+    fn set(&self, key: Vec<u8>, value: Vec<u8>, version: Version) {
+        let shard = self.shard_for_key(&key);
+        self.shards[shard].set(key, value, version);
+    }
+
+    fn set_batch(&self, items: &[(Vec<u8>, Vec<u8>, Version)]) {
+        if items.is_empty() {
+            return;
+        }
+        let mut by_shard: Vec<Vec<(Vec<u8>, Vec<u8>, Version)>> =
+            vec![Vec::new(); self.shards.len()];
+        for (key, value, version) in items {
+            let shard = self.shard_for_key(key);
+            by_shard[shard].push((key.clone(), value.clone(), *version));
+        }
+        for (shard, batch) in by_shard.into_iter().enumerate() {
+            if batch.is_empty() {
+                continue;
+            }
+            self.shards[shard].set_batch(&batch);
+        }
+    }
+
+    fn mark_visible(&self, key: &[u8], version: Version) {
+        let shard = self.shard_for_key(key);
+        self.shards[shard].mark_visible(key, version);
     }
 }
 
@@ -512,7 +623,7 @@ fn decode_versions(data: &[u8]) -> anyhow::Result<Vec<VersionedValue>> {
 }
 
 /// Encode the key prefix used for range scans in the versions partition.
-fn encode_key_prefix(key: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_key_prefix(key: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + key.len());
     out.extend_from_slice(&(key.len() as u32).to_be_bytes());
     out.extend_from_slice(key);
@@ -618,12 +729,13 @@ impl StateMachine for NoopStateMachine {
 /// State machine that applies KV commands to a `KvEngine`.
 pub struct KvStateMachine {
     kv: Arc<dyn KvEngine>,
+    split_lock: Option<Arc<std::sync::RwLock<()>>>,
 }
 
 impl KvStateMachine {
     /// Create a new state machine wrapper around a KV engine.
-    pub fn new(kv: Arc<dyn KvEngine>) -> Self {
-        Self { kv }
+    pub fn new(kv: Arc<dyn KvEngine>, split_lock: Option<Arc<std::sync::RwLock<()>>>) -> Self {
+        Self { kv, split_lock }
     }
 }
 
@@ -635,6 +747,7 @@ impl StateMachine for KvStateMachine {
 
     /// Apply a single command to the KV engine, logging on failure.
     fn apply(&self, data: &[u8], meta: ExecMeta) {
+        let _guard = self.split_lock.as_ref().map(|l| l.read().unwrap());
         if let Err(err) = apply_kv_command(self.kv.as_ref(), data, meta.into()) {
             tracing::warn!(error = ?err, "failed to apply kv command");
         }
@@ -642,6 +755,7 @@ impl StateMachine for KvStateMachine {
 
     /// Apply a batch of commands, coalescing SETs for efficiency.
     fn apply_batch(&self, items: &[(Vec<u8>, ExecMeta)]) {
+        let _guard = self.split_lock.as_ref().map(|l| l.read().unwrap());
         let mut sets: Vec<(Vec<u8>, Vec<u8>, Version)> = Vec::new();
         for (data, meta) in items {
             if data.is_empty() {
@@ -716,24 +830,28 @@ impl StateMachine for KvStateMachine {
 
     /// Execute a read command without mutating state.
     fn read(&self, data: &[u8], meta: ExecMeta) -> anyhow::Result<Option<Vec<u8>>> {
+        let _guard = self.split_lock.as_ref().map(|l| l.read().unwrap());
         anyhow::ensure!(!data.is_empty(), "empty command");
-        let version = Version::from(meta);
+        let _version = Version::from(meta);
         match data[0] {
             CMD_BATCH_GET => {
                 let mut offset = 1;
                 let count = read_u32(data, &mut offset)? as usize;
-                let mut out = Vec::with_capacity(4 + (count * 4));
-                out.extend_from_slice(&(count as u32).to_be_bytes());
+                let mut keys = Vec::with_capacity(count);
                 for _ in 0..count {
                     let key_len = read_u32(data, &mut offset)? as usize;
                     anyhow::ensure!(offset + key_len <= data.len(), "short key");
-                    let key = &data[offset..offset + key_len];
+                    keys.push(data[offset..offset + key_len].to_vec());
                     offset += key_len;
-
-                    match self.kv.get(key, version) {
+                }
+                let latest = self.kv.get_latest_batch(&keys);
+                let mut out = Vec::with_capacity(4 + (count * 4));
+                out.extend_from_slice(&(count as u32).to_be_bytes());
+                for item in latest {
+                    match item {
                         // Encode missing keys as sentinel lengths.
                         None => out.extend_from_slice(&u32::MAX.to_be_bytes()),
-                        Some(v) => {
+                        Some((v, _)) => {
                             out.extend_from_slice(&(v.len() as u32).to_be_bytes());
                             out.extend_from_slice(&v);
                         }
@@ -746,7 +864,15 @@ impl StateMachine for KvStateMachine {
                 let key_len = read_u32(data, &mut offset)? as usize;
                 anyhow::ensure!(offset + key_len <= data.len(), "short key");
                 let key = &data[offset..offset + key_len];
-                Ok(self.kv.get(key, version))
+                // Reads return the latest visible value.
+                //
+                // In range mode, keys can migrate between Accord groups during
+                // splits. Group-local seq values are not globally comparable
+                // across groups, so filtering by `<= read_seq` can hide newer
+                // migrated versions and surface stale values. The read barrier
+                // in the coordinator guarantees required writes are executed
+                // before this read runs, so reading latest-visible here is safe.
+                Ok(self.kv.get_latest(key).map(|(v, _)| v))
             }
             // Non-read commands are ignored by the read path.
             _ => Ok(None),
@@ -755,6 +881,7 @@ impl StateMachine for KvStateMachine {
 
     /// Mark all written keys in a command as visible.
     fn mark_visible(&self, data: &[u8], meta: ExecMeta) {
+        let _guard = self.split_lock.as_ref().map(|l| l.read().unwrap());
         if data.is_empty() {
             // Ignore empty commands to avoid parsing errors.
             return;

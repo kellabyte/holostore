@@ -4,7 +4,7 @@
 //! transport, and Redis protocol server. It also hosts the CLI and runtime
 //! configuration, as well as performance/statistics logging.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, OpenOptions};
 use std::io::{BufWriter, IsTerminal, Write};
 use std::net::SocketAddr;
@@ -15,6 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
+use fjall::{Keyspace, PartitionCreateOptions};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use holo_accord::accord::{self, GroupId, NodeId, TxnId};
 use sysinfo::{Pid, System};
@@ -22,13 +23,21 @@ use tokio::sync::{mpsc, oneshot, Semaphore};
 
 include!(concat!(env!("OUT_DIR"), "/volo_gen.rs"));
 
+mod cluster;
 mod kv;
+mod load;
+mod range_manager;
+mod rebalance_manager;
 mod redis_server;
 mod rpc_service;
 mod transport;
 mod wal;
 
+use cluster::{ClusterStateMachine, ClusterStateStore, MemberInfo, MemberState, ShardDesc};
 use kv::{FjallEngine, KvEngine};
+use load::ShardLoadTracker;
+use range_manager::RangeManagerConfig;
+use rebalance_manager::RebalanceManagerConfig;
 use rpc_service::RpcService;
 use transport::GrpcTransport;
 
@@ -80,9 +89,68 @@ struct NodeArgs {
     #[arg(long, env = "HOLO_WAL_ENGINE", default_value = "raft-engine")]
     wal_engine: WalEngine,
 
-    /// Number of data shards (creates one Accord group per shard).
-    #[arg(long, env = "HOLO_DATA_SHARDS", default_value_t = 1)]
+    /// Maximum shard slots for dynamic ranges.
+    ///
+    /// The node pre-creates this many data group slots at startup; the range
+    /// manager can then split ranges dynamically up to this cap.
+    #[arg(long = "max-shards", env = "HOLO_MAX_SHARDS", default_value_t = 1)]
     data_shards: usize,
+
+    /// Initial number of key ranges to create in cluster metadata.
+    ///
+    /// CockroachDB boots with a small number of ranges and splits dynamically.
+    /// We default to 1 full-keyspace range.
+    #[arg(long, env = "HOLO_INITIAL_RANGES", default_value_t = 1)]
+    initial_ranges: usize,
+
+    /// Range manager evaluation interval (ms).
+    #[arg(long, env = "HOLO_RANGE_MGR_INTERVAL_MS", default_value_t = 500)]
+    range_mgr_interval_ms: u64,
+
+    /// Split a range when it grows beyond this threshold.
+    ///
+    /// Implementation note: this is an approximation today. We use "SET ops
+    /// coordinated by this node for the shard index since its last split" as a
+    /// proxy for key growth, to avoid expensive keyspace scans.
+    ///
+    /// Set to 0 to disable growth-based splitting.
+    #[arg(long, env = "HOLO_RANGE_SPLIT_MIN_KEYS", default_value_t = 50_000)]
+    range_split_min_keys: usize,
+
+    /// Split a hot range when its sustained SET QPS exceeds this threshold.
+    ///
+    /// Set to 0 to disable load-based splitting (size-based splitting may still apply).
+    #[arg(long, env = "HOLO_RANGE_SPLIT_MIN_QPS", default_value_t = 100_000)]
+    range_split_min_qps: u64,
+
+    /// Require the QPS threshold to be exceeded for this many consecutive
+    /// evaluations before proposing a split.
+    #[arg(long, env = "HOLO_RANGE_SPLIT_QPS_SUSTAIN", default_value_t = 3)]
+    range_split_qps_sustain: u8,
+
+    /// Per-shard cooldown after a split (ms) to avoid rapid re-splitting.
+    #[arg(long, env = "HOLO_RANGE_SPLIT_COOLDOWN_MS", default_value_t = 10_000)]
+    range_split_cooldown_ms: u64,
+
+    /// Enable the background replica rebalancer and decommission drain workflow.
+    #[arg(long, env = "HOLO_REBALANCE_ENABLED", default_value_t = true)]
+    rebalance_enabled: bool,
+
+    /// Rebalance manager evaluation interval (ms).
+    #[arg(long, env = "HOLO_REBALANCE_INTERVAL_MS", default_value_t = 1000)]
+    rebalance_interval_ms: u64,
+
+    /// How to map keys to data shards.
+    ///
+    /// `hash` preserves parallelism for workloads with common key prefixes
+    /// (e.g. redis-benchmark's default `key:...`), because the varying suffix
+    /// still spreads across shards.
+    ///
+    /// `range` uses the control-plane's lexicographic key ranges. This is
+    /// Cockroach-style, but without real per-range data movement yet it can
+    /// concentrate traffic into a single shard for prefix-heavy workloads.
+    #[arg(long, env = "HOLO_ROUTING_MODE", default_value = "range")]
+    routing_mode: RoutingMode,
 
     /// Disable automatic Fjall journal persistence (commit log is the durability source).
     #[arg(
@@ -117,7 +185,11 @@ struct NodeArgs {
     read_barrier_timeout_ms: u64,
 
     /// Fall back to quorum reads if read barrier times out.
-    #[arg(long, env = "HOLO_READ_BARRIER_FALLBACK_QUORUM", default_value_t = false)]
+    #[arg(
+        long,
+        env = "HOLO_READ_BARRIER_FALLBACK_QUORUM",
+        default_value_t = false
+    )]
     read_barrier_fallback_quorum: bool,
 
     /// Require last-committed responses from all peers (stronger read barrier).
@@ -143,6 +215,10 @@ struct NodeArgs {
     /// Artificial delay injected into RPC handlers (milliseconds).
     #[arg(long, env = "HOLO_RPC_HANDLER_DELAY_MS", default_value_t = 0)]
     rpc_handler_delay_ms: u64,
+
+    /// Default replication factor for new shards.
+    #[arg(long, env = "HOLO_REPLICATION_FACTOR", default_value_t = 3)]
+    replication_factor: usize,
 
     /// Consecutive execute-stall hits on a PreAccepted blocker before triggering recovery.
     #[arg(long, env = "HOLO_PREACCEPT_STALL_HITS", default_value_t = 3)]
@@ -253,6 +329,7 @@ struct NodeState {
     groups: HashMap<GroupId, Arc<accord::Group>>,
     data_handles: Vec<accord::Handle>,
     data_shards: usize,
+    routing_mode: RoutingMode,
     node_id: NodeId,
     kv_engine: Arc<dyn KvEngine>,
     transport: Arc<GrpcTransport>,
@@ -269,6 +346,70 @@ struct NodeState {
     client_get_tx: mpsc::Sender<BatchGetWork>,
     client_batch_stats: Arc<ClientBatchStats>,
     client_set_batch_target: usize,
+    client_inflight_ops: Arc<AtomicU64>,
+    cluster_store: ClusterStateStore,
+    meta_handle: accord::Handle,
+    split_lock: Arc<std::sync::RwLock<()>>,
+    shard_load: ShardLoadTracker,
+    range_stats: Arc<LocalRangeStats>,
+}
+
+#[derive(Clone, Debug)]
+struct LocalRangeStat {
+    shard_id: u64,
+    shard_index: usize,
+    record_count: u64,
+    is_leaseholder: bool,
+}
+
+/// Local range statistics provider backed by Fjall latest-index partitions.
+#[derive(Clone)]
+struct LocalRangeStats {
+    keyspace: Arc<Keyspace>,
+    max_shards: usize,
+}
+
+impl LocalRangeStats {
+    fn new(keyspace: Arc<Keyspace>, max_shards: usize) -> Self {
+        Self {
+            keyspace,
+            max_shards: max_shards.max(1),
+        }
+    }
+
+    fn latest_partition_name(&self, shard_index: usize) -> String {
+        if self.max_shards <= 1 {
+            "kv_latest".to_string()
+        } else {
+            format!("kv_latest_{shard_index}")
+        }
+    }
+
+    /// Count current visible records for a shard range from the latest index.
+    fn count_range(
+        &self,
+        shard_index: usize,
+        start_key: &[u8],
+        end_key: &[u8],
+    ) -> anyhow::Result<u64> {
+        let latest_name = self.latest_partition_name(shard_index);
+        let latest = self
+            .keyspace
+            .open_partition(&latest_name, PartitionCreateOptions::default())?;
+        let start = start_key.to_vec();
+        let mut iter: Box<dyn Iterator<Item = fjall::Result<fjall::KvPair>>> = if end_key.is_empty()
+        {
+            Box::new(latest.range(start..))
+        } else {
+            Box::new(latest.range(start..end_key.to_vec()))
+        };
+        let mut count = 0u64;
+        while let Some(item) = iter.next() {
+            let _ = item?;
+            count = count.saturating_add(1);
+        }
+        Ok(count)
+    }
 }
 
 /// Read mode options for GETs.
@@ -277,6 +418,13 @@ enum ReadMode {
     Accord,
     Quorum,
     Local,
+}
+
+/// Data shard routing mode.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum RoutingMode {
+    Hash,
+    Range,
 }
 
 /// WAL engine options.
@@ -396,8 +544,10 @@ impl RpcHandlerStats {
     /// Record the latency of a pre-accept batch handler invocation.
     fn record_pre_accept_batch(&self, us: u64) {
         self.pre_accept_batch_count.fetch_add(1, Ordering::Relaxed);
-        self.pre_accept_batch_total_us.fetch_add(us, Ordering::Relaxed);
-        self.pre_accept_batch_max_us.fetch_max(us, Ordering::Relaxed);
+        self.pre_accept_batch_total_us
+            .fetch_add(us, Ordering::Relaxed);
+        self.pre_accept_batch_max_us
+            .fetch_max(us, Ordering::Relaxed);
     }
 
     /// Track an inflight accept handler invocation.
@@ -610,6 +760,17 @@ struct BatchGetWork {
     enqueued_at: Instant,
 }
 
+/// RAII guard for client ops currently executing through the batch-direct path.
+struct InflightClientOpGuard {
+    counter: Arc<AtomicU64>,
+}
+
+impl Drop for InflightClientOpGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 impl ProposalStats {
     /// Record latency for a proposal kind.
     fn record(&self, kind: ProposalKind, dur_us: u64, ok: bool) {
@@ -656,6 +817,27 @@ impl OpStats {
 }
 
 impl NodeState {
+    fn enter_client_op(&self) -> InflightClientOpGuard {
+        self.client_inflight_ops.fetch_add(1, Ordering::Relaxed);
+        InflightClientOpGuard {
+            counter: self.client_inflight_ops.clone(),
+        }
+    }
+
+    pub(crate) async fn wait_for_client_ops_drained(&self, timeout: Duration) -> anyhow::Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let inflight = self.client_inflight_ops.load(Ordering::Relaxed);
+            if inflight == 0 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("timed out waiting for client ops to drain (inflight={inflight})");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// Return the Accord group for a given group id.
     fn group(&self, group_id: GroupId) -> Option<Arc<accord::Group>> {
         self.groups.get(&group_id).cloned()
@@ -663,11 +845,28 @@ impl NodeState {
 
     /// Map a key to a shard index.
     fn shard_for_key(&self, key: &[u8]) -> usize {
-        if self.data_shards <= 1 {
-            // Fast path when there is only one shard.
-            return 0;
+        // Block shard routing while a split is actively migrating keys.
+        let _guard = self.split_lock.read().unwrap();
+        self.shard_for_key_with_snapshot(key, None)
+    }
+
+    /// Map a key to a shard index, optionally using a pre-fetched range snapshot.
+    ///
+    /// The snapshot path avoids repeated lock acquisitions in hot batch loops.
+    fn shard_for_key_with_snapshot(&self, key: &[u8], ranges: Option<&[ShardDesc]>) -> usize {
+        match self.routing_mode {
+            RoutingMode::Hash => {
+                let hash = kv::hash_key(key);
+                (hash as usize) % self.data_shards.max(1)
+            }
+            RoutingMode::Range => {
+                if let Some(shards) = ranges {
+                    shard_index_for_key_in_ranges(key, shards)
+                } else {
+                    self.cluster_store.shard_index_for_key(key)
+                }
+            }
         }
-        (kv::hash_key(key) as usize) % self.data_shards
     }
 
     /// Resolve the Accord handle for a shard index.
@@ -686,13 +885,42 @@ impl NodeState {
         self.kv_engine.get_latest_batch(keys)
     }
 
+    /// Collect local per-range record counts for ranges this node serves.
+    fn local_range_stats(&self) -> anyhow::Result<Vec<LocalRangeStat>> {
+        let shards = self.cluster_store.shards_snapshot();
+        let mut out = Vec::new();
+        for shard in shards {
+            if !shard.replicas.contains(&self.node_id) {
+                continue;
+            }
+            let record_count =
+                self.range_stats
+                    .count_range(shard.shard_index, &shard.start_key, &shard.end_key)?;
+            out.push(LocalRangeStat {
+                shard_id: shard.shard_id,
+                shard_index: shard.shard_index,
+                record_count,
+                is_leaseholder: shard.leaseholder == self.node_id,
+            });
+        }
+        Ok(out)
+    }
+
     /// Snapshot and reset client batch stats.
     fn client_batch_stats_snapshot(&self) -> ClientBatchStatsSnapshot {
         self.client_batch_stats.snapshot_and_reset()
     }
 
+    /// Block client request execution while range operations are in progress.
+    async fn wait_until_unfrozen(&self) {
+        while self.cluster_store.frozen() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// Enqueue a batch SET request to the client batcher.
     async fn execute_batch_set(&self, items: Vec<(Vec<u8>, Vec<u8>)>) -> anyhow::Result<()> {
+        self.wait_until_unfrozen().await;
         if items.is_empty() {
             // Nothing to do.
             return Ok(());
@@ -711,18 +939,27 @@ impl NodeState {
     }
 
     /// Execute a batch SET directly against Accord without client batching.
-    async fn execute_batch_set_direct(
-        &self,
-        items: Vec<(Vec<u8>, Vec<u8>)>,
-    ) -> anyhow::Result<()> {
+    async fn execute_batch_set_direct(&self, items: Vec<(Vec<u8>, Vec<u8>)>) -> anyhow::Result<()> {
+        self.wait_until_unfrozen().await;
+        let _inflight_guard = self.enter_client_op();
         if items.is_empty() {
             // Nothing to do.
             return Ok(());
         }
         let mut by_shard: Vec<Vec<(Vec<u8>, Vec<u8>)>> = vec![Vec::new(); self.data_shards];
-        for (key, value) in items {
-            let shard = self.shard_for_key(&key);
-            by_shard[shard].push((key, value));
+        {
+            // Take split lock and range snapshot once for the whole routing pass.
+            let _guard = self.split_lock.read().unwrap();
+            let range_snapshot = if matches!(self.routing_mode, RoutingMode::Range) {
+                Some(self.cluster_store.shards_snapshot())
+            } else {
+                None
+            };
+            let ranges = range_snapshot.as_deref();
+            for (key, value) in items {
+                let shard = self.shard_for_key_with_snapshot(&key, ranges);
+                by_shard[shard].push((key, value));
+            }
         }
 
         let target = self.client_set_batch_target.max(1);
@@ -732,6 +969,8 @@ impl NodeState {
                 // Skip shards with no work.
                 continue;
             }
+            // Track client-visible write load per shard (best-effort).
+            self.shard_load.record_set_ops(shard, batch.len() as u64);
             let handle = self.handle_for_shard(shard);
             for chunk in batch.chunks(target) {
                 // Split large batches into target-sized chunks for bounded proposal size.
@@ -749,6 +988,7 @@ impl NodeState {
 
     /// Enqueue a batch GET request to the client batcher.
     async fn execute_batch_get(&self, keys: Vec<Vec<u8>>) -> anyhow::Result<Vec<Option<Vec<u8>>>> {
+        self.wait_until_unfrozen().await;
         if keys.is_empty() {
             // Nothing to do.
             return Ok(Vec::new());
@@ -772,14 +1012,26 @@ impl NodeState {
         &self,
         keys: Vec<Vec<u8>>,
     ) -> anyhow::Result<Vec<Option<Vec<u8>>>> {
+        self.wait_until_unfrozen().await;
+        let _inflight_guard = self.enter_client_op();
         if keys.is_empty() {
             // Nothing to do.
             return Ok(Vec::new());
         }
         let mut by_shard: Vec<Vec<(usize, Vec<u8>)>> = vec![Vec::new(); self.data_shards];
-        for (idx, key) in keys.iter().enumerate() {
-            let shard = self.shard_for_key(key);
-            by_shard[shard].push((idx, key.clone()));
+        {
+            // Take split lock and range snapshot once for the whole routing pass.
+            let _guard = self.split_lock.read().unwrap();
+            let range_snapshot = if matches!(self.routing_mode, RoutingMode::Range) {
+                Some(self.cluster_store.shards_snapshot())
+            } else {
+                None
+            };
+            let ranges = range_snapshot.as_deref();
+            for (idx, key) in keys.iter().enumerate() {
+                let shard = self.shard_for_key_with_snapshot(key, ranges);
+                by_shard[shard].push((idx, key.clone()));
+            }
         }
 
         let mut out = vec![None; keys.len()];
@@ -790,6 +1042,8 @@ impl NodeState {
                 // Skip shards with no work.
                 continue;
             }
+            // Track client-visible read load per shard (best-effort).
+            self.shard_load.record_get_ops(shard, entries.len() as u64);
             let mut shard_keys = Vec::with_capacity(entries.len());
             let mut shard_indices = Vec::with_capacity(entries.len());
             for (idx, key) in entries {
@@ -870,6 +1124,9 @@ impl NodeState {
 
     /// Execute a single Redis operation by delegating to batching helpers.
     async fn execute(&self, op: redis_server::KvOp) -> anyhow::Result<redis_server::KvResult> {
+        // If a range operation is in progress, block client traffic until it completes.
+        self.wait_until_unfrozen().await;
+
         match op {
             redis_server::KvOp::HoloStats => {
                 anyhow::bail!("HOLOSTATS is handled at the Redis layer")
@@ -1010,9 +1267,15 @@ impl NodeState {
         // Enforce all-peers or quorum based on configuration.
         if self.read_barrier_all_peers {
             let expected = self.member_ids.len();
-            anyhow::ensure!(ok >= expected, "last_committed all-peers failed (ok={ok}, expected={expected})");
+            anyhow::ensure!(
+                ok >= expected,
+                "last_committed all-peers failed (ok={ok}, expected={expected})"
+            );
         } else {
-            anyhow::ensure!(ok >= quorum, "last_committed quorum failed (ok={ok}, quorum={quorum})");
+            anyhow::ensure!(
+                ok >= quorum,
+                "last_committed quorum failed (ok={ok}, quorum={quorum})"
+            );
         }
         Ok(results)
     }
@@ -1080,7 +1343,10 @@ impl NodeState {
             }
         }
 
-        anyhow::ensure!(ok >= quorum, "quorum read failed (ok={ok}, quorum={quorum})");
+        anyhow::ensure!(
+            ok >= quorum,
+            "quorum read failed (ok={ok}, quorum={quorum})"
+        );
         Ok(pick_latest(results))
     }
 
@@ -1151,7 +1417,10 @@ impl NodeState {
             }
         }
 
-        anyhow::ensure!(ok >= quorum, "quorum read failed (ok={ok}, quorum={quorum})");
+        anyhow::ensure!(
+            ok >= quorum,
+            "quorum read failed (ok={ok}, quorum={quorum})"
+        );
         Ok(merge_quorum_results(&results, keys.len()))
     }
 
@@ -1170,6 +1439,36 @@ impl NodeState {
         }
         peers
     }
+}
+
+/// Resolve a key to a shard index using an in-memory range snapshot.
+fn shard_index_for_key_in_ranges(key: &[u8], shards: &[ShardDesc]) -> usize {
+    if shards.is_empty() {
+        return 0;
+    }
+    if shards.len() == 1 {
+        return shards[0].shard_index;
+    }
+    let has_key_ranges = shards
+        .iter()
+        .any(|s| !s.start_key.is_empty() || !s.end_key.is_empty());
+    if has_key_ranges {
+        for shard in shards {
+            let in_start = shard.start_key.is_empty() || key >= shard.start_key.as_slice();
+            let in_end = shard.end_key.is_empty() || key < shard.end_key.as_slice();
+            if in_start && in_end {
+                return shard.shard_index;
+            }
+        }
+        return 0;
+    }
+    let hash = kv::hash_key(key);
+    for shard in shards {
+        if hash >= shard.start_hash && hash <= shard.end_hash {
+            return shard.shard_index;
+        }
+    }
+    0
 }
 
 /// Collect a batch of SET work items up to size/time limits.
@@ -1584,8 +1883,7 @@ fn log_rpc_stats(snap: &transport::RpcStatsSnapshot) {
 
 /// Log Accord consensus stats for a given group.
 fn log_accord_stats(group_id: GroupId, stats: &accord::DebugStats) {
-    let exec_progress_avg_ms =
-        avg_us_per(stats.exec_progress_total_us, stats.exec_progress_count);
+    let exec_progress_avg_ms = avg_us_per(stats.exec_progress_total_us, stats.exec_progress_count);
     let exec_recover_avg_ms = avg_us_per(stats.exec_recover_total_us, stats.exec_recover_count);
     let apply_write_avg_ms = avg_us_per(stats.apply_write_total_us, stats.apply_write_count);
     let apply_read_avg_ms = avg_us_per(stats.apply_read_total_us, stats.apply_read_count);
@@ -2076,6 +2374,33 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
     }
 
     let members = parse_members(&args.initial_members)?;
+    let member_infos: BTreeMap<NodeId, MemberInfo> = members
+        .iter()
+        .map(|(id, addr)| {
+            (
+                *id,
+                MemberInfo {
+                    node_id: *id,
+                    grpc_addr: addr.to_string(),
+                    // `initial_members` only contains gRPC addrs; seed our own Redis addr.
+                    redis_addr: if *id == args.node_id {
+                        args.listen_redis.to_string()
+                    } else {
+                        String::new()
+                    },
+                    state: MemberState::Active,
+                },
+            )
+        })
+        .collect();
+
+    let cluster_state_path = data_dir.join("meta").join("cluster_state.json");
+    let cluster_store = ClusterStateStore::load_or_init(
+        cluster_state_path,
+        member_infos,
+        args.replication_factor.max(1),
+        args.initial_ranges.max(1).min(args.data_shards.max(1)),
+    )?;
 
     // Clamp timeouts to at least 1ms to avoid zero-duration timeouts.
     let rpc_timeout = Duration::from_millis(args.rpc_timeout_ms.max(1));
@@ -2282,14 +2607,16 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         }
     }
     let kv_engine: Arc<dyn KvEngine> = if data_shards == 1 {
-        // Keep a direct engine when there is only one shard.
         kv_shards[0].clone()
     } else {
-        // Wrap in a sharded engine for multi-shard routing.
-        Arc::new(kv::ShardedKvEngine::new(kv_shards.clone())?)
+        match args.routing_mode {
+            RoutingMode::Hash => Arc::new(kv::ShardedKvEngine::new(kv_shards.clone())?),
+            RoutingMode::Range => Arc::new(kv::RoutedKvEngine::new(
+                kv_shards.clone(),
+                Arc::new(cluster_store.clone()),
+            )?),
+        }
     };
-    let noop_sm = Arc::new(kv::NoopStateMachine);
-
     let accord_members = members
         .keys()
         .copied()
@@ -2309,11 +2636,36 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         commit_log_batch_wait: Duration::from_micros(args.commit_log_batch_wait_us),
     };
 
+    let meta_wal_dir = match args.wal_engine {
+        WalEngine::File => wal_dir.join("meta"),
+        WalEngine::RaftEngine => wal_dir.join("meta-raft-engine"),
+    };
+    let meta_wal: Arc<dyn accord::CommitLog> = match args.wal_engine {
+        WalEngine::File => Arc::new(wal::FileWal::open_dir(&meta_wal_dir)?),
+        WalEngine::RaftEngine => {
+            #[cfg(feature = "raft-engine")]
+            {
+                Arc::new(wal::RaftEngineWal::open_dir(&meta_wal_dir)?)
+            }
+            #[cfg(not(feature = "raft-engine"))]
+            {
+                anyhow::bail!(
+                    "raft-engine WAL selected but feature is not enabled (build with --features raft-engine)"
+                );
+            }
+        }
+    };
+
+    let cluster_sm = Arc::new(ClusterStateMachine::new(
+        cluster_store.clone(),
+        Some(Arc::new(cluster::FjallRangeMigrator::new(keyspace.clone()))),
+        data_shards,
+    ));
     let membership_group = Arc::new(accord::Group::new(
         mk_cfg(GROUP_MEMBERSHIP),
         transport.clone(),
-        noop_sm.clone(),
-        None,
+        cluster_sm,
+        Some(meta_wal),
     ));
 
     let mut data_groups: Vec<Arc<accord::Group>> = Vec::with_capacity(data_shards);
@@ -2321,10 +2673,15 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
     let mut groups = HashMap::new();
     groups.insert(GROUP_MEMBERSHIP, membership_group.clone());
 
+    let split_lock = cluster_store.split_lock();
+
     for shard in 0..data_shards {
         let group_id = GROUP_DATA_BASE + shard as u64;
         let wal = shared_wal.clone();
-        let kv_sm = Arc::new(kv::KvStateMachine::new(kv_shards[shard].clone()));
+        let kv_sm = Arc::new(kv::KvStateMachine::new(
+            kv_shards[shard].clone(),
+            Some(split_lock.clone()),
+        ));
         let data_group = Arc::new(accord::Group::new(
             mk_cfg(group_id),
             transport.clone(),
@@ -2337,7 +2694,11 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
             .context("replay commit log")?;
         if replayed > 0 {
             // Log replay to help track startup recovery cost.
-            tracing::info!(group_id = group_id, replayed = replayed, "replayed commit log entries");
+            tracing::info!(
+                group_id = group_id,
+                replayed = replayed,
+                "replayed commit log entries"
+            );
         }
         data_group.spawn_executor();
         groups.insert(group_id, data_group.clone());
@@ -2345,6 +2706,10 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         data_groups.push(data_group);
     }
 
+    let _ = membership_group
+        .replay_commits()
+        .await
+        .context("replay meta commit log")?;
     membership_group.spawn_executor();
 
     if args.accord_stats_interval_ms > 0 {
@@ -2377,11 +2742,14 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         inflight: args.client_batch_inflight.max(1),
     };
 
+    let meta_handle = membership_group.handle();
+    let range_stats = Arc::new(LocalRangeStats::new(keyspace.clone(), data_shards));
     let state = Arc::new(NodeState {
         initial_members: args.initial_members.clone(),
         groups,
         data_handles,
         data_shards,
+        routing_mode: args.routing_mode,
         node_id: args.node_id,
         kv_engine,
         transport: transport.clone(),
@@ -2403,10 +2771,59 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         } else {
             args.client_set_batch_target.max(1)
         },
+        client_inflight_ops: Arc::new(AtomicU64::new(0)),
+        cluster_store,
+        meta_handle,
+        split_lock: split_lock.clone(),
+        shard_load: ShardLoadTracker::new(data_shards),
+        range_stats,
+    });
+
+    let cluster_store = state.cluster_store.clone();
+    let transport_clone = transport.clone();
+    tokio::spawn(async move {
+        let mut last_epoch = cluster_store.epoch();
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let epoch = cluster_store.epoch();
+            if epoch != last_epoch {
+                match cluster_store.members_map() {
+                    Ok(members) => {
+                        transport_clone.update_members(&members);
+                        last_epoch = epoch;
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = ?err, "failed to refresh cluster members");
+                    }
+                }
+            }
+        }
     });
 
     spawn_set_batcher(state.clone(), client_set_rx, client_batch_cfg);
     spawn_get_batcher(state.clone(), client_get_rx, client_batch_cfg);
+
+    // Range manager (Cockroach-style) for dynamic splits.
+    range_manager::spawn(
+        state.clone(),
+        keyspace.clone(),
+        RangeManagerConfig {
+            interval: Duration::from_millis(args.range_mgr_interval_ms.max(50)),
+            split_min_keys: args.range_split_min_keys,
+            split_min_qps: args.range_split_min_qps,
+            split_qps_sustain: args.range_split_qps_sustain.max(1),
+            split_cooldown: Duration::from_millis(args.range_split_cooldown_ms.max(1)),
+        },
+    );
+
+    if args.rebalance_enabled {
+        rebalance_manager::spawn(
+            state.clone(),
+            RebalanceManagerConfig {
+                interval: Duration::from_millis(args.rebalance_interval_ms.max(100)),
+            },
+        );
+    }
 
     let grpc_addr = args.listen_grpc;
     tokio::spawn({
@@ -2443,7 +2860,14 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
 
     if let Some(seed) = args.join {
         // Join an existing cluster by contacting the seed node.
-        join_seed(args.node_id, seed, &args.initial_members).await?;
+        join_seed(
+            args.node_id,
+            seed,
+            &args.initial_members,
+            args.listen_grpc,
+            args.listen_redis,
+        )
+        .await?;
     }
 
     tracing::info!(
@@ -2458,14 +2882,24 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
 }
 
 /// Attempt to join a seed node, retrying for a fixed number of attempts.
-async fn join_seed(node_id: u64, seed: SocketAddr, expected_members: &str) -> anyhow::Result<()> {
+async fn join_seed(
+    node_id: u64,
+    seed: SocketAddr,
+    expected_members: &str,
+    listen_grpc: SocketAddr,
+    listen_redis: SocketAddr,
+) -> anyhow::Result<()> {
     let client = volo_gen::holo_store::rpc::HoloRpcClientBuilder::new("holo_store.rpc.HoloRpc")
         .address(volo::net::Address::from(seed))
         .build();
 
     for _ in 0..100 {
         match client
-            .join(volo_gen::holo_store::rpc::JoinRequest { node_id })
+            .join(volo_gen::holo_store::rpc::JoinRequest {
+                node_id,
+                grpc_addr: listen_grpc.to_string().into(),
+                redis_addr: listen_redis.to_string().into(),
+            })
             .await
         {
             Ok(resp) => {
@@ -2503,6 +2937,7 @@ fn parse_members(input: &str) -> anyhow::Result<HashMap<NodeId, SocketAddr>> {
     anyhow::ensure!(!out.is_empty(), "initial_members is empty");
     Ok(out)
 }
+
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
