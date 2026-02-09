@@ -46,10 +46,13 @@ fn merge_debug_stats(dst: &mut DebugStats, src: DebugStats) {
     dst.executed_log_capacity += src.executed_log_capacity;
     dst.executed_log_order_capacity += src.executed_log_order_capacity;
     dst.executed_log_command_bytes += src.executed_log_command_bytes;
-    dst.executed_log_max_command_bytes =
-        dst.executed_log_max_command_bytes.max(src.executed_log_max_command_bytes);
+    dst.executed_log_max_command_bytes = dst
+        .executed_log_max_command_bytes
+        .max(src.executed_log_max_command_bytes);
     dst.executed_log_deps_total += src.executed_log_deps_total;
-    dst.executed_log_max_deps_len = dst.executed_log_max_deps_len.max(src.executed_log_max_deps_len);
+    dst.executed_log_max_deps_len = dst
+        .executed_log_max_deps_len
+        .max(src.executed_log_max_deps_len);
     dst.reported_executed_peers = dst.reported_executed_peers.max(src.reported_executed_peers);
     dst.recovering_len += src.recovering_len;
     dst.read_waiters_len += src.read_waiters_len;

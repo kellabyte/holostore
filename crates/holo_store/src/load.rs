@@ -75,4 +75,3 @@ impl ShardLoadTracker {
         ShardLoadSnapshot { set_ops, get_ops }
     }
 }
-

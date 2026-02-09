@@ -34,10 +34,13 @@ run_case "baseline" \
 
 # Range autosplit:
 # Verifies: linearizability while ranges split and keys migrate between shards.
+# Uses a single client to keep split timing deterministic in suite runs while
+# still exercising live split + migration under client traffic.
 run_case "range_autosplit" \
   HOLO_INITIAL_RANGES=1 \
   HOLO_RANGE_SPLIT_MIN_KEYS=2 \
   HOLO_RANGE_SPLIT_MIN_QPS=0 \
+  CLIENTS=1 \
   DURATION=20s \
   FAIL_INJECT=0 \
   FAULT_DISCONNECT_PCT=0

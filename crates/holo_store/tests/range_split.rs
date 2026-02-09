@@ -102,7 +102,10 @@ fn range_autosplit_keeps_reads_writes_working() {
                 break;
             }
         }
-        assert!(Instant::now() < quorum_deadline, "cluster write quorum not ready in time");
+        assert!(
+            Instant::now() < quorum_deadline,
+            "cluster write quorum not ready in time"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
 
@@ -114,9 +117,7 @@ fn range_autosplit_keeps_reads_writes_working() {
         n2.assert_running("before set");
         n3.assert_running("before set");
         let val = format!("v{i:03}");
-        let resp = conn
-            .send_command(&["SET", key, &val])
-            .expect("set command");
+        let resp = conn.send_command(&["SET", key, &val]).expect("set command");
         assert_eq!(resp, b"+OK\r\n".to_vec(), "SET failed");
     }
 
@@ -133,7 +134,11 @@ fn range_autosplit_keeps_reads_writes_working() {
             std::thread::sleep(Duration::from_millis(50));
             continue;
         };
-        let shards = json.get("shards").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let shards = json
+            .get("shards")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
         if shards.len() > 1 {
             saw_split = true;
             break;

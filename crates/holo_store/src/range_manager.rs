@@ -4,6 +4,7 @@
 //! - monitors range load (SET QPS) using node-local counters
 //! - approximates range growth using SET ops since a per-range baseline
 //! - proposes a safe split when a range is too big or too hot and there is a free shard index
+//! - proposes a safe merge when adjacent ranges become too small
 //!
 //! Safety: range splits are coordinated with a cluster-wide "freeze" flag stored
 //! in the meta group. While frozen, nodes block client traffic so there are no
@@ -42,13 +43,24 @@ pub struct RangeManagerConfig {
     pub split_qps_sustain: u8,
     /// Cooldown between splits for the same shard index.
     pub split_cooldown: Duration,
+    /// Merge adjacent ranges when their combined key count is below this threshold.
+    ///
+    /// Set to 0 to disable automatic merge proposals.
+    pub merge_max_keys: usize,
+    /// Cooldown after merge proposals to avoid split/merge oscillation.
+    pub merge_cooldown: Duration,
+    /// Maximum combined sustained SET QPS for an adjacent pair to be eligible
+    /// for automatic merge. Set to 0 to disable QPS-based cold gating.
+    pub merge_max_qps: u64,
+    /// Require low combined QPS for this many consecutive evaluations before
+    /// proposing a merge.
+    pub merge_qps_sustain: u8,
+    /// Hysteresis for merge key threshold as a percentage of `merge_max_keys`
+    /// (1-100). Lower values reduce split/merge oscillation.
+    pub merge_key_hysteresis_pct: u8,
 }
 
-pub fn spawn(
-    state: Arc<NodeState>,
-    keyspace: Arc<Keyspace>,
-    cfg: RangeManagerConfig,
-) {
+pub fn spawn(state: Arc<NodeState>, keyspace: Arc<Keyspace>, cfg: RangeManagerConfig) {
     // Keep it simple: only one node proposes management operations.
     if state.node_id != 1 {
         return;
@@ -70,6 +82,8 @@ pub fn spawn(
         let mut sustained: Vec<u8> = vec![0; state.shard_load.shards()];
         let mut cooldown_until: Vec<std::time::Instant> =
             vec![std::time::Instant::now(); state.shard_load.shards()];
+        let mut merge_cooldown_until = std::collections::BTreeMap::<u64, std::time::Instant>::new();
+        let mut merge_sustained = std::collections::BTreeMap::<u64, u8>::new();
         loop {
             ticker.tick().await;
             let now = std::time::Instant::now();
@@ -81,6 +95,8 @@ pub fn spawn(
                 &mut baseline_set_ops,
                 &mut sustained,
                 &mut cooldown_until,
+                &mut merge_cooldown_until,
+                &mut merge_sustained,
                 now,
             )
             .await
@@ -99,6 +115,8 @@ async fn maybe_split_once(
     baseline_set_ops: &mut [u64],
     sustained: &mut [u8],
     cooldown_until: &mut [std::time::Instant],
+    merge_cooldown_until: &mut std::collections::BTreeMap<u64, std::time::Instant>,
+    merge_sustained: &mut std::collections::BTreeMap<u64, u8>,
     now: std::time::Instant,
 ) -> anyhow::Result<()> {
     if state.cluster_store.frozen() {
@@ -108,7 +126,7 @@ async fn maybe_split_once(
     let cluster_state = state.cluster_store.state();
     // Keep range-split freeze windows out of the way while replica moves are
     // in progress; rebalancing has higher correctness priority.
-    if !cluster_state.shard_rebalances.is_empty() {
+    if !cluster_state.shard_rebalances.is_empty() || !cluster_state.shard_merges.is_empty() {
         return Ok(());
     }
 
@@ -117,7 +135,8 @@ async fn maybe_split_once(
         return Ok(());
     };
 
-    let Some((reason, shard)) = pick_split_candidate(
+    let mut qps_by_idx = Vec::new();
+    if let Some((reason, shard)) = pick_split_candidate(
         state.clone(),
         &cluster_state.shards,
         cfg,
@@ -125,118 +144,161 @@ async fn maybe_split_once(
         baseline_set_ops,
         sustained,
         cooldown_until,
+        &mut qps_by_idx,
         now,
-    )? else {
-        return Ok(());
-    };
+    )? {
+        // Only read the keyspace once we've decided to split.
+        let Some(split_key) = pick_split_key_from_range(keyspace.as_ref(), &shard)? else {
+            // No keys in this range; reset streaks and wait.
+            if shard.shard_index < sustained.len() {
+                sustained[shard.shard_index] = 0;
+            }
+            return Ok(());
+        };
 
-    // Only read the keyspace once we've decided to split.
-    let Some(split_key) = pick_split_key_from_range(keyspace.as_ref(), &shard)? else {
-        // No keys in this range; reset streaks and wait.
-        if shard.shard_index < sustained.len() {
-            sustained[shard.shard_index] = 0;
-        }
-        return Ok(());
-    };
+        tracing::info!(
+            shard_id = shard.shard_id,
+            shard_index = shard.shard_index,
+            reason = reason,
+            target_shard_index = target_idx,
+            split_key = %String::from_utf8_lossy(&split_key),
+            "range manager proposing split"
+        );
 
-    tracing::info!(
-        shard_id = shard.shard_id,
-        shard_index = shard.shard_index,
-        reason = reason,
-        target_shard_index = target_idx,
-        split_key = %String::from_utf8_lossy(&split_key),
-        "range manager proposing split"
-    );
+        // Freeze traffic to avoid in-flight proposals during key migration + reroute.
+        let freeze_before_epoch = state.cluster_store.epoch();
+        propose_meta(state.clone(), ClusterCommand::SetFrozen { frozen: true }).await?;
+        // Any error after freeze must still unfreeze before returning.
+        let split_res = async {
+            let freeze_epoch = wait_for_local_state(
+                state.clone(),
+                freeze_before_epoch,
+                true,
+                Duration::from_secs(5),
+            )
+            .await?;
+            wait_for_cluster_converged(
+                state.clone(),
+                freeze_epoch,
+                true,
+                None,
+                Duration::from_secs(5),
+            )
+            .await?;
 
-    // Freeze traffic to avoid in-flight proposals during key migration + reroute.
-    let freeze_before_epoch = state.cluster_store.epoch();
-    propose_meta(state.clone(), ClusterCommand::SetFrozen { frozen: true }).await?;
-    // Any error after freeze must still unfreeze before returning.
-    let split_res = async {
-        let freeze_epoch =
-            wait_for_local_state(state.clone(), freeze_before_epoch, true, Duration::from_secs(5))
+            // While frozen, wait until the source group has drained all in-flight
+            // consensus work. This avoids migrating from a state that is still
+            // catching up committed writes.
+            // Drain any client operations that already passed the freeze check.
+            state
+                .wait_for_client_ops_drained(Duration::from_secs(5))
                 .await?;
+            wait_for_shard_quiesced(state.clone(), shard.shard_index, Duration::from_secs(5))
+                .await?;
+            let split_before_epoch = state.cluster_store.epoch();
+            propose_meta(
+                state.clone(),
+                ClusterCommand::SplitRange {
+                    split_key,
+                    target_shard_index: target_idx,
+                },
+            )
+            .await?;
+            let split_epoch =
+                wait_for_local_epoch(state.clone(), split_before_epoch, Duration::from_secs(5))
+                    .await?;
+            let shard_count = state.cluster_store.state().shards.len();
+            wait_for_cluster_converged(
+                state.clone(),
+                split_epoch,
+                true,
+                Some(shard_count),
+                Duration::from_secs(8),
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        // Always unfreeze, even if split failed.
+        let unfreeze_before_epoch = state.cluster_store.epoch();
+        let unfreeze_res =
+            propose_meta(state.clone(), ClusterCommand::SetFrozen { frozen: false }).await;
+        if let Err(err) = split_res {
+            if let Err(unfreeze_err) = unfreeze_res {
+                tracing::warn!(error = ?unfreeze_err, "failed to unfreeze after split failure");
+            }
+            return Err(err);
+        }
+        unfreeze_res?;
+        let unfreeze_epoch = wait_for_local_state(
+            state.clone(),
+            unfreeze_before_epoch,
+            false,
+            Duration::from_secs(5),
+        )
+        .await?;
+        let shard_count = state.cluster_store.state().shards.len();
         wait_for_cluster_converged(
             state.clone(),
-            freeze_epoch,
-            true,
-            None,
+            unfreeze_epoch,
+            false,
+            Some(shard_count),
             Duration::from_secs(5),
         )
         .await?;
 
-        // While frozen, wait until the source group has drained all in-flight
-        // consensus work. This avoids migrating from a state that is still
-        // catching up committed writes.
-        // Drain any client operations that already passed the freeze check.
-        state
-            .wait_for_client_ops_drained(Duration::from_secs(5))
-            .await?;
-        wait_for_shard_quiesced(state.clone(), shard.shard_index, Duration::from_secs(5)).await?;
-        let split_before_epoch = state.cluster_store.epoch();
+        // Apply cooldown to the *source* shard index to avoid rapid re-splitting.
+        if let Some(slot) = cooldown_until.get_mut(shard.shard_index) {
+            *slot = now + cfg.split_cooldown;
+        }
+        // Reset "size" baselines for both source and target shard indices.
+        if shard.shard_index < baseline_set_ops.len() {
+            baseline_set_ops[shard.shard_index] = last
+                .set_ops
+                .get(shard.shard_index)
+                .copied()
+                .unwrap_or(baseline_set_ops[shard.shard_index]);
+        }
+        if target_idx < baseline_set_ops.len() {
+            baseline_set_ops[target_idx] = last.set_ops.get(target_idx).copied().unwrap_or(0);
+        }
+        if shard.shard_index < sustained.len() {
+            sustained[shard.shard_index] = 0;
+        }
+        return Ok(());
+    }
+
+    if let Some((left, right, key_total)) = pick_merge_candidate(
+        &cluster_state,
+        keyspace.as_ref(),
+        cfg,
+        &qps_by_idx,
+        merge_cooldown_until,
+        merge_sustained,
+        now,
+    )? {
+        tracing::info!(
+            left_shard_id = left.shard_id,
+            right_shard_id = right.shard_id,
+            left_index = left.shard_index,
+            right_index = right.shard_index,
+            key_total,
+            "range manager proposing merge"
+        );
         propose_meta(
             state.clone(),
-            ClusterCommand::SplitRange {
-                split_key,
-                target_shard_index: target_idx,
+            ClusterCommand::BeginRangeMerge {
+                left_shard_id: left.shard_id,
+                right_shard_id: right.shard_id,
             },
         )
         .await?;
-        let split_epoch =
-            wait_for_local_epoch(state.clone(), split_before_epoch, Duration::from_secs(5)).await?;
-        let shard_count = state.cluster_store.state().shards.len();
-        wait_for_cluster_converged(
-            state.clone(),
-            split_epoch,
-            true,
-            Some(shard_count),
-            Duration::from_secs(8),
-        )
-        .await?;
-        Ok::<(), anyhow::Error>(())
-    }
-    .await;
-
-    // Always unfreeze, even if split failed.
-    let unfreeze_before_epoch = state.cluster_store.epoch();
-    let unfreeze_res = propose_meta(state.clone(), ClusterCommand::SetFrozen { frozen: false }).await;
-    if let Err(err) = split_res {
-        if let Err(unfreeze_err) = unfreeze_res {
-            tracing::warn!(error = ?unfreeze_err, "failed to unfreeze after split failure");
-        }
-        return Err(err);
-    }
-    unfreeze_res?;
-    let unfreeze_epoch =
-        wait_for_local_state(state.clone(), unfreeze_before_epoch, false, Duration::from_secs(5))
-            .await?;
-    let shard_count = state.cluster_store.state().shards.len();
-    wait_for_cluster_converged(
-        state.clone(),
-        unfreeze_epoch,
-        false,
-        Some(shard_count),
-        Duration::from_secs(5),
-    )
-    .await?;
-
-    // Apply cooldown to the *source* shard index to avoid rapid re-splitting.
-    if let Some(slot) = cooldown_until.get_mut(shard.shard_index) {
-        *slot = now + cfg.split_cooldown;
-    }
-    // Reset "size" baselines for both source and target shard indices.
-    if shard.shard_index < baseline_set_ops.len() {
-        baseline_set_ops[shard.shard_index] = last
-            .set_ops
-            .get(shard.shard_index)
-            .copied()
-            .unwrap_or(baseline_set_ops[shard.shard_index]);
-    }
-    if target_idx < baseline_set_ops.len() {
-        baseline_set_ops[target_idx] = last.set_ops.get(target_idx).copied().unwrap_or(0);
-    }
-    if shard.shard_index < sustained.len() {
-        sustained[shard.shard_index] = 0;
+        let cooldown_deadline = now + cfg.merge_cooldown;
+        merge_cooldown_until.insert(left.shard_id, cooldown_deadline);
+        merge_cooldown_until.insert(right.shard_id, cooldown_deadline);
+        merge_sustained.remove(&left.shard_id);
+        merge_sustained.remove(&right.shard_id);
     }
     Ok(())
 }
@@ -352,9 +414,7 @@ async fn wait_for_cluster_converged(
         let mut last_err = String::new();
         for (node_id, grpc_addr) in members {
             if node_id == state.node_id {
-                let shard_ok = min_shards
-                    .map(|n| local.shards.len() >= n)
-                    .unwrap_or(true);
+                let shard_ok = min_shards.map(|n| local.shards.len() >= n).unwrap_or(true);
                 if !(local.epoch >= min_epoch && local.frozen == frozen && shard_ok) {
                     all_ok = false;
                     last_err = format!(
@@ -371,9 +431,7 @@ async fn wait_for_cluster_converged(
 
             match fetch_remote_probe(&grpc_addr, Duration::from_secs(1)).await {
                 Ok(remote) => {
-                    let shard_ok = min_shards
-                        .map(|n| remote.shards.len() >= n)
-                        .unwrap_or(true);
+                    let shard_ok = min_shards.map(|n| remote.shards.len() >= n).unwrap_or(true);
                     if !(remote.epoch >= min_epoch && remote.frozen == frozen && shard_ok) {
                         all_ok = false;
                         last_err = format!(
@@ -436,6 +494,7 @@ fn pick_split_candidate(
     baseline_set_ops: &mut [u64],
     sustained: &mut [u8],
     cooldown_until: &mut [std::time::Instant],
+    qps_by_idx_out: &mut Vec<u64>,
     now: std::time::Instant,
 ) -> anyhow::Result<Option<(&'static str, ShardDesc)>> {
     let cur = state.shard_load.snapshot();
@@ -457,6 +516,7 @@ fn pick_split_candidate(
 
     // Update last snapshot.
     *last = cur;
+    *qps_by_idx_out = qps_by_idx.clone();
 
     // Track sustained-above-threshold streaks.
     for (idx, qps) in qps_by_idx.iter().copied().enumerate() {
@@ -528,7 +588,113 @@ fn pick_split_candidate(
     Ok(None)
 }
 
-fn pick_split_key_from_range(keyspace: &Keyspace, shard: &ShardDesc) -> anyhow::Result<Option<Vec<u8>>> {
+fn pick_merge_candidate(
+    cluster_state: &crate::cluster::ClusterState,
+    keyspace: &Keyspace,
+    cfg: RangeManagerConfig,
+    qps_by_idx: &[u64],
+    merge_cooldown_until: &mut std::collections::BTreeMap<u64, std::time::Instant>,
+    merge_sustained: &mut std::collections::BTreeMap<u64, u8>,
+    now: std::time::Instant,
+) -> anyhow::Result<Option<(ShardDesc, ShardDesc, usize)>> {
+    if cfg.merge_max_keys == 0 || cluster_state.shards.len() < 2 {
+        return Ok(None);
+    }
+    if !cluster_state.shard_rebalances.is_empty() || !cluster_state.shard_merges.is_empty() {
+        return Ok(None);
+    }
+
+    merge_cooldown_until.retain(|_, until| *until > now);
+    let adjacent_left_ids = cluster_state
+        .shards
+        .windows(2)
+        .map(|pair| pair[0].shard_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    merge_sustained.retain(|left_id, _| adjacent_left_ids.contains(left_id));
+
+    let key_threshold = if cfg.merge_key_hysteresis_pct == 0 {
+        cfg.merge_max_keys
+    } else {
+        ((cfg.merge_max_keys as u128).saturating_mul(cfg.merge_key_hysteresis_pct as u128) / 100)
+            .max(1) as usize
+    };
+    let merge_qps_sustain = cfg.merge_qps_sustain.max(1);
+
+    let mut best: Option<(usize, ShardDesc, ShardDesc)> = None;
+    for pair in cluster_state.shards.windows(2) {
+        let left = &pair[0];
+        let right = &pair[1];
+        if !left.end_key.is_empty() && left.end_key != right.start_key {
+            continue;
+        }
+        if left.replicas != right.replicas || left.leaseholder != right.leaseholder {
+            continue;
+        }
+        if merge_cooldown_until
+            .get(&left.shard_id)
+            .map(|until| *until > now)
+            .unwrap_or(false)
+            || merge_cooldown_until
+                .get(&right.shard_id)
+                .map(|until| *until > now)
+                .unwrap_or(false)
+        {
+            continue;
+        }
+
+        let left_count =
+            count_keys_in_range(keyspace, left.shard_index, &left.start_key, &left.end_key)?;
+        let right_count = count_keys_in_range(
+            keyspace,
+            right.shard_index,
+            &right.start_key,
+            &right.end_key,
+        )?;
+        let total = left_count.saturating_add(right_count);
+        if total > key_threshold {
+            merge_sustained.remove(&left.shard_id);
+            continue;
+        }
+        let combined_qps = qps_by_idx.get(left.shard_index).copied().unwrap_or(0)
+            + qps_by_idx.get(right.shard_index).copied().unwrap_or(0);
+        if cfg.merge_max_qps > 0 && combined_qps > cfg.merge_max_qps {
+            merge_sustained.remove(&left.shard_id);
+            continue;
+        }
+        let streak = merge_sustained.entry(left.shard_id).or_insert(0);
+        *streak = streak.saturating_add(1);
+        if *streak < merge_qps_sustain {
+            continue;
+        }
+        match &best {
+            Some((best_total, _, _)) if *best_total <= total => {}
+            _ => best = Some((total, left.clone(), right.clone())),
+        }
+    }
+
+    Ok(best.map(|(total, left, right)| (left, right, total)))
+}
+
+fn count_keys_in_range(
+    keyspace: &Keyspace,
+    shard_index: usize,
+    start_key: &[u8],
+    end_key: &[u8],
+) -> anyhow::Result<usize> {
+    let latest_name = format!("kv_latest_{shard_index}");
+    let latest = keyspace.open_partition(&latest_name, PartitionCreateOptions::default())?;
+    let mut count = 0usize;
+    for item in latest_range(&latest, start_key, end_key) {
+        let _ = item?;
+        count = count.saturating_add(1);
+    }
+    Ok(count)
+}
+
+fn pick_split_key_from_range(
+    keyspace: &Keyspace,
+    shard: &ShardDesc,
+) -> anyhow::Result<Option<Vec<u8>>> {
     let latest_name = format!("kv_latest_{}", shard.shard_index);
     let latest = keyspace.open_partition(&latest_name, PartitionCreateOptions::default())?;
 

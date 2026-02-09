@@ -51,7 +51,11 @@ impl Drop for NodeProcess {
 }
 
 /// Spawn a holo-store node process for testing and capture stderr to a log file.
-pub fn spawn_node(data_dir: &PathBuf, redis_addr: SocketAddr, grpc_addr: SocketAddr) -> NodeProcess {
+pub fn spawn_node(
+    data_dir: &PathBuf,
+    redis_addr: SocketAddr,
+    grpc_addr: SocketAddr,
+) -> NodeProcess {
     spawn_node_with_read_mode(data_dir, redis_addr, grpc_addr, "local")
 }
 
@@ -172,14 +176,34 @@ pub fn holo_store_bin() -> PathBuf {
         return PathBuf::from(bin);
     }
     let root = find_repo_root().unwrap_or_else(|| std::env::current_dir().unwrap());
-    let exe = if cfg!(windows) { "holo-store.exe" } else { "holo-store" };
+    let exe = if cfg!(windows) {
+        "holo-store.exe"
+    } else {
+        "holo-store"
+    };
     let candidate = root.join("target").join("debug").join(exe);
     if candidate.exists() {
         return candidate;
     }
-    panic!(
-        "holo-store binary not found; run `cargo build -p holo_store --bin holo-store` first"
-    );
+    panic!("holo-store binary not found; run `cargo build -p holo_store --bin holo-store` first");
+}
+
+/// Locate the holoctl binary built by cargo.
+pub fn holoctl_bin() -> PathBuf {
+    if let Some(bin) = std::env::var_os("CARGO_BIN_EXE_holoctl") {
+        return PathBuf::from(bin);
+    }
+    let root = find_repo_root().unwrap_or_else(|| std::env::current_dir().unwrap());
+    let exe = if cfg!(windows) {
+        "holoctl.exe"
+    } else {
+        "holoctl"
+    };
+    let candidate = root.join("target").join("debug").join(exe);
+    if candidate.exists() {
+        return candidate;
+    }
+    panic!("holoctl binary not found; run `cargo build -p holo_store --bin holoctl` first");
 }
 
 /// Wait for a TCP port to accept connections.

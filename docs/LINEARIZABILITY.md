@@ -32,8 +32,10 @@ By default, if any operation errored, the checker fails early; you can allow err
 ## Running
 
 - `make check-linearizability`
+- `make check-linearizability-stress` (non-gating stress loop)
 - `./scripts/porcupine.sh` (single scenario)
 - `./scripts/check_linearizability.sh` (suite)
+- `./scripts/check_linearizability_stress.sh` (non-gating autosplit + autosplit/automerge stress suite)
 - `./scripts/check_read_minority.sh` (manual: read-only minority routing)
 
 ## Suite scenarios
@@ -55,6 +57,24 @@ GET/SET workload, but changes routing or failure injection to stress different c
 - **Failures injected:** none, but the node's background range manager will split the keyspace
   and migrate keys between shards during the run.
 - **Expected result:** linearizability should hold across splits (no lost or duplicated committed writes).
+
+### Range autosplit stress (non-gating)
+
+- **Operations:** same mixed GET/SET workload as autosplit.
+- **Read mode:** uses the server’s configured read mode (default `accord`).
+- **Failures injected:** none.
+- **Stress shape:** repeated runs with higher client concurrency (`CLIENTS=3`) while live split/migration is active.
+- **Expected result:** same correctness target as autosplit, but this is intentionally **non-gating** by default.
+  Use it for race detection and soak testing (`STRICT=1` makes failures exit non-zero).
+
+### Autosplit + automerge long run (non-gating)
+
+- **Operations:** mixed GET/SET under longer run time (`MERGE_STRESS_DURATION`, default `60s`).
+- **Read mode:** uses the server’s configured read mode (default `accord`).
+- **Failures injected:** none.
+- **Stress shape:** runs with autosplit and automerge both enabled so descriptors churn in both directions.
+- **Expected result:** successful operations remain linearizable while ranges split/merge over time.
+  This scenario is non-gating by default and intended for soak/race detection.
 
 ### Slow replica
 

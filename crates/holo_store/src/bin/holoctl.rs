@@ -26,6 +26,8 @@ struct Args {
 enum Command {
     /// Fetch and print the cluster state JSON.
     State,
+    /// Show in-flight merge progress/status.
+    MergeStatus,
     /// Show per-node range responsibilities and local record counts.
     Topology,
     /// Add or update a node in the cluster membership.
@@ -55,6 +57,15 @@ enum Command {
     Merge {
         #[arg(long)]
         left_shard_id: u64,
+        /// Pause an in-flight merge.
+        #[arg(long, default_value_t = false)]
+        pause: bool,
+        /// Resume a paused merge.
+        #[arg(long, default_value_t = false)]
+        resume: bool,
+        /// Cancel an in-flight merge (only valid pre-cutover).
+        #[arg(long, default_value_t = false)]
+        cancel: bool,
     },
     /// Request staged range rebalance (single replica replacement) and/or lease transfer.
     Rebalance {
@@ -79,6 +90,8 @@ struct ClusterStateView {
     shards: Vec<ShardView>,
     #[serde(default)]
     shard_rebalances: BTreeMap<String, ReplicaMoveView>,
+    #[serde(default)]
+    shard_merges: BTreeMap<String, RangeMergeView>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -106,6 +119,33 @@ struct ReplicaMoveView {
     phase: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct RangeMergeView {
+    left_shard_id: u64,
+    right_shard_id: u64,
+    phase: String,
+    #[serde(default)]
+    copied_rows: u64,
+    #[serde(default)]
+    copied_bytes: u64,
+    #[serde(default)]
+    lag_ops: u64,
+    #[serde(default)]
+    retry_count: u32,
+    #[serde(default)]
+    eta_seconds: u64,
+    #[serde(default)]
+    last_error: String,
+    #[serde(default)]
+    paused: bool,
+    #[serde(default)]
+    started_unix_ms: u64,
+    #[serde(default)]
+    last_progress_unix_ms: u64,
+    #[serde(default)]
+    cutover_epoch: Option<u64>,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -123,6 +163,75 @@ async fn main() -> anyhow::Result<()> {
                 .into_inner();
             println!("{}", resp.json);
         }
+        Command::MergeStatus => {
+            let resp = client
+                .cluster_state(rpc::ClusterStateRequest {})
+                .await?
+                .into_inner();
+            let state: ClusterStateView =
+                serde_json::from_str(&resp.json).context("parse cluster state json")?;
+            let mut rows = Vec::new();
+            let mut merges = state.shard_merges.values().cloned().collect::<Vec<_>>();
+            merges.sort_by_key(|m| (m.left_shard_id, m.right_shard_id));
+            for merge in merges {
+                rows.push(vec![
+                    merge.left_shard_id.to_string(),
+                    merge.right_shard_id.to_string(),
+                    merge.phase,
+                    if merge.paused { "yes" } else { "no" }.to_string(),
+                    merge.copied_rows.to_string(),
+                    merge.copied_bytes.to_string(),
+                    merge.lag_ops.to_string(),
+                    merge.retry_count.to_string(),
+                    if merge.eta_seconds == 0 {
+                        "-".to_string()
+                    } else {
+                        format!("{}s", merge.eta_seconds)
+                    },
+                    if merge.last_error.is_empty() {
+                        "-".to_string()
+                    } else {
+                        merge.last_error
+                    },
+                    if merge.started_unix_ms == 0 {
+                        "-".to_string()
+                    } else {
+                        merge.started_unix_ms.to_string()
+                    },
+                    if merge.last_progress_unix_ms == 0 {
+                        "-".to_string()
+                    } else {
+                        merge.last_progress_unix_ms.to_string()
+                    },
+                    merge
+                        .cutover_epoch
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                ]);
+            }
+            if rows.is_empty() {
+                println!("no in-flight merges");
+            } else {
+                print_ascii_table(
+                    &[
+                        "LEFT",
+                        "RIGHT",
+                        "PHASE",
+                        "PAUSED",
+                        "ROWS",
+                        "BYTES",
+                        "LAG_OPS",
+                        "RETRIES",
+                        "ETA",
+                        "LAST_ERROR",
+                        "STARTED_MS",
+                        "LAST_PROGRESS_MS",
+                        "CUTOVER_EPOCH",
+                    ],
+                    &rows,
+                );
+            }
+        }
         Command::Topology => {
             let resp = client
                 .cluster_state(rpc::ClusterStateRequest {})
@@ -137,6 +246,13 @@ async fn main() -> anyhow::Result<()> {
                 if let Ok(id) = shard_id.parse::<u64>() {
                     moves_by_shard.insert(id, mv.clone());
                 }
+            }
+            let mut merges_by_shard = HashMap::<u64, String>::new();
+            for merge in state.shard_merges.values() {
+                let left_status = format_merge_status(merge, true);
+                let right_status = format_merge_status(merge, false);
+                merges_by_shard.insert(merge.left_shard_id, left_status);
+                merges_by_shard.insert(merge.right_shard_id, right_status);
             }
 
             // Query local record counts from each non-removed member.
@@ -180,6 +296,11 @@ async fn main() -> anyhow::Result<()> {
                     };
                     let move_status =
                         format_move_status(member.node_id, shard.shard_id, &moves_by_shard);
+                    let merge_status = merges_by_shard
+                        .get(&shard.shard_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    let state_status = format_row_state(&merge_status, &move_status);
                     rows.push(vec![
                         member.node_id.to_string(),
                         member.state.clone(),
@@ -187,14 +308,13 @@ async fn main() -> anyhow::Result<()> {
                         shard.shard_id.to_string(),
                         format_range(&shard.start_key, &shard.end_key),
                         records,
-                        move_status,
+                        state_status,
                     ]);
                 }
                 if node_rows == 0 {
                     rows.push(vec![
                         member.node_id.to_string(),
                         member.state.clone(),
-                        "-".to_string(),
                         "-".to_string(),
                         "-".to_string(),
                         "-".to_string(),
@@ -214,7 +334,15 @@ async fn main() -> anyhow::Result<()> {
                 println!("no shard responsibilities found");
             } else {
                 print_ascii_table(
-                    &["NODE", "STATE", "ROLE", "SHARD", "RANGE", "RECORDS", "MOVE"],
+                    &[
+                        "NODE",
+                        "NODE_STATE",
+                        "ROLE",
+                        "SHARD",
+                        "RANGE",
+                        "RECORDS",
+                        "STATE",
+                    ],
                     &rows,
                 );
             }
@@ -256,11 +384,46 @@ async fn main() -> anyhow::Result<()> {
                 resp.left_shard_id, resp.right_shard_id
             );
         }
-        Command::Merge { left_shard_id } => {
-            client
-                .range_merge(rpc::RangeMergeRequest { left_shard_id })
-                .await?;
-            println!("ok");
+        Command::Merge {
+            left_shard_id,
+            pause,
+            resume,
+            cancel,
+        } => {
+            let mut mode_count = 0u8;
+            if pause {
+                mode_count += 1;
+            }
+            if resume {
+                mode_count += 1;
+            }
+            if cancel {
+                mode_count += 1;
+            }
+            if mode_count > 1 {
+                anyhow::bail!("use at most one of --pause, --resume, --cancel");
+            }
+            let action = if pause {
+                rpc::RangeMergeAction::RANGE_MERGE_ACTION_PAUSE
+            } else if resume {
+                rpc::RangeMergeAction::RANGE_MERGE_ACTION_RESUME
+            } else if cancel {
+                rpc::RangeMergeAction::RANGE_MERGE_ACTION_CANCEL
+            } else {
+                rpc::RangeMergeAction::RANGE_MERGE_ACTION_START
+            };
+            let resp = client
+                .range_merge(rpc::RangeMergeRequest {
+                    left_shard_id,
+                    action,
+                })
+                .await?
+                .into_inner();
+            if resp.message.is_empty() {
+                println!("ok");
+            } else {
+                println!("ok ({})", resp.message);
+            }
         }
         Command::Rebalance {
             shard_id,
@@ -348,14 +511,54 @@ fn format_move_status(
     moves_by_shard: &HashMap<u64, ReplicaMoveView>,
 ) -> String {
     let Some(mv) = moves_by_shard.get(&shard_id) else {
-        return "-".to_string();
+        return String::new();
     };
     if node_id == mv.to_node {
-        format!("incoming:{}", mv.phase)
+        format!("in:{}", mv.phase)
     } else if node_id == mv.from_node {
-        format!("outgoing:{}", mv.phase)
+        format!("out:{}", mv.phase)
     } else {
-        "-".to_string()
+        String::new()
+    }
+}
+
+fn format_merge_status(merge: &RangeMergeView, is_left: bool) -> String {
+    let side = if is_left { "left" } else { "right" };
+    let mut parts = vec![format!("{side}:{}", merge.phase)];
+    if merge.paused {
+        parts.push("paused".to_string());
+    }
+    if merge.copied_rows > 0 {
+        parts.push(format!("rows={}", merge.copied_rows));
+    }
+    if merge.copied_bytes > 0 {
+        parts.push(format!("bytes={}", merge.copied_bytes));
+    }
+    if merge.lag_ops > 0 {
+        parts.push(format!("lag={}", merge.lag_ops));
+    }
+    if merge.retry_count > 0 {
+        parts.push(format!("retries={}", merge.retry_count));
+    }
+    if merge.eta_seconds > 0 {
+        parts.push(format!("eta={}s", merge.eta_seconds));
+    }
+    if !merge.last_error.is_empty() {
+        parts.push(format!("err={}", merge.last_error));
+    }
+    parts.join(" ")
+}
+
+fn format_row_state(merge_status: &str, move_status: &str) -> String {
+    let merge_active = !merge_status.is_empty();
+    let move_active = !move_status.is_empty();
+    match (merge_active, move_active) {
+        (false, false) => String::new(),
+        (true, false) => merge_status.to_string(),
+        (false, true) => move_status.to_string(),
+        // Merge/move are intended to be mutually exclusive for a shard.
+        // Keep both values visible if this invariant is ever violated.
+        (true, true) => format!("BUG merge={merge_status} move={move_status}"),
     }
 }
 

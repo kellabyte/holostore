@@ -232,15 +232,12 @@ impl InflightLimiter {
             if current < limit {
                 if self
                     .in_flight
-                    .compare_exchange(
-                        current,
-                        current + 1,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    )
+                    .compare_exchange(current, current + 1, Ordering::Relaxed, Ordering::Relaxed)
                     .is_ok()
                 {
-                    return InflightPermit { limiter: self.clone() };
+                    return InflightPermit {
+                        limiter: self.clone(),
+                    };
                 }
                 // CAS failed, retry with updated counters.
                 continue;
@@ -355,8 +352,7 @@ impl RecoverCoalescer {
             },
         );
         let inflight = map.len() as u64;
-        self.inflight_peak
-            .fetch_max(inflight, Ordering::Relaxed);
+        self.inflight_peak.fetch_max(inflight, Ordering::Relaxed);
         self.enqueued.fetch_add(1, Ordering::Relaxed);
         RecoverEnqueueDecision::Enqueue
     }
@@ -482,14 +478,26 @@ impl GrpcTransport {
         let peer_stats = Arc::new(PeerStats::default());
         let recover_coalescer = Arc::new(RecoverCoalescer::default());
         // Start each limiter at the configured inflight limit.
-        let pre_accept_limiter =
-            Arc::new(InflightLimiter::new(inflight_limit, inflight_tuning.min, inflight_tuning.max));
-        let accept_limiter =
-            Arc::new(InflightLimiter::new(inflight_limit, inflight_tuning.min, inflight_tuning.max));
-        let commit_limiter =
-            Arc::new(InflightLimiter::new(inflight_limit, inflight_tuning.min, inflight_tuning.max));
-        let recover_limiter =
-            Arc::new(InflightLimiter::new(inflight_limit, inflight_tuning.min, inflight_tuning.max));
+        let pre_accept_limiter = Arc::new(InflightLimiter::new(
+            inflight_limit,
+            inflight_tuning.min,
+            inflight_tuning.max,
+        ));
+        let accept_limiter = Arc::new(InflightLimiter::new(
+            inflight_limit,
+            inflight_tuning.min,
+            inflight_tuning.max,
+        ));
+        let commit_limiter = Arc::new(InflightLimiter::new(
+            inflight_limit,
+            inflight_tuning.min,
+            inflight_tuning.max,
+        ));
+        let recover_limiter = Arc::new(InflightLimiter::new(
+            inflight_limit,
+            inflight_tuning.min,
+            inflight_tuning.max,
+        ));
 
         spawn_kv_get_batcher(
             read_client.clone(),
@@ -688,7 +696,8 @@ impl GrpcTransport {
         let start = std::time::Instant::now();
         let result = time::timeout(
             self.rpc_timeout,
-            peer.read_client.kv_batch_get(rpc::KvBatchGetRequest { keys }),
+            peer.read_client
+                .kv_batch_get(rpc::KvBatchGetRequest { keys }),
         )
         .await;
         let rpc_us = start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
@@ -731,7 +740,8 @@ impl GrpcTransport {
         let start = std::time::Instant::now();
         let resp = time::timeout(
             self.rpc_timeout,
-            peer.read_client.last_committed(rpc::LastCommittedRequest { group_id, keys }),
+            peer.read_client
+                .last_committed(rpc::LastCommittedRequest { group_id, keys }),
         )
         .await;
         let _rpc_us = start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
@@ -798,7 +808,8 @@ impl GrpcTransport {
                 .map(to_rpc_executed_prefix)
                 .collect(),
         };
-        let resp = time::timeout(self.rpc_timeout, peer.read_client.seed_executed_prefix(req)).await;
+        let resp =
+            time::timeout(self.rpc_timeout, peer.read_client.seed_executed_prefix(req)).await;
         match resp {
             Ok(Ok(resp)) => {
                 if resp.into_inner().ok {
@@ -813,12 +824,14 @@ impl GrpcTransport {
     }
 
     /// Fetch and decode the peer's current control-plane state snapshot.
-    pub async fn cluster_state(&self, target: NodeId) -> anyhow::Result<crate::cluster::ClusterState> {
+    pub async fn cluster_state(
+        &self,
+        target: NodeId,
+    ) -> anyhow::Result<crate::cluster::ClusterState> {
         let peer = self.peer(target)?;
         let resp = time::timeout(
             self.rpc_timeout,
-            peer.read_client
-                .cluster_state(rpc::ClusterStateRequest {}),
+            peer.read_client.cluster_state(rpc::ClusterStateRequest {}),
         )
         .await;
         match resp {
@@ -829,6 +842,27 @@ impl GrpcTransport {
             }
             Ok(Err(err)) => Err(anyhow::anyhow!("cluster_state rpc failed: {err}")),
             Err(_) => Err(anyhow::anyhow!("cluster_state rpc timed out")),
+        }
+    }
+
+    /// Fetch local range record counts from a peer keyed by shard id.
+    pub async fn range_stats(&self, target: NodeId) -> anyhow::Result<HashMap<u64, u64>> {
+        let peer = self.peer(target)?;
+        let resp = time::timeout(
+            self.rpc_timeout,
+            peer.read_client.range_stats(rpc::RangeStatsRequest {}),
+        )
+        .await;
+        match resp {
+            Ok(Ok(resp)) => {
+                let mut out = HashMap::new();
+                for range in resp.into_inner().ranges {
+                    out.insert(range.shard_id, range.record_count);
+                }
+                Ok(out)
+            }
+            Ok(Err(err)) => Err(anyhow::anyhow!("range_stats rpc failed: {err}")),
+            Err(_) => Err(anyhow::anyhow!("range_stats rpc timed out")),
         }
     }
 
@@ -850,7 +884,11 @@ impl GrpcTransport {
             cursor: cursor.to_vec().into(),
             limit: limit.min(u32::MAX as usize) as u32,
         };
-        let resp = time::timeout(self.rpc_timeout, peer.read_client.range_snapshot_latest(req)).await;
+        let resp = time::timeout(
+            self.rpc_timeout,
+            peer.read_client.range_snapshot_latest(req),
+        )
+        .await;
         match resp {
             Ok(Ok(resp)) => {
                 let resp = resp.into_inner();
@@ -1153,12 +1191,7 @@ fn spawn_pre_accept_batcher(
                 peer_stats
                     .pre_accept_inflight
                     .fetch_sub(1, Ordering::Relaxed);
-                stats.record_pre_accept_batch(
-                    batch_len,
-                    wait_us_total,
-                    wait_us_max,
-                    rpc_us,
-                );
+                stats.record_pre_accept_batch(batch_len, wait_us_total, wait_us_max, rpc_us);
                 peer_stats.pre_accept_latency.record(rpc_us);
 
                 match result {
@@ -1277,9 +1310,7 @@ fn spawn_accept_batcher(
                 )
                 .await;
                 let rpc_us = rpc_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-                peer_stats
-                    .accept_inflight
-                    .fetch_sub(1, Ordering::Relaxed);
+                peer_stats.accept_inflight.fetch_sub(1, Ordering::Relaxed);
                 stats.record_accept_batch(batch_len, wait_us_total, wait_us_max, rpc_us);
                 peer_stats.accept_latency.record(rpc_us);
 
@@ -1316,9 +1347,7 @@ fn spawn_accept_batcher(
                     Err(_) => {
                         // Timeout: notify all waiters.
                         stats.record_accept_error();
-                        peer_stats
-                            .accept_timeouts
-                            .fetch_add(1, Ordering::Relaxed);
+                        peer_stats.accept_timeouts.fetch_add(1, Ordering::Relaxed);
                         peer_stats.accept_errors.fetch_add(1, Ordering::Relaxed);
                         let err = anyhow::anyhow!("accept_batch rpc timed out");
                         for tx in txs {
@@ -1399,9 +1428,7 @@ fn spawn_commit_batcher(
                 )
                 .await;
                 let rpc_us = rpc_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-                peer_stats
-                    .commit_inflight
-                    .fetch_sub(1, Ordering::Relaxed);
+                peer_stats.commit_inflight.fetch_sub(1, Ordering::Relaxed);
                 stats.record_commit_batch(batch_len, wait_us_total, wait_us_max, rpc_us);
                 peer_stats.commit_latency.record(rpc_us);
 
@@ -1438,9 +1465,7 @@ fn spawn_commit_batcher(
                     Err(_) => {
                         // Timeout: notify all waiters.
                         stats.record_commit_error();
-                        peer_stats
-                            .commit_timeouts
-                            .fetch_add(1, Ordering::Relaxed);
+                        peer_stats.commit_timeouts.fetch_add(1, Ordering::Relaxed);
                         peer_stats.commit_errors.fetch_add(1, Ordering::Relaxed);
                         let err = anyhow::anyhow!("commit_batch rpc timed out");
                         for tx in txs {
@@ -1478,11 +1503,7 @@ fn spawn_recover_batcher(
             let batch_start = std::time::Instant::now();
             let mut wait_us_total = 0u64;
             let mut wait_us_max = 0u64;
-            for RecoverWork {
-                req,
-                enqueued_at,
-            } in items
-            {
+            for RecoverWork { req, enqueued_at } in items {
                 // Track queue wait time for each request in the batch.
                 let wait_us = batch_start
                     .duration_since(enqueued_at)
@@ -1514,9 +1535,7 @@ fn spawn_recover_batcher(
             let permit = limiter.acquire().await;
             tokio::spawn(async move {
                 let _permit = permit;
-                peer_stats
-                    .recover_inflight
-                    .fetch_add(1, Ordering::Relaxed);
+                peer_stats.recover_inflight.fetch_add(1, Ordering::Relaxed);
                 let rpc_start = std::time::Instant::now();
                 let result = time::timeout(
                     timeout,
@@ -1524,9 +1543,7 @@ fn spawn_recover_batcher(
                 )
                 .await;
                 let rpc_us = rpc_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-                peer_stats
-                    .recover_inflight
-                    .fetch_sub(1, Ordering::Relaxed);
+                peer_stats.recover_inflight.fetch_sub(1, Ordering::Relaxed);
                 stats.record_recover_batch(batch_len, wait_us_total, wait_us_max, rpc_us);
                 peer_stats.recover_latency.record(rpc_us);
 
@@ -2068,13 +2085,7 @@ impl PeerStats {
 
 impl RpcStats {
     /// Record a batched KV GET request.
-    fn record_kv_get_batch(
-        &self,
-        items: u64,
-        wait_us_total: u64,
-        wait_us_max: u64,
-        rpc_us: u64,
-    ) {
+    fn record_kv_get_batch(&self, items: u64, wait_us_total: u64, wait_us_max: u64, rpc_us: u64) {
         self.kv_get_batches.fetch_add(1, Ordering::Relaxed);
         self.kv_get_items.fetch_add(items, Ordering::Relaxed);
         self.kv_get_wait_us
@@ -2125,13 +2136,7 @@ impl RpcStats {
     }
 
     /// Record a batched accept RPC call.
-    fn record_accept_batch(
-        &self,
-        items: u64,
-        wait_us_total: u64,
-        wait_us_max: u64,
-        rpc_us: u64,
-    ) {
+    fn record_accept_batch(&self, items: u64, wait_us_total: u64, wait_us_max: u64, rpc_us: u64) {
         self.accept_batches.fetch_add(1, Ordering::Relaxed);
         self.accept_items.fetch_add(items, Ordering::Relaxed);
         self.accept_wait_us
@@ -2148,13 +2153,7 @@ impl RpcStats {
     }
 
     /// Record a batched commit RPC call.
-    fn record_commit_batch(
-        &self,
-        items: u64,
-        wait_us_total: u64,
-        wait_us_max: u64,
-        rpc_us: u64,
-    ) {
+    fn record_commit_batch(&self, items: u64, wait_us_total: u64, wait_us_max: u64, rpc_us: u64) {
         self.commit_batches.fetch_add(1, Ordering::Relaxed);
         self.commit_items.fetch_add(items, Ordering::Relaxed);
         self.commit_wait_us
@@ -2171,20 +2170,13 @@ impl RpcStats {
     }
 
     /// Record a batched recover RPC call.
-    fn record_recover_batch(
-        &self,
-        items: u64,
-        wait_us_total: u64,
-        wait_us_max: u64,
-        rpc_us: u64,
-    ) {
+    fn record_recover_batch(&self, items: u64, wait_us_total: u64, wait_us_max: u64, rpc_us: u64) {
         self.recover_batches.fetch_add(1, Ordering::Relaxed);
         self.recover_items.fetch_add(items, Ordering::Relaxed);
         self.recover_wait_us
             .fetch_add(wait_us_total, Ordering::Relaxed);
         self.recover_rpc_us.fetch_add(rpc_us, Ordering::Relaxed);
-        self.recover_max_batch
-            .fetch_max(items, Ordering::Relaxed);
+        self.recover_max_batch.fetch_max(items, Ordering::Relaxed);
         self.recover_max_wait_us
             .fetch_max(wait_us_max, Ordering::Relaxed);
     }
@@ -2495,7 +2487,9 @@ impl Transport for GrpcTransport {
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 // Backpressure: queue is full.
-                peer.stats.pre_accept_queue_full.fetch_add(1, Ordering::Relaxed);
+                peer.stats
+                    .pre_accept_queue_full
+                    .fetch_add(1, Ordering::Relaxed);
                 return Err(anyhow::anyhow!("pre_accept queue full"));
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
@@ -2608,17 +2602,13 @@ impl Transport for GrpcTransport {
                             .recover_queue_full
                             .fetch_add(1, Ordering::Relaxed);
                         let err = anyhow::anyhow!("recover queue full");
-                        peer.recover_coalescer
-                            .complete_err(txn_id, &err)
-                            .await;
+                        peer.recover_coalescer.complete_err(txn_id, &err).await;
                         return Err(err);
                     }
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                         // Transport is shutting down, propagate error to waiters.
                         let err = anyhow::anyhow!("recover queue closed");
-                        peer.recover_coalescer
-                            .complete_err(txn_id, &err)
-                            .await;
+                        peer.recover_coalescer.complete_err(txn_id, &err).await;
                         return Err(err);
                     }
                 }

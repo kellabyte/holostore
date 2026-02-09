@@ -62,6 +62,55 @@ pub enum ReplicaMovePhase {
     LeaseTransferred,
 }
 
+/// Reconfiguration phase for a range-merge workflow.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RangeMergePhase {
+    Preparing,
+    Copying,
+    Catchup,
+    Cutover,
+    Finalizing,
+}
+
+/// In-flight range merge tracked in control-plane metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RangeMerge {
+    pub left_shard_id: u64,
+    pub right_shard_id: u64,
+    pub phase: RangeMergePhase,
+    #[serde(default)]
+    pub copied_rows: u64,
+    #[serde(default)]
+    pub copied_bytes: u64,
+    #[serde(default)]
+    pub lag_ops: u64,
+    #[serde(default)]
+    pub retry_count: u32,
+    #[serde(default)]
+    pub eta_seconds: u64,
+    #[serde(default)]
+    pub last_error: String,
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default)]
+    pub started_unix_ms: u64,
+    #[serde(default)]
+    pub last_progress_unix_ms: u64,
+    #[serde(default)]
+    pub cutover_epoch: Option<u64>,
+}
+
+/// Retired right-hand range metadata kept briefly before GC cleanup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetiredRange {
+    pub shard_id: u64,
+    pub shard_index: usize,
+    pub start_key: Vec<u8>,
+    pub end_key: Vec<u8>,
+    pub retired_epoch: u64,
+    pub gc_after_epoch: u64,
+}
+
 /// In-flight replica move tracked in the control-plane metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplicaMove {
@@ -92,6 +141,12 @@ pub struct ClusterState {
     pub shard_replica_roles: BTreeMap<u64, BTreeMap<NodeId, ReplicaRole>>,
     #[serde(default)]
     pub shard_rebalances: BTreeMap<u64, ReplicaMove>,
+    #[serde(default)]
+    pub shard_merges: BTreeMap<u64, RangeMerge>,
+    #[serde(default)]
+    pub shard_fences: BTreeMap<u64, String>,
+    #[serde(default)]
+    pub retired_ranges: BTreeMap<u64, RetiredRange>,
 }
 
 /// Commands applied to the meta group state machine.
@@ -118,6 +173,38 @@ pub enum ClusterCommand {
         shard_id: u64,
     },
     AbortReplicaMove {
+        shard_id: u64,
+    },
+    BeginRangeMerge {
+        left_shard_id: u64,
+        right_shard_id: u64,
+    },
+    AdvanceRangeMerge {
+        left_shard_id: u64,
+        phase: RangeMergePhase,
+        copied_rows: u64,
+        copied_bytes: u64,
+        lag_ops: u64,
+        retry_count: u32,
+        eta_seconds: u64,
+        last_error: String,
+    },
+    PauseRangeMerge {
+        left_shard_id: u64,
+        paused: bool,
+    },
+    AbortRangeMerge {
+        left_shard_id: u64,
+    },
+    CompleteRangeMerge {
+        left_shard_id: u64,
+    },
+    SetShardFence {
+        shard_id: u64,
+        fenced: bool,
+        reason: String,
+    },
+    GcRetiredRange {
         shard_id: u64,
     },
     PromoteReplicaLearner {
@@ -298,6 +385,9 @@ impl ClusterStateStore {
             shards: Vec::new(),
             shard_replica_roles: BTreeMap::new(),
             shard_rebalances: BTreeMap::new(),
+            shard_merges: BTreeMap::new(),
+            shard_fences: BTreeMap::new(),
+            retired_ranges: BTreeMap::new(),
         };
         // Start with a single full-keyspace range (Cockroach-style bootstrap).
         let count = initial_ranges.max(1).min(256);
@@ -378,6 +468,23 @@ impl ClusterStateStore {
 
     pub fn frozen(&self) -> bool {
         self.state.read().unwrap().frozen
+    }
+
+    pub fn shard_fence_reason(&self, shard_id: u64) -> Option<String> {
+        self.state
+            .read()
+            .unwrap()
+            .shard_fences
+            .get(&shard_id)
+            .cloned()
+    }
+
+    pub fn is_shard_fenced(&self, shard_id: u64) -> bool {
+        self.state
+            .read()
+            .unwrap()
+            .shard_fences
+            .contains_key(&shard_id)
     }
 
     pub fn members_map(&self) -> anyhow::Result<std::collections::HashMap<NodeId, SocketAddr>> {
@@ -485,6 +592,13 @@ impl ClusterStateStore {
 
         if state.shard_rebalances.contains_key(&shard_id) {
             anyhow::bail!("shard {shard_id} already has an in-flight move");
+        }
+        if state
+            .shard_merges
+            .values()
+            .any(|m| m.left_shard_id == shard_id || m.right_shard_id == shard_id)
+        {
+            anyhow::bail!("shard {shard_id} already has an in-flight merge");
         }
 
         let active_members = active_member_ids_from_state(&state);
@@ -663,6 +777,128 @@ impl ClusterStateStore {
         state.shard_replica_roles.insert(right_id, left_roles);
         state.shard_rebalances.remove(&right_id);
         state.epoch = state.epoch.saturating_add(1);
+
+        drop(state);
+        self.persist()
+    }
+
+    pub fn apply_merge_range(
+        &self,
+        left_shard_id: u64,
+        migrator: Option<&dyn RangeMigrator>,
+    ) -> anyhow::Result<()> {
+        // Block client request routing while we move keys and update descriptors.
+        let _split_guard = self.split_lock.write().unwrap();
+
+        let mut state = self.state.write().unwrap();
+        normalize_replica_metadata(&mut state);
+
+        let idx = match state
+            .shards
+            .iter()
+            .position(|s| s.shard_id == left_shard_id)
+        {
+            Some(idx) => idx,
+            None => anyhow::bail!("unknown shard id {left_shard_id}"),
+        };
+        let left_snapshot = state.shards[idx].clone();
+        let right_snapshot = if idx + 1 < state.shards.len() {
+            Some(state.shards[idx + 1].clone())
+        } else {
+            None
+        };
+
+        let Some(right_snapshot) = right_snapshot else {
+            // Idempotent replay after cutover: shard already has no right neighbor.
+            let epoch_now = state.epoch;
+            if let Some(merge) = state.shard_merges.get_mut(&left_shard_id) {
+                merge.phase = RangeMergePhase::Finalizing;
+                merge.last_progress_unix_ms = unix_time_ms();
+                if merge.cutover_epoch.is_none() {
+                    merge.cutover_epoch = Some(epoch_now);
+                }
+            }
+            return Ok(());
+        };
+
+        if !left_snapshot.end_key.is_empty() && left_snapshot.end_key != right_snapshot.start_key {
+            anyhow::bail!("shards are not adjacent");
+        }
+        if left_snapshot.replicas != right_snapshot.replicas {
+            anyhow::bail!(
+                "cannot merge shards with different replica sets (left={:?}, right={:?})",
+                left_snapshot.replicas,
+                right_snapshot.replicas
+            );
+        }
+        if left_snapshot.leaseholder != right_snapshot.leaseholder {
+            anyhow::bail!(
+                "cannot merge shards with different leaseholders (left={}, right={})",
+                left_snapshot.leaseholder,
+                right_snapshot.leaseholder
+            );
+        }
+        if state.shard_rebalances.contains_key(&left_snapshot.shard_id)
+            || state
+                .shard_rebalances
+                .contains_key(&right_snapshot.shard_id)
+        {
+            anyhow::bail!("cannot merge while either shard has in-flight rebalancing");
+        }
+        if state.shard_merges.iter().any(|(left, m)| {
+            *left != left_shard_id
+                && (m.left_shard_id == left_shard_id
+                    || m.right_shard_id == left_shard_id
+                    || m.left_shard_id == right_snapshot.shard_id
+                    || m.right_shard_id == right_snapshot.shard_id)
+        }) {
+            anyhow::bail!("cannot merge while either shard has an in-flight merge");
+        }
+
+        // When data lives in different physical shard partitions, merge requires
+        // moving right-hand keys into the left shard before descriptor cutover.
+        if left_snapshot.shard_index != right_snapshot.shard_index {
+            let Some(migrator) = migrator else {
+                anyhow::bail!(
+                    "cannot merge shards with different shard_index (left={}, right={}) without a range migrator",
+                    left_snapshot.shard_index,
+                    right_snapshot.shard_index
+                );
+            };
+            migrator.migrate(
+                right_snapshot.shard_index,
+                left_snapshot.shard_index,
+                &right_snapshot.start_key,
+                &right_snapshot.end_key,
+            )?;
+        }
+
+        let right = state.shards.remove(idx + 1);
+        let left = &mut state.shards[idx];
+        left.end_key = right.end_key.clone();
+        state.shard_replica_roles.remove(&right.shard_id);
+        state.shard_rebalances.remove(&right.shard_id);
+        state.shard_fences.remove(&right.shard_id);
+        let cutover_epoch = state.epoch.saturating_add(1);
+        if let Some(merge) = state.shard_merges.get_mut(&left_shard_id) {
+            merge.phase = RangeMergePhase::Finalizing;
+            merge.last_progress_unix_ms = unix_time_ms();
+            merge.cutover_epoch = Some(cutover_epoch);
+        }
+        state.epoch = cutover_epoch;
+        let retired_epoch = state.epoch;
+        let gc_after_epoch = retired_epoch.saturating_add(10);
+        state.retired_ranges.insert(
+            right.shard_id,
+            RetiredRange {
+                shard_id: right.shard_id,
+                shard_index: right.shard_index,
+                start_key: right.start_key.clone(),
+                end_key: right.end_key.clone(),
+                retired_epoch,
+                gc_after_epoch,
+            },
+        );
 
         drop(state);
         self.persist()
@@ -879,7 +1115,8 @@ impl ClusterStateStore {
                         anyhow::bail!("cannot abort move for shard {shard_id}: no replicas remain");
                     }
 
-                    if shard.leaseholder == mv.to_node || !shard.replicas.contains(&shard.leaseholder)
+                    if shard.leaseholder == mv.to_node
+                        || !shard.replicas.contains(&shard.leaseholder)
                     {
                         if shard.replicas.contains(&mv.from_node) {
                             shard.leaseholder = mv.from_node;
@@ -993,6 +1230,150 @@ impl ClusterStateStore {
                 state.shard_rebalances.remove(&shard_id);
                 state.epoch = state.epoch.saturating_add(1);
             }
+            ClusterCommand::BeginRangeMerge {
+                left_shard_id,
+                right_shard_id,
+            } => {
+                if state.shard_merges.contains_key(&left_shard_id) {
+                    // Idempotent replay of already-started merge.
+                    return Ok(());
+                }
+                let left_idx = state
+                    .shards
+                    .iter()
+                    .position(|s| s.shard_id == left_shard_id)
+                    .ok_or_else(|| anyhow::anyhow!("unknown left shard id {left_shard_id}"))?;
+                if left_idx + 1 >= state.shards.len() {
+                    anyhow::bail!("left shard {left_shard_id} has no right neighbor");
+                }
+                let right = &state.shards[left_idx + 1];
+                if right.shard_id != right_shard_id {
+                    anyhow::bail!(
+                        "right neighbor mismatch for left shard {left_shard_id} (expected {right_shard_id}, got {})",
+                        right.shard_id
+                    );
+                }
+                if !state.shards[left_idx].end_key.is_empty()
+                    && state.shards[left_idx].end_key != right.start_key
+                {
+                    anyhow::bail!("shards are not adjacent");
+                }
+                if state.shard_rebalances.contains_key(&left_shard_id)
+                    || state.shard_rebalances.contains_key(&right_shard_id)
+                {
+                    anyhow::bail!(
+                        "cannot start merge while either shard has in-flight rebalancing"
+                    );
+                }
+                if state.shard_merges.values().any(|m| {
+                    m.left_shard_id == left_shard_id
+                        || m.right_shard_id == left_shard_id
+                        || m.left_shard_id == right_shard_id
+                        || m.right_shard_id == right_shard_id
+                }) {
+                    anyhow::bail!("cannot start merge while either shard has in-flight merge");
+                }
+                let now = unix_time_ms();
+                state.shard_merges.insert(
+                    left_shard_id,
+                    RangeMerge {
+                        left_shard_id,
+                        right_shard_id,
+                        phase: RangeMergePhase::Preparing,
+                        copied_rows: 0,
+                        copied_bytes: 0,
+                        lag_ops: 0,
+                        retry_count: 0,
+                        eta_seconds: 0,
+                        last_error: String::new(),
+                        paused: false,
+                        started_unix_ms: now,
+                        last_progress_unix_ms: now,
+                        cutover_epoch: None,
+                    },
+                );
+                state.epoch = state.epoch.saturating_add(1);
+            }
+            ClusterCommand::AdvanceRangeMerge {
+                left_shard_id,
+                phase,
+                copied_rows,
+                copied_bytes,
+                lag_ops,
+                retry_count,
+                eta_seconds,
+                last_error,
+            } => {
+                let Some(merge) = state.shard_merges.get_mut(&left_shard_id) else {
+                    // Merge may already be finalized.
+                    return Ok(());
+                };
+                merge.phase = phase;
+                merge.copied_rows = copied_rows;
+                merge.copied_bytes = copied_bytes;
+                merge.lag_ops = lag_ops;
+                merge.retry_count = retry_count;
+                merge.eta_seconds = eta_seconds;
+                merge.last_error = last_error;
+                merge.last_progress_unix_ms = unix_time_ms();
+                state.epoch = state.epoch.saturating_add(1);
+            }
+            ClusterCommand::PauseRangeMerge {
+                left_shard_id,
+                paused,
+            } => {
+                let Some(merge) = state.shard_merges.get_mut(&left_shard_id) else {
+                    return Ok(());
+                };
+                if merge.paused != paused {
+                    merge.paused = paused;
+                    merge.last_progress_unix_ms = unix_time_ms();
+                    state.epoch = state.epoch.saturating_add(1);
+                }
+            }
+            ClusterCommand::AbortRangeMerge { left_shard_id } => {
+                if let Some(existing) = state.shard_merges.get(&left_shard_id) {
+                    if existing.cutover_epoch.is_some()
+                        || matches!(existing.phase, RangeMergePhase::Finalizing)
+                    {
+                        anyhow::bail!(
+                            "cannot abort merge for shard {left_shard_id} after cutover; finalize instead"
+                        );
+                    }
+                }
+                if let Some(merge) = state.shard_merges.remove(&left_shard_id) {
+                    state.shard_fences.remove(&merge.left_shard_id);
+                    state.shard_fences.remove(&merge.right_shard_id);
+                    state.epoch = state.epoch.saturating_add(1);
+                }
+            }
+            ClusterCommand::CompleteRangeMerge { left_shard_id } => {
+                if let Some(merge) = state.shard_merges.remove(&left_shard_id) {
+                    state.shard_fences.remove(&merge.left_shard_id);
+                    state.shard_fences.remove(&merge.right_shard_id);
+                    state.epoch = state.epoch.saturating_add(1);
+                }
+            }
+            ClusterCommand::SetShardFence {
+                shard_id,
+                fenced,
+                reason,
+            } => {
+                let changed = if fenced {
+                    let prev = state.shard_fences.insert(shard_id, reason.clone());
+                    prev.as_deref() != Some(reason.as_str())
+                } else {
+                    state.shard_fences.remove(&shard_id).is_some()
+                };
+                if changed {
+                    state.epoch = state.epoch.saturating_add(1);
+                }
+            }
+            ClusterCommand::GcRetiredRange { shard_id } => {
+                if state.retired_ranges.remove(&shard_id).is_some() {
+                    state.epoch = state.epoch.saturating_add(1);
+                }
+            }
             ClusterCommand::SetFrozen { frozen } => {
                 state.frozen = frozen;
                 state.epoch = state.epoch.saturating_add(1);
@@ -1002,39 +1383,10 @@ impl ClusterStateStore {
                 // are moved before routing changes.
                 anyhow::bail!("SplitRange must be applied via apply_split_range");
             }
-            ClusterCommand::MergeRange { left_shard_id } => {
-                let idx = match state
-                    .shards
-                    .iter()
-                    .position(|s| s.shard_id == left_shard_id)
-                {
-                    Some(idx) => idx,
-                    None => anyhow::bail!("unknown shard id {left_shard_id}"),
-                };
-                if idx + 1 >= state.shards.len() {
-                    anyhow::bail!("merge requires a right-hand neighbor");
-                }
-                let right = state.shards.remove(idx + 1);
-                let left = &mut state.shards[idx];
-                // Metadata-only merges are only safe when both ranges map to the
-                // same underlying data shard (no data movement yet).
-                if left.shard_index != right.shard_index {
-                    anyhow::bail!(
-                        "cannot merge shards with different shard_index (left={}, right={})",
-                        left.shard_index,
-                        right.shard_index
-                    );
-                }
-                if left.end_key.is_empty() {
-                    anyhow::bail!("cannot merge an unbounded range");
-                }
-                if !left.end_key.is_empty() && left.end_key != right.start_key {
-                    anyhow::bail!("shards are not adjacent");
-                }
-                left.end_key = right.end_key;
-                state.shard_replica_roles.remove(&right.shard_id);
-                state.shard_rebalances.remove(&right.shard_id);
-                state.epoch = state.epoch.saturating_add(1);
+            ClusterCommand::MergeRange { .. } => {
+                // Merge operations must run through `apply_merge_range` so keys
+                // are moved before descriptor cutover.
+                anyhow::bail!("MergeRange must be applied via apply_merge_range");
             }
             ClusterCommand::SetReplicas {
                 shard_id,
@@ -1168,17 +1520,46 @@ fn default_roles_for_replicas(replicas: &[NodeId]) -> BTreeMap<NodeId, ReplicaRo
 }
 
 fn normalize_replica_metadata(state: &mut ClusterState) {
+    let active_shards = state
+        .shards
+        .iter()
+        .map(|s| s.shard_id)
+        .collect::<std::collections::BTreeSet<_>>();
+
     state
         .shard_replica_roles
         .retain(|shard_id, _| state.shards.iter().any(|s| s.shard_id == *shard_id));
+    state.shard_rebalances.retain(|shard_id, mv| {
+        let Some(shard) = state.shards.iter().find(|s| s.shard_id == *shard_id) else {
+            return false;
+        };
+        shard.replicas.contains(&mv.from_node) && shard.replicas.contains(&mv.to_node)
+    });
+    state.shard_merges.retain(|left_shard_id, merge| {
+        if *left_shard_id != merge.left_shard_id {
+            return false;
+        }
+        if merge.started_unix_ms == 0 {
+            merge.started_unix_ms = unix_time_ms();
+        }
+        if merge.last_progress_unix_ms == 0 {
+            merge.last_progress_unix_ms = merge.started_unix_ms;
+        }
+        let left_exists = active_shards.contains(&merge.left_shard_id);
+        let right_exists = active_shards.contains(&merge.right_shard_id);
+        // Keep finalizing merges after right shard cutover until explicit completion.
+        if merge.phase == RangeMergePhase::Finalizing {
+            return left_exists;
+        }
+        left_exists && right_exists
+    });
     state
-        .shard_rebalances
-        .retain(|shard_id, mv| {
-            let Some(shard) = state.shards.iter().find(|s| s.shard_id == *shard_id) else {
-                return false;
-            };
-            shard.replicas.contains(&mv.from_node) && shard.replicas.contains(&mv.to_node)
-        });
+        .shard_fences
+        .retain(|shard_id, _| active_shards.contains(shard_id));
+    state.retired_ranges.retain(|shard_id, retired| {
+        // Retired ranges should no longer be active shards.
+        !active_shards.contains(shard_id) && retired.shard_id == *shard_id
+    });
 
     for shard in &mut state.shards {
         dedupe_nodes_in_place(&mut shard.replicas);
@@ -1235,6 +1616,7 @@ fn dedupe_nodes_in_place(nodes: &mut Vec<NodeId>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn member(node_id: NodeId) -> MemberInfo {
@@ -1278,7 +1660,76 @@ mod tests {
             }],
             shard_replica_roles: BTreeMap::new(),
             shard_rebalances: BTreeMap::new(),
+            shard_merges: BTreeMap::new(),
+            shard_fences: BTreeMap::new(),
+            retired_ranges: BTreeMap::new(),
         }
+    }
+
+    #[derive(Default)]
+    struct MockMigrator {
+        calls: Mutex<Vec<(usize, usize, Vec<u8>, Vec<u8>)>>,
+    }
+
+    impl RangeMigrator for MockMigrator {
+        fn migrate(
+            &self,
+            from_shard: usize,
+            to_shard: usize,
+            start_key: &[u8],
+            end_key: &[u8],
+        ) -> anyhow::Result<()> {
+            self.calls.lock().unwrap().push((
+                from_shard,
+                to_shard,
+                start_key.to_vec(),
+                end_key.to_vec(),
+            ));
+            Ok(())
+        }
+    }
+
+    fn two_shard_state() -> ClusterState {
+        let mut state = base_state();
+        state.shards = vec![
+            ShardDesc {
+                shard_id: 10,
+                shard_index: 0,
+                start_hash: 0,
+                end_hash: 0,
+                start_key: vec![],
+                end_key: b"m".to_vec(),
+                replicas: vec![1, 2, 3],
+                leaseholder: 1,
+            },
+            ShardDesc {
+                shard_id: 11,
+                shard_index: 1,
+                start_hash: 0,
+                end_hash: 0,
+                start_key: b"m".to_vec(),
+                end_key: vec![],
+                replicas: vec![1, 2, 3],
+                leaseholder: 1,
+            },
+        ];
+        state.shard_replica_roles.insert(
+            10,
+            BTreeMap::from([
+                (1, ReplicaRole::Voter),
+                (2, ReplicaRole::Voter),
+                (3, ReplicaRole::Voter),
+            ]),
+        );
+        state.shard_replica_roles.insert(
+            11,
+            BTreeMap::from([
+                (1, ReplicaRole::Voter),
+                (2, ReplicaRole::Voter),
+                (3, ReplicaRole::Voter),
+            ]),
+        );
+        state
     }
 
     #[test]
@@ -1329,10 +1780,9 @@ mod tests {
         let err = store
             .plan_rebalance_command(10, vec![2, 4, 5], Some(4))
             .expect_err("multi-node swap should fail");
-        assert!(
-            err.to_string()
-                .contains("replacing exactly one replica at a time")
-        );
+        assert!(err
+            .to_string()
+            .contains("replacing exactly one replica at a time"));
     }
 
     #[test]
@@ -1353,9 +1803,55 @@ mod tests {
             state.epoch, epoch_after_first,
             "idempotent replay should not bump epoch"
         );
-        assert_eq!(state.shards.len(), 2, "replayed split must not duplicate ranges");
+        assert_eq!(
+            state.shards.len(),
+            2,
+            "replayed split must not duplicate ranges"
+        );
         assert_eq!(state.shards[1].shard_index, 1);
         assert_eq!(state.shards[1].start_key, split_key);
+    }
+
+    #[test]
+    fn merge_range_moves_data_and_updates_descriptors() {
+        let store = test_store(two_shard_state());
+        let migrator = MockMigrator::default();
+
+        let before_epoch = store.state().epoch;
+        store
+            .apply_merge_range(10, Some(&migrator))
+            .expect("merge should apply");
+
+        let state = store.state();
+        assert_eq!(state.epoch, before_epoch + 1);
+        assert_eq!(state.shards.len(), 1);
+        assert_eq!(state.shards[0].shard_id, 10);
+        assert_eq!(state.shards[0].shard_index, 0);
+        assert_eq!(state.shards[0].start_key, Vec::<u8>::new());
+        assert_eq!(state.shards[0].end_key, Vec::<u8>::new());
+        assert!(
+            !state.shard_replica_roles.contains_key(&11),
+            "right shard role metadata must be removed"
+        );
+
+        let calls = migrator.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "migrator should be invoked exactly once");
+        let (from_shard, to_shard, start_key, end_key) = &calls[0];
+        assert_eq!((*from_shard, *to_shard), (1, 0));
+        assert_eq!(start_key.as_slice(), b"m");
+        assert!(end_key.is_empty());
+    }
+
+    #[test]
+    fn merge_range_requires_migrator_for_cross_shard_merge() {
+        let store = test_store(two_shard_state());
+        let err = store
+            .apply_merge_range(10, None)
+            .expect_err("merge without migrator should fail");
+        assert!(
+            err.to_string().contains("without a range migrator"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1374,14 +1870,15 @@ mod tests {
             .expect("abort move");
 
         let state = store.state();
-        let shard = state.shards.iter().find(|s| s.shard_id == 10).expect("shard");
+        let shard = state
+            .shards
+            .iter()
+            .find(|s| s.shard_id == 10)
+            .expect("shard");
         assert_eq!(shard.replicas, vec![1, 2, 3]);
         assert_eq!(shard.leaseholder, 1);
         assert!(state.shard_rebalances.is_empty());
-        let roles = state
-            .shard_replica_roles
-            .get(&10)
-            .expect("shard roles");
+        let roles = state.shard_replica_roles.get(&10).expect("shard roles");
         assert_eq!(roles.get(&1), Some(&ReplicaRole::Voter));
         assert_eq!(roles.get(&2), Some(&ReplicaRole::Voter));
         assert_eq!(roles.get(&3), Some(&ReplicaRole::Voter));
@@ -1417,7 +1914,11 @@ mod tests {
             .expect("abort move");
 
         let state = store.state();
-        let shard = state.shards.iter().find(|s| s.shard_id == 10).expect("shard");
+        let shard = state
+            .shards
+            .iter()
+            .find(|s| s.shard_id == 10)
+            .expect("shard");
         assert_eq!(shard.replicas, vec![1, 2, 3]);
         assert_eq!(shard.leaseholder, 1);
         assert!(state.shard_rebalances.is_empty());
@@ -1489,12 +1990,21 @@ mod tests {
 
         for i in 0..KEY_COUNT {
             let key = format!("k{i:05}").into_bytes();
-            let moved = key.as_slice() >= start_key.as_slice() && key.as_slice() < end_key.as_slice();
+            let moved =
+                key.as_slice() >= start_key.as_slice() && key.as_slice() < end_key.as_slice();
 
             let in_from_latest = from_latest.get(&key).expect("read from latest").is_some();
             let in_to_latest = to_latest.get(&key).expect("read to latest").is_some();
-            assert_eq!(in_to_latest, moved, "latest to-shard mismatch for key {}", i);
-            assert_eq!(in_from_latest, !moved, "latest from-shard mismatch for key {}", i);
+            assert_eq!(
+                in_to_latest, moved,
+                "latest to-shard mismatch for key {}",
+                i
+            );
+            assert_eq!(
+                in_from_latest, !moved,
+                "latest from-shard mismatch for key {}",
+                i
+            );
 
             let mut version_key = Vec::with_capacity(4 + key.len() + 8 + 8 + 8);
             version_key.extend_from_slice(&(key.len() as u32).to_be_bytes());
@@ -1510,10 +2020,13 @@ mod tests {
                 .get(&version_key)
                 .expect("read to versions")
                 .is_some();
-            assert_eq!(in_to_versions, moved, "versions to-shard mismatch for key {}", i);
             assert_eq!(
-                in_from_versions,
-                !moved,
+                in_to_versions, moved,
+                "versions to-shard mismatch for key {}",
+                i
+            );
+            assert_eq!(
+                in_from_versions, !moved,
                 "versions from-shard mismatch for key {}",
                 i
             );
@@ -1574,6 +2087,9 @@ impl StateMachine for ClusterStateMachine {
                     self.migrator.as_deref(),
                     self.shard_limit,
                 ),
+                ClusterCommand::MergeRange { left_shard_id } => self
+                    .store
+                    .apply_merge_range(left_shard_id, self.migrator.as_deref()),
                 other => self.store.apply_command(other),
             };
             if let Err(err) = res {

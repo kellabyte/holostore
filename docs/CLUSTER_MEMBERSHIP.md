@@ -53,9 +53,18 @@ membership and Cockroach-style control-plane metadata.
   - [x] Static lexicographic key ranges to replace hardcoded shard mapping.
 - [x] Range split command + metadata update path.
 - [x] Range merge command + metadata update path.
+- [x] Range merge orchestration safety:
+  - [x] range-scoped fencing on participating ranges for cutover
+  - [x] local quiesce checks before cutover
+  - [x] explicit replica catch-up barrier checks for merged ranges
+  - [x] timeout-safe unfreeze/abort-before-cutover behavior
+  - [x] pause/resume/cancel controls for in-flight merges
 - [x] Range split policy (key-count heuristic via range manager).
-- [ ] Range merge policy (automatic).
+- [x] Range merge policy (automatic).
 - [x] Bootstrap from a single range and split dynamically.
+- [x] Merge-under-load integration test (`tests/range_merge.rs`).
+- [x] Merge crash/restart and merge+rebalance integration tests
+  (`tests/range_merge_recovery.rs`, `tests/range_merge_controls.rs`).
 
 ### Phase 3: Rebalancing
 
@@ -86,8 +95,16 @@ membership and Cockroach-style control-plane metadata.
 ## Notes / Gaps
 
 - Split includes local key movement (`FjallRangeMigrator`) before descriptor update.
-- Merge is still metadata-only and only allowed when both ranges share the same
-  `shard_index` (no cross-shard merge data movement).
+- Merge now performs local key movement (right range -> left shard partition)
+  under split lock before descriptor cutover.
+- Merge currently requires adjacent ranges to have matching replica set and
+  leaseholder, and rejects merges with in-flight replica moves.
+- Merge now runs as a persisted, resumable state machine in control-plane metadata:
+  - `Preparing -> Catchup -> Copying -> Cutover -> Finalizing -> Complete`
+  - supports `pause/resume/cancel` (`holoctl merge --pause|--resume|--cancel`)
+  - restarts resume from persisted phase/progress
+  - cutover fencing is range-scoped (no cluster-wide freeze required)
+  - cutover requires executed-prefix convergence and per-replica row-count convergence
 - Rebalancing now has a background loop:
   - drains `Decommissioning` nodes shard-by-shard
   - finalizes node removal once drained
@@ -99,6 +116,9 @@ membership and Cockroach-style control-plane metadata.
 - In-flight replica moves now persist timing metadata (`started_unix_ms`,
   `last_progress_unix_ms`) in control-plane state. The rebalance manager uses
   these to recover stalled workflows automatically.
+- Retired-range GC is now deferred until control-plane convergence checks pass
+  on all non-removed replicas (epoch and descriptor convergence), reducing
+  premature cleanup risk during recovery.
 - Remaining major production gaps:
   - staged replica reconfiguration is now persisted and replayed through per-shard
     Accord log commands (`CMD_MEMBERSHIP_RECONFIG`), but orchestration is still
@@ -142,6 +162,12 @@ serves, and local record counts per range:
 
 ```bash
 cargo run -q -p holo_store --bin holoctl -- --target 127.0.0.1:15051 topology
+```
+
+For in-flight merge progress details:
+
+```bash
+cargo run -q -p holo_store --bin holoctl -- --target 127.0.0.1:15051 merge-status
 ```
 
 ## Redis Benchmark Tip

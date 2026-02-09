@@ -23,8 +23,8 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use common::{
-    cleanup_dir, pick_free_port, read_keys, spawn_node, test_dir, wait_for_port, wait_for_redis_ready,
-    write_keys, IO_TIMEOUT,
+    cleanup_dir, pick_free_port, read_keys, spawn_node, test_dir, wait_for_port,
+    wait_for_redis_ready, write_keys, IO_TIMEOUT,
 };
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -35,9 +35,7 @@ fn check_timeout(start: Instant, step: &str, node: &mut common::NodeProcess) {
     }
     let stdout = node.read_stdout();
     let stderr = node.read_stderr();
-    panic!(
-        "wal_crash timed out during {step}\nnode stdout:\n{stdout}\nnode stderr:\n{stderr}"
-    );
+    panic!("wal_crash timed out during {step}\nnode stdout:\n{stdout}\nnode stderr:\n{stderr}");
 }
 
 /// Verify that replay after a crash preserves committed writes across shards.

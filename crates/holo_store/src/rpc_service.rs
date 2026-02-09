@@ -4,11 +4,13 @@
 //! protobuf messages into local Accord types and returning responses.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use holo_accord::accord;
+use holo_accord::accord::{self, ExecutedPrefix, NodeId};
 use serde_json;
 
+use crate::cluster::{ClusterCommand, MemberState, ShardDesc};
 use crate::kv::Version;
 use crate::volo_gen::holo_store::rpc;
 use crate::NodeState;
@@ -757,7 +759,9 @@ impl rpc::HoloRpc for RpcService {
             })
             .collect::<Vec<_>>();
         group.seed_executed_prefixes(&prefixes).await;
-        Ok(volo_grpc::Response::new(rpc::SeedExecutedPrefixResponse { ok: true }))
+        Ok(volo_grpc::Response::new(rpc::SeedExecutedPrefixResponse {
+            ok: true,
+        }))
     }
 
     /// Handle an executed RPC request.
@@ -983,19 +987,151 @@ impl rpc::HoloRpc for RpcService {
         req: volo_grpc::Request<rpc::RangeMergeRequest>,
     ) -> Result<volo_grpc::Response<rpc::RangeMergeResponse>, volo_grpc::Status> {
         let req = req.into_inner();
-        let cmd = crate::cluster::ClusterCommand::MergeRange {
-            left_shard_id: req.left_shard_id,
+        let action = req.action;
+        let action_i32 = i32::from(action);
+
+        let propose = |cmd: ClusterCommand| async move {
+            let payload = crate::cluster::ClusterStateMachine::encode_command(&cmd)
+                .map_err(|e| volo_grpc::Status::internal(format!("encode command failed: {e}")))?;
+            self.state
+                .meta_handle
+                .propose(payload)
+                .await
+                .map_err(|e| volo_grpc::Status::internal(format!("meta propose failed: {e}")))?;
+            Ok::<(), volo_grpc::Status>(())
         };
-        let payload = crate::cluster::ClusterStateMachine::encode_command(&cmd)
-            .map_err(|e| volo_grpc::Status::internal(format!("encode command failed: {e}")))?;
-        self.state
-            .meta_handle
-            .propose(payload)
-            .await
-            .map_err(|e| volo_grpc::Status::internal(format!("meta propose failed: {e}")))?;
+
+        if action_i32 == i32::from(rpc::RangeMergeAction::RANGE_MERGE_ACTION_PAUSE)
+            || action_i32 == i32::from(rpc::RangeMergeAction::RANGE_MERGE_ACTION_RESUME)
+        {
+            let paused = action_i32 == i32::from(rpc::RangeMergeAction::RANGE_MERGE_ACTION_PAUSE);
+            let state = self.state.cluster_store.state();
+            if !state.shard_merges.contains_key(&req.left_shard_id) {
+                return Err(volo_grpc::Status::failed_precondition(format!(
+                    "no in-flight merge for shard {}",
+                    req.left_shard_id
+                )));
+            }
+            drop(state);
+            propose(ClusterCommand::PauseRangeMerge {
+                left_shard_id: req.left_shard_id,
+                paused,
+            })
+            .await?;
+            let message = if paused {
+                "merge paused"
+            } else {
+                "merge resumed"
+            };
+            return Ok(volo_grpc::Response::new(rpc::RangeMergeResponse {
+                ok: true,
+                merged_shard_id: req.left_shard_id,
+                message: message.into(),
+            }));
+        }
+
+        if action_i32 == i32::from(rpc::RangeMergeAction::RANGE_MERGE_ACTION_CANCEL) {
+            let state = self.state.cluster_store.state();
+            if !state.shard_merges.contains_key(&req.left_shard_id) {
+                return Err(volo_grpc::Status::failed_precondition(format!(
+                    "no in-flight merge for shard {}",
+                    req.left_shard_id
+                )));
+            }
+            drop(state);
+            propose(ClusterCommand::AbortRangeMerge {
+                left_shard_id: req.left_shard_id,
+            })
+            .await?;
+            return Ok(volo_grpc::Response::new(rpc::RangeMergeResponse {
+                ok: true,
+                merged_shard_id: req.left_shard_id,
+                message: "merge canceled".into(),
+            }));
+        }
+
+        if action_i32 != i32::from(rpc::RangeMergeAction::RANGE_MERGE_ACTION_START) {
+            return Err(volo_grpc::Status::invalid_argument(format!(
+                "unsupported merge action {}",
+                action_i32
+            )));
+        }
+
+        let state = self.state.cluster_store.state();
+        let idx = state
+            .shards
+            .iter()
+            .position(|s| s.shard_id == req.left_shard_id)
+            .ok_or_else(|| {
+                volo_grpc::Status::failed_precondition(format!(
+                    "unknown shard id {}",
+                    req.left_shard_id
+                ))
+            })?;
+        if idx + 1 >= state.shards.len() {
+            return Err(volo_grpc::Status::failed_precondition(
+                "merge requires a right-hand neighbor",
+            ));
+        }
+        let left = &state.shards[idx];
+        let right = &state.shards[idx + 1];
+        let left_shard_id = left.shard_id;
+        let right_shard_id = right.shard_id;
+        if !left.end_key.is_empty() && left.end_key != right.start_key {
+            return Err(volo_grpc::Status::failed_precondition(
+                "ranges are not adjacent",
+            ));
+        }
+        if left.replicas != right.replicas {
+            return Err(volo_grpc::Status::failed_precondition(
+                "left/right range replicas must match for merge",
+            ));
+        }
+        if left.leaseholder != right.leaseholder {
+            return Err(volo_grpc::Status::failed_precondition(
+                "left/right range leaseholder must match for merge",
+            ));
+        }
+        if state.shard_rebalances.contains_key(&left.shard_id)
+            || state.shard_rebalances.contains_key(&right.shard_id)
+        {
+            return Err(volo_grpc::Status::failed_precondition(
+                "cannot merge while either range has an in-flight move",
+            ));
+        }
+        if let Some(existing) = state.shard_merges.get(&left_shard_id) {
+            if existing.right_shard_id == right_shard_id {
+                return Ok(volo_grpc::Response::new(rpc::RangeMergeResponse {
+                    ok: true,
+                    merged_shard_id: req.left_shard_id,
+                    message: "merge already in progress".into(),
+                }));
+            }
+            return Err(volo_grpc::Status::failed_precondition(
+                "left range already has an in-flight merge",
+            ));
+        }
+        if state.shard_merges.values().any(|m| {
+            m.left_shard_id == left_shard_id
+                || m.right_shard_id == left_shard_id
+                || m.left_shard_id == right_shard_id
+                || m.right_shard_id == right_shard_id
+        }) {
+            return Err(volo_grpc::Status::failed_precondition(
+                "one of the ranges already participates in an in-flight merge",
+            ));
+        }
+        drop(state);
+
+        propose(ClusterCommand::BeginRangeMerge {
+            left_shard_id,
+            right_shard_id,
+        })
+        .await?;
         Ok(volo_grpc::Response::new(rpc::RangeMergeResponse {
             ok: true,
             merged_shard_id: req.left_shard_id,
+            message: "merge started".into(),
         }))
     }
 
@@ -1055,7 +1191,11 @@ impl rpc::HoloRpc for RpcService {
         req: volo_grpc::Request<rpc::RangeSnapshotLatestRequest>,
     ) -> Result<volo_grpc::Response<rpc::RangeSnapshotLatestResponse>, volo_grpc::Status> {
         let req = req.into_inner();
-        let limit = if req.limit == 0 { 1024 } else { req.limit as usize };
+        let limit = if req.limit == 0 {
+            1024
+        } else {
+            req.limit as usize
+        };
         let (entries, next_cursor, done) = self
             .state
             .snapshot_range_latest_page(
@@ -1140,9 +1280,7 @@ fn to_rpc_version(version: Version) -> rpc::Version {
 }
 
 /// Convert an RPC version into a local version, rejecting missing txn ids.
-fn from_rpc_version_required(
-    version: Option<rpc::Version>,
-) -> Result<Version, volo_grpc::Status> {
+fn from_rpc_version_required(version: Option<rpc::Version>) -> Result<Version, volo_grpc::Status> {
     let version = version.ok_or_else(|| volo_grpc::Status::invalid_argument("missing version"))?;
     let txn_id = version
         .txn_id
@@ -1167,4 +1305,262 @@ fn parse_command_digest(bytes: Bytes) -> Result<[u8; 32], volo_grpc::Status> {
     let mut out = [0u8; 32];
     out.copy_from_slice(bytes.as_ref());
     Ok(out)
+}
+
+async fn propose_meta(state: Arc<NodeState>, cmd: ClusterCommand) -> anyhow::Result<()> {
+    let payload = crate::cluster::ClusterStateMachine::encode_command(&cmd)?;
+    let _ = state.meta_handle.propose(payload).await?;
+    Ok(())
+}
+
+async fn wait_for_local_epoch(
+    state: Arc<NodeState>,
+    min_epoch: u64,
+    timeout: Duration,
+) -> anyhow::Result<u64> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let local_epoch = state.cluster_store.epoch();
+        if local_epoch > min_epoch {
+            return Ok(local_epoch);
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for local epoch to advance beyond {} (now={})",
+                min_epoch,
+                local_epoch
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_local_state(
+    state: Arc<NodeState>,
+    min_epoch: u64,
+    frozen: bool,
+    timeout: Duration,
+) -> anyhow::Result<u64> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let snapshot = state.cluster_store.state();
+        if snapshot.epoch > min_epoch && snapshot.frozen == frozen {
+            return Ok(snapshot.epoch);
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for local state (epoch>{}, frozen={}) (now_epoch={}, now_frozen={})",
+                min_epoch,
+                frozen,
+                snapshot.epoch,
+                snapshot.frozen
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_cluster_converged(
+    state: Arc<NodeState>,
+    min_epoch: u64,
+    frozen: bool,
+    min_shards: Option<usize>,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let snapshot = state.cluster_store.state();
+        let members = snapshot
+            .members
+            .values()
+            .filter(|m| m.state != MemberState::Removed)
+            .map(|m| m.node_id)
+            .collect::<Vec<_>>();
+        let mut all_ok = true;
+        let mut reason = String::new();
+
+        for node_id in members {
+            let node_state = if node_id == state.node_id {
+                snapshot.clone()
+            } else {
+                match state.transport.cluster_state(node_id).await {
+                    Ok(s) => s,
+                    Err(err) => {
+                        all_ok = false;
+                        reason = format!("node {} state fetch failed: {}", node_id, err);
+                        break;
+                    }
+                }
+            };
+            let shard_ok = min_shards
+                .map(|n| node_state.shards.len() >= n)
+                .unwrap_or(true);
+            if !(node_state.epoch >= min_epoch && node_state.frozen == frozen && shard_ok) {
+                all_ok = false;
+                reason = format!(
+                    "node {} not converged (epoch={}, frozen={}, shards={})",
+                    node_id,
+                    node_state.epoch,
+                    node_state.frozen,
+                    node_state.shards.len()
+                );
+                break;
+            }
+        }
+
+        if all_ok {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for cluster convergence: {}", reason);
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn wait_for_shard_quiesced(
+    state: Arc<NodeState>,
+    shard_index: usize,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let group_id = crate::GROUP_DATA_BASE + shard_index as u64;
+    let group = state
+        .group(group_id)
+        .ok_or_else(|| anyhow::anyhow!("missing group for shard index {}", shard_index))?;
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        let stats = group.debug_stats().await;
+        let pending = stats.records_status_preaccepted_len
+            + stats.records_status_accepted_len
+            + stats.records_status_committed_len
+            + stats.records_status_executing_len
+            + stats.committed_queue_len
+            + stats.read_waiters_len;
+        if pending == 0 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for shard {} quiesce (preaccepted={}, accepted={}, committed={}, executing={}, committed_queue={}, read_waiters={})",
+                shard_index,
+                stats.records_status_preaccepted_len,
+                stats.records_status_accepted_len,
+                stats.records_status_committed_len,
+                stats.records_status_executing_len,
+                stats.committed_queue_len,
+                stats.read_waiters_len
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_shard_prefix_converged(
+    state: Arc<NodeState>,
+    shard: &ShardDesc,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let group_id = crate::GROUP_DATA_BASE + shard.shard_index as u64;
+    let deadline = Instant::now() + timeout;
+    let group = state
+        .group(group_id)
+        .ok_or_else(|| anyhow::anyhow!("missing group for shard index {}", shard.shard_index))?;
+
+    loop {
+        let mut prefixes_by_node = Vec::<(NodeId, Vec<ExecutedPrefix>)>::new();
+        let mut fetch_err = None;
+        for replica in &shard.replicas {
+            let prefixes = if *replica == state.node_id {
+                group.executed_prefixes().await
+            } else {
+                match state
+                    .transport
+                    .last_executed_prefix(*replica, group_id)
+                    .await
+                {
+                    Ok(p) => p,
+                    Err(err) => {
+                        fetch_err =
+                            Some(format!("replica {} prefix fetch failed: {}", replica, err));
+                        break;
+                    }
+                }
+            };
+            prefixes_by_node.push((*replica, prefixes));
+        }
+        if fetch_err.is_none() && shard_prefixes_converged(&prefixes_by_node) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            if let Some(err) = fetch_err {
+                anyhow::bail!(
+                    "timed out waiting for shard {} prefix convergence: {}",
+                    shard.shard_id,
+                    err
+                );
+            }
+            anyhow::bail!(
+                "timed out waiting for shard {} prefix convergence across replicas {:?}",
+                shard.shard_id,
+                shard.replicas
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+fn shard_prefixes_converged(prefixes_by_node: &[(NodeId, Vec<ExecutedPrefix>)]) -> bool {
+    use std::collections::BTreeMap;
+
+    let mut required: BTreeMap<NodeId, u64> = BTreeMap::new();
+    for (_, prefixes) in prefixes_by_node {
+        for p in prefixes {
+            required
+                .entry(p.node_id)
+                .and_modify(|counter| *counter = (*counter).max(p.counter))
+                .or_insert(p.counter);
+        }
+    }
+
+    prefixes_by_node.iter().all(|(_, prefixes)| {
+        required
+            .iter()
+            .all(|(origin, req)| prefix_counter(prefixes, *origin) >= *req)
+    })
+}
+
+fn prefix_counter(prefixes: &[ExecutedPrefix], node_id: NodeId) -> u64 {
+    prefixes
+        .iter()
+        .find(|p| p.node_id == node_id)
+        .map(|p| p.counter)
+        .unwrap_or(0)
+}
+
+async fn wait_for_merge_visible(
+    state: Arc<NodeState>,
+    left_shard_id: u64,
+    right_shard_id: u64,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let snapshot = state.cluster_store.state();
+        let has_left = snapshot.shards.iter().any(|s| s.shard_id == left_shard_id);
+        let has_right = snapshot.shards.iter().any(|s| s.shard_id == right_shard_id);
+        if has_left && !has_right {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for merge visibility (left={}, right={}, has_left={}, has_right={})",
+                left_shard_id,
+                right_shard_id,
+                has_left,
+                has_right
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }

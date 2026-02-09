@@ -135,6 +135,34 @@ struct NodeArgs {
     #[arg(long, env = "HOLO_RANGE_SPLIT_COOLDOWN_MS", default_value_t = 10_000)]
     range_split_cooldown_ms: u64,
 
+    /// Merge adjacent ranges when their combined key count is below this threshold.
+    ///
+    /// Set to 0 to disable automatic merge proposals.
+    #[arg(long, env = "HOLO_RANGE_MERGE_MAX_KEYS", default_value_t = 8_000)]
+    range_merge_max_keys: usize,
+
+    /// Merge only when combined sustained SET QPS is below this threshold.
+    ///
+    /// Set to 0 to disable QPS-based cold gating for merges.
+    #[arg(long, env = "HOLO_RANGE_MERGE_MAX_QPS", default_value_t = 5_000)]
+    range_merge_max_qps: u64,
+
+    /// Require low merge QPS for this many consecutive evaluations.
+    #[arg(long, env = "HOLO_RANGE_MERGE_QPS_SUSTAIN", default_value_t = 3)]
+    range_merge_qps_sustain: u8,
+
+    /// Merge key hysteresis threshold as percentage of `range_merge_max_keys`.
+    #[arg(
+        long,
+        env = "HOLO_RANGE_MERGE_KEY_HYSTERESIS_PCT",
+        default_value_t = 80
+    )]
+    range_merge_key_hysteresis_pct: u8,
+
+    /// Cooldown after auto-merge proposals (ms).
+    #[arg(long, env = "HOLO_RANGE_MERGE_COOLDOWN_MS", default_value_t = 20_000)]
+    range_merge_cooldown_ms: u64,
+
     /// Enable the background replica rebalancer and decommission drain workflow.
     #[arg(long, env = "HOLO_REBALANCE_ENABLED", default_value_t = true)]
     rebalance_enabled: bool,
@@ -147,7 +175,11 @@ struct NodeArgs {
     /// auto-aborts (or force-finalizes post-lease-transfer) in milliseconds.
     ///
     /// Set to 0 to disable timeout-based recovery.
-    #[arg(long, env = "HOLO_REBALANCE_MOVE_TIMEOUT_MS", default_value_t = 180_000)]
+    #[arg(
+        long,
+        env = "HOLO_REBALANCE_MOVE_TIMEOUT_MS",
+        default_value_t = 180_000
+    )]
     rebalance_move_timeout_ms: u64,
 
     /// How to map keys to data shards.
@@ -922,7 +954,10 @@ impl NodeState {
         }
     }
 
-    pub(crate) async fn wait_for_client_ops_drained(&self, timeout: Duration) -> anyhow::Result<()> {
+    pub(crate) async fn wait_for_client_ops_drained(
+        &self,
+        timeout: Duration,
+    ) -> anyhow::Result<()> {
         let deadline = Instant::now() + timeout;
         loop {
             let inflight = self.client_inflight_ops.load(Ordering::Relaxed);
@@ -1039,7 +1074,11 @@ impl NodeState {
         expected_voters.sort_unstable();
         expected_voters.dedup();
 
-        let mut current_members = group.members().into_iter().map(|m| m.id).collect::<Vec<_>>();
+        let mut current_members = group
+            .members()
+            .into_iter()
+            .map(|m| m.id)
+            .collect::<Vec<_>>();
         current_members.sort_unstable();
         current_members.dedup();
         let mut current_voters = group.voters();
@@ -1075,22 +1114,35 @@ impl NodeState {
     }
 
     /// Collect local per-range record counts for ranges this node serves.
-    fn local_range_stats(&self) -> anyhow::Result<Vec<LocalRangeStat>> {
+    pub(crate) fn local_range_stats(&self) -> anyhow::Result<Vec<LocalRangeStat>> {
         let shards = self.cluster_store.shards_snapshot();
         let mut out = Vec::new();
         for shard in shards {
             if !shard.replicas.contains(&self.node_id) {
                 continue;
             }
-            let record_count =
-                self.range_stats
-                    .count_range(shard.shard_index, &shard.start_key, &shard.end_key)?;
+            let record_count = self.range_stats.count_range(
+                shard.shard_index,
+                &shard.start_key,
+                &shard.end_key,
+            )?;
             out.push(LocalRangeStat {
                 shard_id: shard.shard_id,
                 shard_index: shard.shard_index,
                 record_count,
                 is_leaseholder: shard.leaseholder == self.node_id,
             });
+        }
+        Ok(out)
+    }
+
+    /// Local range record counts keyed by shard id.
+    pub(crate) fn local_range_record_counts(
+        &self,
+    ) -> anyhow::Result<std::collections::HashMap<u64, u64>> {
+        let mut out = std::collections::HashMap::new();
+        for stat in self.local_range_stats()? {
+            out.insert(stat.shard_id, stat.record_count);
         }
         Ok(out)
     }
@@ -1132,13 +1184,54 @@ impl NodeState {
         }
     }
 
+    /// Block while any key in the request maps to a currently fenced shard.
+    async fn wait_until_keys_available(&self, keys: &[Vec<u8>]) {
+        if keys.is_empty() {
+            self.wait_until_unfrozen().await;
+            return;
+        }
+        loop {
+            if self.cluster_store.frozen() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                continue;
+            }
+            let snapshot = self.cluster_store.state();
+            if snapshot.shard_fences.is_empty() {
+                return;
+            }
+            let blocked = keys.iter().find_map(|key| {
+                let shard_id = match self.routing_mode {
+                    RoutingMode::Hash => {
+                        let idx = (kv::hash_key(key) as usize) % self.data_shards.max(1);
+                        snapshot
+                            .shards
+                            .iter()
+                            .find(|s| s.shard_index == idx)
+                            .map(|s| s.shard_id)
+                            .unwrap_or(0)
+                    }
+                    RoutingMode::Range => shard_id_for_key_in_ranges(key, &snapshot.shards),
+                };
+                snapshot
+                    .shard_fences
+                    .get(&shard_id)
+                    .map(|reason| (shard_id, reason.clone()))
+            });
+            if blocked.is_none() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// Enqueue a batch SET request to the client batcher.
     async fn execute_batch_set(&self, items: Vec<(Vec<u8>, Vec<u8>)>) -> anyhow::Result<()> {
-        self.wait_until_unfrozen().await;
         if items.is_empty() {
             // Nothing to do.
             return Ok(());
         }
+        let keys = items.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>();
+        self.wait_until_keys_available(&keys).await;
         let (tx, rx) = oneshot::channel();
         let work = BatchSetWork {
             items,
@@ -1154,12 +1247,13 @@ impl NodeState {
 
     /// Execute a batch SET directly against Accord without client batching.
     async fn execute_batch_set_direct(&self, items: Vec<(Vec<u8>, Vec<u8>)>) -> anyhow::Result<()> {
-        self.wait_until_unfrozen().await;
-        let _inflight_guard = self.enter_client_op();
         if items.is_empty() {
             // Nothing to do.
             return Ok(());
         }
+        let keys = items.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>();
+        self.wait_until_keys_available(&keys).await;
+        let _inflight_guard = self.enter_client_op();
         let mut by_shard: Vec<Vec<(Vec<u8>, Vec<u8>)>> = vec![Vec::new(); self.data_shards];
         {
             // Take split lock and range snapshot once for the whole routing pass.
@@ -1202,11 +1296,11 @@ impl NodeState {
 
     /// Enqueue a batch GET request to the client batcher.
     async fn execute_batch_get(&self, keys: Vec<Vec<u8>>) -> anyhow::Result<Vec<Option<Vec<u8>>>> {
-        self.wait_until_unfrozen().await;
         if keys.is_empty() {
             // Nothing to do.
             return Ok(Vec::new());
         }
+        self.wait_until_keys_available(&keys).await;
 
         let (tx, rx) = oneshot::channel();
         let work = BatchGetWork {
@@ -1226,12 +1320,12 @@ impl NodeState {
         &self,
         keys: Vec<Vec<u8>>,
     ) -> anyhow::Result<Vec<Option<Vec<u8>>>> {
-        self.wait_until_unfrozen().await;
-        let _inflight_guard = self.enter_client_op();
         if keys.is_empty() {
             // Nothing to do.
             return Ok(Vec::new());
         }
+        self.wait_until_keys_available(&keys).await;
+        let _inflight_guard = self.enter_client_op();
         let mut by_shard: Vec<Vec<(usize, Vec<u8>)>> = vec![Vec::new(); self.data_shards];
         {
             // Take split lock and range snapshot once for the whole routing pass.
@@ -1685,6 +1779,36 @@ fn shard_index_for_key_in_ranges(key: &[u8], shards: &[ShardDesc]) -> usize {
     0
 }
 
+/// Resolve a key to a shard id using an in-memory range snapshot.
+fn shard_id_for_key_in_ranges(key: &[u8], shards: &[ShardDesc]) -> u64 {
+    if shards.is_empty() {
+        return 0;
+    }
+    if shards.len() == 1 {
+        return shards[0].shard_id;
+    }
+    let has_key_ranges = shards
+        .iter()
+        .any(|s| !s.start_key.is_empty() || !s.end_key.is_empty());
+    if has_key_ranges {
+        for shard in shards {
+            let in_start = shard.start_key.is_empty() || key >= shard.start_key.as_slice();
+            let in_end = shard.end_key.is_empty() || key < shard.end_key.as_slice();
+            if in_start && in_end {
+                return shard.shard_id;
+            }
+        }
+        return shards[0].shard_id;
+    }
+    let hash = kv::hash_key(key);
+    for shard in shards {
+        if hash >= shard.start_hash && hash <= shard.end_hash {
+            return shard.shard_id;
+        }
+    }
+    shards[0].shard_id
+}
+
 /// Resolve voting members for a shard from staged replica-role metadata.
 fn shard_membership_sets(snapshot: &ClusterState, shard: &ShardDesc) -> (Vec<NodeId>, Vec<NodeId>) {
     let mut members = shard.replicas.clone();
@@ -1697,11 +1821,7 @@ fn shard_membership_sets(snapshot: &ClusterState, shard: &ShardDesc) -> (Vec<Nod
             .iter()
             .copied()
             .filter(|id| {
-                roles
-                    .get(id)
-                    .copied()
-                    .unwrap_or(ReplicaRole::Voter)
-                    != ReplicaRole::Learner
+                roles.get(id).copied().unwrap_or(ReplicaRole::Voter) != ReplicaRole::Learner
             })
             .collect::<Vec<_>>()
     } else {
@@ -2624,13 +2744,8 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         // Join first and fetch a control-plane snapshot before initializing
         // transport/groups so this node starts from the current cluster view.
         Some(
-            join_seed_and_fetch_snapshot(
-                args.node_id,
-                seed,
-                args.listen_grpc,
-                args.listen_redis,
-            )
-            .await?,
+            join_seed_and_fetch_snapshot(args.node_id, seed, args.listen_grpc, args.listen_redis)
+                .await?,
         )
     } else {
         None
@@ -2941,7 +3056,11 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
 
     let split_lock = cluster_store.split_lock();
     let data_group_slots = (0..data_shards)
-        .map(|_| Arc::new(std::sync::RwLock::new(None::<std::sync::Weak<accord::Group>>)))
+        .map(|_| {
+            Arc::new(std::sync::RwLock::new(
+                None::<std::sync::Weak<accord::Group>>,
+            ))
+        })
         .collect::<Vec<_>>();
 
     for shard in 0..data_shards {
@@ -3149,18 +3268,22 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
             split_min_qps: args.range_split_min_qps,
             split_qps_sustain: args.range_split_qps_sustain.max(1),
             split_cooldown: Duration::from_millis(args.range_split_cooldown_ms.max(1)),
+            merge_max_keys: args.range_merge_max_keys,
+            merge_cooldown: Duration::from_millis(args.range_merge_cooldown_ms.max(1)),
+            merge_max_qps: args.range_merge_max_qps,
+            merge_qps_sustain: args.range_merge_qps_sustain.max(1),
+            merge_key_hysteresis_pct: args.range_merge_key_hysteresis_pct.clamp(1, 100),
         },
     );
 
-    if args.rebalance_enabled {
-        rebalance_manager::spawn(
-            state.clone(),
-            RebalanceManagerConfig {
-                interval: Duration::from_millis(args.rebalance_interval_ms.max(100)),
-                move_timeout: Duration::from_millis(args.rebalance_move_timeout_ms),
-            },
-        );
-    }
+    rebalance_manager::spawn(
+        state.clone(),
+        RebalanceManagerConfig {
+            enable_balancing: args.rebalance_enabled,
+            interval: Duration::from_millis(args.rebalance_interval_ms.max(100)),
+            move_timeout: Duration::from_millis(args.rebalance_move_timeout_ms),
+        },
+    );
 
     let grpc_addr = args.listen_grpc;
     tokio::spawn({
@@ -3319,6 +3442,9 @@ mod tests {
             shards: vec![],
             shard_replica_roles: BTreeMap::new(),
             shard_rebalances: BTreeMap::new(),
+            shard_merges: BTreeMap::new(),
+            shard_fences: BTreeMap::new(),
+            retired_ranges: BTreeMap::new(),
         }
     }
 
