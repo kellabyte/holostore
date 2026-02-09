@@ -184,9 +184,7 @@ fn multi_node_crash_restart() {
     if !wait_for_redis_ready(redis_addrs[1], IO_TIMEOUT) {
         let stdout = node2.read_stdout();
         let stderr = node2.read_stderr();
-        panic!(
-            "node2 redis did not respond\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        );
+        panic!("node2 redis did not respond\nstdout:\n{stdout}\nstderr:\n{stderr}");
     }
     nodes[1] = node2;
 

@@ -1,4 +1,4 @@
-.PHONY: all build build-release check-linearizability
+.PHONY: all build build-release check-linearizability check-linearizability-stress
 
 all: build
 
@@ -10,3 +10,6 @@ build-release:
 
 check-linearizability:
 	./scripts/check_linearizability.sh
+
+check-linearizability-stress:
+	./scripts/check_linearizability_stress.sh

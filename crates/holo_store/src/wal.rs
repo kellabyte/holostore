@@ -3,9 +3,9 @@
 //! This module provides a file-backed `CommitLog` implementation that batches
 //! writes, optionally fsyncs, and supports compaction based on executed txns.
 
-use std::collections::HashSet;
 #[cfg(feature = "raft-engine")]
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -19,9 +19,9 @@ use std::{env, str::FromStr};
 
 use anyhow::Context;
 use crc32fast::Hasher;
-use holo_accord::accord::{CommitLog, CommitLogEntry, TxnId};
 #[cfg(feature = "raft-engine")]
 use holo_accord::accord::{txn_group_id, GroupId};
+use holo_accord::accord::{CommitLog, CommitLogEntry, TxnId};
 
 #[cfg(feature = "raft-engine")]
 use raft_engine::{Config as RaftConfig, Engine as RaftEngine, LogBatch};
@@ -166,11 +166,7 @@ impl FileWal {
         let persist_every = read_env_u64("HOLO_WAL_PERSIST_EVERY", WAL_PERSIST_EVERY);
         let persist_interval_us =
             read_env_u64("HOLO_WAL_PERSIST_INTERVAL_US", WAL_PERSIST_INTERVAL_US);
-        let persist_mode = parse_persist_mode(
-            env::var("HOLO_WAL_PERSIST_MODE")
-                .ok()
-                .as_deref(),
-        );
+        let persist_mode = parse_persist_mode(env::var("HOLO_WAL_PERSIST_MODE").ok().as_deref());
         let persist_async = read_env_bool("HOLO_WAL_PERSIST_ASYNC", false);
 
         let commit_batch_max =
@@ -350,12 +346,8 @@ impl RaftEngineWal {
         let persist_every = read_env_u64("HOLO_WAL_PERSIST_EVERY", WAL_PERSIST_EVERY);
         let persist_interval_us =
             read_env_u64("HOLO_WAL_PERSIST_INTERVAL_US", WAL_PERSIST_INTERVAL_US);
-        let persist_mode = parse_persist_mode(
-            env::var("HOLO_WAL_PERSIST_MODE")
-                .ok()
-                .as_deref(),
-        )
-        .unwrap_or(SyncMode::None);
+        let persist_mode = parse_persist_mode(env::var("HOLO_WAL_PERSIST_MODE").ok().as_deref())
+            .unwrap_or(SyncMode::None);
 
         let mut state = RaftWalState::new();
         if let Some(buf) = engine.get(WAL_META_REGION_ID, WAL_META_GROUPS_KEY) {
@@ -377,7 +369,12 @@ impl RaftEngineWal {
         })
     }
 
-    fn persist_should_sync(&self, state: &RaftWalState, batch_len: usize, now: u64) -> (bool, u64, u64) {
+    fn persist_should_sync(
+        &self,
+        state: &RaftWalState,
+        batch_len: usize,
+        now: u64,
+    ) -> (bool, u64, u64) {
         if matches!(self.persist_mode, SyncMode::None) {
             return (false, state.pending_count, state.last_persist_us);
         }
@@ -444,7 +441,11 @@ impl CommitLog for RaftEngineWal {
         for (group_id, last_index) in &per_group_last {
             let payload = last_index.to_be_bytes();
             batch
-                .put(*group_id, WAL_META_LAST_INDEX_KEY.to_vec(), payload.to_vec())
+                .put(
+                    *group_id,
+                    WAL_META_LAST_INDEX_KEY.to_vec(),
+                    payload.to_vec(),
+                )
                 .context("raft wal batch put last index")?;
         }
         if !new_groups.is_empty() {
@@ -682,8 +683,8 @@ fn wal_worker(
             let now = epoch_micros();
             // Decide whether to sync based on count or elapsed time thresholds.
             let hit_count = persist_every > 0 && pending_count >= persist_every;
-            let hit_interval =
-                persist_interval_us > 0 && now.saturating_sub(last_persist_us) >= persist_interval_us;
+            let hit_interval = persist_interval_us > 0
+                && now.saturating_sub(last_persist_us) >= persist_interval_us;
             if hit_count || hit_interval {
                 pending_count = 0;
                 last_persist_us = now;
@@ -847,10 +848,7 @@ fn compact_log(
 
 /// Open the WAL log file for appending.
 fn open_log_for_append(path: &Path) -> std::io::Result<File> {
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
+    OpenOptions::new().create(true).append(true).open(path)
 }
 
 /// Background thread that performs fsyncs on demand.
@@ -886,9 +884,8 @@ fn sync_file(file: &File, mode: SyncMode) -> std::io::Result<()> {
 
 /// Encode a commit log entry to a compact binary representation.
 fn encode_entry(entry: &CommitLogEntry) -> Vec<u8> {
-    let mut out = Vec::with_capacity(
-        8 + 8 + 8 + 4 + (entry.deps.len() * 16) + 4 + entry.command.len(),
-    );
+    let mut out =
+        Vec::with_capacity(8 + 8 + 8 + 4 + (entry.deps.len() * 16) + 4 + entry.command.len());
     out.extend_from_slice(&entry.txn_id.node_id.to_be_bytes());
     out.extend_from_slice(&entry.txn_id.counter.to_be_bytes());
     out.extend_from_slice(&entry.seq.to_be_bytes());

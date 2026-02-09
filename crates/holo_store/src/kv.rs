@@ -169,7 +169,8 @@ impl FjallEngine {
     pub fn open_shard(keyspace: Arc<Keyspace>, shard: usize) -> anyhow::Result<Self> {
         let versions_name = format!("kv_versions_{shard}");
         let latest_name = format!("kv_latest_{shard}");
-        let versions = keyspace.open_partition(&versions_name, PartitionCreateOptions::default())?;
+        let versions =
+            keyspace.open_partition(&versions_name, PartitionCreateOptions::default())?;
         let latest = keyspace.open_partition(&latest_name, PartitionCreateOptions::default())?;
         Ok(Self {
             keyspace,
@@ -314,7 +315,11 @@ impl KvEngine for FjallEngine {
             }
         });
         if should_update_latest {
-            batch.insert(&self.latest, key.to_vec(), encode_latest_value(version, &value));
+            batch.insert(
+                &self.latest,
+                key.to_vec(),
+                encode_latest_value(version, &value),
+            );
         }
 
         if let Err(err) = batch.commit() {
@@ -335,7 +340,10 @@ impl RoutedKvEngine {
         shards: Vec<Arc<dyn KvEngine>>,
         router: Arc<dyn ShardRouter>,
     ) -> anyhow::Result<Self> {
-        anyhow::ensure!(!shards.is_empty(), "routed kv engine requires at least one shard");
+        anyhow::ensure!(
+            !shards.is_empty(),
+            "routed kv engine requires at least one shard"
+        );
         Ok(Self { shards, router })
     }
 
@@ -421,7 +429,10 @@ pub struct ShardedKvEngine {
 impl ShardedKvEngine {
     /// Create a sharded engine from pre-built shard engines.
     pub fn new(shards: Vec<Arc<dyn KvEngine>>) -> anyhow::Result<Self> {
-        anyhow::ensure!(!shards.is_empty(), "sharded kv engine requires at least one shard");
+        anyhow::ensure!(
+            !shards.is_empty(),
+            "sharded kv engine requires at least one shard"
+        );
         Ok(Self { shards })
     }
 
@@ -601,7 +612,10 @@ fn decode_versions(data: &[u8]) -> anyhow::Result<Vec<VersionedValue>> {
     let count = read_u32(data, &mut offset)? as usize;
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
-        anyhow::ensure!(offset + 8 + 8 + 8 + 1 + 4 <= data.len(), "short version header");
+        anyhow::ensure!(
+            offset + 8 + 8 + 8 + 1 + 4 <= data.len(),
+            "short version header"
+        );
         let seq = read_u64(data, &mut offset)?;
         let node_id = read_u64(data, &mut offset)?;
         let counter = read_u64(data, &mut offset)?;
@@ -1059,7 +1073,10 @@ fn decode_membership_reconfig_command(data: &[u8]) -> anyhow::Result<Option<Memb
     for _ in 0..voters_len {
         voters.push(read_u64(data, &mut offset)?);
     }
-    anyhow::ensure!(voters_len > 0, "membership reconfiguration voter set cannot be empty");
+    anyhow::ensure!(
+        voters_len > 0,
+        "membership reconfiguration voter set cannot be empty"
+    );
     Ok(Some(MembershipReconfig { members, voters }))
 }
 
@@ -1258,11 +1275,7 @@ mod tests {
             guard.push(cfg);
             Ok(())
         });
-        let sm = KvStateMachine::with_membership_hook(
-            Arc::new(KvStore::new()),
-            None,
-            Some(hook),
-        );
+        let sm = KvStateMachine::with_membership_hook(Arc::new(KvStore::new()), None, Some(hook));
         let payload = encode_membership_reconfig(&[1, 2, 4], &[1, 2]);
         sm.apply(
             &payload,

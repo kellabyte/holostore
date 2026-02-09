@@ -289,13 +289,22 @@ message RangeSplitResponse {
   uint64 right_shard_id = 3;
 }
 
+enum RangeMergeAction {
+  RANGE_MERGE_ACTION_START = 0;
+  RANGE_MERGE_ACTION_PAUSE = 1;
+  RANGE_MERGE_ACTION_RESUME = 2;
+  RANGE_MERGE_ACTION_CANCEL = 3;
+}
+
 message RangeMergeRequest {
   uint64 left_shard_id = 1;
+  RangeMergeAction action = 2;
 }
 
 message RangeMergeResponse {
   bool ok = 1;
   uint64 merged_shard_id = 2;
+  string message = 3;
 }
 
 message RangeRebalanceRequest {

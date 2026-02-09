@@ -16,13 +16,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use holo_accord::accord::{ExecutedPrefix, NodeId};
 
 use crate::cluster::{
-    ClusterCommand, ClusterState, MemberState, ReplicaMove, ReplicaMovePhase, ReplicaRole, ShardDesc,
+    ClusterCommand, ClusterState, MemberState, RangeMergePhase, ReplicaMove, ReplicaMovePhase,
+    ReplicaRole, ShardDesc,
 };
 use crate::NodeState;
 
 /// Configuration for the background rebalancer.
 #[derive(Clone, Copy, Debug)]
 pub struct RebalanceManagerConfig {
+    /// Enable automatic balancing/decommission planning (not required for
+    /// progressing already-started staged workflows).
+    pub enable_balancing: bool,
     /// Evaluate and apply at most one metadata change at this interval.
     pub interval: Duration,
     /// Abort/force-complete an in-flight move that has made no persisted
@@ -59,23 +63,40 @@ async fn reconcile_once(state: Arc<NodeState>, cfg: RebalanceManagerConfig) -> a
         return Ok(());
     }
 
+    if let Some(cmd) = plan_stalled_merge_step(&snapshot, cfg.move_timeout) {
+        propose_meta(state, cmd).await?;
+        return Ok(());
+    }
+
+    if let Some(cmd) = plan_inflight_merge_step(state.clone(), &snapshot).await? {
+        propose_meta(state, cmd).await?;
+        return Ok(());
+    }
+
     if let Some(cmd) = plan_inflight_move_step(state.clone(), &snapshot).await? {
         propose_meta(state, cmd).await?;
         return Ok(());
     }
 
-    if let Some(cmd) = plan_decommission_step(&snapshot) {
+    if let Some(cmd) = plan_retired_range_gc_step(state.clone(), &snapshot).await? {
         propose_meta(state, cmd).await?;
         return Ok(());
     }
 
-    if let Some(cmd) = plan_replica_balance_step(&snapshot) {
-        propose_meta(state, cmd).await?;
-        return Ok(());
-    }
+    if cfg.enable_balancing {
+        if let Some(cmd) = plan_decommission_step(&snapshot) {
+            propose_meta(state.clone(), cmd).await?;
+            return Ok(());
+        }
 
-    if let Some(cmd) = plan_lease_balance_step(&snapshot) {
-        propose_meta(state, cmd).await?;
+        if let Some(cmd) = plan_replica_balance_step(&snapshot) {
+            propose_meta(state.clone(), cmd).await?;
+            return Ok(());
+        }
+
+        if let Some(cmd) = plan_lease_balance_step(&snapshot) {
+            propose_meta(state, cmd).await?;
+        }
     }
 
     Ok(())
@@ -129,6 +150,348 @@ fn plan_stalled_move_step(state: &ClusterState, move_timeout: Duration) -> Optio
     }
 }
 
+fn plan_stalled_merge_step(state: &ClusterState, move_timeout: Duration) -> Option<ClusterCommand> {
+    if move_timeout.is_zero() {
+        return None;
+    }
+    let timeout_ms = move_timeout.as_millis().min(u128::from(u64::MAX)) as u64;
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0);
+
+    let (&left_shard_id, merge) = state.shard_merges.iter().next()?;
+    if merge.paused {
+        return None;
+    }
+    let last_progress = merge.last_progress_unix_ms.max(merge.started_unix_ms);
+    if last_progress == 0 {
+        return None;
+    }
+    let idle_ms = now_ms.saturating_sub(last_progress);
+    if idle_ms < timeout_ms {
+        return None;
+    }
+
+    match merge.phase {
+        RangeMergePhase::Finalizing => {
+            tracing::warn!(
+                left_shard_id,
+                right_shard_id = merge.right_shard_id,
+                phase = ?merge.phase,
+                idle_ms,
+                timeout_ms,
+                "forcing finalize for stalled range merge"
+            );
+            Some(ClusterCommand::CompleteRangeMerge { left_shard_id })
+        }
+        _ => {
+            tracing::warn!(
+                left_shard_id,
+                right_shard_id = merge.right_shard_id,
+                phase = ?merge.phase,
+                idle_ms,
+                timeout_ms,
+                "aborting stalled range merge"
+            );
+            Some(ClusterCommand::AbortRangeMerge { left_shard_id })
+        }
+    }
+}
+
+async fn plan_inflight_merge_step(
+    state: Arc<NodeState>,
+    snapshot: &ClusterState,
+) -> anyhow::Result<Option<ClusterCommand>> {
+    let Some((&left_shard_id, merge)) = snapshot.shard_merges.iter().next() else {
+        return Ok(None);
+    };
+    if merge.paused {
+        return Ok(None);
+    }
+
+    let left = snapshot
+        .shards
+        .iter()
+        .find(|s| s.shard_id == left_shard_id)
+        .cloned();
+    let right = snapshot
+        .shards
+        .iter()
+        .find(|s| s.shard_id == merge.right_shard_id)
+        .cloned();
+
+    // Left shard must always exist for an in-flight merge.
+    let Some(left) = left else {
+        return Ok(Some(ClusterCommand::AbortRangeMerge { left_shard_id }));
+    };
+
+    match merge.phase {
+        RangeMergePhase::Preparing => {
+            // If cutover already happened on another replica, move to finalizing.
+            if right.is_none() {
+                return Ok(Some(ClusterCommand::AdvanceRangeMerge {
+                    left_shard_id,
+                    phase: RangeMergePhase::Finalizing,
+                    copied_rows: merge.copied_rows,
+                    copied_bytes: merge.copied_bytes,
+                    lag_ops: merge.lag_ops,
+                    retry_count: merge.retry_count,
+                    eta_seconds: merge.eta_seconds,
+                    last_error: merge.last_error.clone(),
+                }));
+            }
+            let right = right.expect("checked is_some");
+            if !left.end_key.is_empty() && left.end_key != right.start_key {
+                return Ok(Some(ClusterCommand::AbortRangeMerge { left_shard_id }));
+            }
+            if left.replicas != right.replicas || left.leaseholder != right.leaseholder {
+                return Ok(Some(ClusterCommand::AbortRangeMerge { left_shard_id }));
+            }
+            if snapshot.shard_rebalances.contains_key(&left.shard_id)
+                || snapshot
+                    .shard_rebalances
+                    .contains_key(&merge.right_shard_id)
+            {
+                return Ok(Some(ClusterCommand::AbortRangeMerge { left_shard_id }));
+            }
+            return Ok(Some(ClusterCommand::AdvanceRangeMerge {
+                left_shard_id,
+                phase: RangeMergePhase::Catchup,
+                copied_rows: merge.copied_rows,
+                copied_bytes: merge.copied_bytes,
+                lag_ops: merge.lag_ops,
+                retry_count: merge.retry_count,
+                eta_seconds: merge.eta_seconds,
+                last_error: merge.last_error.clone(),
+            }));
+        }
+        RangeMergePhase::Catchup => {
+            // If the right shard already disappeared (replay/recovery), continue to finalize.
+            if right.is_none() {
+                return Ok(Some(ClusterCommand::AdvanceRangeMerge {
+                    left_shard_id,
+                    phase: RangeMergePhase::Finalizing,
+                    copied_rows: merge.copied_rows,
+                    copied_bytes: merge.copied_bytes,
+                    lag_ops: merge.lag_ops,
+                    retry_count: merge.retry_count,
+                    eta_seconds: merge.eta_seconds,
+                    last_error: merge.last_error.clone(),
+                }));
+            }
+            let right = right.expect("checked is_some");
+            if !local_shard_quiesced(state.clone(), left.shard_index).await? {
+                return Ok(None);
+            }
+            if right.shard_index != left.shard_index
+                && !local_shard_quiesced(state.clone(), right.shard_index).await?
+            {
+                return Ok(None);
+            }
+            if !shard_prefixes_converged(state.clone(), &left).await? {
+                return Ok(None);
+            }
+            if right.shard_index != left.shard_index
+                && !shard_prefixes_converged(state.clone(), &right).await?
+            {
+                return Ok(None);
+            }
+            let left_count =
+                match shard_replica_record_count_converged(state.clone(), &left).await? {
+                    Some(count) => count,
+                    None => return Ok(None),
+                };
+            let right_count =
+                match shard_replica_record_count_converged(state.clone(), &right).await? {
+                    Some(count) => count,
+                    None => return Ok(None),
+                };
+            let mut lag_ops = shard_replica_prefix_lag(state.clone(), &left).await?;
+            lag_ops = lag_ops.max(shard_replica_prefix_lag(state.clone(), &right).await?);
+            return Ok(Some(ClusterCommand::AdvanceRangeMerge {
+                left_shard_id,
+                phase: RangeMergePhase::Copying,
+                copied_rows: merge
+                    .copied_rows
+                    .max(left_count.saturating_add(right_count)),
+                copied_bytes: merge.copied_bytes,
+                lag_ops,
+                retry_count: merge.retry_count,
+                eta_seconds: if lag_ops == 0 { 0 } else { 1 },
+                last_error: merge.last_error.clone(),
+            }));
+        }
+        RangeMergePhase::Copying => {
+            // Local migrator runs atomically as part of MergeRange apply.
+            return Ok(Some(ClusterCommand::AdvanceRangeMerge {
+                left_shard_id,
+                phase: RangeMergePhase::Cutover,
+                copied_rows: merge.copied_rows,
+                copied_bytes: merge.copied_bytes,
+                lag_ops: merge.lag_ops,
+                retry_count: merge.retry_count,
+                eta_seconds: merge.eta_seconds,
+                last_error: merge.last_error.clone(),
+            }));
+        }
+        RangeMergePhase::Cutover => {
+            if right.is_none() {
+                return Ok(Some(ClusterCommand::AdvanceRangeMerge {
+                    left_shard_id,
+                    phase: RangeMergePhase::Finalizing,
+                    copied_rows: merge.copied_rows,
+                    copied_bytes: merge.copied_bytes,
+                    lag_ops: merge.lag_ops,
+                    retry_count: merge.retry_count,
+                    eta_seconds: merge.eta_seconds,
+                    last_error: merge.last_error.clone(),
+                }));
+            }
+            let right = right.expect("checked is_some");
+            if !left.end_key.is_empty() && left.end_key != right.start_key {
+                return Ok(Some(ClusterCommand::AbortRangeMerge { left_shard_id }));
+            }
+            if left.replicas != right.replicas || left.leaseholder != right.leaseholder {
+                return Ok(Some(ClusterCommand::AbortRangeMerge { left_shard_id }));
+            }
+            if snapshot.shard_rebalances.contains_key(&left.shard_id)
+                || snapshot.shard_rebalances.contains_key(&right.shard_id)
+            {
+                return Ok(Some(ClusterCommand::AbortRangeMerge { left_shard_id }));
+            }
+            if !snapshot.shard_fences.contains_key(&left.shard_id) {
+                return Ok(Some(ClusterCommand::SetShardFence {
+                    shard_id: left.shard_id,
+                    fenced: true,
+                    reason: format!("range-merge:{}:{}", left.shard_id, merge.right_shard_id),
+                }));
+            }
+            if !snapshot.shard_fences.contains_key(&right.shard_id) {
+                return Ok(Some(ClusterCommand::SetShardFence {
+                    shard_id: right.shard_id,
+                    fenced: true,
+                    reason: format!("range-merge:{}:{}", left.shard_id, merge.right_shard_id),
+                }));
+            }
+            if !local_shard_quiesced(state.clone(), left.shard_index).await? {
+                return Ok(None);
+            }
+            if right.shard_index != left.shard_index
+                && !local_shard_quiesced(state.clone(), right.shard_index).await?
+            {
+                return Ok(None);
+            }
+            if !shard_prefixes_converged(state.clone(), &left).await? {
+                return Ok(None);
+            }
+            if right.shard_index != left.shard_index
+                && !shard_prefixes_converged(state.clone(), &right).await?
+            {
+                return Ok(None);
+            }
+            if shard_replica_record_count_converged(state.clone(), &left)
+                .await?
+                .is_none()
+            {
+                return Ok(None);
+            }
+            if shard_replica_record_count_converged(state.clone(), &right)
+                .await?
+                .is_none()
+            {
+                return Ok(None);
+            }
+            return Ok(Some(ClusterCommand::MergeRange { left_shard_id }));
+        }
+        RangeMergePhase::Finalizing => {
+            if right.is_some() {
+                // Wait for cutover visibility on this node first.
+                return Ok(None);
+            }
+            if snapshot.shard_fences.contains_key(&merge.right_shard_id) {
+                return Ok(Some(ClusterCommand::SetShardFence {
+                    shard_id: merge.right_shard_id,
+                    fenced: false,
+                    reason: String::new(),
+                }));
+            }
+            if snapshot.shard_fences.contains_key(&left.shard_id) {
+                return Ok(Some(ClusterCommand::SetShardFence {
+                    shard_id: left.shard_id,
+                    fenced: false,
+                    reason: String::new(),
+                }));
+            }
+            return Ok(Some(ClusterCommand::CompleteRangeMerge { left_shard_id }));
+        }
+    }
+}
+
+async fn plan_retired_range_gc_step(
+    state: Arc<NodeState>,
+    snapshot: &ClusterState,
+) -> anyhow::Result<Option<ClusterCommand>> {
+    for (shard_id, retired) in &snapshot.retired_ranges {
+        if snapshot.epoch < retired.gc_after_epoch {
+            continue;
+        }
+        if snapshot.shards.iter().any(|s| s.shard_id == *shard_id) {
+            continue;
+        }
+        if snapshot
+            .shard_merges
+            .values()
+            .any(|m| m.left_shard_id == *shard_id || m.right_shard_id == *shard_id)
+        {
+            continue;
+        }
+
+        // Retired-range GC is safe only after all non-removed nodes have
+        // converged beyond the retirement epoch and no longer expose this shard.
+        let mut converged = true;
+        for (node_id, member) in &snapshot.members {
+            if member.state == MemberState::Removed {
+                continue;
+            }
+            let view = if *node_id == state.node_id {
+                snapshot.clone()
+            } else {
+                match state.transport.cluster_state(*node_id).await {
+                    Ok(v) => v,
+                    Err(_) => {
+                        converged = false;
+                        break;
+                    }
+                }
+            };
+            if view.epoch < retired.gc_after_epoch {
+                converged = false;
+                break;
+            }
+            if view.shards.iter().any(|s| s.shard_id == *shard_id) {
+                converged = false;
+                break;
+            }
+            if view
+                .shard_merges
+                .values()
+                .any(|m| m.left_shard_id == *shard_id || m.right_shard_id == *shard_id)
+            {
+                converged = false;
+                break;
+            }
+        }
+        if !converged {
+            continue;
+        }
+        return Ok(Some(ClusterCommand::GcRetiredRange {
+            shard_id: *shard_id,
+        }));
+    }
+    Ok(None)
+}
+
 async fn propose_meta(state: Arc<NodeState>, cmd: ClusterCommand) -> anyhow::Result<()> {
     let payload = crate::cluster::ClusterStateMachine::encode_command(&cmd)?;
     let _ = state.meta_handle.propose(payload).await?;
@@ -166,13 +529,8 @@ async fn plan_inflight_move_step(
                 );
                 return Ok(None);
             }
-            if !target_has_learner_sync_state(
-                state.clone(),
-                snapshot.epoch,
-                shard.shard_id,
-                mv,
-            )
-            .await
+            if !target_has_learner_sync_state(state.clone(), snapshot.epoch, shard.shard_id, mv)
+                .await
             {
                 tracing::debug!(
                     shard_id = shard.shard_id,
@@ -230,13 +588,8 @@ async fn plan_inflight_move_step(
             {
                 return Ok(None);
             }
-            if !target_has_joint_config_state(
-                state.clone(),
-                snapshot.epoch,
-                shard.shard_id,
-                mv,
-            )
-            .await
+            if !target_has_joint_config_state(state.clone(), snapshot.epoch, shard.shard_id, mv)
+                .await
             {
                 return Ok(None);
             }
@@ -604,8 +957,14 @@ async fn learner_caught_up(
     target: NodeId,
 ) -> anyhow::Result<bool> {
     let group_id = crate::GROUP_DATA_BASE + shard.shard_index as u64;
-    let source_prefixes = state.transport.last_executed_prefix(source, group_id).await?;
-    let target_prefixes = state.transport.last_executed_prefix(target, group_id).await?;
+    let source_prefixes = state
+        .transport
+        .last_executed_prefix(source, group_id)
+        .await?;
+    let target_prefixes = state
+        .transport
+        .last_executed_prefix(target, group_id)
+        .await?;
     // Learner is considered caught up when it has executed at least everything
     // the source has executed for every origin node in this group.
     for src in &source_prefixes {
@@ -641,6 +1000,131 @@ async fn learner_caught_up(
     Ok(target_seen_source >= source_counter)
 }
 
+async fn local_shard_quiesced(state: Arc<NodeState>, shard_index: usize) -> anyhow::Result<bool> {
+    let group_id = crate::GROUP_DATA_BASE + shard_index as u64;
+    let Some(group) = state.group(group_id) else {
+        return Ok(false);
+    };
+    let stats = group.debug_stats().await;
+    let pending = stats.records_status_preaccepted_len
+        + stats.records_status_accepted_len
+        + stats.records_status_committed_len
+        + stats.records_status_executing_len
+        + stats.committed_queue_len
+        + stats.read_waiters_len;
+    Ok(pending == 0)
+}
+
+async fn shard_prefixes_by_replica(
+    state: Arc<NodeState>,
+    shard: &ShardDesc,
+) -> anyhow::Result<Option<Vec<(NodeId, Vec<ExecutedPrefix>)>>> {
+    let group_id = crate::GROUP_DATA_BASE + shard.shard_index as u64;
+    let mut prefixes_by_node = Vec::<(NodeId, Vec<ExecutedPrefix>)>::new();
+
+    for replica in &shard.replicas {
+        let prefixes = if *replica == state.node_id {
+            let Some(group) = state.group(group_id) else {
+                return Ok(None);
+            };
+            group.executed_prefixes().await
+        } else {
+            match state
+                .transport
+                .last_executed_prefix(*replica, group_id)
+                .await
+            {
+                Ok(p) => p,
+                Err(_) => return Ok(None),
+            }
+        };
+        prefixes_by_node.push((*replica, prefixes));
+    }
+    Ok(Some(prefixes_by_node))
+}
+
+async fn shard_prefixes_converged(
+    state: Arc<NodeState>,
+    shard: &ShardDesc,
+) -> anyhow::Result<bool> {
+    let Some(prefixes_by_node) = shard_prefixes_by_replica(state, shard).await? else {
+        return Ok(false);
+    };
+    Ok(prefix_sets_converged(&prefixes_by_node))
+}
+
+async fn shard_replica_prefix_lag(state: Arc<NodeState>, shard: &ShardDesc) -> anyhow::Result<u64> {
+    let Some(prefixes_by_node) = shard_prefixes_by_replica(state, shard).await? else {
+        return Ok(u64::MAX);
+    };
+    let mut required: BTreeMap<NodeId, u64> = BTreeMap::new();
+    for (_, prefixes) in &prefixes_by_node {
+        for p in prefixes {
+            required
+                .entry(p.node_id)
+                .and_modify(|counter| *counter = (*counter).max(p.counter))
+                .or_insert(p.counter);
+        }
+    }
+    let mut max_lag = 0u64;
+    for (_, prefixes) in &prefixes_by_node {
+        for (origin, req) in &required {
+            let have = prefix_counter(prefixes, *origin);
+            max_lag = max_lag.max(req.saturating_sub(have));
+        }
+    }
+    Ok(max_lag)
+}
+
+async fn shard_replica_record_count_converged(
+    state: Arc<NodeState>,
+    shard: &ShardDesc,
+) -> anyhow::Result<Option<u64>> {
+    let mut expected: Option<u64> = None;
+    for replica in &shard.replicas {
+        let count = if *replica == state.node_id {
+            state
+                .local_range_record_counts()?
+                .get(&shard.shard_id)
+                .copied()
+        } else {
+            let map = match state.transport.range_stats(*replica).await {
+                Ok(m) => m,
+                Err(_) => return Ok(None),
+            };
+            map.get(&shard.shard_id).copied()
+        };
+        let Some(count) = count else {
+            return Ok(None);
+        };
+        if let Some(cur) = expected {
+            if cur != count {
+                return Ok(None);
+            }
+        } else {
+            expected = Some(count);
+        }
+    }
+    Ok(expected)
+}
+
+fn prefix_sets_converged(prefixes_by_node: &[(NodeId, Vec<ExecutedPrefix>)]) -> bool {
+    let mut required: BTreeMap<NodeId, u64> = BTreeMap::new();
+    for (_, prefixes) in prefixes_by_node {
+        for p in prefixes {
+            required
+                .entry(p.node_id)
+                .and_modify(|counter| *counter = (*counter).max(p.counter))
+                .or_insert(p.counter);
+        }
+    }
+    prefixes_by_node.iter().all(|(_, prefixes)| {
+        required
+            .iter()
+            .all(|(origin, req)| prefix_counter(prefixes, *origin) >= *req)
+    })
+}
+
 fn prefix_counter(prefixes: &[ExecutedPrefix], node_id: NodeId) -> u64 {
     prefixes
         .iter()
@@ -669,7 +1153,10 @@ fn plan_decommission_step(state: &ClusterState) -> Option<ClusterCommand> {
             if state.shard_rebalances.contains_key(&shard.shard_id) {
                 return None;
             }
-            let Some(target) = active.iter().copied().find(|id| !shard.replicas.contains(id))
+            let Some(target) = active
+                .iter()
+                .copied()
+                .find(|id| !shard.replicas.contains(id))
             else {
                 // No destination available yet.
                 return None;
@@ -861,6 +1348,9 @@ mod tests {
             shards: vec![shard(10, vec![1, 2, 3], 3)],
             shard_replica_roles: roles,
             shard_rebalances: moves,
+            shard_merges: BTreeMap::new(),
+            shard_fences: BTreeMap::new(),
+            retired_ranges: BTreeMap::new(),
         };
 
         let cmd = plan_decommission_step(&state).expect("expected decommission step");
@@ -906,14 +1396,15 @@ mod tests {
             ],
             shard_replica_roles: roles,
             shard_rebalances: moves,
+            shard_merges: BTreeMap::new(),
+            shard_fences: BTreeMap::new(),
+            retired_ranges: BTreeMap::new(),
         };
 
         let cmd = plan_replica_balance_step(&state).expect("expected rebalance");
         match cmd {
             ClusterCommand::BeginReplicaMove {
-                from_node,
-                to_node,
-                ..
+                from_node, to_node, ..
             } => {
                 assert!(from_node == 1 || from_node == 2);
                 assert_eq!(to_node, 3);
@@ -941,6 +1432,9 @@ mod tests {
             ],
             shard_replica_roles: roles,
             shard_rebalances: moves,
+            shard_merges: BTreeMap::new(),
+            shard_fences: BTreeMap::new(),
+            retired_ranges: BTreeMap::new(),
         };
 
         let cmd = plan_lease_balance_step(&state).expect("expected lease rebalance");
@@ -994,6 +1488,9 @@ mod tests {
             shards: vec![shard(1, vec![1, 2, 3, 4], 1)],
             shard_replica_roles: roles,
             shard_rebalances: moves,
+            shard_merges: BTreeMap::new(),
+            shard_fences: BTreeMap::new(),
+            retired_ranges: BTreeMap::new(),
         };
 
         let cmd = plan_stalled_move_step(&state, Duration::from_millis(1_000))
@@ -1035,6 +1532,9 @@ mod tests {
             shards: vec![shard(1, vec![1, 2, 3, 4], 4)],
             shard_replica_roles: BTreeMap::new(),
             shard_rebalances: moves,
+            shard_merges: BTreeMap::new(),
+            shard_fences: BTreeMap::new(),
+            retired_ranges: BTreeMap::new(),
         };
 
         let cmd = plan_stalled_move_step(&state, Duration::from_millis(1_000))
