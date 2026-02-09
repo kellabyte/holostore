@@ -54,6 +54,14 @@ pub struct GrpcTransport {
     inflight_limit: usize,
 }
 
+/// One latest-visible KV row used for replica backfill.
+#[derive(Clone, Debug)]
+pub struct RangeLatestEntry {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+    pub version: Version,
+}
+
 /// Collect a batch of items from a channel with a size/time bound.
 async fn collect_batch<T>(
     first: T,
@@ -771,6 +779,126 @@ impl GrpcTransport {
                 .collect()),
             Ok(Err(err)) => Err(anyhow::anyhow!("last_executed_prefix rpc failed: {err}")),
             Err(_) => Err(anyhow::anyhow!("last_executed_prefix rpc timed out")),
+        }
+    }
+
+    /// Seed executed-prefix floors on a peer for a group.
+    pub async fn seed_executed_prefix(
+        &self,
+        target: NodeId,
+        group_id: u64,
+        prefixes: &[ExecutedPrefix],
+    ) -> anyhow::Result<()> {
+        let peer = self.peer(target)?;
+        let req = rpc::SeedExecutedPrefixRequest {
+            group_id,
+            prefixes: prefixes
+                .iter()
+                .cloned()
+                .map(to_rpc_executed_prefix)
+                .collect(),
+        };
+        let resp = time::timeout(self.rpc_timeout, peer.read_client.seed_executed_prefix(req)).await;
+        match resp {
+            Ok(Ok(resp)) => {
+                if resp.into_inner().ok {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("seed_executed_prefix rpc returned not-ok"))
+                }
+            }
+            Ok(Err(err)) => Err(anyhow::anyhow!("seed_executed_prefix rpc failed: {err}")),
+            Err(_) => Err(anyhow::anyhow!("seed_executed_prefix rpc timed out")),
+        }
+    }
+
+    /// Fetch and decode the peer's current control-plane state snapshot.
+    pub async fn cluster_state(&self, target: NodeId) -> anyhow::Result<crate::cluster::ClusterState> {
+        let peer = self.peer(target)?;
+        let resp = time::timeout(
+            self.rpc_timeout,
+            peer.read_client
+                .cluster_state(rpc::ClusterStateRequest {}),
+        )
+        .await;
+        match resp {
+            Ok(Ok(resp)) => {
+                let json = resp.into_inner().json.to_string();
+                serde_json::from_str(&json)
+                    .with_context(|| format!("failed to parse cluster_state from node {target}"))
+            }
+            Ok(Err(err)) => Err(anyhow::anyhow!("cluster_state rpc failed: {err}")),
+            Err(_) => Err(anyhow::anyhow!("cluster_state rpc timed out")),
+        }
+    }
+
+    /// Fetch one page of latest-visible rows from a peer for `[start, end)`.
+    pub async fn range_snapshot_latest(
+        &self,
+        target: NodeId,
+        shard_index: usize,
+        start_key: &[u8],
+        end_key: &[u8],
+        cursor: &[u8],
+        limit: usize,
+    ) -> anyhow::Result<(Vec<RangeLatestEntry>, Vec<u8>, bool)> {
+        let peer = self.peer(target)?;
+        let req = rpc::RangeSnapshotLatestRequest {
+            shard_index: shard_index as u64,
+            start_key: start_key.to_vec().into(),
+            end_key: end_key.to_vec().into(),
+            cursor: cursor.to_vec().into(),
+            limit: limit.min(u32::MAX as usize) as u32,
+        };
+        let resp = time::timeout(self.rpc_timeout, peer.read_client.range_snapshot_latest(req)).await;
+        match resp {
+            Ok(Ok(resp)) => {
+                let resp = resp.into_inner();
+                let mut entries = Vec::with_capacity(resp.entries.len());
+                for item in resp.entries {
+                    let version = from_rpc_version_required(item.version)?;
+                    entries.push(RangeLatestEntry {
+                        key: item.key.to_vec(),
+                        value: item.value.to_vec(),
+                        version,
+                    });
+                }
+                Ok((entries, resp.next_cursor.to_vec(), resp.done))
+            }
+            Ok(Err(err)) => Err(anyhow::anyhow!("range_snapshot_latest rpc failed: {err}")),
+            Err(_) => Err(anyhow::anyhow!("range_snapshot_latest rpc timed out")),
+        }
+    }
+
+    /// Apply one page of latest-visible rows to a peer shard for `[start, end)`.
+    pub async fn range_apply_latest(
+        &self,
+        target: NodeId,
+        shard_index: usize,
+        start_key: &[u8],
+        end_key: &[u8],
+        entries: Vec<RangeLatestEntry>,
+    ) -> anyhow::Result<u64> {
+        let peer = self.peer(target)?;
+        let rpc_entries = entries
+            .into_iter()
+            .map(|entry| rpc::RangeSnapshotLatestEntry {
+                key: entry.key.into(),
+                value: entry.value.into(),
+                version: Some(to_rpc_version(entry.version)),
+            })
+            .collect();
+        let req = rpc::RangeApplyLatestRequest {
+            shard_index: shard_index as u64,
+            start_key: start_key.to_vec().into(),
+            end_key: end_key.to_vec().into(),
+            entries: rpc_entries,
+        };
+        let resp = time::timeout(self.rpc_timeout, peer.read_client.range_apply_latest(req)).await;
+        match resp {
+            Ok(Ok(resp)) => Ok(resp.into_inner().applied),
+            Ok(Err(err)) => Err(anyhow::anyhow!("range_apply_latest rpc failed: {err}")),
+            Err(_) => Err(anyhow::anyhow!("range_apply_latest rpc timed out")),
         }
     }
 
@@ -2124,6 +2252,14 @@ fn to_rpc_txn_id(txn_id: TxnId) -> rpc::TxnId {
     }
 }
 
+/// Convert a local version to its RPC representation.
+fn to_rpc_version(version: Version) -> rpc::Version {
+    rpc::Version {
+        seq: version.seq,
+        txn_id: Some(to_rpc_txn_id(version.txn_id)),
+    }
+}
+
 /// Convert a local ballot to its RPC representation.
 fn to_rpc_ballot(ballot: Ballot) -> rpc::Ballot {
     rpc::Ballot {
@@ -2146,6 +2282,18 @@ fn from_rpc_version(version: Option<rpc::Version>) -> Version {
         seq: version.seq,
         txn_id,
     }
+}
+
+/// Decode an RPC version, rejecting missing fields.
+fn from_rpc_version_required(version: Option<rpc::Version>) -> anyhow::Result<Version> {
+    let version = version.ok_or_else(|| anyhow::anyhow!("missing version"))?;
+    let txn_id = version
+        .txn_id
+        .ok_or_else(|| anyhow::anyhow!("missing version.txn_id"))?;
+    Ok(Version {
+        seq: version.seq,
+        txn_id: from_rpc_txn_id(txn_id),
+    })
 }
 
 /// Convert an RPC txn id into a local representation.

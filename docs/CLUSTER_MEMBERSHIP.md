@@ -69,8 +69,14 @@ membership and Cockroach-style control-plane metadata.
   - [x] promote to joint-config metadata phase
   - [x] transfer lease
   - [x] finalize cutover and remove outgoing replica
+  - [x] timeout safety: abort stalled pre-cutover moves, force-finalize stalled post-lease moves
+  - [x] rollback safety: explicit `AbortReplicaMove` restores pre-move placement/roles
 - [x] Manual `RangeRebalance` now uses staged workflow (single replica replacement)
   instead of immediate `SetReplicas` cutover.
+- [x] Data-plane runtime reconfiguration of per-shard Accord membership:
+  - [x] runtime member set follows shard replicas
+  - [x] runtime voter set follows `shard_replica_roles` (`Learner` excluded from quorum)
+  - [x] commit fanout includes learners for catch-up while quorum only counts voters
 
 ### Phase 4: Meta Resilience (Cockroach-style)
 
@@ -88,11 +94,18 @@ membership and Cockroach-style control-plane metadata.
   - balances replica and leaseholder counts across active nodes
 - `ClusterRemoveNode` now means "begin decommissioning", not immediate hard removal.
 - Replica configuration is validated against active members and target RF.
-- Remaining major production gap:
-  - per-range `replicas` are now orchestrated through staged control-plane
-    reconfiguration, but Accord data-group members are still static at startup
-  - true production-grade per-range consensus membership changes still require
-    dynamic Accord group membership reconfiguration in the data plane
+- Per-shard Accord groups now refresh membership/voters from meta state on every
+  cluster epoch change (instead of static-at-startup members).
+- In-flight replica moves now persist timing metadata (`started_unix_ms`,
+  `last_progress_unix_ms`) in control-plane state. The rebalance manager uses
+  these to recover stalled workflows automatically.
+- Remaining major production gaps:
+  - staged replica reconfiguration is now persisted and replayed through per-shard
+    Accord log commands (`CMD_MEMBERSHIP_RECONFIG`), but orchestration is still
+    controller-driven (not a shard-local autonomous joint-consensus workflow)
+  - meta-plane still runs as a single range (no meta split / multi-meta-range)
+  - move-controller HA is still single-writer (node 1); metadata is durable, but
+    orchestration leader election is not implemented yet
 
 - The node defaults to `--routing-mode range` (lexicographic key ranges).
   Prefix-heavy workloads can concentrate traffic into a single range until
@@ -154,4 +167,7 @@ auto-splitting while measuring:
 
 ```bash
 HOLO_RANGE_SPLIT_MIN_KEYS=0 HOLO_RANGE_SPLIT_MIN_QPS=0 ./scripts/start_cluster.sh
+
+# Optional: move timeout safety for staged reconfiguration (default 180000 ms).
+HOLO_REBALANCE_MOVE_TIMEOUT_MS=180000 ./scripts/start_cluster.sh
 ```

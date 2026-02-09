@@ -15,6 +15,7 @@ service HoloRpc {
   rpc ReportExecuted(ReportExecutedRequest) returns (ReportExecutedResponse);
   rpc LastCommitted(LastCommittedRequest) returns (LastCommittedResponse);
   rpc LastExecutedPrefix(LastExecutedPrefixRequest) returns (LastExecutedPrefixResponse);
+  rpc SeedExecutedPrefix(SeedExecutedPrefixRequest) returns (SeedExecutedPrefixResponse);
   rpc Executed(ExecutedRequest) returns (ExecutedResponse);
   rpc MarkVisible(MarkVisibleRequest) returns (MarkVisibleResponse);
   rpc KvGet(KvGetRequest) returns (KvGetResponse);
@@ -27,6 +28,8 @@ service HoloRpc {
   rpc RangeMerge(RangeMergeRequest) returns (RangeMergeResponse);
   rpc RangeRebalance(RangeRebalanceRequest) returns (RangeRebalanceResponse);
   rpc RangeStats(RangeStatsRequest) returns (RangeStatsResponse);
+  rpc RangeSnapshotLatest(RangeSnapshotLatestRequest) returns (RangeSnapshotLatestResponse);
+  rpc RangeApplyLatest(RangeApplyLatestRequest) returns (RangeApplyLatestResponse);
   rpc ClusterFreeze(ClusterFreezeRequest) returns (ClusterFreezeResponse);
 }
 
@@ -215,6 +218,15 @@ message LastExecutedPrefixResponse {
   repeated ExecutedPrefix prefixes = 1;
 }
 
+message SeedExecutedPrefixRequest {
+  uint64 group_id = 1;
+  repeated ExecutedPrefix prefixes = 2;
+}
+
+message SeedExecutedPrefixResponse {
+  bool ok = 1;
+}
+
 message ExecutedRequest {
   uint64 group_id = 1;
   TxnId txn_id = 2;
@@ -308,6 +320,37 @@ message RangeStat {
 message RangeStatsResponse {
   uint64 node_id = 1;
   repeated RangeStat ranges = 2;
+}
+
+message RangeSnapshotLatestRequest {
+  uint64 shard_index = 1;
+  bytes start_key = 2;
+  bytes end_key = 3;
+  bytes cursor = 4;
+  uint32 limit = 5;
+}
+
+message RangeSnapshotLatestEntry {
+  bytes key = 1;
+  bytes value = 2;
+  Version version = 3;
+}
+
+message RangeSnapshotLatestResponse {
+  repeated RangeSnapshotLatestEntry entries = 1;
+  bytes next_cursor = 2;
+  bool done = 3;
+}
+
+message RangeApplyLatestRequest {
+  uint64 shard_index = 1;
+  bytes start_key = 2;
+  bytes end_key = 3;
+  repeated RangeSnapshotLatestEntry entries = 4;
+}
+
+message RangeApplyLatestResponse {
+  uint64 applied = 1;
 }
 
 message ClusterFreezeRequest {

@@ -33,7 +33,10 @@ mod rpc_service;
 mod transport;
 mod wal;
 
-use cluster::{ClusterStateMachine, ClusterStateStore, MemberInfo, MemberState, ShardDesc};
+use cluster::{
+    ClusterState, ClusterStateMachine, ClusterStateStore, MemberInfo, MemberState, ReplicaRole,
+    ShardDesc,
+};
 use kv::{FjallEngine, KvEngine};
 use load::ShardLoadTracker;
 use range_manager::RangeManagerConfig;
@@ -139,6 +142,13 @@ struct NodeArgs {
     /// Rebalance manager evaluation interval (ms).
     #[arg(long, env = "HOLO_REBALANCE_INTERVAL_MS", default_value_t = 1000)]
     rebalance_interval_ms: u64,
+
+    /// Max idle time for an in-flight replica move before the manager
+    /// auto-aborts (or force-finalizes post-lease-transfer) in milliseconds.
+    ///
+    /// Set to 0 to disable timeout-based recovery.
+    #[arg(long, env = "HOLO_REBALANCE_MOVE_TIMEOUT_MS", default_value_t = 180_000)]
+    rebalance_move_timeout_ms: u64,
 
     /// How to map keys to data shards.
     ///
@@ -362,6 +372,14 @@ struct LocalRangeStat {
     is_leaseholder: bool,
 }
 
+/// One latest-visible KV entry used for replica backfill.
+#[derive(Clone, Debug)]
+pub(crate) struct RangeSnapshotLatestEntry {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+    pub version: kv::Version,
+}
+
 /// Local range statistics provider backed by Fjall latest-index partitions.
 #[derive(Clone)]
 struct LocalRangeStats {
@@ -409,6 +427,86 @@ impl LocalRangeStats {
             count = count.saturating_add(1);
         }
         Ok(count)
+    }
+
+    /// Read one paged snapshot of latest-visible rows for `[start_key, end_key)`.
+    fn snapshot_latest_page(
+        &self,
+        shard_index: usize,
+        start_key: &[u8],
+        end_key: &[u8],
+        cursor: &[u8],
+        limit: usize,
+    ) -> anyhow::Result<(Vec<RangeSnapshotLatestEntry>, Vec<u8>, bool)> {
+        let limit = limit.clamp(1, 10_000);
+        let latest_name = self.latest_partition_name(shard_index);
+        let latest = self
+            .keyspace
+            .open_partition(&latest_name, PartitionCreateOptions::default())?;
+
+        let mut lower = start_key.to_vec();
+        if !cursor.is_empty() && cursor > lower.as_slice() {
+            lower = cursor.to_vec();
+        }
+        let mut iter: Box<dyn Iterator<Item = fjall::Result<fjall::KvPair>>> = if end_key.is_empty()
+        {
+            Box::new(latest.range(lower..))
+        } else {
+            Box::new(latest.range(lower..end_key.to_vec()))
+        };
+
+        let mut out = Vec::with_capacity(limit);
+        let mut last_key = Vec::new();
+        let mut has_more = false;
+        while let Some(item) = iter.next() {
+            let (key, value) = item?;
+            let key = key.to_vec();
+            if !cursor.is_empty() && key.as_slice() <= cursor {
+                continue;
+            }
+            let (version, row) = kv::decode_latest_value(&value)?;
+            last_key = key.clone();
+            out.push(RangeSnapshotLatestEntry {
+                key,
+                value: row,
+                version,
+            });
+            if out.len() >= limit {
+                has_more = true;
+                break;
+            }
+        }
+
+        let done = !has_more;
+        let next_cursor = if has_more { last_key } else { Vec::new() };
+        Ok((out, next_cursor, done))
+    }
+
+    /// Apply backfilled latest rows into a local shard's KV partitions.
+    fn apply_latest_entries(
+        &self,
+        shard_index: usize,
+        start_key: &[u8],
+        end_key: &[u8],
+        entries: &[RangeSnapshotLatestEntry],
+    ) -> anyhow::Result<u64> {
+        let engine: Arc<dyn KvEngine> = if self.max_shards <= 1 {
+            Arc::new(FjallEngine::open(self.keyspace.clone())?)
+        } else {
+            Arc::new(FjallEngine::open_shard(self.keyspace.clone(), shard_index)?)
+        };
+        let mut applied = 0u64;
+        for entry in entries {
+            let in_start = start_key.is_empty() || entry.key.as_slice() >= start_key;
+            let in_end = end_key.is_empty() || entry.key.as_slice() < end_key;
+            if !in_start || !in_end {
+                continue;
+            }
+            engine.set(entry.key.clone(), entry.value.clone(), entry.version);
+            engine.mark_visible(&entry.key, entry.version);
+            applied = applied.saturating_add(1);
+        }
+        Ok(applied)
     }
 }
 
@@ -843,6 +941,53 @@ impl NodeState {
         self.groups.get(&group_id).cloned()
     }
 
+    /// Apply control-plane replica membership to runtime Accord data groups.
+    fn refresh_group_memberships(&self) -> anyhow::Result<()> {
+        let snapshot = self.cluster_store.state();
+
+        // Meta/control group tracks all non-removed nodes.
+        if let Some(meta) = self.group(GROUP_MEMBERSHIP) {
+            let mut members = snapshot
+                .members
+                .values()
+                .filter(|m| m.state != MemberState::Removed)
+                .map(|m| accord::Member { id: m.node_id })
+                .collect::<Vec<_>>();
+            members.sort_by_key(|m| m.id);
+            members.dedup_by_key(|m| m.id);
+            if !members.is_empty() {
+                meta.update_members(members)?;
+            }
+        }
+
+        // Per-range data groups track voting replicas only (learners excluded).
+        //
+        // During an in-flight replica move, runtime membership transitions are
+        // driven by committed shard-log reconfiguration commands. Skipping
+        // control-plane refresh for those shards prevents the background
+        // refresher from racing and reverting an in-progress stage.
+        for shard in &snapshot.shards {
+            if snapshot.shard_rebalances.contains_key(&shard.shard_id) {
+                continue;
+            }
+            let group_id = GROUP_DATA_BASE + shard.shard_index as u64;
+            let Some(group) = self.group(group_id) else {
+                continue;
+            };
+            let (members, voters) = shard_membership_sets(&snapshot, shard);
+            if members.is_empty() || voters.is_empty() {
+                continue;
+            }
+            let members = members
+                .into_iter()
+                .map(|id| accord::Member { id })
+                .collect::<Vec<_>>();
+            group.update_membership(members, voters)?;
+        }
+
+        Ok(())
+    }
+
     /// Map a key to a shard index.
     fn shard_for_key(&self, key: &[u8]) -> usize {
         // Block shard routing while a split is actively migrating keys.
@@ -875,6 +1020,50 @@ impl NodeState {
         self.data_handles[idx].clone()
     }
 
+    /// Compare runtime Accord membership against the expected member/voter sets.
+    fn shard_membership_matches(
+        &self,
+        shard_index: usize,
+        members: &[NodeId],
+        voters: &[NodeId],
+    ) -> bool {
+        let group_id = GROUP_DATA_BASE + shard_index as u64;
+        let Some(group) = self.group(group_id) else {
+            return false;
+        };
+
+        let mut expected_members = members.to_vec();
+        expected_members.sort_unstable();
+        expected_members.dedup();
+        let mut expected_voters = voters.to_vec();
+        expected_voters.sort_unstable();
+        expected_voters.dedup();
+
+        let mut current_members = group.members().into_iter().map(|m| m.id).collect::<Vec<_>>();
+        current_members.sort_unstable();
+        current_members.dedup();
+        let mut current_voters = group.voters();
+        current_voters.sort_unstable();
+        current_voters.dedup();
+
+        current_members == expected_members && current_voters == expected_voters
+    }
+
+    /// Propose an internal shard-membership reconfiguration command.
+    async fn propose_shard_membership_reconfig(
+        &self,
+        shard_index: usize,
+        members: &[NodeId],
+        voters: &[NodeId],
+    ) -> anyhow::Result<()> {
+        if self.shard_membership_matches(shard_index, members, voters) {
+            return Ok(());
+        }
+        let payload = kv::encode_membership_reconfig(members, voters);
+        let _ = self.handle_for_shard(shard_index).propose(payload).await?;
+        Ok(())
+    }
+
     /// Read the latest visible value for a key from the local KV engine.
     fn kv_latest(&self, key: &[u8]) -> Option<(Vec<u8>, kv::Version)> {
         self.kv_engine.get_latest(key)
@@ -904,6 +1093,31 @@ impl NodeState {
             });
         }
         Ok(out)
+    }
+
+    /// Read one paged snapshot of latest rows for a shard range.
+    fn snapshot_range_latest_page(
+        &self,
+        shard_index: usize,
+        start_key: &[u8],
+        end_key: &[u8],
+        cursor: &[u8],
+        limit: usize,
+    ) -> anyhow::Result<(Vec<RangeSnapshotLatestEntry>, Vec<u8>, bool)> {
+        self.range_stats
+            .snapshot_latest_page(shard_index, start_key, end_key, cursor, limit)
+    }
+
+    /// Apply one page of latest rows into a local shard range.
+    fn apply_range_latest_page(
+        &self,
+        shard_index: usize,
+        start_key: &[u8],
+        end_key: &[u8],
+        entries: &[RangeSnapshotLatestEntry],
+    ) -> anyhow::Result<u64> {
+        self.range_stats
+            .apply_latest_entries(shard_index, start_key, end_key, entries)
     }
 
     /// Snapshot and reset client batch stats.
@@ -1469,6 +1683,38 @@ fn shard_index_for_key_in_ranges(key: &[u8], shards: &[ShardDesc]) -> usize {
         }
     }
     0
+}
+
+/// Resolve voting members for a shard from staged replica-role metadata.
+fn shard_membership_sets(snapshot: &ClusterState, shard: &ShardDesc) -> (Vec<NodeId>, Vec<NodeId>) {
+    let mut members = shard.replicas.clone();
+    members.sort_unstable();
+    members.dedup();
+
+    let mut voters = if let Some(roles) = snapshot.shard_replica_roles.get(&shard.shard_id) {
+        shard
+            .replicas
+            .iter()
+            .copied()
+            .filter(|id| {
+                roles
+                    .get(id)
+                    .copied()
+                    .unwrap_or(ReplicaRole::Voter)
+                    != ReplicaRole::Learner
+            })
+            .collect::<Vec<_>>()
+    } else {
+        shard.replicas.clone()
+    };
+
+    if voters.is_empty() {
+        voters = members.clone();
+    }
+    voters.sort_unstable();
+    voters.dedup();
+
+    (members, voters)
 }
 
 /// Collect a batch of SET work items up to size/time limits.
@@ -2373,8 +2619,24 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         anyhow::bail!("exactly one of --bootstrap or --join must be set");
     }
 
-    let members = parse_members(&args.initial_members)?;
-    let member_infos: BTreeMap<NodeId, MemberInfo> = members
+    let seed_members = parse_members(&args.initial_members)?;
+    let join_snapshot = if let Some(seed) = args.join {
+        // Join first and fetch a control-plane snapshot before initializing
+        // transport/groups so this node starts from the current cluster view.
+        Some(
+            join_seed_and_fetch_snapshot(
+                args.node_id,
+                seed,
+                args.listen_grpc,
+                args.listen_redis,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
+    let member_infos: BTreeMap<NodeId, MemberInfo> = seed_members
         .iter()
         .map(|(id, addr)| {
             (
@@ -2401,6 +2663,10 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         args.replication_factor.max(1),
         args.initial_ranges.max(1).min(args.data_shards.max(1)),
     )?;
+    if let Some(snapshot) = join_snapshot {
+        cluster_store.install_snapshot(snapshot)?;
+    }
+    let runtime_members = cluster_store.members_map()?;
 
     // Clamp timeouts to at least 1ms to avoid zero-duration timeouts.
     let rpc_timeout = Duration::from_millis(args.rpc_timeout_ms.max(1));
@@ -2416,7 +2682,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         low_queue: args.rpc_inflight_low_queue,
     };
     let transport = Arc::new(GrpcTransport::new(
-        &members,
+        &runtime_members,
         rpc_timeout,
         commit_timeout,
         args.rpc_inflight_limit,
@@ -2617,7 +2883,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
             )?),
         }
     };
-    let accord_members = members
+    let accord_members = runtime_members
         .keys()
         .copied()
         .map(|id| accord::Member { id })
@@ -2674,13 +2940,32 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
     groups.insert(GROUP_MEMBERSHIP, membership_group.clone());
 
     let split_lock = cluster_store.split_lock();
+    let data_group_slots = (0..data_shards)
+        .map(|_| Arc::new(std::sync::RwLock::new(None::<std::sync::Weak<accord::Group>>)))
+        .collect::<Vec<_>>();
 
     for shard in 0..data_shards {
         let group_id = GROUP_DATA_BASE + shard as u64;
         let wal = shared_wal.clone();
-        let kv_sm = Arc::new(kv::KvStateMachine::new(
+        let group_slot = data_group_slots[shard].clone();
+        let membership_hook: Arc<kv::MembershipUpdateHook> = Arc::new(move |reconfig| {
+            let maybe_group = group_slot
+                .read()
+                .ok()
+                .and_then(|slot| slot.as_ref().and_then(|weak| weak.upgrade()));
+            let group = maybe_group
+                .ok_or_else(|| anyhow::anyhow!("data group {group_id} is not initialized"))?;
+            let members = reconfig
+                .members
+                .into_iter()
+                .map(|id| accord::Member { id })
+                .collect::<Vec<_>>();
+            group.update_membership(members, reconfig.voters)
+        });
+        let kv_sm = Arc::new(kv::KvStateMachine::with_membership_hook(
             kv_shards[shard].clone(),
             Some(split_lock.clone()),
+            Some(membership_hook),
         ));
         let data_group = Arc::new(accord::Group::new(
             mk_cfg(group_id),
@@ -2688,6 +2973,10 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
             kv_sm,
             Some(wal),
         ));
+        if let Ok(mut slot) = data_group_slots[shard].write() {
+            *slot = Some(Arc::downgrade(&data_group));
+        }
+        groups.insert(group_id, data_group.clone());
         let replayed = data_group
             .replay_commits()
             .await
@@ -2701,7 +2990,6 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
             );
         }
         data_group.spawn_executor();
-        groups.insert(group_id, data_group.clone());
         data_handles.push(data_group.handle());
         data_groups.push(data_group);
     }
@@ -2729,7 +3017,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         });
     }
 
-    let member_ids = members.keys().copied().collect::<Vec<_>>();
+    let member_ids = runtime_members.keys().copied().collect::<Vec<_>>();
 
     let client_batch_stats = Arc::new(ClientBatchStats::default());
     let client_batch_queue = args.client_batch_queue.max(1);
@@ -2745,7 +3033,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
     let meta_handle = membership_group.handle();
     let range_stats = Arc::new(LocalRangeStats::new(keyspace.clone(), data_shards));
     let state = Arc::new(NodeState {
-        initial_members: args.initial_members.clone(),
+        initial_members: cluster_store.members_string(),
         groups,
         data_handles,
         data_shards,
@@ -2779,26 +3067,74 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         range_stats,
     });
 
-    let cluster_store = state.cluster_store.clone();
-    let transport_clone = transport.clone();
+    let refresh_state = state.clone();
     tokio::spawn(async move {
-        let mut last_epoch = cluster_store.epoch();
+        // Force one refresh on startup, then apply on each metadata epoch bump.
+        let mut last_epoch = 0u64;
         loop {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            let epoch = cluster_store.epoch();
+            let epoch = refresh_state.cluster_store.epoch();
             if epoch != last_epoch {
-                match cluster_store.members_map() {
+                match refresh_state.cluster_store.members_map() {
                     Ok(members) => {
-                        transport_clone.update_members(&members);
-                        last_epoch = epoch;
+                        refresh_state.transport.update_members(&members);
                     }
                     Err(err) => {
                         tracing::warn!(error = ?err, "failed to refresh cluster members");
                     }
                 }
+                if let Err(err) = refresh_state.refresh_group_memberships() {
+                    tracing::warn!(error = ?err, "failed to refresh group memberships");
+                }
+                last_epoch = epoch;
             }
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     });
+
+    if args.join.is_some() {
+        let sync_state = state.clone();
+        tokio::spawn(async move {
+            // Best-effort control-plane pull for joiners. This keeps late-joining
+            // nodes converged even if they temporarily miss meta-group traffic.
+            loop {
+                let local = sync_state.cluster_store.state();
+                let source = local
+                    .members
+                    .iter()
+                    .filter_map(|(id, member)| {
+                        (member.state != MemberState::Removed && *id != sync_state.node_id)
+                            .then_some(*id)
+                    })
+                    .min();
+                drop(local);
+
+                if let Some(source) = source {
+                    match sync_state.transport.cluster_state(source).await {
+                        Ok(remote) => {
+                            if remote.epoch > sync_state.cluster_store.epoch() {
+                                if let Err(err) = sync_state.cluster_store.install_snapshot(remote)
+                                {
+                                    tracing::warn!(
+                                        error = ?err,
+                                        source,
+                                        "failed to install pulled cluster snapshot"
+                                    );
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            tracing::debug!(
+                                error = ?err,
+                                source,
+                                "failed to pull cluster snapshot from source"
+                            );
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        });
+    }
 
     spawn_set_batcher(state.clone(), client_set_rx, client_batch_cfg);
     spawn_get_batcher(state.clone(), client_get_rx, client_batch_cfg);
@@ -2821,6 +3157,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
             state.clone(),
             RebalanceManagerConfig {
                 interval: Duration::from_millis(args.rebalance_interval_ms.max(100)),
+                move_timeout: Duration::from_millis(args.rebalance_move_timeout_ms),
             },
         );
     }
@@ -2858,18 +3195,6 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         }
     });
 
-    if let Some(seed) = args.join {
-        // Join an existing cluster by contacting the seed node.
-        join_seed(
-            args.node_id,
-            seed,
-            &args.initial_members,
-            args.listen_grpc,
-            args.listen_redis,
-        )
-        .await?;
-    }
-
     tracing::info!(
         node_id = args.node_id,
         redis = %redis_addr,
@@ -2881,19 +3206,45 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Attempt to join a seed node, retrying for a fixed number of attempts.
-async fn join_seed(
+/// Attempt to join a seed node, then fetch and return a converged control-plane
+/// snapshot that includes this joining node as Active.
+async fn join_seed_and_fetch_snapshot(
     node_id: u64,
     seed: SocketAddr,
-    expected_members: &str,
     listen_grpc: SocketAddr,
     listen_redis: SocketAddr,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ClusterState> {
     let client = volo_gen::holo_store::rpc::HoloRpcClientBuilder::new("holo_store.rpc.HoloRpc")
         .address(volo::net::Address::from(seed))
         .build();
 
-    for _ in 0..100 {
+    // Fast path: if the node is already present in the seed snapshot (typical
+    // for preconfigured bootstrap members), do not issue AddNode.
+    for _ in 0..300 {
+        let resp = client
+            .cluster_state(volo_gen::holo_store::rpc::ClusterStateRequest {})
+            .await;
+        match resp {
+            Ok(resp) => {
+                let json = resp.into_inner().json.to_string();
+                let state: ClusterState = serde_json::from_str(&json)
+                    .with_context(|| format!("failed to decode cluster state from seed {seed}"))?;
+                let already_active = state
+                    .members
+                    .get(&node_id)
+                    .map(|m| m.state == MemberState::Active)
+                    .unwrap_or(false);
+                if already_active {
+                    return Ok(state);
+                }
+            }
+            Err(_) => {}
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let mut joined = false;
+    for _ in 0..300 {
         match client
             .join(volo_gen::holo_store::rpc::JoinRequest {
                 node_id,
@@ -2902,25 +3253,42 @@ async fn join_seed(
             })
             .await
         {
-            Ok(resp) => {
-                let members = resp.into_inner().initial_members;
-                if members.as_str() != expected_members {
-                    // Warn when seed membership differs from the expected config.
-                    tracing::warn!(
-                        seed = %seed,
-                        expected = expected_members,
-                        got = %members,
-                        "seed returned different membership string"
-                    );
-                }
-                return Ok(());
+            Ok(_) => {
+                joined = true;
+                break;
             }
             // Retry after a short delay if the seed is not ready.
             Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
         }
     }
+    if !joined {
+        anyhow::bail!("failed to join seed {seed}");
+    }
 
-    anyhow::bail!("failed to join seed {seed}");
+    for _ in 0..300 {
+        let resp = client
+            .cluster_state(volo_gen::holo_store::rpc::ClusterStateRequest {})
+            .await;
+        match resp {
+            Ok(resp) => {
+                let json = resp.into_inner().json.to_string();
+                let state: ClusterState = serde_json::from_str(&json)
+                    .with_context(|| format!("failed to decode cluster state from seed {seed}"))?;
+                let joined = state
+                    .members
+                    .get(&node_id)
+                    .map(|m| m.state == MemberState::Active)
+                    .unwrap_or(false);
+                if joined {
+                    return Ok(state);
+                }
+            }
+            Err(_) => {}
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    anyhow::bail!("joined seed {seed} but failed to observe node {node_id} as Active");
 }
 
 /// Parse a comma-separated `id@host:port` membership string.
@@ -2936,6 +3304,74 @@ fn parse_members(input: &str) -> anyhow::Result<HashMap<NodeId, SocketAddr>> {
     }
     anyhow::ensure!(!out.is_empty(), "initial_members is empty");
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_state() -> ClusterState {
+        ClusterState {
+            epoch: 1,
+            frozen: false,
+            replication_factor: 3,
+            members: BTreeMap::new(),
+            shards: vec![],
+            shard_replica_roles: BTreeMap::new(),
+            shard_rebalances: BTreeMap::new(),
+        }
+    }
+
+    fn sample_shard() -> ShardDesc {
+        ShardDesc {
+            shard_id: 10,
+            shard_index: 2,
+            start_hash: 0,
+            end_hash: 0,
+            start_key: vec![],
+            end_key: vec![],
+            replicas: vec![1, 2, 3],
+            leaseholder: 1,
+        }
+    }
+
+    #[test]
+    fn shard_membership_sets_excludes_learners_from_voters() {
+        let mut state = sample_state();
+        let shard = sample_shard();
+        state.shards.push(shard.clone());
+        state.shard_replica_roles.insert(
+            shard.shard_id,
+            BTreeMap::from([
+                (1, ReplicaRole::Voter),
+                (2, ReplicaRole::Learner),
+                (3, ReplicaRole::Outgoing),
+            ]),
+        );
+
+        let (members, voters) = shard_membership_sets(&state, &shard);
+        assert_eq!(members, vec![1, 2, 3]);
+        assert_eq!(voters, vec![1, 3]);
+    }
+
+    #[test]
+    fn shard_membership_sets_fallbacks_when_all_roles_are_learners() {
+        let mut state = sample_state();
+        let shard = sample_shard();
+        state.shards.push(shard.clone());
+        state.shard_replica_roles.insert(
+            shard.shard_id,
+            BTreeMap::from([
+                (1, ReplicaRole::Learner),
+                (2, ReplicaRole::Learner),
+                (3, ReplicaRole::Learner),
+            ]),
+        );
+
+        let (members, voters) = shard_membership_sets(&state, &shard);
+        assert_eq!(members, vec![1, 2, 3]);
+        assert_eq!(voters, vec![1, 2, 3]);
+    }
 }
 
 #[cfg(feature = "mimalloc")]

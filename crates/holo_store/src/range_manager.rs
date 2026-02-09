@@ -105,12 +105,18 @@ async fn maybe_split_once(
         return Ok(());
     }
 
+    let cluster_state = state.cluster_store.state();
+    // Keep range-split freeze windows out of the way while replica moves are
+    // in progress; rebalancing has higher correctness priority.
+    if !cluster_state.shard_rebalances.is_empty() {
+        return Ok(());
+    }
+
     let shard_limit = state.data_shards.max(1);
     let Some(target_idx) = state.cluster_store.first_free_shard_index(shard_limit) else {
         return Ok(());
     };
 
-    let cluster_state = state.cluster_store.state();
     let Some((reason, shard)) = pick_split_candidate(
         state.clone(),
         &cluster_state.shards,
@@ -145,20 +151,23 @@ async fn maybe_split_once(
     // Freeze traffic to avoid in-flight proposals during key migration + reroute.
     let freeze_before_epoch = state.cluster_store.epoch();
     propose_meta(state.clone(), ClusterCommand::SetFrozen { frozen: true }).await?;
-    let freeze_epoch = wait_for_local_state(state.clone(), freeze_before_epoch, true, Duration::from_secs(5)).await?;
-    wait_for_cluster_converged(
-        state.clone(),
-        freeze_epoch,
-        true,
-        None,
-        Duration::from_secs(5),
-    )
-    .await?;
-
-    // While frozen, wait until the source group has drained all in-flight
-    // consensus work. This avoids migrating from a state that is still catching
-    // up committed writes.
+    // Any error after freeze must still unfreeze before returning.
     let split_res = async {
+        let freeze_epoch =
+            wait_for_local_state(state.clone(), freeze_before_epoch, true, Duration::from_secs(5))
+                .await?;
+        wait_for_cluster_converged(
+            state.clone(),
+            freeze_epoch,
+            true,
+            None,
+            Duration::from_secs(5),
+        )
+        .await?;
+
+        // While frozen, wait until the source group has drained all in-flight
+        // consensus work. This avoids migrating from a state that is still
+        // catching up committed writes.
         // Drain any client operations that already passed the freeze check.
         state
             .wait_for_client_ops_drained(Duration::from_secs(5))

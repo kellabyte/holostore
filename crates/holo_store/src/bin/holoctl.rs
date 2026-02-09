@@ -77,6 +77,8 @@ enum Command {
 struct ClusterStateView {
     members: BTreeMap<String, MemberView>,
     shards: Vec<ShardView>,
+    #[serde(default)]
+    shard_rebalances: BTreeMap<String, ReplicaMoveView>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -95,6 +97,13 @@ struct ShardView {
     end_key: Vec<u8>,
     replicas: Vec<u64>,
     leaseholder: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ReplicaMoveView {
+    from_node: u64,
+    to_node: u64,
+    phase: String,
 }
 
 #[tokio::main]
@@ -123,6 +132,12 @@ async fn main() -> anyhow::Result<()> {
                 serde_json::from_str(&resp.json).context("parse cluster state json")?;
             let mut members = state.members.values().cloned().collect::<Vec<_>>();
             members.sort_by_key(|m| m.node_id);
+            let mut moves_by_shard = HashMap::new();
+            for (shard_id, mv) in &state.shard_rebalances {
+                if let Ok(id) = shard_id.parse::<u64>() {
+                    moves_by_shard.insert(id, mv.clone());
+                }
+            }
 
             // Query local record counts from each non-removed member.
             let mut counts_by_node: HashMap<u64, HashMap<u64, u64>> = HashMap::new();
@@ -163,6 +178,8 @@ async fn main() -> anyhow::Result<()> {
                             .map(|v| v.to_string())
                             .unwrap_or_else(|| "n/a".to_string())
                     };
+                    let move_status =
+                        format_move_status(member.node_id, shard.shard_id, &moves_by_shard);
                     rows.push(vec![
                         member.node_id.to_string(),
                         member.state.clone(),
@@ -170,12 +187,14 @@ async fn main() -> anyhow::Result<()> {
                         shard.shard_id.to_string(),
                         format_range(&shard.start_key, &shard.end_key),
                         records,
+                        move_status,
                     ]);
                 }
                 if node_rows == 0 {
                     rows.push(vec![
                         member.node_id.to_string(),
                         member.state.clone(),
+                        "-".to_string(),
                         "-".to_string(),
                         "-".to_string(),
                         "-".to_string(),
@@ -195,7 +214,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("no shard responsibilities found");
             } else {
                 print_ascii_table(
-                    &["NODE", "STATE", "ROLE", "SHARD", "RANGE", "RECORDS"],
+                    &["NODE", "STATE", "ROLE", "SHARD", "RANGE", "RECORDS", "MOVE"],
                     &rows,
                 );
             }
@@ -321,6 +340,23 @@ fn format_range(start: &[u8], end: &[u8]) -> String {
         format_key_bound(start, true),
         format_key_bound(end, false)
     )
+}
+
+fn format_move_status(
+    node_id: u64,
+    shard_id: u64,
+    moves_by_shard: &HashMap<u64, ReplicaMoveView>,
+) -> String {
+    let Some(mv) = moves_by_shard.get(&shard_id) else {
+        return "-".to_string();
+    };
+    if node_id == mv.to_node {
+        format!("incoming:{}", mv.phase)
+    } else if node_id == mv.from_node {
+        format!("outgoing:{}", mv.phase)
+    } else {
+        "-".to_string()
+    }
 }
 
 fn format_key_bound(key: &[u8], is_start: bool) -> String {
