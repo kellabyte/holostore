@@ -10,7 +10,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, RwLock};
 
 use fjall::{Keyspace, PartitionCreateOptions};
-use holo_accord::accord::{txn_group_id, CommandKeys, ExecMeta, StateMachine, TxnId};
+use holo_accord::accord::{txn_group_id, CommandKeys, ExecMeta, NodeId, StateMachine, TxnId};
 use tracing::warn;
 
 /// Storage engine API used by the Accord state machine.
@@ -696,7 +696,7 @@ fn encode_latest_value(version: Version, value: &[u8]) -> Vec<u8> {
 }
 
 /// Decode the "latest" index value.
-fn decode_latest_value(data: &[u8]) -> anyhow::Result<(Version, Vec<u8>)> {
+pub(crate) fn decode_latest_value(data: &[u8]) -> anyhow::Result<(Version, Vec<u8>)> {
     let mut offset = 0usize;
     let seq = read_u64(data, &mut offset)?;
     let node_id = read_u64(data, &mut offset)?;
@@ -730,12 +730,41 @@ impl StateMachine for NoopStateMachine {
 pub struct KvStateMachine {
     kv: Arc<dyn KvEngine>,
     split_lock: Option<Arc<std::sync::RwLock<()>>>,
+    membership_hook: Option<Arc<MembershipUpdateHook>>,
 }
+
+/// Committed membership update payload replicated through a shard Accord log.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MembershipReconfig {
+    pub members: Vec<NodeId>,
+    pub voters: Vec<NodeId>,
+}
+
+/// Callback used by `KvStateMachine` to apply committed membership updates.
+pub type MembershipUpdateHook =
+    dyn Fn(MembershipReconfig) -> anyhow::Result<()> + Send + Sync + 'static;
 
 impl KvStateMachine {
     /// Create a new state machine wrapper around a KV engine.
     pub fn new(kv: Arc<dyn KvEngine>, split_lock: Option<Arc<std::sync::RwLock<()>>>) -> Self {
-        Self { kv, split_lock }
+        Self {
+            kv,
+            split_lock,
+            membership_hook: None,
+        }
+    }
+
+    /// Create a new state machine wrapper with an optional membership callback.
+    pub fn with_membership_hook(
+        kv: Arc<dyn KvEngine>,
+        split_lock: Option<Arc<std::sync::RwLock<()>>>,
+        membership_hook: Option<Arc<MembershipUpdateHook>>,
+    ) -> Self {
+        Self {
+            kv,
+            split_lock,
+            membership_hook,
+        }
     }
 }
 
@@ -748,6 +777,24 @@ impl StateMachine for KvStateMachine {
     /// Apply a single command to the KV engine, logging on failure.
     fn apply(&self, data: &[u8], meta: ExecMeta) {
         let _guard = self.split_lock.as_ref().map(|l| l.read().unwrap());
+        match decode_membership_reconfig_command(data) {
+            Ok(Some(reconfig)) => {
+                if let Some(hook) = &self.membership_hook {
+                    if let Err(err) = hook(reconfig) {
+                        tracing::warn!(error = ?err, "failed to apply committed membership update");
+                    }
+                }
+                return;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(
+                    error = ?err,
+                    "failed to decode membership reconfiguration command"
+                );
+                return;
+            }
+        }
         if let Err(err) = apply_kv_command(self.kv.as_ref(), data, meta.into()) {
             tracing::warn!(error = ?err, "failed to apply kv command");
         }
@@ -874,6 +921,7 @@ impl StateMachine for KvStateMachine {
                 // before this read runs, so reading latest-visible here is safe.
                 Ok(self.kv.get_latest(key).map(|(v, _)| v))
             }
+            CMD_MEMBERSHIP_RECONFIG => Ok(None),
             // Non-read commands are ignored by the read path.
             _ => Ok(None),
         }
@@ -908,6 +956,8 @@ const CMD_GET: u8 = 2;
 const CMD_BATCH_SET: u8 = 3;
 /// Command tag for a multi-key GET batch.
 const CMD_BATCH_GET: u8 = 4;
+/// Internal command tag for committed shard-membership reconfiguration.
+const CMD_MEMBERSHIP_RECONFIG: u8 = 5;
 
 /// Encode a single-key SET command.
 pub fn encode_set(key: &[u8], value: &[u8]) -> Vec<u8> {
@@ -964,6 +1014,53 @@ pub fn encode_batch_get(keys: &[Vec<u8>]) -> Vec<u8> {
         out.extend_from_slice(key);
     }
     out
+}
+
+/// Encode an internal command that updates shard runtime membership after commit.
+///
+/// This command is only issued by the rebalancer/controller; clients never send it.
+pub fn encode_membership_reconfig(members: &[NodeId], voters: &[NodeId]) -> Vec<u8> {
+    let mut members = members.to_vec();
+    members.sort_unstable();
+    members.dedup();
+
+    let mut voters = voters.to_vec();
+    voters.sort_unstable();
+    voters.dedup();
+
+    let mut out = Vec::with_capacity(1 + 4 + members.len() * 8 + 4 + voters.len() * 8);
+    out.push(CMD_MEMBERSHIP_RECONFIG);
+    out.extend_from_slice(&(members.len() as u32).to_be_bytes());
+    for id in members {
+        out.extend_from_slice(&id.to_be_bytes());
+    }
+    out.extend_from_slice(&(voters.len() as u32).to_be_bytes());
+    for id in voters {
+        out.extend_from_slice(&id.to_be_bytes());
+    }
+    out
+}
+
+fn decode_membership_reconfig_command(data: &[u8]) -> anyhow::Result<Option<MembershipReconfig>> {
+    if data.is_empty() {
+        anyhow::bail!("empty command");
+    }
+    if data[0] != CMD_MEMBERSHIP_RECONFIG {
+        return Ok(None);
+    }
+    let mut offset = 1usize;
+    let members_len = read_u32(data, &mut offset)? as usize;
+    let mut members = Vec::with_capacity(members_len);
+    for _ in 0..members_len {
+        members.push(read_u64(data, &mut offset)?);
+    }
+    let voters_len = read_u32(data, &mut offset)? as usize;
+    let mut voters = Vec::with_capacity(voters_len);
+    for _ in 0..voters_len {
+        voters.push(read_u64(data, &mut offset)?);
+    }
+    anyhow::ensure!(voters_len > 0, "membership reconfiguration voter set cannot be empty");
+    Ok(Some(MembershipReconfig { members, voters }))
 }
 
 /// Decode the result of a batch GET command into optional values.
@@ -1025,6 +1122,7 @@ fn apply_kv_command(kv: &dyn KvEngine, data: &[u8], version: Version) -> anyhow:
         // GET commands are no-ops for write application.
         CMD_BATCH_GET => Ok(()),
         CMD_GET => Ok(()),
+        CMD_MEMBERSHIP_RECONFIG => Ok(()),
         // Reject unknown command tags to avoid corrupting state.
         other => anyhow::bail!("unknown command tag {other}"),
     }
@@ -1091,6 +1189,10 @@ fn command_keys(data: &[u8]) -> anyhow::Result<CommandKeys> {
                 writes: Vec::new(),
             })
         }
+        CMD_MEMBERSHIP_RECONFIG => Ok(CommandKeys {
+            reads: Vec::new(),
+            writes: Vec::new(),
+        }),
         // Reject unknown command tags to avoid corrupting state.
         other => anyhow::bail!("unknown command tag {other}"),
     }
@@ -1120,4 +1222,67 @@ fn read_u64(data: &[u8], offset: &mut usize) -> anyhow::Result<u64> {
     buf.copy_from_slice(&data[*offset..*offset + 8]);
     *offset += 8;
     Ok(u64::from_be_bytes(buf))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    use holo_accord::accord::StateMachine;
+
+    #[test]
+    fn membership_reconfig_roundtrip() {
+        let payload = encode_membership_reconfig(&[3, 1, 2, 2], &[3, 1, 1]);
+        let parsed = decode_membership_reconfig_command(&payload)
+            .expect("decode")
+            .expect("membership payload");
+        assert_eq!(parsed.members, vec![1, 2, 3]);
+        assert_eq!(parsed.voters, vec![1, 3]);
+    }
+
+    #[test]
+    fn membership_reconfig_has_empty_command_keys() {
+        let payload = encode_membership_reconfig(&[1, 2, 3], &[1, 2]);
+        let keys = command_keys(&payload).expect("command keys");
+        assert!(keys.reads.is_empty());
+        assert!(keys.writes.is_empty());
+    }
+
+    #[test]
+    fn kv_state_machine_applies_membership_hook() {
+        let seen: Arc<Mutex<Vec<MembershipReconfig>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_hook = seen.clone();
+        let hook: Arc<MembershipUpdateHook> = Arc::new(move |cfg| {
+            let mut guard = seen_hook.lock().expect("lock");
+            guard.push(cfg);
+            Ok(())
+        });
+        let sm = KvStateMachine::with_membership_hook(
+            Arc::new(KvStore::new()),
+            None,
+            Some(hook),
+        );
+        let payload = encode_membership_reconfig(&[1, 2, 4], &[1, 2]);
+        sm.apply(
+            &payload,
+            ExecMeta {
+                seq: 1,
+                txn_id: TxnId {
+                    node_id: 1,
+                    counter: 1,
+                },
+            },
+        );
+
+        let guard = seen.lock().expect("lock");
+        assert_eq!(guard.len(), 1);
+        assert_eq!(
+            guard[0],
+            MembershipReconfig {
+                members: vec![1, 2, 4],
+                voters: vec![1, 2],
+            }
+        );
+    }
 }

@@ -80,8 +80,32 @@ fn range_autosplit_keeps_reads_writes_working() {
         wait_for_redis_ready(redis1, Duration::from_secs(20)),
         "redis not ready on node1"
     );
+    assert!(
+        wait_for_redis_ready(redis2, Duration::from_secs(20)),
+        "redis not ready on node2"
+    );
+    assert!(
+        wait_for_redis_ready(redis3, Duration::from_secs(20)),
+        "redis not ready on node3"
+    );
 
     let mut conn = common::RespConn::connect(redis1);
+    // Node1 can accept TCP before quorum is fully available; wait until a
+    // committed write succeeds to avoid startup flake.
+    let quorum_deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        n1.assert_running("waiting for write quorum");
+        n2.assert_running("waiting for write quorum");
+        n3.assert_running("waiting for write quorum");
+        if let Ok(resp) = conn.send_command(&["SET", "__ready__", "1"]) {
+            if resp == b"+OK\r\n".to_vec() {
+                break;
+            }
+        }
+        assert!(Instant::now() < quorum_deadline, "cluster write quorum not ready in time");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
     let keys = (0..20)
         .map(|i| format!("holo_test_k{i:03}"))
         .collect::<Vec<_>>();
@@ -127,4 +151,3 @@ fn range_autosplit_keeps_reads_writes_working() {
 
     cleanup_dir(&dir);
 }
-

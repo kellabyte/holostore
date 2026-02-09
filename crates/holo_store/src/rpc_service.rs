@@ -737,6 +737,29 @@ impl rpc::HoloRpc for RpcService {
         }))
     }
 
+    /// Handle a seed_executed_prefix RPC request.
+    async fn seed_executed_prefix(
+        &self,
+        req: volo_grpc::Request<rpc::SeedExecutedPrefixRequest>,
+    ) -> Result<volo_grpc::Response<rpc::SeedExecutedPrefixResponse>, volo_grpc::Status> {
+        self.maybe_delay().await;
+        let req = req.into_inner();
+        let group = self
+            .state
+            .group(req.group_id)
+            .ok_or_else(|| volo_grpc::Status::not_found("unknown group"))?;
+        let prefixes = req
+            .prefixes
+            .into_iter()
+            .map(|p| accord::ExecutedPrefix {
+                node_id: p.node_id,
+                counter: p.counter,
+            })
+            .collect::<Vec<_>>();
+        group.seed_executed_prefixes(&prefixes).await;
+        Ok(volo_grpc::Response::new(rpc::SeedExecutedPrefixResponse { ok: true }))
+    }
+
     /// Handle an executed RPC request.
     async fn executed(
         &self,
@@ -1027,6 +1050,65 @@ impl rpc::HoloRpc for RpcService {
         }))
     }
 
+    async fn range_snapshot_latest(
+        &self,
+        req: volo_grpc::Request<rpc::RangeSnapshotLatestRequest>,
+    ) -> Result<volo_grpc::Response<rpc::RangeSnapshotLatestResponse>, volo_grpc::Status> {
+        let req = req.into_inner();
+        let limit = if req.limit == 0 { 1024 } else { req.limit as usize };
+        let (entries, next_cursor, done) = self
+            .state
+            .snapshot_range_latest_page(
+                req.shard_index as usize,
+                req.start_key.as_ref(),
+                req.end_key.as_ref(),
+                req.cursor.as_ref(),
+                limit,
+            )
+            .map_err(|e| volo_grpc::Status::internal(format!("range snapshot failed: {e}")))?;
+        let entries = entries
+            .into_iter()
+            .map(|entry| rpc::RangeSnapshotLatestEntry {
+                key: entry.key.into(),
+                value: entry.value.into(),
+                version: Some(to_rpc_version(entry.version)),
+            })
+            .collect();
+        Ok(volo_grpc::Response::new(rpc::RangeSnapshotLatestResponse {
+            entries,
+            next_cursor: next_cursor.into(),
+            done,
+        }))
+    }
+
+    async fn range_apply_latest(
+        &self,
+        req: volo_grpc::Request<rpc::RangeApplyLatestRequest>,
+    ) -> Result<volo_grpc::Response<rpc::RangeApplyLatestResponse>, volo_grpc::Status> {
+        let req = req.into_inner();
+        let mut entries = Vec::with_capacity(req.entries.len());
+        for entry in req.entries {
+            let version = from_rpc_version_required(entry.version)?;
+            entries.push(crate::RangeSnapshotLatestEntry {
+                key: entry.key.to_vec(),
+                value: entry.value.to_vec(),
+                version,
+            });
+        }
+        let applied = self
+            .state
+            .apply_range_latest_page(
+                req.shard_index as usize,
+                req.start_key.as_ref(),
+                req.end_key.as_ref(),
+                &entries,
+            )
+            .map_err(|e| volo_grpc::Status::internal(format!("range apply failed: {e}")))?;
+        Ok(volo_grpc::Response::new(rpc::RangeApplyLatestResponse {
+            applied,
+        }))
+    }
+
     async fn cluster_freeze(
         &self,
         req: volo_grpc::Request<rpc::ClusterFreezeRequest>,
@@ -1055,6 +1137,23 @@ fn to_rpc_version(version: Version) -> rpc::Version {
             counter: version.txn_id.counter,
         }),
     }
+}
+
+/// Convert an RPC version into a local version, rejecting missing txn ids.
+fn from_rpc_version_required(
+    version: Option<rpc::Version>,
+) -> Result<Version, volo_grpc::Status> {
+    let version = version.ok_or_else(|| volo_grpc::Status::invalid_argument("missing version"))?;
+    let txn_id = version
+        .txn_id
+        .ok_or_else(|| volo_grpc::Status::invalid_argument("missing version.txn_id"))?;
+    Ok(Version {
+        seq: version.seq,
+        txn_id: accord::TxnId {
+            node_id: txn_id.node_id,
+            counter: txn_id.counter,
+        },
+    })
 }
 
 /// Parse a 32-byte command digest from the wire format.

@@ -6,6 +6,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use holo_accord::accord::{CommandKeys, ExecMeta, NodeId, StateMachine};
@@ -68,7 +69,15 @@ pub struct ReplicaMove {
     pub to_node: NodeId,
     pub phase: ReplicaMovePhase,
     #[serde(default)]
+    pub backfill_done: bool,
+    #[serde(default)]
     pub target_leaseholder: Option<NodeId>,
+    /// Wall-clock timestamp when this move was created.
+    #[serde(default)]
+    pub started_unix_ms: u64,
+    /// Wall-clock timestamp when this move last advanced phase/progress.
+    #[serde(default)]
+    pub last_progress_unix_ms: u64,
 }
 
 /// Cluster-wide metadata stored in the meta group.
@@ -104,6 +113,12 @@ pub enum ClusterCommand {
         from_node: NodeId,
         to_node: NodeId,
         target_leaseholder: Option<NodeId>,
+    },
+    MarkReplicaMoveBackfilled {
+        shard_id: u64,
+    },
+    AbortReplicaMove {
+        shard_id: u64,
     },
     PromoteReplicaLearner {
         shard_id: u64,
@@ -325,6 +340,20 @@ impl ClusterStateStore {
 
     pub fn state(&self) -> ClusterState {
         self.state.read().unwrap().clone()
+    }
+
+    /// Install a full control-plane snapshot from a remote seed.
+    ///
+    /// The snapshot is only applied when it is at least as new as local state.
+    pub fn install_snapshot(&self, mut snapshot: ClusterState) -> anyhow::Result<()> {
+        normalize_replica_metadata(&mut snapshot);
+        let mut state = self.state.write().unwrap();
+        if snapshot.epoch < state.epoch {
+            return Ok(());
+        }
+        *state = snapshot;
+        drop(state);
+        self.persist()
     }
 
     /// Return just the shard descriptors for routing snapshots.
@@ -567,20 +596,33 @@ impl ClusterStateStore {
         let _split_guard = self.split_lock.write().unwrap();
 
         let mut state = self.state.write().unwrap();
+
+        // Idempotent replay: a late-joining node may re-apply an already committed
+        // split command from the shard log. Treat the exact same split boundary as
+        // a no-op so metadata catch-up can continue.
+        if let Some(existing_idx) = state
+            .shards
+            .iter()
+            .position(|s| s.shard_index == target_shard_index)
+        {
+            let existing = &state.shards[existing_idx];
+            let has_left_boundary = existing_idx > 0
+                && state
+                    .shards
+                    .get(existing_idx.saturating_sub(1))
+                    .map(|left| left.end_key == split_key)
+                    .unwrap_or(false);
+            if existing.start_key == split_key && has_left_boundary {
+                return Ok(());
+            }
+            anyhow::bail!("target shard index {target_shard_index} already in use");
+        }
+
         let idx = state
             .shards
             .iter()
             .position(|s| key_in_range(&split_key, &s.start_key, &s.end_key))
             .ok_or_else(|| anyhow::anyhow!("split key does not map to any shard"))?;
-
-        // Ensure we are not reusing an active shard index.
-        if state
-            .shards
-            .iter()
-            .any(|s| s.shard_index == target_shard_index)
-        {
-            anyhow::bail!("target shard index {target_shard_index} already in use");
-        }
 
         let shard_snapshot = state.shards[idx].clone();
         if !shard_snapshot.start_key.is_empty() && split_key <= shard_snapshot.start_key {
@@ -728,7 +770,14 @@ impl ClusterStateStore {
                 if from_node == to_node {
                     anyhow::bail!("from_node and to_node cannot be equal");
                 }
-                if state.shard_rebalances.contains_key(&shard_id) {
+                if let Some(existing) = state.shard_rebalances.get(&shard_id) {
+                    if existing.from_node == from_node
+                        && existing.to_node == to_node
+                        && existing.target_leaseholder == target_leaseholder
+                    {
+                        // Idempotent replay of the same move intent.
+                        return Ok(());
+                    }
                     anyhow::bail!("shard {shard_id} already has an in-flight move");
                 }
                 let active_members = active_member_ids_from_state(&state);
@@ -782,24 +831,91 @@ impl ClusterStateStore {
                         from_node,
                         to_node,
                         phase: ReplicaMovePhase::LearnerSync,
+                        backfill_done: false,
                         target_leaseholder,
+                        started_unix_ms: unix_time_ms(),
+                        last_progress_unix_ms: unix_time_ms(),
                     },
                 );
                 state.epoch = state.epoch.saturating_add(1);
             }
-            ClusterCommand::PromoteReplicaLearner { shard_id } => {
-                let (to_node, from_node) = {
-                    let mv = state
-                        .shard_rebalances
-                        .get_mut(&shard_id)
-                        .ok_or_else(|| anyhow::anyhow!("shard {shard_id} has no in-flight move"))?;
-                    if mv.phase != ReplicaMovePhase::LearnerSync {
-                        anyhow::bail!(
-                            "shard {shard_id} learner can only be promoted from LearnerSync"
-                        );
+            ClusterCommand::MarkReplicaMoveBackfilled { shard_id } => {
+                let Some(mv) = state.shard_rebalances.get_mut(&shard_id) else {
+                    // Idempotent replay after the move already finalized/aborted.
+                    return Ok(());
+                };
+                if mv.backfill_done {
+                    // Already marked done.
+                    return Ok(());
+                }
+                if mv.phase != ReplicaMovePhase::LearnerSync {
+                    // Move has already advanced beyond LearnerSync on this node.
+                    return Ok(());
+                }
+                mv.backfill_done = true;
+                mv.last_progress_unix_ms = unix_time_ms();
+                state.epoch = state.epoch.saturating_add(1);
+            }
+            ClusterCommand::AbortReplicaMove { shard_id } => {
+                let mv = state
+                    .shard_rebalances
+                    .get(&shard_id)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("shard {shard_id} has no in-flight move"))?;
+                let shard_idx = state
+                    .shards
+                    .iter()
+                    .position(|s| s.shard_id == shard_id)
+                    .ok_or_else(|| anyhow::anyhow!("unknown shard id {shard_id}"))?;
+
+                let replicas_snapshot = {
+                    let shard = &mut state.shards[shard_idx];
+                    if !shard.replicas.contains(&mv.from_node) {
+                        shard.replicas.push(mv.from_node);
                     }
-                    mv.phase = ReplicaMovePhase::JointConfig;
-                    (mv.to_node, mv.from_node)
+                    shard.replicas.retain(|id| *id != mv.to_node);
+                    dedupe_nodes_in_place(&mut shard.replicas);
+                    if shard.replicas.is_empty() {
+                        anyhow::bail!("cannot abort move for shard {shard_id}: no replicas remain");
+                    }
+
+                    if shard.leaseholder == mv.to_node || !shard.replicas.contains(&shard.leaseholder)
+                    {
+                        if shard.replicas.contains(&mv.from_node) {
+                            shard.leaseholder = mv.from_node;
+                        } else {
+                            shard.leaseholder = shard.replicas[0];
+                        }
+                    }
+                    shard.replicas.clone()
+                };
+
+                state
+                    .shard_replica_roles
+                    .insert(shard_id, default_roles_for_replicas(&replicas_snapshot));
+                state.shard_rebalances.remove(&shard_id);
+                state.epoch = state.epoch.saturating_add(1);
+            }
+            ClusterCommand::PromoteReplicaLearner { shard_id } => {
+                let (to_node, from_node) = match state.shard_rebalances.get_mut(&shard_id) {
+                    None => {
+                        // Idempotent replay after completion.
+                        return Ok(());
+                    }
+                    Some(mv) => {
+                        if mv.phase != ReplicaMovePhase::LearnerSync {
+                            // Already promoted or finalized.
+                            return Ok(());
+                        }
+                        if !mv.backfill_done {
+                            anyhow::bail!(
+                                "shard {shard_id} learner cannot be promoted before backfill completes"
+                            );
+                        }
+                        mv.phase = ReplicaMovePhase::JointConfig;
+                        mv.last_progress_unix_ms = unix_time_ms();
+                        (mv.to_node, mv.from_node)
+                    }
                 };
                 let roles = state
                     .shard_replica_roles
@@ -840,16 +956,16 @@ impl ClusterStateStore {
                 if let Some(mv) = state.shard_rebalances.get_mut(&shard_id) {
                     if mv.phase == ReplicaMovePhase::JointConfig {
                         mv.phase = ReplicaMovePhase::LeaseTransferred;
+                        mv.last_progress_unix_ms = unix_time_ms();
                     }
                 }
                 state.epoch = state.epoch.saturating_add(1);
             }
             ClusterCommand::FinalizeReplicaMove { shard_id } => {
-                let mv = state
-                    .shard_rebalances
-                    .get(&shard_id)
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("shard {shard_id} has no in-flight move"))?;
+                let Some(mv) = state.shard_rebalances.get(&shard_id).cloned() else {
+                    // Idempotent replay after completion.
+                    return Ok(());
+                };
                 if mv.phase == ReplicaMovePhase::LearnerSync {
                     anyhow::bail!("cannot finalize shard {shard_id} before learner promotion");
                 }
@@ -1089,8 +1205,21 @@ fn normalize_replica_metadata(state: &mut ClusterState) {
                     mv.target_leaseholder = None;
                 }
             }
+            if mv.started_unix_ms == 0 {
+                mv.started_unix_ms = unix_time_ms();
+            }
+            if mv.last_progress_unix_ms == 0 {
+                mv.last_progress_unix_ms = mv.started_unix_ms;
+            }
         }
     }
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }
 
 fn dedupe_nodes_in_place(nodes: &mut Vec<NodeId>) {
@@ -1204,6 +1333,94 @@ mod tests {
             err.to_string()
                 .contains("replacing exactly one replica at a time")
         );
+    }
+
+    #[test]
+    fn split_range_is_idempotent_on_replay() {
+        let store = test_store(base_state());
+        let split_key = b"key:050000".to_vec();
+
+        store
+            .apply_split_range(split_key.clone(), 1, None, 8)
+            .expect("first split should apply");
+        let epoch_after_first = store.state().epoch;
+
+        store
+            .apply_split_range(split_key.clone(), 1, None, 8)
+            .expect("replayed split should be a no-op");
+        let state = store.state();
+        assert_eq!(
+            state.epoch, epoch_after_first,
+            "idempotent replay should not bump epoch"
+        );
+        assert_eq!(state.shards.len(), 2, "replayed split must not duplicate ranges");
+        assert_eq!(state.shards[1].shard_index, 1);
+        assert_eq!(state.shards[1].start_key, split_key);
+    }
+
+    #[test]
+    fn abort_replica_move_restores_original_layout() {
+        let store = test_store(base_state());
+        store
+            .apply_command(ClusterCommand::BeginReplicaMove {
+                shard_id: 10,
+                from_node: 1,
+                to_node: 4,
+                target_leaseholder: None,
+            })
+            .expect("begin move");
+        store
+            .apply_command(ClusterCommand::AbortReplicaMove { shard_id: 10 })
+            .expect("abort move");
+
+        let state = store.state();
+        let shard = state.shards.iter().find(|s| s.shard_id == 10).expect("shard");
+        assert_eq!(shard.replicas, vec![1, 2, 3]);
+        assert_eq!(shard.leaseholder, 1);
+        assert!(state.shard_rebalances.is_empty());
+        let roles = state
+            .shard_replica_roles
+            .get(&10)
+            .expect("shard roles");
+        assert_eq!(roles.get(&1), Some(&ReplicaRole::Voter));
+        assert_eq!(roles.get(&2), Some(&ReplicaRole::Voter));
+        assert_eq!(roles.get(&3), Some(&ReplicaRole::Voter));
+        assert!(!roles.contains_key(&4));
+    }
+
+    #[test]
+    fn abort_replica_move_after_lease_transfer_restores_source_leaseholder() {
+        let store = test_store(base_state());
+        store
+            .apply_command(ClusterCommand::BeginReplicaMove {
+                shard_id: 10,
+                from_node: 1,
+                to_node: 4,
+                target_leaseholder: Some(4),
+            })
+            .expect("begin move");
+        store
+            .apply_command(ClusterCommand::MarkReplicaMoveBackfilled { shard_id: 10 })
+            .expect("mark backfilled");
+        store
+            .apply_command(ClusterCommand::PromoteReplicaLearner { shard_id: 10 })
+            .expect("promote learner");
+        store
+            .apply_command(ClusterCommand::TransferShardLease {
+                shard_id: 10,
+                leaseholder: 4,
+            })
+            .expect("transfer lease");
+
+        store
+            .apply_command(ClusterCommand::AbortReplicaMove { shard_id: 10 })
+            .expect("abort move");
+
+        let state = store.state();
+        let shard = state.shards.iter().find(|s| s.shard_id == 10).expect("shard");
+        assert_eq!(shard.replicas, vec![1, 2, 3]);
+        assert_eq!(shard.leaseholder, 1);
+        assert!(state.shard_rebalances.is_empty());
     }
 
     #[test]

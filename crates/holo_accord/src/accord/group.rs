@@ -8,6 +8,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::Duration;
 use std::sync::mpsc as std_mpsc;
 
@@ -21,7 +22,7 @@ use super::state::{
 };
 use super::types::{
     txn_group_id, AcceptRequest, AcceptResponse, Ballot, CommandKeys, CommitLog, CommitLogEntry,
-    CommitRequest, CommitResponse, Config, ExecMeta, ExecutedPrefix, NodeId, PreAcceptRequest,
+    CommitRequest, CommitResponse, Config, ExecMeta, ExecutedPrefix, Member, NodeId, PreAcceptRequest,
     PreAcceptResponse, RecoverRequest, RecoverResponse, ReportExecutedRequest,
     ReportExecutedResponse, StateMachine, Transport, TxnId, TxnStatus,
     TXN_COUNTER_SHARD_SHIFT,
@@ -148,6 +149,8 @@ impl Handle {
 ///   async runtime during heavy write batches.
 pub struct Group {
     config: Config,
+    members: RwLock<Vec<Member>>,
+    voters: RwLock<Vec<NodeId>>,
     transport: Arc<dyn Transport>,
     sm: Arc<dyn StateMachine>,
     commit_log: Option<Arc<dyn CommitLog>>,
@@ -506,7 +509,13 @@ impl Group {
             Some(tx)
         };
 
+        let mut initial_voters = config.members.iter().map(|m| m.id).collect::<Vec<_>>();
+        initial_voters.sort_unstable();
+        initial_voters.dedup();
+
         Self {
+            members: RwLock::new(config.members.clone()),
+            voters: RwLock::new(initial_voters),
             config,
             transport,
             sm,
@@ -522,6 +531,130 @@ impl Group {
             peer_rr: AtomicU64::new(0),
             start_at: time::Instant::now(),
         }
+    }
+
+    /// Replace the current runtime membership for this group.
+    ///
+    /// This updates quorum/peer selection for new proposals and RPC handling.
+    /// In-flight proposals continue on the previous view.
+    pub fn update_members(&self, members: Vec<Member>) -> anyhow::Result<()> {
+        let voters = members.iter().map(|m| m.id).collect::<Vec<_>>();
+        self.update_membership(members, voters)
+    }
+
+    /// Replace runtime membership and explicit voter set for this group.
+    pub fn update_membership(
+        &self,
+        mut members: Vec<Member>,
+        mut voters: Vec<NodeId>,
+    ) -> anyhow::Result<()> {
+        if members.is_empty() {
+            anyhow::bail!("group membership cannot be empty");
+        }
+        members.sort_by_key(|m| m.id);
+        members.dedup_by_key(|m| m.id);
+        voters.sort_unstable();
+        voters.dedup();
+        if voters.is_empty() {
+            anyhow::bail!("group voter set cannot be empty");
+        }
+        let member_set = members
+            .iter()
+            .map(|m| m.id)
+            .collect::<HashSet<_>>();
+        for voter in &voters {
+            if !member_set.contains(voter) {
+                anyhow::bail!("voter {voter} must also be present in group members");
+            }
+        }
+        let mut guard = self
+            .members
+            .write()
+            .map_err(|_| anyhow::anyhow!("group membership lock poisoned"))?;
+        *guard = members;
+        let mut voters_guard = self
+            .voters
+            .write()
+            .map_err(|_| anyhow::anyhow!("group voter lock poisoned"))?;
+        *voters_guard = voters;
+        Ok(())
+    }
+
+    /// Return the current runtime members.
+    pub fn members(&self) -> Vec<Member> {
+        self.members.read().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// Return the current runtime voter set.
+    pub fn voters(&self) -> Vec<NodeId> {
+        self.voters.read().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    fn voters_snapshot(&self) -> Vec<NodeId> {
+        self.voters.read().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    fn local_is_member(&self) -> bool {
+        let local = self.config.node_id;
+        self.members
+            .read()
+            .map(|m| m.iter().any(|member| member.id == local))
+            .unwrap_or(false)
+    }
+
+    fn local_is_voter(&self) -> bool {
+        let local = self.config.node_id;
+        self.voters
+            .read()
+            .map(|voters| voters.iter().any(|id| *id == local))
+            .unwrap_or(false)
+    }
+
+    fn peers_snapshot(&self) -> Vec<NodeId> {
+        let local = self.config.node_id;
+        self.members
+            .read()
+            .map(|members| {
+                members
+                    .iter()
+                    .map(|m| m.id)
+                    .filter(|id| *id != local)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    }
+
+    fn voter_peers_snapshot(&self) -> Vec<NodeId> {
+        let local = self.config.node_id;
+        self.voters
+            .read()
+            .map(|voters| {
+                voters
+                    .iter()
+                    .copied()
+                    .filter(|id| *id != local)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    }
+
+    fn quorum(&self) -> usize {
+        let n = self.voters.read().map(|m| m.len()).unwrap_or(0);
+        (n / 2) + 1
+    }
+
+    fn fast_quorum(&self) -> usize {
+        self.quorum()
+    }
+
+    fn config_with_runtime_voters(&self) -> Config {
+        let mut cfg = self.config.clone();
+        cfg.members = self
+            .voters_snapshot()
+            .into_iter()
+            .map(|id| Member { id })
+            .collect();
+        cfg
     }
 
     pub fn handle(self: &Arc<Self>) -> Handle {
@@ -571,11 +704,41 @@ impl Group {
             .collect()
     }
 
+    /// Seed lower bounds for executed prefixes after external snapshot/backfill.
+    ///
+    /// This is used when adding a learner via out-of-band state transfer: the
+    /// learner receives KV state first, then needs executed-prefix floors so
+    /// future per-origin counters can advance contiguously.
+    pub async fn seed_executed_prefixes(&self, prefixes: &[ExecutedPrefix]) {
+        let mut state = self.state.lock().await;
+        let mut changed = false;
+        for p in prefixes {
+            let entry = state.executed_prefix_by_node.entry(p.node_id).or_insert(0);
+            if p.counter > *entry {
+                *entry = p.counter;
+                changed = true;
+            }
+        }
+        if changed {
+            let floors = state.executed_prefix_by_node.clone();
+            state.executed_out_of_order.retain(|txn_id| {
+                let floor = floors.get(&txn_id.node_id).copied().unwrap_or(0);
+                txn_id.counter > floor
+            });
+        }
+    }
+
     pub async fn executed(&self, txn_id: TxnId) -> bool {
+        if !self.local_is_member() {
+            return false;
+        }
         self.is_executed(txn_id).await
     }
 
     pub async fn mark_visible(&self, txn_id: TxnId) -> anyhow::Result<bool> {
+        if !self.local_is_member() {
+            return Ok(false);
+        }
         let entry = {
             let mut state = self.state.lock().await;
             if state.visible_txns.contains(&txn_id) {
@@ -739,7 +902,7 @@ impl Group {
     }
 
     fn peers_round_robin(&self) -> Vec<NodeId> {
-        let mut peers = self.config.peers();
+        let mut peers = self.voter_peers_snapshot();
         if peers.len() <= 1 {
             return peers;
         }
@@ -900,6 +1063,14 @@ impl Group {
     }
 
     pub async fn rpc_pre_accept(&self, req: PreAcceptRequest) -> PreAcceptResponse {
+        if !self.local_is_voter() {
+            return PreAcceptResponse {
+                ok: false,
+                promised: Ballot::zero(),
+                seq: 0,
+                deps: Vec::new(),
+            };
+        }
         let now = time::Instant::now();
         let mut state = self.state.lock().await;
         if state.is_executed(&req.txn_id) {
@@ -1029,7 +1200,8 @@ impl Group {
             .context("missing keys for preaccepted txn")
             .unwrap_or_default();
 
-        let (local_seq, local_deps) = state.compute_seq_deps(&self.config, req.txn_id, &keys);
+        let runtime_cfg = self.config_with_runtime_voters();
+        let (local_seq, local_deps) = state.compute_seq_deps(&runtime_cfg, req.txn_id, &keys);
         let mut merged_deps = local_deps;
         merged_deps.extend(req.deps);
 
@@ -1072,6 +1244,12 @@ impl Group {
     }
 
     pub async fn rpc_accept(&self, req: AcceptRequest) -> AcceptResponse {
+        if !self.local_is_voter() {
+            return AcceptResponse {
+                ok: false,
+                promised: Ballot::zero(),
+            };
+        }
         let AcceptRequest {
             group_id: _,
             txn_id,
@@ -1253,6 +1431,9 @@ impl Group {
     }
 
     pub async fn rpc_commit(&self, req: CommitRequest) -> CommitResponse {
+        if !self.local_is_member() {
+            return CommitResponse { ok: false };
+        }
         let CommitRequest {
             group_id: _,
             txn_id,
@@ -1472,6 +1653,17 @@ impl Group {
     }
 
     pub async fn rpc_recover(&self, req: RecoverRequest) -> RecoverResponse {
+        if !self.local_is_voter() {
+            return RecoverResponse {
+                ok: false,
+                promised: Ballot::zero(),
+                status: TxnStatus::Unknown,
+                accepted_ballot: None,
+                command: Vec::new(),
+                seq: 0,
+                deps: Vec::new(),
+            };
+        }
         let now = time::Instant::now();
         let mut state = self.state.lock().await;
         if state.is_executed(&req.txn_id) {
@@ -1559,7 +1751,17 @@ impl Group {
             .reported_executed_prefix_by_peer
             .insert(req.from_node_id, prefixes);
 
-        let _ = Self::maybe_gc_executed_log_locked(&self.config, &mut state, now);
+        let runtime_members = self
+            .voters_snapshot()
+            .into_iter()
+            .map(|id| Member { id })
+            .collect::<Vec<_>>();
+        let _ = Self::maybe_gc_executed_log_locked(
+            self.config.node_id,
+            &runtime_members,
+            &mut state,
+            now,
+        );
         let _ = Self::maybe_compact_state_locked(&mut state, now);
 
         ReportExecutedResponse { ok: true }
@@ -1775,7 +1977,8 @@ impl Group {
     }
 
     fn maybe_gc_executed_log_locked(
-        config: &Config,
+        node_id: NodeId,
+        members: &[Member],
         state: &mut State,
         now: time::Instant,
     ) -> usize {
@@ -1785,7 +1988,7 @@ impl Group {
         }
 
         let mut global_min_by_node: HashMap<NodeId, u64> = HashMap::new();
-        for member in &config.members {
+        for member in members {
             let origin = member.id;
             let mut min_prefix = state
                 .executed_prefix_by_node
@@ -1793,9 +1996,9 @@ impl Group {
                 .copied()
                 .unwrap_or(0);
 
-            for peer in &config.members {
+            for peer in members {
                 let peer_id = peer.id;
-                if peer_id == config.node_id {
+                if peer_id == node_id {
                     continue;
                 }
                 let Some(peer_prefixes) = state.reported_executed_prefix_by_peer.get(&peer_id)
@@ -1852,16 +2055,18 @@ impl Group {
         const SLOW_READ_PROPOSE_US: u64 = 50_000;
         const SLOW_WRITE_PROPOSE_US: u64 = 50_000;
         let peers = self.peers_round_robin();
-        let quorum = self.config.quorum();
+        let local_is_voter = self.local_is_voter();
+        let member_count = self.voters_snapshot().len().max(1);
+        let quorum = self.quorum();
         let read_quorum = if needs_execution {
-            self.config.members.len()
+            member_count
         } else {
             quorum
         };
         let fast_quorum = if needs_execution {
             read_quorum
         } else {
-            self.config.fast_quorum()
+            self.fast_quorum()
         };
         let rpc_timeout = self.config.rpc_timeout;
         let log_phases = true;
@@ -1870,8 +2075,8 @@ impl Group {
         let mut commit_us = 0u64;
         let mut execute_us = 0u64;
         let visible_us = 0u64;
-        let mut received = 1usize;
-        let mut ok = 1usize;
+        let mut received = 0usize;
+        let mut ok = 0usize;
         let mut fast_path = false;
         let mut merged_seq = 0u64;
         let mut merged_deps_len = 0usize;
@@ -1885,22 +2090,43 @@ impl Group {
         } else {
             forced_seq.saturating_add(1)
         };
+        let mut request_seq = forced_seq;
+        let mut request_deps = forced_deps.clone();
+        let mut oks: Vec<PreAcceptResponse> = Vec::new();
+        let mut max_promised = ballot;
 
-        let local = self
-            .rpc_pre_accept(PreAcceptRequest {
-                group_id: self.config.group_id,
-                txn_id,
-                ballot,
-                command: command.clone(),
-                seq: forced_seq,
-                deps: forced_deps.clone(),
-            })
-            .await;
+        if local_is_voter {
+            let local = self
+                .rpc_pre_accept(PreAcceptRequest {
+                    group_id: self.config.group_id,
+                    txn_id,
+                    ballot,
+                    command: command.clone(),
+                    seq: forced_seq,
+                    deps: forced_deps.clone(),
+                })
+                .await;
 
-        if !local.ok {
-            return Err(ProposeOnceError::Rejected {
-                promised: local.promised,
-            });
+            if !local.ok {
+                return Err(ProposeOnceError::Rejected {
+                    promised: local.promised,
+                });
+            }
+            received = 1;
+            ok = 1;
+            max_promised = max_promised.max(local.promised);
+            request_seq = local.seq.max(forced_seq);
+            request_deps = if forced_deps.is_empty() {
+                local.deps.clone()
+            } else {
+                let mut deps = local.deps.clone();
+                deps.extend(forced_deps.iter().copied());
+                deps.into_iter()
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect()
+            };
+            oks.push(local);
         }
 
         let (tx, mut rx) =
@@ -1913,14 +2139,8 @@ impl Group {
                 txn_id,
                 ballot,
                 command: command.clone(),
-                seq: local.seq.max(forced_seq),
-                deps: if forced_deps.is_empty() {
-                    local.deps.clone()
-                } else {
-                    let mut deps = local.deps.clone();
-                    deps.extend(forced_deps.iter().copied());
-                    deps.into_iter().collect::<BTreeSet<_>>().into_iter().collect()
-                },
+                seq: request_seq,
+                deps: request_deps.clone(),
             };
             tokio::spawn(async move {
                 let resp = match time::timeout(rpc_timeout, transport.pre_accept(peer, req)).await {
@@ -1932,9 +2152,6 @@ impl Group {
             });
         }
         drop(tx);
-
-        let mut oks = vec![local.clone()];
-        let mut max_promised = local.promised;
 
         let deadline = time::Instant::now() + rpc_timeout;
         while ok < read_quorum {
@@ -2135,7 +2352,7 @@ impl Group {
                 continue;
             }
 
-            let peers = self.config.peers();
+            let peers = self.peers_snapshot();
             if peers.is_empty() {
                 return Ok(());
             }
@@ -2193,7 +2410,7 @@ impl Group {
                 continue;
             }
 
-            let peers = self.config.peers();
+            let peers = self.peers_snapshot();
             if peers.is_empty() {
                 return Ok(());
             }
@@ -2244,7 +2461,8 @@ impl Group {
         inline_command: bool,
     ) -> Result<AcceptResponse, ProposeOnceError> {
         let peers = self.peers_round_robin();
-        let quorum = self.config.quorum();
+        let quorum = self.quorum();
+        let local_is_voter = self.local_is_voter();
         let rpc_timeout = self.config.rpc_timeout;
 
         let (command_payload, has_command) = if inline_command {
@@ -2252,26 +2470,33 @@ impl Group {
         } else {
             (Vec::new(), false)
         };
-        let local = self
-            .rpc_accept(AcceptRequest {
-                group_id: self.config.group_id,
-                txn_id,
-                ballot,
-                command: command_payload.clone(),
-                command_digest,
-                has_command,
-                seq,
-                deps: deps.clone(),
-            })
-            .await;
-        if !local.ok {
-            return Ok(local);
+        let mut ok = 0usize;
+        let mut max_promised = ballot;
+
+        if local_is_voter {
+            let local = self
+                .rpc_accept(AcceptRequest {
+                    group_id: self.config.group_id,
+                    txn_id,
+                    ballot,
+                    command: command_payload.clone(),
+                    command_digest,
+                    has_command,
+                    seq,
+                    deps: deps.clone(),
+                })
+                .await;
+            max_promised = max_promised.max(local.promised);
+            if !local.ok {
+                return Ok(local);
+            }
+            ok = 1;
         }
 
-        if quorum <= 1 {
+        if ok >= quorum {
             return Ok(AcceptResponse {
                 ok: true,
-                promised: local.promised,
+                promised: max_promised,
             });
         }
 
@@ -2301,8 +2526,6 @@ impl Group {
         }
         drop(tx);
 
-        let mut ok = 1usize;
-        let mut max_promised = local.promised;
         let deadline = time::Instant::now() + rpc_timeout;
         while ok < quorum {
             let remaining = deadline.saturating_duration_since(time::Instant::now());
@@ -2352,8 +2575,11 @@ impl Group {
         deps: Vec<TxnId>,
         inline_command: bool,
     ) -> Result<(), ProposeOnceError> {
-        let peers = self.peers_round_robin();
-        let quorum = self.config.quorum();
+        let peers = self.peers_snapshot();
+        let quorum = self.quorum();
+        let local_is_member = self.local_is_member();
+        let local_is_voter = self.local_is_voter();
+        let voter_set = self.voters_snapshot().into_iter().collect::<HashSet<_>>();
         // Commit messages should eventually reach every replica. We don't block the coordinator on
         // slow replicas, but we allow more time for the RPC to complete to reduce the chance of
         // leaving long-lived PreAccepted records behind.
@@ -2364,32 +2590,39 @@ impl Group {
         } else {
             (Vec::new(), false)
         };
-        let local = self
-            .rpc_commit(CommitRequest {
-                group_id: self.config.group_id,
-                txn_id,
-                ballot,
-                command: command_payload.clone(),
-                command_digest,
-                has_command,
-                seq,
-                deps: deps.clone(),
-            })
-            .await;
-        if !local.ok {
-            return Err(ProposeOnceError::NoQuorum(anyhow::anyhow!(
-                "local commit rejected"
-            )));
+        let mut ok = 0usize;
+        if local_is_member {
+            let local = self
+                .rpc_commit(CommitRequest {
+                    group_id: self.config.group_id,
+                    txn_id,
+                    ballot,
+                    command: command_payload.clone(),
+                    command_digest,
+                    has_command,
+                    seq,
+                    deps: deps.clone(),
+                })
+                .await;
+            if !local.ok {
+                return Err(ProposeOnceError::NoQuorum(anyhow::anyhow!(
+                    "local commit rejected"
+                )));
+            }
+            if local_is_voter {
+                ok = 1;
+            }
         }
 
-        if quorum <= 1 {
+        if ok >= quorum {
             return Ok(());
         }
 
-        let (tx, mut rx) = mpsc::channel::<bool>(peers.len().max(1));
+        let (tx, mut rx) = mpsc::channel::<(bool, bool)>(peers.len().max(1));
         for peer in peers.iter().copied() {
             let transport = self.transport.clone();
             let tx = tx.clone();
+            let count_for_quorum = voter_set.contains(&peer);
             let req = CommitRequest {
                 group_id: self.config.group_id,
                 txn_id,
@@ -2405,12 +2638,11 @@ impl Group {
                     Ok(res) => res.ok().is_some_and(|r| r.ok),
                     Err(_) => false,
                 };
-                let _ = tx.send(ok).await;
+                let _ = tx.send((ok, count_for_quorum)).await;
             });
         }
         drop(tx);
 
-        let mut ok = 1usize;
         let deadline = time::Instant::now() + self.config.rpc_timeout;
         while ok < quorum {
             let remaining = deadline.saturating_duration_since(time::Instant::now());
@@ -2418,10 +2650,10 @@ impl Group {
                 break;
             }
             let recv = time::timeout(remaining, rx.recv()).await;
-            let Ok(Some(peer_ok)) = recv else {
+            let Ok(Some((peer_ok, count_for_quorum))) = recv else {
                 break;
             };
-            if peer_ok {
+            if peer_ok && count_for_quorum {
                 ok += 1;
                 if ok >= quorum {
                     return Ok(());
@@ -3125,6 +3357,22 @@ impl Group {
             }
         }
 
+        // Some commands intentionally have no read/write keys (for example,
+        // control commands that mutate runtime metadata in the state machine).
+        // These commands still need an `apply` callback when they reach execute.
+        for item in &to_apply {
+            if item.keys.is_write() || !item.keys.reads.is_empty() {
+                continue;
+            }
+            let meta = ExecMeta {
+                seq: item.seq,
+                txn_id: item.id,
+            };
+            let start = time::Instant::now();
+            self.sm.apply(&item.command, meta);
+            self.metrics.record_apply_write(start.elapsed());
+        }
+
         for item in &to_apply {
             let meta = ExecMeta {
                 seq: item.seq,
@@ -3293,8 +3541,9 @@ impl Group {
     }
 
     async fn recover_txn_inner(&self, txn_id: TxnId) -> anyhow::Result<RecoveryKind> {
-        let peers = self.config.peers();
-        let quorum = self.config.quorum();
+        let peers = self.voter_peers_snapshot();
+        let quorum = self.quorum();
+        let local_is_voter = self.local_is_voter();
         let rpc_timeout = self.config.rpc_timeout;
 
         let mut ballot = self.next_ballot_after(Ballot::zero()).await;
@@ -3305,17 +3554,25 @@ impl Group {
                 anyhow::bail!("recovery timed out for txn {:?}", txn_id);
             }
 
-            let local = self
-                .rpc_recover(RecoverRequest {
-                    group_id: self.config.group_id,
-                    txn_id,
-                    ballot,
-                })
-                .await;
+            let mut replies = Vec::new();
+            let mut ok = 0usize;
+            let mut max_promised = ballot;
+            if local_is_voter {
+                let local = self
+                    .rpc_recover(RecoverRequest {
+                        group_id: self.config.group_id,
+                        txn_id,
+                        ballot,
+                    })
+                    .await;
 
-            if !local.ok {
-                ballot = self.next_ballot_after(local.promised).await;
-                continue;
+                max_promised = max_promised.max(local.promised);
+                if !local.ok {
+                    ballot = self.next_ballot_after(local.promised).await;
+                    continue;
+                }
+                replies.push(local);
+                ok = 1;
             }
 
             let (tx, mut rx) =
@@ -3340,9 +3597,6 @@ impl Group {
             }
             drop(tx);
 
-            let mut replies = vec![local.clone()];
-            let mut ok = 1usize;
-            let mut max_promised = local.promised;
             let deadline = time::Instant::now() + self.config.rpc_timeout;
             while ok < quorum {
                 let remaining = deadline.saturating_duration_since(time::Instant::now());
