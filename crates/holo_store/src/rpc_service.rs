@@ -874,11 +874,8 @@ impl rpc::HoloRpc for RpcService {
             grpc_addr: req.grpc_addr.to_string(),
             redis_addr: req.redis_addr.to_string(),
         };
-        let payload = crate::cluster::ClusterStateMachine::encode_command(&cmd)
-            .map_err(|e| volo_grpc::Status::internal(format!("encode command failed: {e}")))?;
         self.state
-            .meta_handle
-            .propose(payload)
+            .propose_meta_command(cmd)
             .await
             .map_err(|e| volo_grpc::Status::internal(format!("meta propose failed: {e}")))?;
         Ok(volo_grpc::Response::new(rpc::JoinResponse {
@@ -891,7 +888,64 @@ impl rpc::HoloRpc for RpcService {
         _req: volo_grpc::Request<rpc::ClusterStateRequest>,
     ) -> Result<volo_grpc::Response<rpc::ClusterStateResponse>, volo_grpc::Status> {
         let state = self.state.cluster_store.state();
-        let json = serde_json::to_string_pretty(&state)
+        let ops_by_index = self.state.cluster_store.meta_ops_total_by_index();
+        let lag_by_index = self.state.meta_group_lag_by_index().await;
+        let proposal = self.state.meta_proposal_stats_peek();
+        let proposal_total_avg_us = if proposal.total.count == 0 {
+            0.0
+        } else {
+            proposal.total.total_us as f64 / proposal.total.count as f64
+        };
+        let proposal_by_index = proposal
+            .by_index
+            .iter()
+            .map(|(idx, snap)| {
+                let avg_us = if snap.count == 0 {
+                    0.0
+                } else {
+                    snap.total_us as f64 / snap.count as f64
+                };
+                (
+                    *idx,
+                    serde_json::json!({
+                        "count": snap.count,
+                        "errors": snap.errors,
+                        "avg_us": avg_us,
+                        "max_us": snap.max_us,
+                    }),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        let now_ms = crate::unix_time_ms();
+        let stuck_threshold_ms = self.state.meta_move_stuck_warn_ms();
+        let rebalances_stuck = state
+            .meta_rebalances
+            .values()
+            .filter(|mv| {
+                let last = mv.last_progress_unix_ms.max(mv.started_unix_ms);
+                last > 0 && now_ms.saturating_sub(last) >= stuck_threshold_ms
+            })
+            .count();
+
+        let mut root = serde_json::to_value(&state)
+            .map_err(|e| volo_grpc::Status::internal(format!("serialize state failed: {e}")))?;
+        root["meta_health"] = serde_json::json!({
+            "ops_by_index": ops_by_index,
+            "lag_by_index": lag_by_index,
+            "proposal_total": {
+                "count": proposal.total.count,
+                "errors": proposal.total.errors,
+                "avg_us": proposal_total_avg_us,
+                "max_us": proposal.total.max_us,
+            },
+            "proposal_by_index": proposal_by_index,
+            "rebalances_inflight": state.meta_rebalances.len(),
+            "rebalances_stuck": rebalances_stuck,
+            "stuck_threshold_ms": stuck_threshold_ms,
+        });
+
+        let json = serde_json::to_string_pretty(&root)
             .map_err(|e| volo_grpc::Status::internal(format!("serialize state failed: {e}")))?;
         Ok(volo_grpc::Response::new(rpc::ClusterStateResponse {
             json: json.into(),
@@ -908,11 +962,8 @@ impl rpc::HoloRpc for RpcService {
             grpc_addr: req.grpc_addr.to_string(),
             redis_addr: req.redis_addr.to_string(),
         };
-        let payload = crate::cluster::ClusterStateMachine::encode_command(&cmd)
-            .map_err(|e| volo_grpc::Status::internal(format!("encode command failed: {e}")))?;
         self.state
-            .meta_handle
-            .propose(payload)
+            .propose_meta_command(cmd)
             .await
             .map_err(|e| volo_grpc::Status::internal(format!("meta propose failed: {e}")))?;
         Ok(volo_grpc::Response::new(rpc::ClusterAddNodeResponse {
@@ -930,14 +981,97 @@ impl rpc::HoloRpc for RpcService {
         let cmd = crate::cluster::ClusterCommand::RemoveNode {
             node_id: req.node_id,
         };
-        let payload = crate::cluster::ClusterStateMachine::encode_command(&cmd)
-            .map_err(|e| volo_grpc::Status::internal(format!("encode command failed: {e}")))?;
         self.state
-            .meta_handle
-            .propose(payload)
+            .propose_meta_command(cmd)
             .await
             .map_err(|e| volo_grpc::Status::internal(format!("meta propose failed: {e}")))?;
         Ok(volo_grpc::Response::new(rpc::ClusterRemoveNodeResponse {
+            ok: true,
+        }))
+    }
+
+    async fn cluster_split_meta_range(
+        &self,
+        req: volo_grpc::Request<rpc::ClusterSplitMetaRangeRequest>,
+    ) -> Result<volo_grpc::Response<rpc::ClusterSplitMetaRangeResponse>, volo_grpc::Status> {
+        let req = req.into_inner();
+        let split_hash = req.split_hash;
+        let snapshot = self.state.cluster_store.state();
+        let source = snapshot
+            .meta_ranges
+            .iter()
+            .find(|range| split_hash >= range.start_hash && split_hash <= range.end_hash)
+            .ok_or_else(|| {
+                volo_grpc::Status::failed_precondition(
+                    "split hash does not map to any existing meta range",
+                )
+            })?
+            .clone();
+        if split_hash == source.start_hash {
+            return Err(volo_grpc::Status::invalid_argument(
+                "split hash must be greater than the source range start",
+            ));
+        }
+        let max_meta_groups = self.state.meta_handles.len().max(1);
+        let target_meta_index = if req.target_meta_index == 0 {
+            self.state
+                .cluster_store
+                .first_free_meta_index(max_meta_groups)
+                .ok_or_else(|| {
+                    volo_grpc::Status::failed_precondition(
+                        "no free meta group slot available; raise --meta-groups",
+                    )
+                })?
+        } else {
+            req.target_meta_index as usize
+        };
+        if target_meta_index >= max_meta_groups {
+            return Err(volo_grpc::Status::failed_precondition(format!(
+                "target meta index {} exceeds configured meta groups {}",
+                target_meta_index, max_meta_groups
+            )));
+        }
+        drop(snapshot);
+
+        let cmd = crate::cluster::ClusterCommand::SplitMetaRange {
+            split_hash,
+            target_meta_index,
+        };
+        self.state
+            .propose_meta_command(cmd)
+            .await
+            .map_err(|e| volo_grpc::Status::internal(format!("meta propose failed: {e}")))?;
+
+        Ok(volo_grpc::Response::new(rpc::ClusterSplitMetaRangeResponse {
+            ok: true,
+            left_meta_index: source.meta_index as u64,
+            right_meta_index: target_meta_index as u64,
+        }))
+    }
+
+    async fn cluster_meta_rebalance(
+        &self,
+        req: volo_grpc::Request<rpc::ClusterMetaRebalanceRequest>,
+    ) -> Result<volo_grpc::Response<rpc::ClusterMetaRebalanceResponse>, volo_grpc::Status> {
+        let req = req.into_inner();
+        if req.replicas.is_empty() {
+            return Err(volo_grpc::Status::invalid_argument(
+                "at least one replica is required",
+            ));
+        }
+        let leaseholder = (req.leaseholder != 0).then_some(req.leaseholder);
+        let planned = self
+            .state
+            .cluster_store
+            .plan_meta_rebalance_command(req.meta_range_id, req.replicas.clone(), leaseholder)
+            .map_err(|e| volo_grpc::Status::failed_precondition(format!("{e}")))?;
+        if let Some(cmd) = planned {
+            self.state
+                .propose_meta_command(cmd)
+                .await
+                .map_err(|e| volo_grpc::Status::internal(format!("meta propose failed: {e}")))?;
+        }
+        Ok(volo_grpc::Response::new(rpc::ClusterMetaRebalanceResponse {
             ok: true,
         }))
     }
@@ -961,11 +1095,8 @@ impl rpc::HoloRpc for RpcService {
             split_key: split_key.clone(),
             target_shard_index,
         };
-        let payload = crate::cluster::ClusterStateMachine::encode_command(&cmd)
-            .map_err(|e| volo_grpc::Status::internal(format!("encode command failed: {e}")))?;
         self.state
-            .meta_handle
-            .propose(payload)
+            .propose_meta_command(cmd)
             .await
             .map_err(|e| volo_grpc::Status::internal(format!("meta propose failed: {e}")))?;
         let state = self.state.cluster_store.state();
@@ -991,11 +1122,8 @@ impl rpc::HoloRpc for RpcService {
         let action_i32 = i32::from(action);
 
         let propose = |cmd: ClusterCommand| async move {
-            let payload = crate::cluster::ClusterStateMachine::encode_command(&cmd)
-                .map_err(|e| volo_grpc::Status::internal(format!("encode command failed: {e}")))?;
             self.state
-                .meta_handle
-                .propose(payload)
+                .propose_meta_command(cmd)
                 .await
                 .map_err(|e| volo_grpc::Status::internal(format!("meta propose failed: {e}")))?;
             Ok::<(), volo_grpc::Status>(())
@@ -1151,11 +1279,8 @@ impl rpc::HoloRpc for RpcService {
                 ok: true,
             }));
         };
-        let payload = crate::cluster::ClusterStateMachine::encode_command(&cmd)
-            .map_err(|e| volo_grpc::Status::internal(format!("encode command failed: {e}")))?;
         self.state
-            .meta_handle
-            .propose(payload)
+            .propose_meta_command(cmd)
             .await
             .map_err(|e| volo_grpc::Status::internal(format!("meta propose failed: {e}")))?;
         Ok(volo_grpc::Response::new(rpc::RangeRebalanceResponse {
@@ -1255,11 +1380,8 @@ impl rpc::HoloRpc for RpcService {
     ) -> Result<volo_grpc::Response<rpc::ClusterFreezeResponse>, volo_grpc::Status> {
         let req = req.into_inner();
         let cmd = crate::cluster::ClusterCommand::SetFrozen { frozen: req.frozen };
-        let payload = crate::cluster::ClusterStateMachine::encode_command(&cmd)
-            .map_err(|e| volo_grpc::Status::internal(format!("encode command failed: {e}")))?;
         self.state
-            .meta_handle
-            .propose(payload)
+            .propose_meta_command(cmd)
             .await
             .map_err(|e| volo_grpc::Status::internal(format!("meta propose failed: {e}")))?;
         Ok(volo_grpc::Response::new(rpc::ClusterFreezeResponse {
@@ -1308,9 +1430,7 @@ fn parse_command_digest(bytes: Bytes) -> Result<[u8; 32], volo_grpc::Status> {
 }
 
 async fn propose_meta(state: Arc<NodeState>, cmd: ClusterCommand) -> anyhow::Result<()> {
-    let payload = crate::cluster::ClusterStateMachine::encode_command(&cmd)?;
-    let _ = state.meta_handle.propose(payload).await?;
-    Ok(())
+    state.propose_meta_command(cmd).await
 }
 
 async fn wait_for_local_epoch(

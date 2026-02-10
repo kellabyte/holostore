@@ -24,6 +24,8 @@ service HoloRpc {
   rpc ClusterState(ClusterStateRequest) returns (ClusterStateResponse);
   rpc ClusterAddNode(ClusterAddNodeRequest) returns (ClusterAddNodeResponse);
   rpc ClusterRemoveNode(ClusterRemoveNodeRequest) returns (ClusterRemoveNodeResponse);
+  rpc ClusterSplitMetaRange(ClusterSplitMetaRangeRequest) returns (ClusterSplitMetaRangeResponse);
+  rpc ClusterMetaRebalance(ClusterMetaRebalanceRequest) returns (ClusterMetaRebalanceResponse);
   rpc RangeSplit(RangeSplitRequest) returns (RangeSplitResponse);
   rpc RangeMerge(RangeMergeRequest) returns (RangeMergeResponse);
   rpc RangeRebalance(RangeRebalanceRequest) returns (RangeRebalanceResponse);
@@ -276,6 +278,27 @@ message ClusterRemoveNodeRequest {
 }
 
 message ClusterRemoveNodeResponse {
+  bool ok = 1;
+}
+
+message ClusterSplitMetaRangeRequest {
+  uint64 split_hash = 1;
+  uint64 target_meta_index = 2;
+}
+
+message ClusterSplitMetaRangeResponse {
+  bool ok = 1;
+  uint64 left_meta_index = 2;
+  uint64 right_meta_index = 3;
+}
+
+message ClusterMetaRebalanceRequest {
+  uint64 meta_range_id = 1;
+  repeated uint64 replicas = 2;
+  uint64 leaseholder = 3;
+}
+
+message ClusterMetaRebalanceResponse {
   bool ok = 1;
 }
 

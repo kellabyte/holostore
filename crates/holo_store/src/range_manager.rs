@@ -17,7 +17,7 @@ use fjall::{Keyspace, PartitionCreateOptions};
 use serde::Deserialize;
 use volo::net::Address;
 
-use crate::cluster::{ClusterCommand, MemberState, ShardDesc};
+use crate::cluster::{ClusterCommand, ControllerDomain, MemberState, ShardDesc};
 use crate::load::ShardLoadSnapshot;
 use crate::volo_gen::holo_store::rpc;
 use crate::NodeState;
@@ -61,10 +61,6 @@ pub struct RangeManagerConfig {
 }
 
 pub fn spawn(state: Arc<NodeState>, keyspace: Arc<Keyspace>, cfg: RangeManagerConfig) {
-    // Keep it simple: only one node proposes management operations.
-    if state.node_id != 1 {
-        return;
-    }
     if state.data_shards <= 1 {
         return;
     }
@@ -86,6 +82,12 @@ pub fn spawn(state: Arc<NodeState>, keyspace: Arc<Keyspace>, cfg: RangeManagerCo
         let mut merge_sustained = std::collections::BTreeMap::<u64, u8>::new();
         loop {
             ticker.tick().await;
+            if !state
+                .ensure_controller_leader(ControllerDomain::Range)
+                .await
+            {
+                continue;
+            }
             let now = std::time::Instant::now();
             if let Err(err) = maybe_split_once(
                 state.clone(),
@@ -481,9 +483,9 @@ async fn fetch_remote_probe(addr: &str, timeout: Duration) -> anyhow::Result<Clu
 }
 
 async fn propose_meta(state: Arc<NodeState>, cmd: ClusterCommand) -> anyhow::Result<()> {
-    let payload = crate::cluster::ClusterStateMachine::encode_command(&cmd)?;
-    let _ = state.meta_handle.propose(payload).await?;
-    Ok(())
+    state
+        .propose_meta_command_guarded(ControllerDomain::Range, cmd)
+        .await
 }
 
 fn pick_split_candidate(

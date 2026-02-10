@@ -16,8 +16,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use holo_accord::accord::{ExecutedPrefix, NodeId};
 
 use crate::cluster::{
-    ClusterCommand, ClusterState, MemberState, RangeMergePhase, ReplicaMove, ReplicaMovePhase,
-    ReplicaRole, ShardDesc,
+    ClusterCommand, ClusterState, ControllerDomain, MemberState, RangeMergePhase, ReplicaMove,
+    ReplicaMovePhase, ReplicaRole, ShardDesc,
 };
 use crate::NodeState;
 
@@ -36,15 +36,16 @@ pub struct RebalanceManagerConfig {
 
 /// Spawn the background rebalancer.
 pub fn spawn(state: Arc<NodeState>, cfg: RebalanceManagerConfig) {
-    // Keep a single controller to avoid competing proposals.
-    if state.node_id != 1 {
-        return;
-    }
-
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(cfg.interval);
         loop {
             ticker.tick().await;
+            if !state
+                .ensure_controller_leader(ControllerDomain::Rebalance)
+                .await
+            {
+                continue;
+            }
             if state.cluster_store.frozen() {
                 continue;
             }
@@ -493,9 +494,9 @@ async fn plan_retired_range_gc_step(
 }
 
 async fn propose_meta(state: Arc<NodeState>, cmd: ClusterCommand) -> anyhow::Result<()> {
-    let payload = crate::cluster::ClusterStateMachine::encode_command(&cmd)?;
-    let _ = state.meta_handle.propose(payload).await?;
-    Ok(())
+    state
+        .propose_meta_command_guarded(ControllerDomain::Rebalance, cmd)
+        .await
 }
 
 async fn plan_inflight_move_step(
@@ -1351,6 +1352,11 @@ mod tests {
             shard_merges: BTreeMap::new(),
             shard_fences: BTreeMap::new(),
             retired_ranges: BTreeMap::new(),
+            meta_ranges: Vec::new(),
+            meta_replica_roles: BTreeMap::new(),
+            meta_rebalances: BTreeMap::new(),
+            controller_leases: BTreeMap::new(),
+            meta_controller_lease: None,
         };
 
         let cmd = plan_decommission_step(&state).expect("expected decommission step");
@@ -1399,6 +1405,11 @@ mod tests {
             shard_merges: BTreeMap::new(),
             shard_fences: BTreeMap::new(),
             retired_ranges: BTreeMap::new(),
+            meta_ranges: Vec::new(),
+            meta_replica_roles: BTreeMap::new(),
+            meta_rebalances: BTreeMap::new(),
+            controller_leases: BTreeMap::new(),
+            meta_controller_lease: None,
         };
 
         let cmd = plan_replica_balance_step(&state).expect("expected rebalance");
@@ -1435,6 +1446,11 @@ mod tests {
             shard_merges: BTreeMap::new(),
             shard_fences: BTreeMap::new(),
             retired_ranges: BTreeMap::new(),
+            meta_ranges: Vec::new(),
+            meta_replica_roles: BTreeMap::new(),
+            meta_rebalances: BTreeMap::new(),
+            controller_leases: BTreeMap::new(),
+            meta_controller_lease: None,
         };
 
         let cmd = plan_lease_balance_step(&state).expect("expected lease rebalance");
@@ -1491,6 +1507,11 @@ mod tests {
             shard_merges: BTreeMap::new(),
             shard_fences: BTreeMap::new(),
             retired_ranges: BTreeMap::new(),
+            meta_ranges: Vec::new(),
+            meta_replica_roles: BTreeMap::new(),
+            meta_rebalances: BTreeMap::new(),
+            controller_leases: BTreeMap::new(),
+            meta_controller_lease: None,
         };
 
         let cmd = plan_stalled_move_step(&state, Duration::from_millis(1_000))
@@ -1535,6 +1556,11 @@ mod tests {
             shard_merges: BTreeMap::new(),
             shard_fences: BTreeMap::new(),
             retired_ranges: BTreeMap::new(),
+            meta_ranges: Vec::new(),
+            meta_replica_roles: BTreeMap::new(),
+            meta_rebalances: BTreeMap::new(),
+            controller_leases: BTreeMap::new(),
+            meta_controller_lease: None,
         };
 
         let cmd = plan_stalled_move_step(&state, Duration::from_millis(1_000))

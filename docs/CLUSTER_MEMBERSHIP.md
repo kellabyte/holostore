@@ -17,7 +17,8 @@ membership and Cockroach-style control-plane metadata.
 
 ### Meta Group (control plane)
 
-- Single, fixed Accord group (meta group) replicated across all nodes.
+- Metadata is sharded into **meta ranges**, each backed by its own Accord group.
+- Meta ranges are routed by a stable hash of control-plane command keys.
 - Stores `ClusterState` as a replicated log:
   - `members`: node_id → {grpc_addr, redis_addr, status}
   - `shards`: range descriptors and replica placements
@@ -89,8 +90,8 @@ membership and Cockroach-style control-plane metadata.
 
 ### Phase 4: Meta Resilience (Cockroach-style)
 
-- [ ] Meta range split for large cluster metadata.
-- [ ] Multiple meta ranges with well-known descriptors.
+- [x] Meta range split for large cluster metadata.
+- [x] Multiple meta ranges with well-known descriptors.
 
 ## Notes / Gaps
 
@@ -119,13 +120,30 @@ membership and Cockroach-style control-plane metadata.
 - Retired-range GC is now deferred until control-plane convergence checks pass
   on all non-removed replicas (epoch and descriptor convergence), reducing
   premature cleanup risk during recovery.
-- Remaining major production gaps:
-  - staged replica reconfiguration is now persisted and replayed through per-shard
-    Accord log commands (`CMD_MEMBERSHIP_RECONFIG`), but orchestration is still
-    controller-driven (not a shard-local autonomous joint-consensus workflow)
-  - meta-plane still runs as a single range (no meta split / multi-meta-range)
-  - move-controller HA is still single-writer (node 1); metadata is durable, but
-    orchestration leader election is not implemented yet
+- Meta plane now supports:
+  - routed proposals across multiple meta groups (`--meta-groups`)
+  - persisted `meta_ranges` descriptors in `ClusterState`
+  - explicit meta-range split command (`holoctl split-meta ...`)
+  - command-local routing for meta reconfiguration:
+    - `Begin/Promote/Transfer/FinalizeMetaReplicaMove` are proposed to the
+      owning meta range group (not hash-fallback routing)
+  - controller lease election (`AcquireMetaControllerLease`) used by background
+    split/rebalance/meta managers (no static node-1-only orchestrator)
+  - leaseholder-scoped meta orchestration:
+    - in-flight meta replica moves are advanced by each range's current
+      leaseholder, so progress is no longer gated on one global meta controller
+    - balancing/split decisions are issued by the range leaseholder responsible
+      for the affected meta range
+    - this enables multi-controller progress across ranges while preserving
+      single-writer semantics per range via lease ownership
+  - conservative meta autosplit policy (`HOLO_META_*` knobs)
+  - failover coverage for add-node/meta-split/range-split/rebalance while the
+    bootstrap node is down (`tests/meta_plane_failover.rs`)
+  - explicit operator visibility for meta-plane SLOs:
+    - `holoctl meta-status` (per-meta-range load/lag/proposal/move status)
+    - `holoctl controller-status` (controller lease holder/term/expiry)
+    - `HOLOMETRICS` Redis command (Prometheus-style node metrics)
+    - `scripts/check_meta_plane_health.sh` (threshold checks for lag/error/stuck)
 
 - The node defaults to `--routing-mode range` (lexicographic key ranges).
   Prefix-heavy workloads can concentrate traffic into a single range until
@@ -162,6 +180,30 @@ serves, and local record counts per range:
 
 ```bash
 cargo run -q -p holo_store --bin holoctl -- --target 127.0.0.1:15051 topology
+```
+
+Meta-plane status and controller lease status:
+
+```bash
+cargo run -q -p holo_store --bin holoctl -- --target 127.0.0.1:15051 meta-status
+cargo run -q -p holo_store --bin holoctl -- --target 127.0.0.1:15051 controller-status
+# Node metrics (Prometheus text format):
+redis-cli -p 16379 HOLOMETRICS
+```
+
+You can also run a simple SLO gate for meta-plane health:
+
+```bash
+TARGET=127.0.0.1:15051 ./scripts/check_meta_plane_health.sh
+```
+
+Override thresholds when needed:
+
+```bash
+HOLO_META_MAX_LAG_OPS=512 \
+HOLO_META_MAX_PROPOSAL_ERROR_RATE=0.02 \
+HOLO_META_MAX_STUCK_REBALANCES=0 \
+TARGET=127.0.0.1:15051 ./scripts/check_meta_plane_health.sh
 ```
 
 For in-flight merge progress details:
