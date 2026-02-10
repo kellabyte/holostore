@@ -530,13 +530,10 @@ async fn plan_inflight_move_step(
                 );
                 return Ok(None);
             }
-            if !target_has_learner_sync_state(state.clone(), snapshot.epoch, shard.shard_id, mv)
-                .await
-            {
+            if !target_has_learner_sync_state(state.clone(), shard.shard_id, mv).await {
                 tracing::debug!(
                     shard_id = shard.shard_id,
                     target = mv.to_node,
-                    min_epoch = snapshot.epoch,
                     "waiting for target learner-sync metadata state"
                 );
                 return Ok(None);
@@ -589,9 +586,7 @@ async fn plan_inflight_move_step(
             {
                 return Ok(None);
             }
-            if !target_has_joint_config_state(state.clone(), snapshot.epoch, shard.shard_id, mv)
-                .await
-            {
+            if !target_has_joint_config_state(state.clone(), shard.shard_id, mv).await {
                 return Ok(None);
             }
             let requested = mv
@@ -606,7 +601,6 @@ async fn plan_inflight_move_step(
             } else {
                 if !target_has_lease_state(
                     state.clone(),
-                    snapshot.epoch,
                     shard.shard_id,
                     mv,
                     desired_leaseholder,
@@ -623,17 +617,18 @@ async fn plan_inflight_move_step(
                 if stable_members.is_empty() {
                     return Ok(None);
                 }
-                if !ensure_data_group_membership(
+                // Do not block final metadata cutover on exact runtime membership
+                // convergence. If this best-effort update is delayed, the regular
+                // background membership refresher will apply the finalized control-plane
+                // member/voter set after `FinalizeReplicaMove` commits.
+                best_effort_data_group_membership(
                     state.clone(),
                     shard,
                     stable_members.clone(),
                     stable_members,
                     "finalize-cutover",
                 )
-                .await?
-                {
-                    return Ok(None);
-                }
+                .await;
                 Ok(Some(ClusterCommand::FinalizeReplicaMove { shard_id }))
             }
         }
@@ -644,7 +639,6 @@ async fn plan_inflight_move_step(
             let desired_leaseholder = requested.unwrap_or(mv.to_node);
             if !target_has_lease_state(
                 state.clone(),
-                snapshot.epoch,
                 shard.shard_id,
                 mv,
                 desired_leaseholder,
@@ -661,17 +655,16 @@ async fn plan_inflight_move_step(
             if stable_members.is_empty() {
                 return Ok(None);
             }
-            if !ensure_data_group_membership(
+            // Same rationale as above: best-effort apply now, but never stall
+            // LeaseTransferred indefinitely on this convergence check.
+            best_effort_data_group_membership(
                 state.clone(),
                 shard,
                 stable_members.clone(),
                 stable_members,
                 "finalize-cutover",
             )
-            .await?
-            {
-                return Ok(None);
-            }
+            .await;
             Ok(Some(ClusterCommand::FinalizeReplicaMove { shard_id }))
         }
     }
@@ -746,6 +739,40 @@ async fn ensure_data_group_membership(
         );
     }
     Ok(matched)
+}
+
+async fn best_effort_data_group_membership(
+    state: Arc<NodeState>,
+    shard: &ShardDesc,
+    mut members: Vec<NodeId>,
+    mut voters: Vec<NodeId>,
+    stage: &'static str,
+) {
+    members.sort_unstable();
+    members.dedup();
+    voters.sort_unstable();
+    voters.dedup();
+    if members.is_empty() || voters.is_empty() {
+        return;
+    }
+    if voters.iter().any(|id| !members.contains(id)) {
+        return;
+    }
+    if state.shard_membership_matches(shard.shard_index, &members, &voters) {
+        return;
+    }
+    if let Err(err) = state
+        .propose_shard_membership_reconfig(shard.shard_index, &members, &voters)
+        .await
+    {
+        tracing::debug!(
+            shard_id = shard.shard_id,
+            shard_index = shard.shard_index,
+            stage,
+            error = ?err,
+            "best-effort shard membership update did not commit yet"
+        );
+    }
 }
 
 async fn backfill_learner_replica(
@@ -849,16 +876,12 @@ fn shard_role(state: &ClusterState, shard_id: u64, node_id: NodeId) -> Option<Re
 
 async fn target_has_learner_sync_state(
     state: Arc<NodeState>,
-    min_epoch: u64,
     shard_id: u64,
     mv: &ReplicaMove,
 ) -> bool {
     let Some(target_state) = fetch_target_snapshot(state, mv.to_node).await else {
         return false;
     };
-    if target_state.epoch < min_epoch {
-        return false;
-    }
     let Some(target_mv) = target_state.shard_rebalances.get(&shard_id) else {
         return false;
     };
@@ -882,16 +905,12 @@ async fn target_has_learner_sync_state(
 
 async fn target_has_joint_config_state(
     state: Arc<NodeState>,
-    min_epoch: u64,
     shard_id: u64,
     mv: &ReplicaMove,
 ) -> bool {
     let Some(target_state) = fetch_target_snapshot(state, mv.to_node).await else {
         return false;
     };
-    if target_state.epoch < min_epoch {
-        return false;
-    }
     let Some(target_mv) = target_state.shard_rebalances.get(&shard_id) else {
         return false;
     };
@@ -912,7 +931,6 @@ async fn target_has_joint_config_state(
 
 async fn target_has_lease_state(
     state: Arc<NodeState>,
-    min_epoch: u64,
     shard_id: u64,
     mv: &ReplicaMove,
     expected_leaseholder: NodeId,
@@ -921,9 +939,6 @@ async fn target_has_lease_state(
     let Some(target_state) = fetch_target_snapshot(state, mv.to_node).await else {
         return false;
     };
-    if target_state.epoch < min_epoch {
-        return false;
-    }
     let Some(target_mv) = target_state.shard_rebalances.get(&shard_id) else {
         return false;
     };

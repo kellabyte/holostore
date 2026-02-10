@@ -1258,6 +1258,14 @@ impl NodeState {
             .controller_lease_renew_margin
             .as_millis()
             .min(u128::from(u64::MAX)) as u64;
+        let snapshot = self.cluster_store.state();
+
+        // Some control loops require the holder to be an eligible participant
+        // in the in-flight workflow (for example, not the learner currently
+        // being staged in a shard move). Refuse leadership when ineligible.
+        if !Self::controller_lease_eligible_for_domain(&snapshot, domain, self.node_id) {
+            return false;
+        }
         if self
             .cluster_store
             .is_controller_leader(domain, self.node_id, now.saturating_add(renew_margin))
@@ -1269,12 +1277,17 @@ impl NodeState {
         let current_holder_active = current
             .as_ref()
             .map(|lease| {
-                self.cluster_store
-                    .state()
+                snapshot
                     .members
                     .get(&lease.holder)
                     .map(|m| m.state == MemberState::Active)
                     .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        let current_holder_eligible = current
+            .as_ref()
+            .map(|lease| {
+                Self::controller_lease_eligible_for_domain(&snapshot, domain, lease.holder)
             })
             .unwrap_or(false);
 
@@ -1284,6 +1297,7 @@ impl NodeState {
             if cur.holder != self.node_id
                 && cur.lease_until_ms > now.saturating_add(renew_margin)
                 && current_holder_active
+                && current_holder_eligible
             {
                 return false;
             }
@@ -1322,6 +1336,54 @@ impl NodeState {
         self.cluster_store
             .is_controller_leader(domain, self.node_id, unix_time_ms())
     }
+
+fn controller_lease_eligible_for_domain(
+    snapshot: &ClusterState,
+    domain: ControllerDomain,
+    node_id: NodeId,
+) -> bool {
+    match domain {
+        ControllerDomain::Rebalance => {
+            if let Some((&shard_id, _)) = snapshot.shard_rebalances.iter().next() {
+                let Some(shard) = snapshot.shards.iter().find(|s| s.shard_id == shard_id) else {
+                    return false;
+                };
+                if !shard.replicas.contains(&node_id) {
+                    return false;
+                }
+                let role = snapshot
+                    .shard_replica_roles
+                    .get(&shard_id)
+                    .and_then(|roles| roles.get(&node_id))
+                    .copied()
+                    .unwrap_or(ReplicaRole::Voter);
+                return role != ReplicaRole::Learner;
+            }
+
+            if let Some((&meta_range_id, _)) = snapshot.meta_rebalances.iter().next() {
+                let Some(range) = snapshot
+                    .meta_ranges
+                    .iter()
+                    .find(|r| r.meta_range_id == meta_range_id)
+                else {
+                    return false;
+                };
+                if !range.replicas.contains(&node_id) {
+                    return false;
+                }
+                let role = snapshot
+                    .meta_replica_roles
+                    .get(&meta_range_id)
+                    .and_then(|roles| roles.get(&node_id))
+                    .copied()
+                    .unwrap_or(ReplicaRole::Voter);
+                return role != ReplicaRole::Learner;
+            }
+            true
+        }
+        _ => true,
+    }
+}
 
     /// Apply control-plane replica membership to runtime Accord data groups.
     fn refresh_group_memberships(&self) -> anyhow::Result<()> {
@@ -3873,6 +3935,7 @@ fn parse_members(input: &str) -> anyhow::Result<HashMap<NodeId, SocketAddr>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cluster::{ReplicaMove, ReplicaMovePhase};
 
     fn sample_state() -> ClusterState {
         ClusterState {
@@ -3943,6 +4006,99 @@ mod tests {
         let (members, voters) = shard_membership_sets(&state, &shard);
         assert_eq!(members, vec![1, 2, 3]);
         assert_eq!(voters, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn rebalance_controller_eligibility_rejects_learner_during_move() {
+        let mut state = sample_state();
+        state.members = BTreeMap::from([
+            (
+                1,
+                MemberInfo {
+                    node_id: 1,
+                    grpc_addr: "127.0.0.1:15051".to_string(),
+                    redis_addr: "127.0.0.1:16379".to_string(),
+                    state: MemberState::Active,
+                },
+            ),
+            (
+                2,
+                MemberInfo {
+                    node_id: 2,
+                    grpc_addr: "127.0.0.1:15052".to_string(),
+                    redis_addr: "127.0.0.1:16380".to_string(),
+                    state: MemberState::Active,
+                },
+            ),
+            (
+                3,
+                MemberInfo {
+                    node_id: 3,
+                    grpc_addr: "127.0.0.1:15053".to_string(),
+                    redis_addr: "127.0.0.1:16381".to_string(),
+                    state: MemberState::Active,
+                },
+            ),
+            (
+                4,
+                MemberInfo {
+                    node_id: 4,
+                    grpc_addr: "127.0.0.1:15054".to_string(),
+                    redis_addr: "127.0.0.1:16382".to_string(),
+                    state: MemberState::Active,
+                },
+            ),
+        ]);
+        let mut shard = sample_shard();
+        shard.replicas = vec![1, 2, 3, 4];
+        state.shards.push(shard.clone());
+        state.shard_replica_roles.insert(
+            shard.shard_id,
+            BTreeMap::from([
+                (1, ReplicaRole::Voter),
+                (2, ReplicaRole::Voter),
+                (3, ReplicaRole::Voter),
+                (4, ReplicaRole::Learner),
+            ]),
+        );
+        state.shard_rebalances.insert(
+            shard.shard_id,
+            ReplicaMove {
+                from_node: 3,
+                to_node: 4,
+                phase: ReplicaMovePhase::LearnerSync,
+                backfill_done: false,
+                target_leaseholder: None,
+                started_unix_ms: 1,
+                last_progress_unix_ms: 1,
+            },
+        );
+
+        assert!(NodeState::controller_lease_eligible_for_domain(
+            &state,
+            ControllerDomain::Rebalance,
+            1
+        ));
+        assert!(!NodeState::controller_lease_eligible_for_domain(
+            &state,
+            ControllerDomain::Rebalance,
+            4
+        ));
+    }
+
+    #[test]
+    fn rebalance_controller_eligibility_allows_any_node_without_inflight_move() {
+        let state = sample_state();
+        assert!(NodeState::controller_lease_eligible_for_domain(
+            &state,
+            ControllerDomain::Rebalance,
+            42
+        ));
+        assert!(NodeState::controller_lease_eligible_for_domain(
+            &state,
+            ControllerDomain::Range,
+            42
+        ));
     }
 }
 
