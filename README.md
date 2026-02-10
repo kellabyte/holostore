@@ -39,6 +39,16 @@ In this repository we implement:
 make build-release
 ```
 
+**Meta-plane health**
+```bash
+./target/release/holoctl --target 127.0.0.1:15051 meta-status
+./target/release/holoctl --target 127.0.0.1:15051 controller-status
+TARGET=127.0.0.1:15051 ./scripts/check_meta_plane_health.sh
+
+# Prometheus-style metrics export from any node:
+redis-cli -p 16379 HOLOMETRICS
+```
+
 **Run a local 3-node cluster**
 ```bash
 ./scripts/cleanup_cluster.sh

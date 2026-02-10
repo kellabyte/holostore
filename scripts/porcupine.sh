@@ -123,8 +123,29 @@ wait_port() {
   return 1
 }
 
-echo "==> waiting for redis port 16379"
-wait_port 127.0.0.1 16379 || { echo "error: redis port 16379 not ready" >&2; exit 1; }
+wait_for_nodes() {
+  local list="$1"
+  local seen=","
+  local endpoint host port
+  IFS=',' read -r -a endpoints <<<"$list"
+  for endpoint in "${endpoints[@]}"; do
+    endpoint="${endpoint// /}"
+    [[ -z "$endpoint" ]] && continue
+    if [[ "$seen" == *",$endpoint,"* ]]; then
+      continue
+    fi
+    seen="${seen}${endpoint},"
+    host="${endpoint%:*}"
+    port="${endpoint##*:}"
+    echo "==> waiting for redis port ${host}:${port}"
+    wait_port "$host" "$port" || {
+      echo "error: redis port ${host}:${port} not ready" >&2
+      exit 1
+    }
+  done
+}
+
+wait_for_nodes "$NODES"
 
 echo "==> building holo-workload (release)"
 cargo build -p holo_workload --release

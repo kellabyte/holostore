@@ -26,6 +26,7 @@ include!(concat!(env!("OUT_DIR"), "/volo_gen.rs"));
 mod cluster;
 mod kv;
 mod load;
+mod meta_manager;
 mod range_manager;
 mod rebalance_manager;
 mod redis_server;
@@ -34,11 +35,12 @@ mod transport;
 mod wal;
 
 use cluster::{
-    ClusterState, ClusterStateMachine, ClusterStateStore, MemberInfo, MemberState, ReplicaRole,
-    ShardDesc,
+    ClusterState, ClusterStateMachine, ClusterStateStore, ControllerDomain, ControllerFence,
+    MemberInfo, MemberState, ReplicaRole, ShardDesc,
 };
 use kv::{FjallEngine, KvEngine};
 use load::ShardLoadTracker;
+use meta_manager::MetaManagerConfig;
 use range_manager::RangeManagerConfig;
 use rebalance_manager::RebalanceManagerConfig;
 use rpc_service::RpcService;
@@ -46,8 +48,25 @@ use transport::GrpcTransport;
 
 /// Group id used for the membership/control group.
 const GROUP_MEMBERSHIP: GroupId = 0;
+/// Base group id for additional metadata groups (meta index >= 1).
+const GROUP_META_EXTRA_BASE: GroupId = 10_000;
 /// Base group id for data shards (shard index is added to this base).
 const GROUP_DATA_BASE: GroupId = 1;
+
+fn meta_group_id_for_index(meta_index: usize) -> GroupId {
+    if meta_index == 0 {
+        GROUP_MEMBERSHIP
+    } else {
+        GROUP_META_EXTRA_BASE + meta_index as u64
+    }
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
 
 /// CLI entry point wrapper.
 #[derive(Parser, Debug)]
@@ -105,6 +124,69 @@ struct NodeArgs {
     /// We default to 1 full-keyspace range.
     #[arg(long, env = "HOLO_INITIAL_RANGES", default_value_t = 1)]
     initial_ranges: usize,
+
+    /// Maximum number of metadata consensus groups.
+    ///
+    /// `1` keeps the legacy single meta group. Values >1 allow meta-range
+    /// splitting and routed control-plane proposals across independent groups.
+    #[arg(long, env = "HOLO_META_GROUPS", default_value_t = 1)]
+    meta_groups: usize,
+
+    /// Enable automatic metadata-range splitting.
+    #[arg(long, env = "HOLO_META_SPLIT_ENABLED", default_value_t = true)]
+    meta_split_enabled: bool,
+
+    /// Meta manager evaluation interval (ms).
+    #[arg(long, env = "HOLO_META_MGR_INTERVAL_MS", default_value_t = 1000)]
+    meta_mgr_interval_ms: u64,
+
+    /// Split a metadata range when its sustained routed command QPS exceeds this threshold.
+    #[arg(long, env = "HOLO_META_SPLIT_MIN_QPS", default_value_t = 200)]
+    meta_split_min_qps: u64,
+
+    /// Minimum cumulative command count for a metadata range before splitting.
+    #[arg(long, env = "HOLO_META_SPLIT_MIN_OPS", default_value_t = 500)]
+    meta_split_min_ops: u64,
+
+    /// Require the meta QPS threshold for this many consecutive evaluations.
+    #[arg(long, env = "HOLO_META_SPLIT_QPS_SUSTAIN", default_value_t = 5)]
+    meta_split_qps_sustain: u8,
+
+    /// Per-meta-index cooldown after a split (ms).
+    #[arg(long, env = "HOLO_META_SPLIT_COOLDOWN_MS", default_value_t = 30_000)]
+    meta_split_cooldown_ms: u64,
+
+    /// Enable automatic metadata range balancing/reconfiguration.
+    #[arg(long, env = "HOLO_META_BALANCE_ENABLED", default_value_t = true)]
+    meta_balance_enabled: bool,
+
+    /// Require at least this replica-count skew before moving a meta range replica.
+    #[arg(long, env = "HOLO_META_REPLICA_SKEW_THRESHOLD", default_value_t = 1)]
+    meta_replica_skew_threshold: usize,
+
+    /// Require at least this leaseholder-count skew before moving a meta lease.
+    #[arg(long, env = "HOLO_META_LEASE_SKEW_THRESHOLD", default_value_t = 1)]
+    meta_lease_skew_threshold: usize,
+
+    /// Cooldown between automatic meta balancing actions for the same range (ms).
+    #[arg(long, env = "HOLO_META_BALANCE_COOLDOWN_MS", default_value_t = 10_000)]
+    meta_balance_cooldown_ms: u64,
+
+    /// Warn if a meta move has no progress for longer than this duration (ms).
+    #[arg(long, env = "HOLO_META_MOVE_STUCK_WARN_MS", default_value_t = 30_000)]
+    meta_move_stuck_warn_ms: u64,
+
+    /// Abort stalled pre-cutover meta moves (or force-finalize post-lease moves) after this duration (ms).
+    #[arg(long, env = "HOLO_META_MOVE_TIMEOUT_MS", default_value_t = 180_000)]
+    meta_move_timeout_ms: u64,
+
+    /// Warn when a meta group's executed-prefix lag exceeds this threshold.
+    #[arg(long, env = "HOLO_META_LAG_WARN_OPS", default_value_t = 128)]
+    meta_lag_warn_ops: u64,
+
+    /// Skip meta manager proposals while client inflight ops exceed this threshold.
+    #[arg(long, env = "HOLO_META_MAX_CLIENT_INFLIGHT", default_value_t = 10_000)]
+    meta_max_client_inflight: u64,
 
     /// Range manager evaluation interval (ms).
     #[arg(long, env = "HOLO_RANGE_MGR_INTERVAL_MS", default_value_t = 500)]
@@ -181,6 +263,18 @@ struct NodeArgs {
         default_value_t = 180_000
     )]
     rebalance_move_timeout_ms: u64,
+
+    /// Metadata controller lease TTL (ms) used for split/rebalance managers.
+    #[arg(long, env = "HOLO_CONTROLLER_LEASE_TTL_MS", default_value_t = 5000)]
+    controller_lease_ttl_ms: u64,
+
+    /// Renew the controller lease when remaining TTL falls below this (ms).
+    #[arg(
+        long,
+        env = "HOLO_CONTROLLER_LEASE_RENEW_MARGIN_MS",
+        default_value_t = 1000
+    )]
+    controller_lease_renew_margin_ms: u64,
 
     /// How to map keys to data shards.
     ///
@@ -382,6 +476,7 @@ struct NodeState {
     read_barrier_all_peers: bool,
     proposal_stats: Arc<ProposalStats>,
     proposal_stats_enabled: bool,
+    meta_proposal_stats: Arc<MetaProposalStats>,
     rpc_handler_stats: Arc<RpcHandlerStats>,
     rpc_handler_delay: Duration,
     client_set_tx: mpsc::Sender<BatchSetWork>,
@@ -390,7 +485,10 @@ struct NodeState {
     client_set_batch_target: usize,
     client_inflight_ops: Arc<AtomicU64>,
     cluster_store: ClusterStateStore,
-    meta_handle: accord::Handle,
+    meta_handles: BTreeMap<usize, accord::Handle>,
+    controller_lease_ttl: Duration,
+    controller_lease_renew_margin: Duration,
+    meta_move_stuck_warn: Duration,
     split_lock: Arc<std::sync::RwLock<()>>,
     shard_load: ShardLoadTracker,
     range_stats: Arc<LocalRangeStats>,
@@ -599,6 +697,20 @@ struct ProposalStatsSnapshot {
     set: OpStatsSnapshot,
     batch_get: OpStatsSnapshot,
     batch_set: OpStatsSnapshot,
+}
+
+/// Aggregated control-plane proposal latency stats.
+#[derive(Default)]
+struct MetaProposalStats {
+    total: OpStats,
+    by_index: std::sync::RwLock<BTreeMap<usize, OpStats>>,
+}
+
+/// Snapshot of control-plane proposal stats.
+#[derive(Default, Debug, Clone)]
+struct MetaProposalStatsSnapshot {
+    total: OpStatsSnapshot,
+    by_index: BTreeMap<usize, OpStatsSnapshot>,
 }
 
 /// Server-side RPC handler latency counters.
@@ -923,6 +1035,43 @@ impl ProposalStats {
     }
 }
 
+impl MetaProposalStats {
+    /// Record latency for a routed control-plane proposal.
+    fn record(&self, meta_index: usize, dur_us: u64, ok: bool) {
+        self.total.record(dur_us, ok);
+        let mut by_index = self.by_index.write().unwrap();
+        let entry = by_index.entry(meta_index).or_default();
+        entry.record(dur_us, ok);
+    }
+
+    /// Snapshot and reset all control-plane proposal stats.
+    fn snapshot_and_reset(&self) -> MetaProposalStatsSnapshot {
+        let mut by_index = self.by_index.write().unwrap();
+        let mut out = BTreeMap::new();
+        for (idx, stats) in by_index.iter() {
+            out.insert(*idx, stats.snapshot());
+        }
+        by_index.clear();
+        MetaProposalStatsSnapshot {
+            total: self.total.snapshot(),
+            by_index: out,
+        }
+    }
+
+    /// Snapshot control-plane proposal stats without resetting counters.
+    fn snapshot(&self) -> MetaProposalStatsSnapshot {
+        let by_index = self.by_index.read().unwrap();
+        let mut out = BTreeMap::new();
+        for (idx, stats) in by_index.iter() {
+            out.insert(*idx, stats.peek());
+        }
+        MetaProposalStatsSnapshot {
+            total: self.total.peek(),
+            by_index: out,
+        }
+    }
+}
+
 impl OpStats {
     /// Record a single operation's latency and success/failure.
     fn record(&self, dur_us: u64, ok: bool) {
@@ -942,6 +1091,16 @@ impl OpStats {
             errors: self.errors.swap(0, Ordering::Relaxed),
             total_us: self.total_us.swap(0, Ordering::Relaxed),
             max_us: self.max_us.swap(0, Ordering::Relaxed),
+        }
+    }
+
+    /// Snapshot counters without resetting them.
+    fn peek(&self) -> OpStatsSnapshot {
+        OpStatsSnapshot {
+            count: self.count.load(Ordering::Relaxed),
+            errors: self.errors.load(Ordering::Relaxed),
+            total_us: self.total_us.load(Ordering::Relaxed),
+            max_us: self.max_us.load(Ordering::Relaxed),
         }
     }
 }
@@ -976,22 +1135,230 @@ impl NodeState {
         self.groups.get(&group_id).cloned()
     }
 
+    fn meta_route_for_key(&self, key: &[u8]) -> Option<(usize, accord::Handle)> {
+        let idx = self.cluster_store.meta_range_index_for_key(key);
+        self.meta_handles
+            .get(&idx)
+            .cloned()
+            .map(|h| (idx, h))
+            .or_else(|| self.meta_handles.get(&0).cloned().map(|h| (0, h)))
+    }
+
+    pub(crate) async fn propose_meta_command(
+        &self,
+        cmd: cluster::ClusterCommand,
+    ) -> anyhow::Result<()> {
+        let key = cluster::cluster_command_key(&cmd);
+        let payload = ClusterStateMachine::encode_command(&cmd)?;
+        let explicit_meta_index = self.cluster_store.meta_range_index_for_command(&cmd);
+        let (meta_index, handle) = if let Some(idx) = explicit_meta_index {
+            self.meta_handles
+                .get(&idx)
+                .cloned()
+                .map(|h| (idx, h))
+                .or_else(|| self.meta_handles.get(&0).cloned().map(|h| (0, h)))
+                .ok_or_else(|| anyhow!("meta handle not available for index {idx}"))?
+        } else {
+            self.meta_route_for_key(&key)
+                .ok_or_else(|| anyhow!("meta handle not available for routed key"))?
+        };
+        let start = Instant::now();
+        let res = handle.propose(payload).await;
+        let dur_us = start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        self.meta_proposal_stats
+            .record(meta_index, dur_us, res.is_ok());
+        let _ = res?;
+        Ok(())
+    }
+
+    fn controller_fence_for_domain(&self, domain: ControllerDomain) -> Option<ControllerFence> {
+        let now = unix_time_ms();
+        self.cluster_store.controller_lease(domain).and_then(|lease| {
+            (lease.holder == self.node_id && lease.lease_until_ms > now).then_some(ControllerFence {
+                domain,
+                holder: lease.holder,
+                term: lease.term,
+            })
+        })
+    }
+
+    pub(crate) async fn propose_meta_command_guarded(
+        &self,
+        domain: ControllerDomain,
+        cmd: cluster::ClusterCommand,
+    ) -> anyhow::Result<()> {
+        let fence = self
+            .controller_fence_for_domain(domain)
+            .ok_or_else(|| anyhow!("not current controller leader for {domain:?}"))?;
+        self.propose_meta_command(cluster::ClusterCommand::Guarded {
+            fence,
+            command: Box::new(cmd),
+        })
+        .await
+    }
+
+    pub(crate) fn client_inflight_ops(&self) -> u64 {
+        self.client_inflight_ops.load(Ordering::Relaxed)
+    }
+
+    fn meta_proposal_stats_snapshot(&self) -> MetaProposalStatsSnapshot {
+        self.meta_proposal_stats.snapshot_and_reset()
+    }
+
+    pub(crate) fn meta_proposal_stats_peek(&self) -> MetaProposalStatsSnapshot {
+        self.meta_proposal_stats.snapshot()
+    }
+
+    pub(crate) fn meta_move_stuck_warn_ms(&self) -> u64 {
+        self.meta_move_stuck_warn
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64
+    }
+
+    /// Compute per-meta-index executed-prefix lag across each range's replicas.
+    ///
+    /// Lag is the summed spread (`max-min`) per source node counter.
+    pub(crate) async fn meta_group_lag_by_index(&self) -> BTreeMap<usize, u64> {
+        let snapshot = self.cluster_store.state();
+        let mut lag_by_index = BTreeMap::<usize, u64>::new();
+        for range in snapshot.meta_ranges {
+            let gid = meta_group_id_for_index(range.meta_index);
+            let mut by_source = BTreeMap::<NodeId, (u64, u64)>::new();
+            let mut complete = true;
+            for node in range.replicas {
+                let prefixes = match self.transport.last_executed_prefix(node, gid).await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        complete = false;
+                        break;
+                    }
+                };
+                for p in prefixes {
+                    let entry = by_source.entry(p.node_id).or_insert((p.counter, p.counter));
+                    entry.0 = entry.0.min(p.counter);
+                    entry.1 = entry.1.max(p.counter);
+                }
+            }
+            let range_lag = if complete {
+                by_source
+                    .into_iter()
+                    .fold(0u64, |acc, (_, (min_c, max_c))| acc.saturating_add(max_c.saturating_sub(min_c)))
+            } else {
+                0
+            };
+            let entry = lag_by_index.entry(range.meta_index).or_insert(0);
+            *entry = entry.saturating_add(range_lag);
+        }
+        lag_by_index
+    }
+
+    pub(crate) async fn ensure_controller_leader(&self, domain: ControllerDomain) -> bool {
+        let now = unix_time_ms();
+        let renew_margin = self
+            .controller_lease_renew_margin
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        if self
+            .cluster_store
+            .is_controller_leader(domain, self.node_id, now.saturating_add(renew_margin))
+        {
+            return true;
+        }
+
+        let current = self.cluster_store.controller_lease(domain);
+        let current_holder_active = current
+            .as_ref()
+            .map(|lease| {
+                self.cluster_store
+                    .state()
+                    .members
+                    .get(&lease.holder)
+                    .map(|m| m.state == MemberState::Active)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+
+        // Respect a healthy incumbent while its lease is still valid.
+        // This avoids unnecessary term churn across competing managers.
+        if let Some(cur) = current.as_ref() {
+            if cur.holder != self.node_id
+                && cur.lease_until_ms > now.saturating_add(renew_margin)
+                && current_holder_active
+            {
+                return false;
+            }
+        }
+
+        let term = current
+            .as_ref()
+            .map(|lease| {
+                if lease.holder == self.node_id {
+                    lease.term
+                } else if lease.lease_until_ms > now && current_holder_active {
+                    lease.term
+                } else {
+                    lease.term.saturating_add(1)
+                }
+            })
+            .unwrap_or(1);
+        let ttl_ms = self
+            .controller_lease_ttl
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        let lease_until_ms = now.saturating_add(ttl_ms.max(1));
+
+        if self
+            .propose_meta_command(cluster::ClusterCommand::AcquireControllerLease {
+                domain,
+                node_id: self.node_id,
+                term,
+                lease_until_ms,
+            })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        self.cluster_store
+            .is_controller_leader(domain, self.node_id, unix_time_ms())
+    }
+
     /// Apply control-plane replica membership to runtime Accord data groups.
     fn refresh_group_memberships(&self) -> anyhow::Result<()> {
         let snapshot = self.cluster_store.state();
 
-        // Meta/control group tracks all non-removed nodes.
-        if let Some(meta) = self.group(GROUP_MEMBERSHIP) {
-            let mut members = snapshot
-                .members
-                .values()
-                .filter(|m| m.state != MemberState::Removed)
-                .map(|m| accord::Member { id: m.node_id })
+        // Meta/control groups track metadata-range replica sets.
+        let mut default_members = snapshot
+            .members
+            .values()
+            .filter(|m| m.state != MemberState::Removed)
+            .map(|m| accord::Member { id: m.node_id })
+            .collect::<Vec<_>>();
+        default_members.sort_by_key(|m| m.id);
+        default_members.dedup_by_key(|m| m.id);
+        for meta_range in &snapshot.meta_ranges {
+            let gid = meta_group_id_for_index(meta_range.meta_index);
+            let Some(meta) = self.group(gid) else {
+                continue;
+            };
+            let (members, voters) = meta_membership_sets(&snapshot, meta_range);
+            let members = members
+                .into_iter()
+                .map(|id| accord::Member { id })
                 .collect::<Vec<_>>();
-            members.sort_by_key(|m| m.id);
-            members.dedup_by_key(|m| m.id);
-            if !members.is_empty() {
-                meta.update_members(members)?;
+            if !members.is_empty() && !voters.is_empty() {
+                meta.update_membership(members, voters)?;
+            }
+        }
+
+        // Fallback for very early bootstrap only: if no descriptor owns meta
+        // index 0 yet, keep group 0 aligned with currently known members.
+        let has_meta_index_zero = snapshot.meta_ranges.iter().any(|r| r.meta_index == 0);
+        if !has_meta_index_zero {
+            if let Some(meta) = self.group(GROUP_MEMBERSHIP) {
+                if !default_members.is_empty() {
+                    meta.update_members(default_members)?;
+                }
             }
         }
 
@@ -1439,6 +1806,9 @@ impl NodeState {
             redis_server::KvOp::HoloStats => {
                 anyhow::bail!("HOLOSTATS is handled at the Redis layer")
             }
+            redis_server::KvOp::HoloMetrics => {
+                anyhow::bail!("HOLOMETRICS is handled at the Redis layer")
+            }
             redis_server::KvOp::Ping => Ok(redis_server::KvResult::Pong),
             redis_server::KvOp::Get { key } => {
                 let mut values = self.execute_batch_get(vec![key]).await?;
@@ -1834,6 +2204,35 @@ fn shard_membership_sets(snapshot: &ClusterState, shard: &ShardDesc) -> (Vec<Nod
     voters.sort_unstable();
     voters.dedup();
 
+    (members, voters)
+}
+
+/// Resolve voting members for a metadata range from staged replica-role metadata.
+fn meta_membership_sets(
+    snapshot: &ClusterState,
+    range: &cluster::MetaRangeDesc,
+) -> (Vec<NodeId>, Vec<NodeId>) {
+    let mut members = range.replicas.clone();
+    members.sort_unstable();
+    members.dedup();
+
+    let mut voters = if let Some(roles) = snapshot.meta_replica_roles.get(&range.meta_range_id) {
+        range
+            .replicas
+            .iter()
+            .copied()
+            .filter(|id| {
+                roles.get(id).copied().unwrap_or(ReplicaRole::Voter) != ReplicaRole::Learner
+            })
+            .collect::<Vec<_>>()
+    } else {
+        range.replicas.clone()
+    };
+    if voters.is_empty() {
+        voters = members.clone();
+    }
+    voters.sort_unstable();
+    voters.dedup();
     (members, voters)
 }
 
@@ -3017,24 +3416,28 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         commit_log_batch_wait: Duration::from_micros(args.commit_log_batch_wait_us),
     };
 
-    let meta_wal_dir = match args.wal_engine {
+    let meta_wal_root = match args.wal_engine {
         WalEngine::File => wal_dir.join("meta"),
         WalEngine::RaftEngine => wal_dir.join("meta-raft-engine"),
     };
-    let meta_wal: Arc<dyn accord::CommitLog> = match args.wal_engine {
-        WalEngine::File => Arc::new(wal::FileWal::open_dir(&meta_wal_dir)?),
-        WalEngine::RaftEngine => {
-            #[cfg(feature = "raft-engine")]
-            {
-                Arc::new(wal::RaftEngineWal::open_dir(&meta_wal_dir)?)
+    let open_meta_wal = |meta_index: usize| -> anyhow::Result<Arc<dyn accord::CommitLog>> {
+        let meta_wal_dir = meta_wal_root.join(format!("group-{meta_index}"));
+        let wal: Arc<dyn accord::CommitLog> = match args.wal_engine {
+            WalEngine::File => Arc::new(wal::FileWal::open_dir(&meta_wal_dir)?),
+            WalEngine::RaftEngine => {
+                #[cfg(feature = "raft-engine")]
+                {
+                    Arc::new(wal::RaftEngineWal::open_dir(&meta_wal_dir)?)
+                }
+                #[cfg(not(feature = "raft-engine"))]
+                {
+                    anyhow::bail!(
+                        "raft-engine WAL selected but feature is not enabled (build with --features raft-engine)"
+                    );
+                }
             }
-            #[cfg(not(feature = "raft-engine"))]
-            {
-                anyhow::bail!(
-                    "raft-engine WAL selected but feature is not enabled (build with --features raft-engine)"
-                );
-            }
-        }
+        };
+        Ok(wal)
     };
 
     let cluster_sm = Arc::new(ClusterStateMachine::new(
@@ -3042,17 +3445,26 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         Some(Arc::new(cluster::FjallRangeMigrator::new(keyspace.clone()))),
         data_shards,
     ));
-    let membership_group = Arc::new(accord::Group::new(
-        mk_cfg(GROUP_MEMBERSHIP),
-        transport.clone(),
-        cluster_sm,
-        Some(meta_wal),
-    ));
-
+    let meta_group_count = args.meta_groups.max(1);
+    let mut meta_groups: Vec<(usize, GroupId, Arc<accord::Group>)> =
+        Vec::with_capacity(meta_group_count);
+    let mut meta_handles = BTreeMap::new();
     let mut data_groups: Vec<Arc<accord::Group>> = Vec::with_capacity(data_shards);
     let mut data_handles: Vec<accord::Handle> = Vec::with_capacity(data_shards);
     let mut groups = HashMap::new();
-    groups.insert(GROUP_MEMBERSHIP, membership_group.clone());
+    for meta_index in 0..meta_group_count {
+        let group_id = meta_group_id_for_index(meta_index);
+        let meta_wal = open_meta_wal(meta_index)?;
+        let meta_group = Arc::new(accord::Group::new(
+            mk_cfg(group_id),
+            transport.clone(),
+            cluster_sm.clone(),
+            Some(meta_wal),
+        ));
+        meta_handles.insert(meta_index, meta_group.handle());
+        groups.insert(group_id, meta_group.clone());
+        meta_groups.push((meta_index, group_id, meta_group));
+    }
 
     let split_lock = cluster_store.split_lock();
     let data_group_slots = (0..data_shards)
@@ -3113,11 +3525,13 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         data_groups.push(data_group);
     }
 
-    let _ = membership_group
-        .replay_commits()
-        .await
-        .context("replay meta commit log")?;
-    membership_group.spawn_executor();
+    for (meta_index, group_id, meta_group) in &meta_groups {
+        let _ = meta_group
+            .replay_commits()
+            .await
+            .with_context(|| format!("replay meta commit log (meta_index={meta_index}, group={group_id})"))?;
+        meta_group.spawn_executor();
+    }
 
     if args.accord_stats_interval_ms > 0 {
         // Periodically log Accord executor stats per data group.
@@ -3139,6 +3553,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
     let member_ids = runtime_members.keys().copied().collect::<Vec<_>>();
 
     let client_batch_stats = Arc::new(ClientBatchStats::default());
+    let meta_proposal_stats = Arc::new(MetaProposalStats::default());
     let client_batch_queue = args.client_batch_queue.max(1);
     let (client_set_tx, client_set_rx) = mpsc::channel(client_batch_queue);
     let (client_get_tx, client_get_rx) = mpsc::channel(client_batch_queue);
@@ -3149,7 +3564,6 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         inflight: args.client_batch_inflight.max(1),
     };
 
-    let meta_handle = membership_group.handle();
     let range_stats = Arc::new(LocalRangeStats::new(keyspace.clone(), data_shards));
     let state = Arc::new(NodeState {
         initial_members: cluster_store.members_string(),
@@ -3167,6 +3581,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         read_barrier_all_peers: args.read_barrier_all_peers,
         proposal_stats,
         proposal_stats_enabled,
+        meta_proposal_stats,
         rpc_handler_stats: rpc_handler_stats.clone(),
         rpc_handler_delay: Duration::from_millis(args.rpc_handler_delay_ms),
         client_set_tx,
@@ -3180,7 +3595,12 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         },
         client_inflight_ops: Arc::new(AtomicU64::new(0)),
         cluster_store,
-        meta_handle,
+        meta_handles,
+        controller_lease_ttl: Duration::from_millis(args.controller_lease_ttl_ms.max(1)),
+        controller_lease_renew_margin: Duration::from_millis(
+            args.controller_lease_renew_margin_ms.max(1),
+        ),
+        meta_move_stuck_warn: Duration::from_millis(args.meta_move_stuck_warn_ms.max(1)),
         split_lock: split_lock.clone(),
         shard_load: ShardLoadTracker::new(data_shards),
         range_stats,
@@ -3282,6 +3702,27 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
             enable_balancing: args.rebalance_enabled,
             interval: Duration::from_millis(args.rebalance_interval_ms.max(100)),
             move_timeout: Duration::from_millis(args.rebalance_move_timeout_ms),
+        },
+    );
+
+    meta_manager::spawn(
+        state.clone(),
+        MetaManagerConfig {
+            enable_split: args.meta_split_enabled,
+            enable_balance: args.meta_balance_enabled,
+            interval: Duration::from_millis(args.meta_mgr_interval_ms.max(100)),
+            split_min_qps: args.meta_split_min_qps,
+            split_min_ops: args.meta_split_min_ops,
+            split_qps_sustain: args.meta_split_qps_sustain.max(1),
+            split_cooldown: Duration::from_millis(args.meta_split_cooldown_ms.max(1)),
+            max_meta_groups: args.meta_groups.max(1),
+            replica_skew_threshold: args.meta_replica_skew_threshold.max(1),
+            lease_skew_threshold: args.meta_lease_skew_threshold.max(1),
+            balance_cooldown: Duration::from_millis(args.meta_balance_cooldown_ms.max(1)),
+            move_stuck_warn: Duration::from_millis(args.meta_move_stuck_warn_ms.max(1)),
+            lag_warn_ops: args.meta_lag_warn_ops.max(1),
+            move_timeout: Duration::from_millis(args.meta_move_timeout_ms),
+            max_client_inflight: args.meta_max_client_inflight.max(1),
         },
     );
 
@@ -3445,6 +3886,11 @@ mod tests {
             shard_merges: BTreeMap::new(),
             shard_fences: BTreeMap::new(),
             retired_ranges: BTreeMap::new(),
+            meta_ranges: Vec::new(),
+            meta_replica_roles: BTreeMap::new(),
+            meta_rebalances: BTreeMap::new(),
+            controller_leases: BTreeMap::new(),
+            meta_controller_lease: None,
         }
     }
 

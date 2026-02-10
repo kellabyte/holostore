@@ -1,11 +1,13 @@
 //! Redis protocol server that exposes HoloStore as a RESP-compatible service.
 //!
 //! This module handles client connections, parses commands, batches GET/SET
-//! operations, and returns responses. It also exposes `HOLOSTATS` for metrics.
+//! operations, and returns responses. It also exposes `HOLOSTATS` and
+//! `HOLOMETRICS` for runtime metrics.
 
 use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use holo_accord::accord::DebugStats;
@@ -15,6 +17,7 @@ use redis_protocol::resp2::types::Resp2Frame;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::Framed;
 
+use crate::cluster::ControllerDomain;
 use crate::{wal, NodeState};
 
 /// Default maximum number of SET operations to batch per connection read loop.
@@ -101,6 +104,7 @@ pub enum KvOp {
     Get { key: Vec<u8> },
     Set { key: Vec<u8>, value: Vec<u8> },
     HoloStats,
+    HoloMetrics,
     Ping,
 }
 
@@ -389,6 +393,267 @@ async fn handle_conn(socket: TcpStream, state: Arc<NodeState>) -> anyhow::Result
                     shard_set_ops,
                     shard_get_ops
                 ));
+                let meta_ops = state.cluster_store.meta_ops_total_by_index();
+                let meta_ops_by_index = meta_ops
+                    .iter()
+                    .map(|(idx, v)| format!("{idx}:{v}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let meta_prop = state.meta_proposal_stats_snapshot();
+                let meta_prop_avg_us = if meta_prop.total.count == 0 {
+                    0.0
+                } else {
+                    meta_prop.total.total_us as f64 / meta_prop.total.count as f64
+                };
+                let meta_prop_by_index = meta_prop
+                    .by_index
+                    .iter()
+                    .map(|(idx, snap)| {
+                        let avg_us = if snap.count == 0 {
+                            0.0
+                        } else {
+                            snap.total_us as f64 / snap.count as f64
+                        };
+                        format!(
+                            "{idx}:count={},errors={},avg_us={:.2},max_us={}",
+                            snap.count, snap.errors, avg_us, snap.max_us
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let cluster = state.cluster_store.state();
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+                    .unwrap_or(0);
+                let stuck_threshold_ms = state
+                    .meta_move_stuck_warn
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64;
+                let meta_rebalances_inflight = cluster.meta_rebalances.len();
+                let meta_rebalances_stuck = cluster
+                    .meta_rebalances
+                    .values()
+                    .filter(|mv| {
+                        let last = mv.last_progress_unix_ms.max(mv.started_unix_ms);
+                        last > 0 && now_ms.saturating_sub(last) >= stuck_threshold_ms
+                    })
+                    .count();
+                let format_controller = |domain: ControllerDomain| {
+                    cluster
+                        .controller_leases
+                        .get(&domain)
+                        .map(|lease| {
+                            format!(
+                                "holder:{} term:{} until_ms:{}",
+                                lease.holder, lease.term, lease.lease_until_ms
+                            )
+                        })
+                        .unwrap_or_else(|| "none".to_string())
+                };
+                let meta_controller = format_controller(ControllerDomain::Meta);
+                let range_controller = format_controller(ControllerDomain::Range);
+                let rebalance_controller = format_controller(ControllerDomain::Rebalance);
+                msg.push_str(&format!(
+                    " meta.ranges={} meta.load.ops_by_index={} meta.rebalances.inflight={} meta.rebalances.stuck={} meta.propose.count={} meta.propose.errors={} meta.propose.avg_us={:.2} meta.propose.max_us={} meta.propose.by_index={} meta.controller.meta={} meta.controller.range={} meta.controller.rebalance={}",
+                    cluster.meta_ranges.len(),
+                    meta_ops_by_index,
+                    meta_rebalances_inflight,
+                    meta_rebalances_stuck,
+                    meta_prop.total.count,
+                    meta_prop.total.errors,
+                    meta_prop_avg_us,
+                    meta_prop.total.max_us,
+                    meta_prop_by_index,
+                    meta_controller,
+                    range_controller,
+                    rebalance_controller
+                ));
+                feed_resp(
+                    &mut framed,
+                    BytesFrame::BulkString(bytes::Bytes::from(msg.into_bytes())),
+                )
+                .await?;
+                flush_resp(&mut framed).await?;
+            }
+            KvOp::HoloMetrics => {
+                let cluster = state.cluster_store.state();
+                let meta_ops = state.cluster_store.meta_ops_total_by_index();
+                let meta_prop = state.meta_proposal_stats_peek();
+                let lag_by_index = state.meta_group_lag_by_index().await;
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+                    .unwrap_or(0);
+                let stuck_threshold_ms = state
+                    .meta_move_stuck_warn
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64;
+                let meta_rebalances_inflight = cluster.meta_rebalances.len() as u64;
+                let meta_rebalances_stuck = cluster
+                    .meta_rebalances
+                    .values()
+                    .filter(|mv| {
+                        let last = mv.last_progress_unix_ms.max(mv.started_unix_ms);
+                        last > 0 && now_ms.saturating_sub(last) >= stuck_threshold_ms
+                    })
+                    .count() as u64;
+
+                let mut msg = String::new();
+                msg.push_str("# HELP holo_meta_ranges Number of metadata ranges.\n");
+                msg.push_str("# TYPE holo_meta_ranges gauge\n");
+                msg.push_str(&format!("holo_meta_ranges {}\n", cluster.meta_ranges.len()));
+
+                msg.push_str(
+                    "# HELP holo_meta_rebalances_inflight Number of in-flight metadata replica moves.\n",
+                );
+                msg.push_str("# TYPE holo_meta_rebalances_inflight gauge\n");
+                msg.push_str(&format!(
+                    "holo_meta_rebalances_inflight {}\n",
+                    meta_rebalances_inflight
+                ));
+
+                msg.push_str(
+                    "# HELP holo_meta_rebalances_stuck Number of metadata replica moves considered stuck.\n",
+                );
+                msg.push_str("# TYPE holo_meta_rebalances_stuck gauge\n");
+                msg.push_str(&format!(
+                    "holo_meta_rebalances_stuck {}\n",
+                    meta_rebalances_stuck
+                ));
+
+                msg.push_str(
+                    "# HELP holo_meta_rebalance_stuck_threshold_ms Threshold used to classify stuck metadata rebalances.\n",
+                );
+                msg.push_str("# TYPE holo_meta_rebalance_stuck_threshold_ms gauge\n");
+                msg.push_str(&format!(
+                    "holo_meta_rebalance_stuck_threshold_ms {}\n",
+                    stuck_threshold_ms
+                ));
+
+                msg.push_str("# HELP holo_meta_lag_ops Metadata executed-prefix lag (ops) by meta index.\n");
+                msg.push_str("# TYPE holo_meta_lag_ops gauge\n");
+                for (idx, lag) in lag_by_index {
+                    msg.push_str(&format!(
+                        "holo_meta_lag_ops{{meta_index=\"{}\"}} {}\n",
+                        idx, lag
+                    ));
+                }
+
+                msg.push_str("# HELP holo_meta_ops_total Metadata command apply count by routed meta index.\n");
+                msg.push_str("# TYPE holo_meta_ops_total counter\n");
+                for (idx, count) in meta_ops {
+                    msg.push_str(&format!(
+                        "holo_meta_ops_total{{meta_index=\"{}\"}} {}\n",
+                        idx, count
+                    ));
+                }
+
+                let proposal_total_avg_us = if meta_prop.total.count == 0 {
+                    0.0
+                } else {
+                    meta_prop.total.total_us as f64 / meta_prop.total.count as f64
+                };
+                msg.push_str(
+                    "# HELP holo_meta_proposal_total Total number of metadata proposals.\n",
+                );
+                msg.push_str("# TYPE holo_meta_proposal_total counter\n");
+                msg.push_str(&format!(
+                    "holo_meta_proposal_total{{meta_index=\"all\"}} {}\n",
+                    meta_prop.total.count
+                ));
+                msg.push_str(
+                    "# HELP holo_meta_proposal_errors_total Total number of failed metadata proposals.\n",
+                );
+                msg.push_str("# TYPE holo_meta_proposal_errors_total counter\n");
+                msg.push_str(&format!(
+                    "holo_meta_proposal_errors_total{{meta_index=\"all\"}} {}\n",
+                    meta_prop.total.errors
+                ));
+                msg.push_str("# HELP holo_meta_proposal_avg_us Average metadata proposal latency in microseconds.\n");
+                msg.push_str("# TYPE holo_meta_proposal_avg_us gauge\n");
+                msg.push_str(&format!(
+                    "holo_meta_proposal_avg_us{{meta_index=\"all\"}} {:.2}\n",
+                    proposal_total_avg_us
+                ));
+                msg.push_str("# HELP holo_meta_proposal_max_us Maximum metadata proposal latency in microseconds.\n");
+                msg.push_str("# TYPE holo_meta_proposal_max_us gauge\n");
+                msg.push_str(&format!(
+                    "holo_meta_proposal_max_us{{meta_index=\"all\"}} {}\n",
+                    meta_prop.total.max_us
+                ));
+
+                for (idx, snap) in meta_prop.by_index {
+                    let avg_us = if snap.count == 0 {
+                        0.0
+                    } else {
+                        snap.total_us as f64 / snap.count as f64
+                    };
+                    msg.push_str(&format!(
+                        "holo_meta_proposal_total{{meta_index=\"{}\"}} {}\n",
+                        idx, snap.count
+                    ));
+                    msg.push_str(&format!(
+                        "holo_meta_proposal_errors_total{{meta_index=\"{}\"}} {}\n",
+                        idx, snap.errors
+                    ));
+                    msg.push_str(&format!(
+                        "holo_meta_proposal_avg_us{{meta_index=\"{}\"}} {:.2}\n",
+                        idx, avg_us
+                    ));
+                    msg.push_str(&format!(
+                        "holo_meta_proposal_max_us{{meta_index=\"{}\"}} {}\n",
+                        idx, snap.max_us
+                    ));
+                }
+
+                msg.push_str(
+                    "# HELP holo_controller_lease_holder Controller lease holder node id by domain (0 when absent).\n",
+                );
+                msg.push_str("# TYPE holo_controller_lease_holder gauge\n");
+                msg.push_str(
+                    "# HELP holo_controller_lease_term Controller lease term by domain.\n",
+                );
+                msg.push_str("# TYPE holo_controller_lease_term gauge\n");
+                msg.push_str(
+                    "# HELP holo_controller_lease_until_ms Controller lease expiry epoch in ms by domain.\n",
+                );
+                msg.push_str("# TYPE holo_controller_lease_until_ms gauge\n");
+                for domain in [
+                    ControllerDomain::Meta,
+                    ControllerDomain::Range,
+                    ControllerDomain::Rebalance,
+                ] {
+                    let label = controller_domain_label(domain);
+                    if let Some(lease) = cluster.controller_leases.get(&domain) {
+                        msg.push_str(&format!(
+                            "holo_controller_lease_holder{{domain=\"{}\"}} {}\n",
+                            label, lease.holder
+                        ));
+                        msg.push_str(&format!(
+                            "holo_controller_lease_term{{domain=\"{}\"}} {}\n",
+                            label, lease.term
+                        ));
+                        msg.push_str(&format!(
+                            "holo_controller_lease_until_ms{{domain=\"{}\"}} {}\n",
+                            label, lease.lease_until_ms
+                        ));
+                    } else {
+                        msg.push_str(&format!(
+                            "holo_controller_lease_holder{{domain=\"{}\"}} 0\n",
+                            label
+                        ));
+                        msg.push_str(&format!(
+                            "holo_controller_lease_term{{domain=\"{}\"}} 0\n",
+                            label
+                        ));
+                        msg.push_str(&format!(
+                            "holo_controller_lease_until_ms{{domain=\"{}\"}} 0\n",
+                            label
+                        ));
+                    }
+                }
+
                 feed_resp(
                     &mut framed,
                     BytesFrame::BulkString(bytes::Bytes::from(msg.into_bytes())),
@@ -568,6 +833,10 @@ fn parse_command(frame: BytesFrame) -> anyhow::Result<Option<KvOp>> {
             anyhow::ensure!(parts.len() == 1, "HOLOSTATS expects 0 arguments");
             Ok(Some(KvOp::HoloStats))
         }
+        "HOLOMETRICS" => {
+            anyhow::ensure!(parts.len() == 1, "HOLOMETRICS expects 0 arguments");
+            Ok(Some(KvOp::HoloMetrics))
+        }
         "PING" => {
             anyhow::ensure!(parts.len() == 1, "PING expects 0 arguments");
             Ok(Some(KvOp::Ping))
@@ -607,4 +876,12 @@ fn read_env_usize(name: &str, default: usize) -> usize {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(default)
+}
+
+fn controller_domain_label(domain: ControllerDomain) -> &'static str {
+    match domain {
+        ControllerDomain::Meta => "meta",
+        ControllerDomain::Range => "range",
+        ControllerDomain::Rebalance => "rebalance",
+    }
 }

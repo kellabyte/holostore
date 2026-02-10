@@ -30,6 +30,10 @@ enum Command {
     MergeStatus,
     /// Show per-node range responsibilities and local record counts.
     Topology,
+    /// Show meta-range load/lag/proposal and in-flight move status.
+    MetaStatus,
+    /// Show controller lease holders for each controller domain.
+    ControllerStatus,
     /// Add or update a node in the cluster membership.
     AddNode {
         #[arg(long)]
@@ -43,6 +47,24 @@ enum Command {
     RemoveNode {
         #[arg(long)]
         node_id: u64,
+    },
+    /// Split a metadata range at a hash boundary.
+    ///
+    /// By default, `--target-meta-index 0` selects the first free meta-group slot.
+    SplitMeta {
+        #[arg(long)]
+        split_hash: u64,
+        #[arg(long, default_value_t = 0)]
+        target_meta_index: u64,
+    },
+    /// Request staged metadata-range rebalance (single replica replacement) and/or lease transfer.
+    MetaRebalance {
+        #[arg(long)]
+        meta_range_id: u64,
+        #[arg(long = "replica")]
+        replicas: Vec<u64>,
+        #[arg(long, default_value_t = 0)]
+        leaseholder: u64,
     },
     /// Split the range that owns the provided key.
     Split {
@@ -89,9 +111,17 @@ struct ClusterStateView {
     members: BTreeMap<String, MemberView>,
     shards: Vec<ShardView>,
     #[serde(default)]
+    meta_ranges: Vec<MetaRangeView>,
+    #[serde(default)]
+    meta_rebalances: BTreeMap<String, ReplicaMoveView>,
+    #[serde(default)]
+    controller_leases: BTreeMap<String, ControllerLeaseView>,
+    #[serde(default)]
     shard_rebalances: BTreeMap<String, ReplicaMoveView>,
     #[serde(default)]
     shard_merges: BTreeMap<String, RangeMergeView>,
+    #[serde(default)]
+    meta_health: MetaHealthView,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -113,10 +143,69 @@ struct ShardView {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct MetaRangeView {
+    meta_range_id: u64,
+    meta_index: usize,
+    start_hash: u64,
+    end_hash: u64,
+    replicas: Vec<u64>,
+    leaseholder: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct ReplicaMoveView {
     from_node: u64,
     to_node: u64,
     phase: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ControllerLeaseView {
+    holder: u64,
+    term: u64,
+    lease_until_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct MetaHealthView {
+    #[serde(default)]
+    ops_by_index: BTreeMap<String, u64>,
+    #[serde(default)]
+    lag_by_index: BTreeMap<String, u64>,
+    #[serde(default)]
+    proposal_total: MetaProposalTotalView,
+    #[serde(default)]
+    proposal_by_index: BTreeMap<String, MetaProposalIndexView>,
+    #[serde(default)]
+    rebalances_inflight: u64,
+    #[serde(default)]
+    rebalances_stuck: u64,
+    #[serde(default)]
+    stuck_threshold_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct MetaProposalTotalView {
+    #[serde(default)]
+    count: u64,
+    #[serde(default)]
+    errors: u64,
+    #[serde(default)]
+    avg_us: f64,
+    #[serde(default)]
+    max_us: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct MetaProposalIndexView {
+    #[serde(default)]
+    count: u64,
+    #[serde(default)]
+    errors: u64,
+    #[serde(default)]
+    avg_us: f64,
+    #[serde(default)]
+    max_us: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -347,6 +436,120 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
         }
+        Command::MetaStatus => {
+            let resp = client
+                .cluster_state(rpc::ClusterStateRequest {})
+                .await?
+                .into_inner();
+            let state: ClusterStateView =
+                serde_json::from_str(&resp.json).context("parse cluster state json")?;
+
+            let mut rows = Vec::new();
+            let mut ranges = state.meta_ranges.clone();
+            ranges.sort_by_key(|r| (r.meta_index, r.meta_range_id));
+            for range in ranges {
+                let idx_key = range.meta_index.to_string();
+                let ops = state
+                    .meta_health
+                    .ops_by_index
+                    .get(&idx_key)
+                    .copied()
+                    .unwrap_or(0);
+                let lag = state
+                    .meta_health
+                    .lag_by_index
+                    .get(&idx_key)
+                    .copied()
+                    .unwrap_or(0);
+                let prop = state
+                    .meta_health
+                    .proposal_by_index
+                    .get(&idx_key)
+                    .cloned()
+                    .unwrap_or_default();
+                rows.push(vec![
+                    range.meta_range_id.to_string(),
+                    range.meta_index.to_string(),
+                    format_hash_range(range.start_hash, range.end_hash),
+                    range.leaseholder.to_string(),
+                    join_ids(&range.replicas),
+                    ops.to_string(),
+                    lag.to_string(),
+                    prop.count.to_string(),
+                    prop.errors.to_string(),
+                    format!("{:.1}", prop.avg_us),
+                    prop.max_us.to_string(),
+                    format_meta_move_status(range.meta_range_id, &state.meta_rebalances),
+                ]);
+            }
+            if rows.is_empty() {
+                println!("no meta ranges");
+            } else {
+                print_ascii_table(
+                    &[
+                        "META_RANGE",
+                        "META_INDEX",
+                        "HASH_RANGE",
+                        "LEASEHOLDER",
+                        "REPLICAS",
+                        "OPS",
+                        "LAG",
+                        "PROP_COUNT",
+                        "PROP_ERR",
+                        "PROP_AVG_US",
+                        "PROP_MAX_US",
+                        "MOVE",
+                    ],
+                    &rows,
+                );
+                println!(
+                    "meta totals: inflight_moves={} stuck_moves={} stuck_threshold_ms={} proposal_count={} proposal_errors={} proposal_avg_us={:.1} proposal_max_us={}",
+                    state.meta_health.rebalances_inflight,
+                    state.meta_health.rebalances_stuck,
+                    state.meta_health.stuck_threshold_ms,
+                    state.meta_health.proposal_total.count,
+                    state.meta_health.proposal_total.errors,
+                    state.meta_health.proposal_total.avg_us,
+                    state.meta_health.proposal_total.max_us
+                );
+            }
+        }
+        Command::ControllerStatus => {
+            let resp = client
+                .cluster_state(rpc::ClusterStateRequest {})
+                .await?
+                .into_inner();
+            let state: ClusterStateView =
+                serde_json::from_str(&resp.json).context("parse cluster state json")?;
+            let now_ms = unix_time_ms();
+            let mut rows = Vec::new();
+            let mut domains = state.controller_leases.into_iter().collect::<Vec<_>>();
+            domains.sort_by(|a, b| a.0.cmp(&b.0));
+            for (domain, lease) in domains {
+                let remaining = lease.lease_until_ms.saturating_sub(now_ms);
+                let active = if lease.lease_until_ms > now_ms {
+                    "yes"
+                } else {
+                    "no"
+                };
+                rows.push(vec![
+                    domain,
+                    lease.holder.to_string(),
+                    lease.term.to_string(),
+                    lease.lease_until_ms.to_string(),
+                    remaining.to_string(),
+                    active.to_string(),
+                ]);
+            }
+            if rows.is_empty() {
+                println!("no controller leases");
+            } else {
+                print_ascii_table(
+                    &["DOMAIN", "HOLDER", "TERM", "LEASE_UNTIL_MS", "REMAINING_MS", "ACTIVE"],
+                    &rows,
+                );
+            }
+        }
         Command::AddNode {
             node_id,
             grpc_addr,
@@ -366,6 +569,39 @@ async fn main() -> anyhow::Result<()> {
                 .cluster_remove_node(rpc::ClusterRemoveNodeRequest { node_id })
                 .await?;
             println!("ok (node marked decommissioning)");
+        }
+        Command::SplitMeta {
+            split_hash,
+            target_meta_index,
+        } => {
+            let resp = client
+                .cluster_split_meta_range(rpc::ClusterSplitMetaRangeRequest {
+                    split_hash,
+                    target_meta_index,
+                })
+                .await?
+                .into_inner();
+            println!(
+                "ok left_meta_index={} right_meta_index={}",
+                resp.left_meta_index, resp.right_meta_index
+            );
+        }
+        Command::MetaRebalance {
+            meta_range_id,
+            replicas,
+            leaseholder,
+        } => {
+            if replicas.is_empty() {
+                anyhow::bail!("at least one --replica is required");
+            }
+            client
+                .cluster_meta_rebalance(rpc::ClusterMetaRebalanceRequest {
+                    meta_range_id,
+                    replicas,
+                    leaseholder,
+                })
+                .await?;
+            println!("ok (meta rebalance step accepted)");
         }
         Command::Split { split_key, hex } => {
             let key_bytes = if hex {
@@ -522,6 +758,16 @@ fn format_move_status(
     }
 }
 
+fn format_meta_move_status(
+    meta_range_id: u64,
+    moves_by_range: &BTreeMap<String, ReplicaMoveView>,
+) -> String {
+    let Some(mv) = moves_by_range.get(&meta_range_id.to_string()) else {
+        return String::new();
+    };
+    format!("{}->{}:{}", mv.from_node, mv.to_node, mv.phase)
+}
+
 fn format_merge_status(merge: &RangeMergeView, is_left: bool) -> String {
     let side = if is_left { "left" } else { "right" };
     let mut parts = vec![format!("{side}:{}", merge.phase)];
@@ -576,6 +822,27 @@ fn format_key_bound(key: &[u8], is_start: bool) -> String {
         }
     }
     format!("0x{}", hex_encode(key))
+}
+
+fn format_hash_range(start: u64, end: u64) -> String {
+    if start == 0 && end == u64::MAX {
+        return "all_hashes".to_string();
+    }
+    format!("[{}, {}]", start, end)
+}
+
+fn join_ids(ids: &[u64]) -> String {
+    ids.iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

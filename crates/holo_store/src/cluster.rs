@@ -129,6 +129,54 @@ pub struct ReplicaMove {
     pub last_progress_unix_ms: u64,
 }
 
+/// Metadata range descriptor for sharding control-plane keys.
+///
+/// Hash ranges are inclusive (`start_hash <= h <= end_hash`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetaRangeDesc {
+    pub meta_range_id: u64,
+    pub meta_index: usize,
+    pub start_hash: u64,
+    pub end_hash: u64,
+    pub replicas: Vec<NodeId>,
+    pub leaseholder: NodeId,
+}
+
+/// Controller lease for singleton control loops (split/rebalance).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControllerLease {
+    pub holder: NodeId,
+    pub term: u64,
+    pub lease_until_ms: u64,
+}
+
+/// Fencing token attached to controller-driven commands.
+///
+/// A guarded command is applied only when the referenced controller lease is
+/// still owned by `holder` with matching `term`.
+///
+/// Expiry is evaluated when leadership is acquired/renewed by controllers.
+/// Replicated apply intentionally avoids local wall-clock checks so the state
+/// machine remains deterministic across replicas.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControllerFence {
+    pub domain: ControllerDomain,
+    pub holder: NodeId,
+    pub term: u64,
+}
+
+/// Controller lease domains.
+///
+/// Each domain can be led by a different node at the same time. This avoids
+/// forcing all background control loops through one active orchestrator.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ControllerDomain {
+    Meta,
+    Range,
+    Rebalance,
+}
+
 /// Cluster-wide metadata stored in the meta group.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterState {
@@ -147,11 +195,26 @@ pub struct ClusterState {
     pub shard_fences: BTreeMap<u64, String>,
     #[serde(default)]
     pub retired_ranges: BTreeMap<u64, RetiredRange>,
+    #[serde(default)]
+    pub meta_ranges: Vec<MetaRangeDesc>,
+    #[serde(default)]
+    pub meta_replica_roles: BTreeMap<u64, BTreeMap<NodeId, ReplicaRole>>,
+    #[serde(default)]
+    pub meta_rebalances: BTreeMap<u64, ReplicaMove>,
+    #[serde(default)]
+    pub controller_leases: BTreeMap<ControllerDomain, ControllerLease>,
+    #[serde(default)]
+    pub meta_controller_lease: Option<ControllerLease>,
 }
 
 /// Commands applied to the meta group state machine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClusterCommand {
+    /// Apply the inner command only if the fence still matches.
+    Guarded {
+        fence: ControllerFence,
+        command: Box<ClusterCommand>,
+    },
     AddNode {
         node_id: NodeId,
         grpc_addr: String,
@@ -231,6 +294,40 @@ pub enum ClusterCommand {
         shard_id: u64,
         replicas: Vec<NodeId>,
         leaseholder: NodeId,
+    },
+    SplitMetaRange {
+        split_hash: u64,
+        target_meta_index: usize,
+    },
+    BeginMetaReplicaMove {
+        meta_range_id: u64,
+        from_node: NodeId,
+        to_node: NodeId,
+        target_leaseholder: Option<NodeId>,
+    },
+    AbortMetaReplicaMove {
+        meta_range_id: u64,
+    },
+    PromoteMetaReplicaLearner {
+        meta_range_id: u64,
+    },
+    TransferMetaRangeLease {
+        meta_range_id: u64,
+        leaseholder: NodeId,
+    },
+    FinalizeMetaReplicaMove {
+        meta_range_id: u64,
+    },
+    AcquireControllerLease {
+        domain: ControllerDomain,
+        node_id: NodeId,
+        term: u64,
+        lease_until_ms: u64,
+    },
+    AcquireMetaControllerLease {
+        node_id: NodeId,
+        term: u64,
+        lease_until_ms: u64,
     },
 }
 
@@ -355,6 +452,7 @@ pub struct ClusterStateStore {
     state: Arc<RwLock<ClusterState>>,
     path: PathBuf,
     split_lock: Arc<std::sync::RwLock<()>>,
+    meta_ops: Arc<RwLock<BTreeMap<usize, u64>>>,
 }
 
 impl ClusterStateStore {
@@ -372,6 +470,7 @@ impl ClusterStateStore {
                     state: Arc::new(RwLock::new(state)),
                     path,
                     split_lock: Arc::new(std::sync::RwLock::new(())),
+                    meta_ops: Arc::new(RwLock::new(BTreeMap::new())),
                 });
             }
         }
@@ -388,6 +487,11 @@ impl ClusterStateStore {
             shard_merges: BTreeMap::new(),
             shard_fences: BTreeMap::new(),
             retired_ranges: BTreeMap::new(),
+            meta_ranges: Vec::new(),
+            meta_replica_roles: BTreeMap::new(),
+            meta_rebalances: BTreeMap::new(),
+            controller_leases: BTreeMap::new(),
+            meta_controller_lease: None,
         };
         // Start with a single full-keyspace range (Cockroach-style bootstrap).
         let count = initial_ranges.max(1).min(256);
@@ -418,11 +522,13 @@ impl ClusterStateStore {
             }
         }
         normalize_replica_metadata(&mut state);
+        ensure_meta_ranges_initialized(&mut state);
 
         let store = Self {
             state: Arc::new(RwLock::new(state)),
             path,
             split_lock: Arc::new(std::sync::RwLock::new(())),
+            meta_ops: Arc::new(RwLock::new(BTreeMap::new())),
         };
         store.persist()?;
         Ok(store)
@@ -557,8 +663,73 @@ impl ClusterStateStore {
         self.shard_index_for_hash(hash_key(key))
     }
 
+    pub fn meta_range_index_for_key(&self, key: &[u8]) -> usize {
+        self.meta_range_index_for_hash(hash_key(key))
+    }
+
+    pub fn meta_range_index_for_hash(&self, hash: u64) -> usize {
+        let state = self.state.read().unwrap();
+        for range in &state.meta_ranges {
+            if hash >= range.start_hash && hash <= range.end_hash {
+                return range.meta_index;
+            }
+        }
+        0
+    }
+
+    /// Resolve the owning meta-group index for a control-plane command when
+    /// the command is explicitly bound to a meta range.
+    pub fn meta_range_index_for_command(&self, cmd: &ClusterCommand) -> Option<usize> {
+        let state = self.state.read().unwrap();
+        meta_range_index_for_command_in_state(&state, cmd)
+    }
+
+    pub fn first_free_meta_index(&self, limit: usize) -> Option<usize> {
+        if limit == 0 {
+            return None;
+        }
+        let state = self.state.read().unwrap();
+        let mut used = vec![false; limit];
+        for range in &state.meta_ranges {
+            if range.meta_index < limit {
+                used[range.meta_index] = true;
+            }
+        }
+        used.iter().position(|u| !*u)
+    }
+
+    pub fn controller_lease(&self, domain: ControllerDomain) -> Option<ControllerLease> {
+        self.state
+            .read()
+            .unwrap()
+            .controller_leases
+            .get(&domain)
+            .cloned()
+    }
+
+    pub fn is_controller_leader(
+        &self,
+        domain: ControllerDomain,
+        node_id: NodeId,
+        now_ms: u64,
+    ) -> bool {
+        self.state
+            .read()
+            .unwrap()
+            .controller_leases
+            .get(&domain)
+            .as_ref()
+            .map(|l| l.holder == node_id && l.lease_until_ms > now_ms)
+            .unwrap_or(false)
+    }
+
     pub fn split_lock(&self) -> Arc<std::sync::RwLock<()>> {
         self.split_lock.clone()
+    }
+
+    /// Snapshot of committed meta-plane command counts by meta range index.
+    pub fn meta_ops_total_by_index(&self) -> BTreeMap<usize, u64> {
+        self.meta_ops.read().unwrap().clone()
     }
 
     pub fn first_free_shard_index(&self, limit: usize) -> Option<usize> {
@@ -688,6 +859,120 @@ impl ClusterStateStore {
 
         anyhow::bail!(
             "staged rebalance supports replacing exactly one replica at a time (current={:?}, requested={:?})",
+            current,
+            desired
+        );
+    }
+
+    /// Plan a staged rebalance command for a metadata range.
+    ///
+    /// This mirrors shard rebalance constraints:
+    /// - no-op or lease-only transfer
+    /// - single replica replacement (`from -> to`) with optional target leaseholder
+    pub fn plan_meta_rebalance_command(
+        &self,
+        meta_range_id: u64,
+        replicas: Vec<NodeId>,
+        leaseholder: Option<NodeId>,
+    ) -> anyhow::Result<Option<ClusterCommand>> {
+        let state = self.state.read().unwrap();
+        let range = state
+            .meta_ranges
+            .iter()
+            .find(|r| r.meta_range_id == meta_range_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown meta range id {meta_range_id}"))?;
+
+        if state.meta_rebalances.contains_key(&meta_range_id) {
+            anyhow::bail!("meta range {meta_range_id} already has an in-flight move");
+        }
+
+        let active_members = active_member_ids_from_state(&state);
+        if active_members.is_empty() {
+            anyhow::bail!("no active members available");
+        }
+        let expected_replicas = state.replication_factor.min(active_members.len()).max(1);
+
+        let mut desired = replicas;
+        dedupe_nodes_in_place(&mut desired);
+        if desired.is_empty() {
+            anyhow::bail!("replicas cannot be empty");
+        }
+        if desired.len() != expected_replicas {
+            anyhow::bail!(
+                "invalid replica count for meta range {meta_range_id}: got {}, expected {} (rf={}, active={})",
+                desired.len(),
+                expected_replicas,
+                state.replication_factor,
+                active_members.len()
+            );
+        }
+        for id in &desired {
+            let Some(member) = state.members.get(id) else {
+                anyhow::bail!("replica node {id} does not exist");
+            };
+            if member.state != MemberState::Active {
+                anyhow::bail!("replica node {id} is not Active");
+            }
+        }
+
+        if let Some(target_leaseholder) = leaseholder {
+            if !desired.contains(&target_leaseholder) {
+                anyhow::bail!(
+                    "leaseholder {} must be in requested replicas {:?}",
+                    target_leaseholder,
+                    desired
+                );
+            }
+        }
+
+        let mut current = range.replicas.clone();
+        dedupe_nodes_in_place(&mut current);
+        let added = desired
+            .iter()
+            .copied()
+            .filter(|id| !current.contains(id))
+            .collect::<Vec<_>>();
+        let removed = current
+            .iter()
+            .copied()
+            .filter(|id| !desired.contains(id))
+            .collect::<Vec<_>>();
+
+        if added.is_empty() && removed.is_empty() {
+            if let Some(target_leaseholder) = leaseholder {
+                if target_leaseholder != range.leaseholder {
+                    return Ok(Some(ClusterCommand::TransferMetaRangeLease {
+                        meta_range_id,
+                        leaseholder: target_leaseholder,
+                    }));
+                }
+            }
+            return Ok(None);
+        }
+
+        if added.len() == 1 && removed.len() == 1 && desired.len() == current.len() {
+            let from_node = removed[0];
+            let to_node = added[0];
+            if let Some(target_leaseholder) = leaseholder {
+                if target_leaseholder == from_node {
+                    anyhow::bail!(
+                        "leaseholder {} cannot be source node for move {} -> {}",
+                        target_leaseholder,
+                        from_node,
+                        to_node
+                    );
+                }
+            }
+            return Ok(Some(ClusterCommand::BeginMetaReplicaMove {
+                meta_range_id,
+                from_node,
+                to_node,
+                target_leaseholder: leaseholder,
+            }));
+        }
+
+        anyhow::bail!(
+            "staged meta rebalance supports replacing exactly one replica at a time (current={:?}, requested={:?})",
             current,
             desired
         );
@@ -907,7 +1192,36 @@ impl ClusterStateStore {
     pub fn apply_command(&self, cmd: ClusterCommand) -> anyhow::Result<()> {
         let mut state = self.state.write().unwrap();
         normalize_replica_metadata(&mut state);
+        let routed_meta_index = {
+            let key_hash = hash_key(&cluster_command_key(&cmd));
+            state
+                .meta_ranges
+                .iter()
+                .find(|range| {
+                    key_hash >= range.start_hash && key_hash <= range.end_hash
+                })
+                .map(|range| range.meta_index)
+                .unwrap_or(0)
+        };
+        let mut cmd = cmd;
+        loop {
+            let ClusterCommand::Guarded { fence, command } = cmd else {
+                break;
+            };
+            let Some(current) = state.controller_leases.get(&fence.domain) else {
+                // No active lease for this domain: drop stale guarded command.
+                return Ok(());
+            };
+            if current.holder != fence.holder || current.term != fence.term {
+                // Stale guarded command.
+                return Ok(());
+            }
+            cmd = *command;
+        }
         match cmd {
+            ClusterCommand::Guarded { .. } => {
+                unreachable!("guarded command must be unwrapped before apply")
+            }
             ClusterCommand::AddNode {
                 node_id,
                 grpc_addr,
@@ -1453,9 +1767,330 @@ impl ClusterStateStore {
                 state.shard_rebalances.remove(&shard_id);
                 state.epoch = state.epoch.saturating_add(1);
             }
+            ClusterCommand::SplitMetaRange {
+                split_hash,
+                target_meta_index,
+            } => {
+                if !state.meta_rebalances.is_empty() {
+                    anyhow::bail!("cannot split meta ranges while meta replica moves are in-flight");
+                }
+                let target_in_use = state
+                    .meta_ranges
+                    .iter()
+                    .any(|range| range.meta_index == target_meta_index);
+                if target_in_use {
+                    anyhow::bail!("target meta index {target_meta_index} already in use");
+                }
+                let idx = state
+                    .meta_ranges
+                    .iter()
+                    .position(|range| split_hash >= range.start_hash && split_hash <= range.end_hash)
+                    .ok_or_else(|| anyhow::anyhow!("split hash does not map to any meta range"))?;
+
+                let src = state.meta_ranges[idx].clone();
+                if split_hash == src.start_hash {
+                    anyhow::bail!("split hash must be greater than range start");
+                }
+                if split_hash > src.end_hash {
+                    anyhow::bail!("split hash must be within range end");
+                }
+                let left_end = split_hash.saturating_sub(1);
+                if left_end < src.start_hash {
+                    anyhow::bail!("invalid split boundary");
+                }
+
+                let right = MetaRangeDesc {
+                    meta_range_id: next_meta_range_id(&state.meta_ranges),
+                    meta_index: target_meta_index,
+                    start_hash: split_hash,
+                    end_hash: src.end_hash,
+                    replicas: src.replicas.clone(),
+                    leaseholder: src.leaseholder,
+                };
+                state.meta_ranges[idx].end_hash = left_end;
+                state.meta_ranges.insert(idx + 1, right);
+                let src_roles = state
+                    .meta_replica_roles
+                    .get(&src.meta_range_id)
+                    .cloned()
+                    .unwrap_or_else(|| default_roles_for_replicas(&src.replicas));
+                let right_id = state.meta_ranges[idx + 1].meta_range_id;
+                state
+                    .meta_replica_roles
+                    .insert(src.meta_range_id, src_roles.clone());
+                state.meta_replica_roles.insert(right_id, src_roles);
+                state.epoch = state.epoch.saturating_add(1);
+            }
+            ClusterCommand::BeginMetaReplicaMove {
+                meta_range_id,
+                from_node,
+                to_node,
+                target_leaseholder,
+            } => {
+                if state.meta_rebalances.contains_key(&meta_range_id) {
+                    anyhow::bail!("meta range {meta_range_id} already has an in-flight move");
+                }
+                let idx = state
+                    .meta_ranges
+                    .iter()
+                    .position(|r| r.meta_range_id == meta_range_id)
+                    .ok_or_else(|| anyhow::anyhow!("unknown meta range id {meta_range_id}"))?;
+                let active_members = active_member_ids_from_state(&state);
+                if active_members.is_empty() {
+                    anyhow::bail!("no active members available");
+                }
+                let desired = state.replication_factor.min(active_members.len()).max(1);
+                let now = unix_time_ms();
+                let replicas = state.meta_ranges[idx].replicas.clone();
+                if replicas.len() != desired {
+                    anyhow::bail!(
+                        "meta range {meta_range_id} replica count {} does not match desired {}",
+                        replicas.len(),
+                        desired
+                    );
+                }
+                if from_node == to_node {
+                    anyhow::bail!("from_node and to_node must differ");
+                }
+                if !replicas.contains(&from_node) {
+                    anyhow::bail!("from_node {from_node} is not a replica of meta range {meta_range_id}");
+                }
+                if replicas.contains(&to_node) {
+                    anyhow::bail!("to_node {to_node} is already a replica of meta range {meta_range_id}");
+                }
+                let Some(member) = state.members.get(&to_node) else {
+                    anyhow::bail!("to_node {to_node} does not exist");
+                };
+                if member.state != MemberState::Active {
+                    anyhow::bail!("to_node {to_node} is not Active");
+                }
+                let range = &mut state.meta_ranges[idx];
+                range.replicas.push(to_node);
+                dedupe_nodes_in_place(&mut range.replicas);
+
+                let mut roles = default_roles_for_replicas(&range.replicas);
+                roles.insert(to_node, ReplicaRole::Learner);
+                roles.insert(from_node, ReplicaRole::Outgoing);
+                state.meta_replica_roles.insert(meta_range_id, roles);
+                state.meta_rebalances.insert(
+                    meta_range_id,
+                    ReplicaMove {
+                        from_node,
+                        to_node,
+                        phase: ReplicaMovePhase::LearnerSync,
+                        backfill_done: false,
+                        target_leaseholder,
+                        started_unix_ms: now,
+                        last_progress_unix_ms: now,
+                    },
+                );
+                state.epoch = state.epoch.saturating_add(1);
+            }
+            ClusterCommand::AbortMetaReplicaMove { meta_range_id } => {
+                let Some(existing) = state.meta_rebalances.get(&meta_range_id) else {
+                    return Ok(());
+                };
+                if matches!(existing.phase, ReplicaMovePhase::LeaseTransferred) {
+                    anyhow::bail!(
+                        "cannot abort meta move for range {meta_range_id} after lease transfer"
+                    );
+                }
+                let existing = existing.clone();
+                let idx = state
+                    .meta_ranges
+                    .iter()
+                    .position(|r| r.meta_range_id == meta_range_id)
+                    .ok_or_else(|| anyhow::anyhow!("unknown meta range id {meta_range_id}"))?;
+                let replicas = {
+                    let range = &mut state.meta_ranges[idx];
+                    range.replicas.retain(|id| *id != existing.to_node);
+                    if !range.replicas.contains(&existing.from_node) {
+                        range.replicas.push(existing.from_node);
+                    }
+                    dedupe_nodes_in_place(&mut range.replicas);
+                    if !range.replicas.contains(&range.leaseholder) {
+                        range.leaseholder = range.replicas[0];
+                    }
+                    range.replicas.clone()
+                };
+                state
+                    .meta_replica_roles
+                    .insert(meta_range_id, default_roles_for_replicas(&replicas));
+                state.meta_rebalances.remove(&meta_range_id);
+                state.epoch = state.epoch.saturating_add(1);
+            }
+            ClusterCommand::PromoteMetaReplicaLearner { meta_range_id } => {
+                let (from_node, to_node) = {
+                    let Some(mv) = state.meta_rebalances.get_mut(&meta_range_id) else {
+                        return Ok(());
+                    };
+                    if !matches!(mv.phase, ReplicaMovePhase::LearnerSync) {
+                        return Ok(());
+                    }
+                    mv.phase = ReplicaMovePhase::JointConfig;
+                    mv.last_progress_unix_ms = unix_time_ms();
+                    (mv.from_node, mv.to_node)
+                };
+                let idx = state
+                    .meta_ranges
+                    .iter()
+                    .position(|r| r.meta_range_id == meta_range_id)
+                    .ok_or_else(|| anyhow::anyhow!("unknown meta range id {meta_range_id}"))?;
+                let range = &state.meta_ranges[idx];
+                let mut roles = default_roles_for_replicas(&range.replicas);
+                roles.insert(to_node, ReplicaRole::Voter);
+                roles.insert(from_node, ReplicaRole::Outgoing);
+                state.meta_replica_roles.insert(meta_range_id, roles);
+                state.epoch = state.epoch.saturating_add(1);
+            }
+            ClusterCommand::TransferMetaRangeLease {
+                meta_range_id,
+                leaseholder,
+            } => {
+                let idx = state
+                    .meta_ranges
+                    .iter()
+                    .position(|r| r.meta_range_id == meta_range_id)
+                    .ok_or_else(|| anyhow::anyhow!("unknown meta range id {meta_range_id}"))?;
+                let range = &mut state.meta_ranges[idx];
+                if !range.replicas.contains(&leaseholder) {
+                    anyhow::bail!(
+                        "leaseholder {leaseholder} must be a replica of meta range {meta_range_id}"
+                    );
+                }
+                if range.leaseholder != leaseholder {
+                    range.leaseholder = leaseholder;
+                    if let Some(mv) = state.meta_rebalances.get_mut(&meta_range_id) {
+                        mv.phase = ReplicaMovePhase::LeaseTransferred;
+                        mv.last_progress_unix_ms = unix_time_ms();
+                    }
+                    state.epoch = state.epoch.saturating_add(1);
+                }
+            }
+            ClusterCommand::FinalizeMetaReplicaMove { meta_range_id } => {
+                let Some(mv) = state.meta_rebalances.get(&meta_range_id) else {
+                    return Ok(());
+                };
+                if !matches!(mv.phase, ReplicaMovePhase::LeaseTransferred) {
+                    anyhow::bail!(
+                        "meta range {meta_range_id} move must reach LeaseTransferred before finalize"
+                    );
+                }
+                let mv = mv.clone();
+                let idx = state
+                    .meta_ranges
+                    .iter()
+                    .position(|r| r.meta_range_id == meta_range_id)
+                    .ok_or_else(|| anyhow::anyhow!("unknown meta range id {meta_range_id}"))?;
+                let replicas = {
+                    let range = &mut state.meta_ranges[idx];
+                    range.replicas.retain(|id| *id != mv.from_node);
+                    if !range.replicas.contains(&mv.to_node) {
+                        range.replicas.push(mv.to_node);
+                    }
+                    dedupe_nodes_in_place(&mut range.replicas);
+                    if !range.replicas.contains(&range.leaseholder) {
+                        range.leaseholder = mv.target_leaseholder.unwrap_or(range.replicas[0]);
+                    }
+                    range.replicas.clone()
+                };
+                state
+                    .meta_replica_roles
+                    .insert(meta_range_id, default_roles_for_replicas(&replicas));
+                state.meta_rebalances.remove(&meta_range_id);
+                state.epoch = state.epoch.saturating_add(1);
+            }
+            ClusterCommand::AcquireControllerLease {
+                domain,
+                node_id,
+                term,
+                lease_until_ms,
+            } => {
+                let current = state.controller_leases.get(&domain);
+                let should_take = match current {
+                    None => true,
+                    Some(cur) => {
+                        if term > cur.term {
+                            true
+                        } else if term == cur.term && cur.holder == node_id {
+                            lease_until_ms > cur.lease_until_ms
+                        } else {
+                            false
+                        }
+                    }
+                };
+                if should_take {
+                    let changed = current
+                        .map(|cur| {
+                            cur.holder != node_id || cur.term != term || cur.lease_until_ms != lease_until_ms
+                        })
+                        .unwrap_or(true);
+                    state.controller_leases.insert(
+                        domain,
+                        ControllerLease {
+                            holder: node_id,
+                            term,
+                            lease_until_ms,
+                        },
+                    );
+                    if domain == ControllerDomain::Meta {
+                        state.meta_controller_lease = state.controller_leases.get(&domain).cloned();
+                    }
+                    if changed {
+                        state.epoch = state.epoch.saturating_add(1);
+                    }
+                }
+            }
+            ClusterCommand::AcquireMetaControllerLease {
+                node_id,
+                term,
+                lease_until_ms,
+            } => {
+                let current = state.controller_leases.get(&ControllerDomain::Meta);
+                let should_take = match current {
+                    None => true,
+                    Some(cur) => {
+                        if term > cur.term {
+                            true
+                        } else if term == cur.term && cur.holder == node_id {
+                            lease_until_ms > cur.lease_until_ms
+                        } else {
+                            false
+                        }
+                    }
+                };
+                if should_take {
+                    let changed = current
+                        .map(|cur| {
+                            cur.holder != node_id || cur.term != term || cur.lease_until_ms != lease_until_ms
+                        })
+                        .unwrap_or(true);
+                    state.controller_leases.insert(
+                        ControllerDomain::Meta,
+                        ControllerLease {
+                            holder: node_id,
+                            term,
+                            lease_until_ms,
+                        },
+                    );
+                    state.meta_controller_lease = state
+                        .controller_leases
+                        .get(&ControllerDomain::Meta)
+                        .cloned();
+                    if changed {
+                        state.epoch = state.epoch.saturating_add(1);
+                    }
+                }
+            }
         }
         normalize_replica_metadata(&mut state);
+        ensure_meta_ranges_initialized(&mut state);
         drop(state);
+        {
+            let mut counters = self.meta_ops.write().unwrap();
+            let entry = counters.entry(routed_meta_index).or_insert(0);
+            *entry = entry.saturating_add(1);
+        }
         self.persist()
     }
 
@@ -1594,6 +2229,9 @@ fn normalize_replica_metadata(state: &mut ClusterState) {
             }
         }
     }
+    normalize_meta_ranges(state);
+    normalize_meta_replica_metadata(state);
+    normalize_controller_leases(state);
 }
 
 fn unix_time_ms() -> u64 {
@@ -1611,6 +2249,187 @@ fn dedupe_nodes_in_place(nodes: &mut Vec<NodeId>) {
         }
     }
     *nodes = out;
+}
+
+fn normalize_meta_ranges(state: &mut ClusterState) {
+    ensure_meta_ranges_initialized(state);
+    state
+        .meta_ranges
+        .retain(|range| !range.replicas.is_empty() && range.start_hash <= range.end_hash);
+    state.meta_ranges.sort_by_key(|range| range.start_hash);
+    for range in &mut state.meta_ranges {
+        dedupe_nodes_in_place(&mut range.replicas);
+        if range.replicas.is_empty() {
+            continue;
+        }
+        if !range.replicas.contains(&range.leaseholder) {
+            range.leaseholder = range.replicas[0];
+        }
+    }
+    if state.meta_ranges.is_empty() {
+        ensure_meta_ranges_initialized(state);
+    }
+}
+
+fn normalize_meta_replica_metadata(state: &mut ClusterState) {
+    let mut active_meta = BTreeMap::<u64, Vec<NodeId>>::new();
+    for range in &state.meta_ranges {
+        active_meta.insert(range.meta_range_id, range.replicas.clone());
+    }
+
+    state.meta_rebalances.retain(|meta_range_id, mv| {
+        let Some(replicas) = active_meta.get(meta_range_id) else {
+            return false;
+        };
+        replicas.contains(&mv.from_node) && replicas.contains(&mv.to_node)
+    });
+
+    for range in &mut state.meta_ranges {
+        let roles = state
+            .meta_replica_roles
+            .entry(range.meta_range_id)
+            .or_insert_with(|| default_roles_for_replicas(&range.replicas));
+        roles.retain(|id, _| range.replicas.contains(id));
+        for id in &range.replicas {
+            roles.entry(*id).or_insert(ReplicaRole::Voter);
+        }
+        if let Some(mv) = state.meta_rebalances.get_mut(&range.meta_range_id) {
+            if mv.target_leaseholder == Some(mv.from_node) {
+                mv.target_leaseholder = None;
+            }
+            if let Some(target) = mv.target_leaseholder {
+                if !range.replicas.contains(&target) {
+                    mv.target_leaseholder = None;
+                }
+            }
+            if mv.started_unix_ms == 0 {
+                mv.started_unix_ms = unix_time_ms();
+            }
+            if mv.last_progress_unix_ms == 0 {
+                mv.last_progress_unix_ms = mv.started_unix_ms;
+            }
+        }
+    }
+}
+
+fn normalize_controller_leases(state: &mut ClusterState) {
+    state
+        .controller_leases
+        .retain(|_, lease| lease.lease_until_ms > 0);
+    if state.controller_leases.is_empty() {
+        if let Some(legacy) = state.meta_controller_lease.clone() {
+            state.controller_leases.insert(ControllerDomain::Meta, legacy);
+        }
+    }
+    state.meta_controller_lease = state
+        .controller_leases
+        .get(&ControllerDomain::Meta)
+        .cloned();
+}
+
+fn ensure_meta_ranges_initialized(state: &mut ClusterState) {
+    if !state.meta_ranges.is_empty() {
+        return;
+    }
+    let mut replicas = active_member_ids_from_state(state);
+    if replicas.is_empty() {
+        replicas = state.members.keys().copied().collect();
+    }
+    if replicas.is_empty() {
+        return;
+    }
+    replicas.sort_unstable();
+    let leaseholder = replicas[0];
+    state.meta_ranges.push(MetaRangeDesc {
+        meta_range_id: 1,
+        meta_index: 0,
+        start_hash: 0,
+        end_hash: u64::MAX,
+        replicas,
+        leaseholder,
+    });
+}
+
+fn next_meta_range_id(ranges: &[MetaRangeDesc]) -> u64 {
+    ranges.iter().map(|r| r.meta_range_id).max().unwrap_or(0) + 1
+}
+
+fn meta_range_index_for_command_in_state(
+    state: &ClusterState,
+    cmd: &ClusterCommand,
+) -> Option<usize> {
+    match cmd {
+        ClusterCommand::Guarded { command, .. } => {
+            meta_range_index_for_command_in_state(state, command)
+        }
+        ClusterCommand::BeginMetaReplicaMove { meta_range_id, .. }
+        | ClusterCommand::AbortMetaReplicaMove { meta_range_id }
+        | ClusterCommand::PromoteMetaReplicaLearner { meta_range_id }
+        | ClusterCommand::TransferMetaRangeLease { meta_range_id, .. }
+        | ClusterCommand::FinalizeMetaReplicaMove { meta_range_id } => state
+            .meta_ranges
+            .iter()
+            .find(|r| r.meta_range_id == *meta_range_id)
+            .map(|r| r.meta_index),
+        ClusterCommand::SplitMetaRange { split_hash, .. } => state
+            .meta_ranges
+            .iter()
+            .find(|r| *split_hash >= r.start_hash && *split_hash <= r.end_hash)
+            .map(|r| r.meta_index),
+        _ => None,
+    }
+}
+
+/// Derive a stable routing key for control-plane commands.
+pub fn cluster_command_key(cmd: &ClusterCommand) -> Vec<u8> {
+    match cmd {
+        ClusterCommand::Guarded { command, .. } => cluster_command_key(command),
+        ClusterCommand::AddNode { node_id, .. }
+        | ClusterCommand::RemoveNode { node_id }
+        | ClusterCommand::FinalizeNodeRemoval { node_id } => {
+            format!("member/{node_id:020}").into_bytes()
+        }
+        ClusterCommand::BeginReplicaMove { shard_id, .. }
+        | ClusterCommand::MarkReplicaMoveBackfilled { shard_id }
+        | ClusterCommand::AbortReplicaMove { shard_id }
+        | ClusterCommand::PromoteReplicaLearner { shard_id }
+        | ClusterCommand::TransferShardLease { shard_id, .. }
+        | ClusterCommand::FinalizeReplicaMove { shard_id }
+        | ClusterCommand::SetReplicas { shard_id, .. } => {
+            format!("shard/{shard_id:020}").into_bytes()
+        }
+        ClusterCommand::BeginRangeMerge { left_shard_id, .. }
+        | ClusterCommand::AdvanceRangeMerge { left_shard_id, .. }
+        | ClusterCommand::PauseRangeMerge { left_shard_id, .. }
+        | ClusterCommand::AbortRangeMerge { left_shard_id }
+        | ClusterCommand::CompleteRangeMerge { left_shard_id }
+        | ClusterCommand::MergeRange { left_shard_id } => {
+            format!("merge/{left_shard_id:020}").into_bytes()
+        }
+        ClusterCommand::SetShardFence { shard_id, .. } | ClusterCommand::GcRetiredRange { shard_id } => {
+            format!("range/{shard_id:020}").into_bytes()
+        }
+        ClusterCommand::SplitRange { split_key, .. } => {
+            let mut key = b"split/".to_vec();
+            key.extend_from_slice(split_key);
+            key
+        }
+        ClusterCommand::SplitMetaRange { split_hash, .. } => {
+            format!("meta/split/{split_hash:020}").into_bytes()
+        }
+        ClusterCommand::BeginMetaReplicaMove { meta_range_id, .. }
+        | ClusterCommand::AbortMetaReplicaMove { meta_range_id }
+        | ClusterCommand::PromoteMetaReplicaLearner { meta_range_id }
+        | ClusterCommand::TransferMetaRangeLease { meta_range_id, .. }
+        | ClusterCommand::FinalizeMetaReplicaMove { meta_range_id } => {
+            format!("meta/rebalance/{meta_range_id:020}").into_bytes()
+        }
+        ClusterCommand::AcquireControllerLease { domain, .. } => {
+            format!("meta/controller/{domain:?}").into_bytes()
+        }
+        ClusterCommand::AcquireMetaControllerLease { .. } => b"meta/controller".to_vec(),
+        ClusterCommand::SetFrozen { .. } => b"cluster/frozen".to_vec(),
+    }
 }
 
 #[cfg(test)]
@@ -1633,6 +2452,7 @@ mod tests {
             path: PathBuf::from("/tmp/cluster_state_test.json"),
             state: Arc::new(RwLock::new(state)),
             split_lock: Arc::new(RwLock::new(())),
+            meta_ops: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
 
@@ -1663,6 +2483,18 @@ mod tests {
             shard_merges: BTreeMap::new(),
             shard_fences: BTreeMap::new(),
             retired_ranges: BTreeMap::new(),
+            meta_ranges: vec![MetaRangeDesc {
+                meta_range_id: 1,
+                meta_index: 0,
+                start_hash: 0,
+                end_hash: u64::MAX,
+                replicas: vec![1, 2, 3],
+                leaseholder: 1,
+            }],
+            meta_replica_roles: BTreeMap::new(),
+            meta_rebalances: BTreeMap::new(),
+            controller_leases: BTreeMap::new(),
+            meta_controller_lease: None,
         }
     }
 
@@ -1730,6 +2562,75 @@ mod tests {
             ]),
         );
         state
+    }
+
+    #[test]
+    fn meta_range_index_for_command_routes_meta_rebalance_commands_by_range_id() {
+        let mut state = base_state();
+        state.meta_ranges = vec![
+            MetaRangeDesc {
+                meta_range_id: 1,
+                meta_index: 0,
+                start_hash: 0,
+                end_hash: u64::MAX / 2,
+                replicas: vec![1, 2, 3],
+                leaseholder: 1,
+            },
+            MetaRangeDesc {
+                meta_range_id: 2,
+                meta_index: 1,
+                start_hash: u64::MAX / 2 + 1,
+                end_hash: u64::MAX,
+                replicas: vec![1, 2, 3],
+                leaseholder: 1,
+            },
+        ];
+        let store = test_store(state);
+        let cmd = ClusterCommand::BeginMetaReplicaMove {
+            meta_range_id: 2,
+            from_node: 1,
+            to_node: 4,
+            target_leaseholder: None,
+        };
+        assert_eq!(store.meta_range_index_for_command(&cmd), Some(1));
+        let guarded = ClusterCommand::Guarded {
+            fence: ControllerFence {
+                domain: ControllerDomain::Meta,
+                holder: 1,
+                term: 1,
+            },
+            command: Box::new(cmd),
+        };
+        assert_eq!(store.meta_range_index_for_command(&guarded), Some(1));
+    }
+
+    #[test]
+    fn meta_range_index_for_command_routes_split_by_split_hash_owner() {
+        let mut state = base_state();
+        state.meta_ranges = vec![
+            MetaRangeDesc {
+                meta_range_id: 1,
+                meta_index: 0,
+                start_hash: 0,
+                end_hash: 1_000,
+                replicas: vec![1, 2, 3],
+                leaseholder: 1,
+            },
+            MetaRangeDesc {
+                meta_range_id: 2,
+                meta_index: 1,
+                start_hash: 1_001,
+                end_hash: 2_000,
+                replicas: vec![1, 2, 3],
+                leaseholder: 2,
+            },
+        ];
+        let store = test_store(state);
+        let cmd = ClusterCommand::SplitMetaRange {
+            split_hash: 1_500,
+            target_meta_index: 2,
+        };
+        assert_eq!(store.meta_range_index_for_command(&cmd), Some(1));
     }
 
     #[test]
@@ -1925,6 +2826,98 @@ mod tests {
     }
 
     #[test]
+    fn guarded_command_applies_only_with_matching_lease_term() {
+        let store = test_store(base_state());
+        let now = unix_time_ms();
+        store
+            .apply_command(ClusterCommand::AcquireControllerLease {
+                domain: ControllerDomain::Meta,
+                node_id: 1,
+                term: 1,
+                lease_until_ms: now.saturating_add(60_000),
+            })
+            .expect("acquire lease");
+
+        store
+            .apply_command(ClusterCommand::Guarded {
+                fence: ControllerFence {
+                    domain: ControllerDomain::Meta,
+                    holder: 1,
+                    term: 1,
+                },
+                command: Box::new(ClusterCommand::AddNode {
+                    node_id: 9,
+                    grpc_addr: "127.0.0.1:15059".to_string(),
+                    redis_addr: "127.0.0.1:16387".to_string(),
+                }),
+            })
+            .expect("guarded add-node");
+        assert!(
+            store.state().members.contains_key(&9),
+            "matching lease fence must allow command"
+        );
+
+        let now = unix_time_ms();
+        store
+            .apply_command(ClusterCommand::AcquireControllerLease {
+                domain: ControllerDomain::Meta,
+                node_id: 2,
+                term: 2,
+                lease_until_ms: now.saturating_add(60_000),
+            })
+            .expect("takeover lease");
+
+        let before = store.state().epoch;
+        store
+            .apply_command(ClusterCommand::Guarded {
+                fence: ControllerFence {
+                    domain: ControllerDomain::Meta,
+                    holder: 1,
+                    term: 1,
+                },
+                command: Box::new(ClusterCommand::RemoveNode { node_id: 2 }),
+            })
+            .expect("stale guarded command should no-op");
+        assert_eq!(
+            store.state().epoch,
+            before,
+            "stale fenced command must not mutate metadata"
+        );
+    }
+
+    #[test]
+    fn acquire_controller_lease_rejects_lower_term() {
+        let store = test_store(base_state());
+        let now = unix_time_ms();
+        store
+            .apply_command(ClusterCommand::AcquireControllerLease {
+                domain: ControllerDomain::Meta,
+                node_id: 2,
+                term: 7,
+                lease_until_ms: now.saturating_add(60_000),
+            })
+            .expect("seed lease");
+        let before = store.state();
+
+        store
+            .apply_command(ClusterCommand::AcquireControllerLease {
+                domain: ControllerDomain::Meta,
+                node_id: 1,
+                term: 6,
+                lease_until_ms: now.saturating_add(120_000),
+            })
+            .expect("lower term should no-op");
+        let after = store.state();
+        let lease = after
+            .controller_leases
+            .get(&ControllerDomain::Meta)
+            .expect("lease present");
+        assert_eq!(lease.holder, 2);
+        assert_eq!(lease.term, 7);
+        assert_eq!(after.epoch, before.epoch);
+    }
+
+    #[test]
     fn migrator_moves_all_keys_without_loss() {
         fn temp_dir(name: &str) -> PathBuf {
             let nanos = SystemTime::now()
@@ -2068,16 +3061,47 @@ fn next_shard_id(shards: &[ShardDesc]) -> u64 {
 // groups for new ranges.
 
 impl StateMachine for ClusterStateMachine {
-    fn command_keys(&self, _data: &[u8]) -> anyhow::Result<CommandKeys> {
+    fn command_keys(&self, data: &[u8]) -> anyhow::Result<CommandKeys> {
+        let key = Self::decode_command(data)
+            .map(|cmd| cluster_command_key(&cmd))
+            .unwrap_or_else(|_| b"cluster".to_vec());
         Ok(CommandKeys {
             reads: Vec::new(),
-            writes: vec![b"cluster".to_vec()],
+            writes: vec![key],
         })
     }
 
     fn apply(&self, data: &[u8], _meta: ExecMeta) {
         if let Ok(cmd) = Self::decode_command(data) {
-            let res = match cmd {
+            // Split/Merge need the state-machine migrator path. Unwrap guarded
+            // commands here so guarded split/merge dispatches to the correct
+            // apply_* handler instead of generic apply_command.
+            let mut unwrapped = cmd;
+            loop {
+                match unwrapped {
+                    ClusterCommand::Guarded { fence, command } => {
+                        let is_current = {
+                            let state = self.store.state.read().unwrap();
+                            state
+                                .controller_leases
+                                .get(&fence.domain)
+                                .map(|cur| cur.holder == fence.holder && cur.term == fence.term)
+                                .unwrap_or(false)
+                        };
+                        if !is_current {
+                            // Stale fenced command: no-op.
+                            return;
+                        }
+                        unwrapped = *command;
+                    }
+                    other => {
+                        unwrapped = other;
+                        break;
+                    }
+                }
+            }
+
+            let res = match unwrapped {
                 ClusterCommand::SplitRange {
                     split_key,
                     target_shard_index,
