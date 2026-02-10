@@ -33,6 +33,7 @@ service HoloRpc {
   rpc RangeSnapshotLatest(RangeSnapshotLatestRequest) returns (RangeSnapshotLatestResponse);
   rpc RangeApplyLatest(RangeApplyLatestRequest) returns (RangeApplyLatestResponse);
   rpc ClusterFreeze(ClusterFreezeRequest) returns (ClusterFreezeResponse);
+  rpc ClusterCheckpointControl(ClusterCheckpointControlRequest) returns (ClusterCheckpointControlResponse);
 }
 
 message TxnId {
@@ -391,4 +392,35 @@ message ClusterFreezeRequest {
 
 message ClusterFreezeResponse {
   bool ok = 1;
+}
+
+enum ClusterCheckpointAction {
+  CLUSTER_CHECKPOINT_ACTION_STATUS = 0;
+  CLUSTER_CHECKPOINT_ACTION_PAUSE = 1;
+  CLUSTER_CHECKPOINT_ACTION_RESUME = 2;
+  CLUSTER_CHECKPOINT_ACTION_TRIGGER = 3;
+}
+
+message ClusterCheckpointControlRequest {
+  ClusterCheckpointAction action = 1;
+}
+
+message ClusterCheckpointControlResponse {
+  bool ok = 1;
+  string message = 2;
+  bool paused = 3;
+  uint64 checkpoint_successes = 4;
+  uint64 checkpoint_failures = 5;
+  uint64 checkpoint_manual_triggers = 6;
+  uint64 checkpoint_manual_trigger_failures = 7;
+  uint64 checkpoint_pressure_skips = 8;
+  uint64 checkpoint_manifest_parse_errors = 9;
+  uint64 last_attempt_ms = 10;
+  uint64 last_success_ms = 11;
+  uint64 max_lag_entries = 12;
+  uint64 blocked_groups = 13;
+  string last_run_reason = 14;
+  uint64 last_free_bytes = 15;
+  double last_free_pct = 16;
+  string last_error = 17;
 }

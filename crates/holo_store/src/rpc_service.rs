@@ -890,6 +890,7 @@ impl rpc::HoloRpc for RpcService {
         let state = self.state.cluster_store.state();
         let ops_by_index = self.state.cluster_store.meta_ops_total_by_index();
         let lag_by_index = self.state.meta_group_lag_by_index().await;
+        let recovery = self.state.recovery_checkpoint_snapshot();
         let proposal = self.state.meta_proposal_stats_peek();
         let proposal_total_avg_us = if proposal.total.count == 0 {
             0.0
@@ -943,6 +944,23 @@ impl rpc::HoloRpc for RpcService {
             "rebalances_inflight": state.meta_rebalances.len(),
             "rebalances_stuck": rebalances_stuck,
             "stuck_threshold_ms": stuck_threshold_ms,
+        });
+        root["recovery_health"] = serde_json::json!({
+            "checkpoint_successes": recovery.success_count,
+            "checkpoint_failures": recovery.failure_count,
+            "checkpoint_manual_triggers": recovery.manual_trigger_count,
+            "checkpoint_manual_trigger_failures": recovery.manual_trigger_failure_count,
+            "checkpoint_pressure_skips": recovery.pressure_skip_count,
+            "checkpoint_manifest_parse_errors": recovery.manifest_parse_error_count,
+            "last_attempt_ms": recovery.last_attempt_ms,
+            "last_success_ms": recovery.last_success_ms,
+            "max_lag_entries": recovery.max_lag_entries,
+            "blocked_groups": recovery.blocked_groups,
+            "paused": recovery.paused,
+            "last_run_reason": recovery.last_run_reason,
+            "last_free_bytes": recovery.last_free_bytes,
+            "last_free_pct": recovery.last_free_pct,
+            "last_error": recovery.last_error,
         });
 
         let json = serde_json::to_string_pretty(&root)
@@ -1042,11 +1060,13 @@ impl rpc::HoloRpc for RpcService {
             .await
             .map_err(|e| volo_grpc::Status::internal(format!("meta propose failed: {e}")))?;
 
-        Ok(volo_grpc::Response::new(rpc::ClusterSplitMetaRangeResponse {
-            ok: true,
-            left_meta_index: source.meta_index as u64,
-            right_meta_index: target_meta_index as u64,
-        }))
+        Ok(volo_grpc::Response::new(
+            rpc::ClusterSplitMetaRangeResponse {
+                ok: true,
+                left_meta_index: source.meta_index as u64,
+                right_meta_index: target_meta_index as u64,
+            },
+        ))
     }
 
     async fn cluster_meta_rebalance(
@@ -1071,9 +1091,9 @@ impl rpc::HoloRpc for RpcService {
                 .await
                 .map_err(|e| volo_grpc::Status::internal(format!("meta propose failed: {e}")))?;
         }
-        Ok(volo_grpc::Response::new(rpc::ClusterMetaRebalanceResponse {
-            ok: true,
-        }))
+        Ok(volo_grpc::Response::new(
+            rpc::ClusterMetaRebalanceResponse { ok: true },
+        ))
     }
 
     async fn range_split(
@@ -1387,6 +1407,75 @@ impl rpc::HoloRpc for RpcService {
         Ok(volo_grpc::Response::new(rpc::ClusterFreezeResponse {
             ok: true,
         }))
+    }
+
+    async fn cluster_checkpoint_control(
+        &self,
+        req: volo_grpc::Request<rpc::ClusterCheckpointControlRequest>,
+    ) -> Result<volo_grpc::Response<rpc::ClusterCheckpointControlResponse>, volo_grpc::Status> {
+        let req = req.into_inner();
+        let action =
+            rpc::ClusterCheckpointAction::try_from_i32(req.action.inner()).ok_or_else(|| {
+                volo_grpc::Status::invalid_argument(format!(
+                    "invalid checkpoint action {}",
+                    req.action.inner()
+                ))
+            })?;
+
+        let message = match action.inner() {
+            x if x == rpc::ClusterCheckpointAction::CLUSTER_CHECKPOINT_ACTION_STATUS.inner() => {
+                "checkpoint status".to_string()
+            }
+            x if x == rpc::ClusterCheckpointAction::CLUSTER_CHECKPOINT_ACTION_PAUSE.inner() => {
+                self.state
+                    .recovery_checkpoint_set_paused(true)
+                    .await
+                    .map_err(|e| volo_grpc::Status::failed_precondition(e.to_string()))?;
+                "checkpoint paused".to_string()
+            }
+            x if x == rpc::ClusterCheckpointAction::CLUSTER_CHECKPOINT_ACTION_RESUME.inner() => {
+                self.state
+                    .recovery_checkpoint_set_paused(false)
+                    .await
+                    .map_err(|e| volo_grpc::Status::failed_precondition(e.to_string()))?;
+                "checkpoint resumed".to_string()
+            }
+            x if x == rpc::ClusterCheckpointAction::CLUSTER_CHECKPOINT_ACTION_TRIGGER.inner() => {
+                self.state
+                    .recovery_checkpoint_trigger()
+                    .await
+                    .map_err(|e| volo_grpc::Status::failed_precondition(e.to_string()))?;
+                "checkpoint triggered".to_string()
+            }
+            _ => {
+                return Err(volo_grpc::Status::invalid_argument(
+                    "invalid checkpoint action".to_string(),
+                ));
+            }
+        };
+
+        let snapshot = self.state.recovery_checkpoint_snapshot();
+        Ok(volo_grpc::Response::new(
+            rpc::ClusterCheckpointControlResponse {
+                ok: true,
+                message: message.into(),
+                paused: snapshot.paused,
+                checkpoint_successes: snapshot.success_count,
+                checkpoint_failures: snapshot.failure_count,
+                checkpoint_manual_triggers: snapshot.manual_trigger_count,
+                checkpoint_manual_trigger_failures: snapshot.manual_trigger_failure_count,
+                checkpoint_pressure_skips: snapshot.pressure_skip_count,
+                checkpoint_manifest_parse_errors: snapshot.manifest_parse_error_count,
+                last_attempt_ms: snapshot.last_attempt_ms,
+                last_success_ms: snapshot.last_success_ms,
+                max_lag_entries: snapshot.max_lag_entries,
+                blocked_groups: snapshot.blocked_groups,
+                last_run_reason: snapshot.last_run_reason.into(),
+                last_free_bytes: snapshot.last_free_bytes,
+                last_free_pct: snapshot.last_free_pct,
+                last_error: snapshot.last_error.into(),
+            },
+        ))
     }
 }
 

@@ -469,6 +469,34 @@ async fn handle_conn(socket: TcpStream, state: Arc<NodeState>) -> anyhow::Result
                     range_controller,
                     rebalance_controller
                 ));
+                let recovery = state.recovery_checkpoint_snapshot();
+                let recovery_last_error = if recovery.last_error.is_empty() {
+                    "-".to_string()
+                } else {
+                    recovery.last_error.replace(char::is_whitespace, "_")
+                };
+                msg.push_str(&format!(
+                    " recovery.checkpoint.successes={} recovery.checkpoint.failures={} recovery.checkpoint.manual_triggers={} recovery.checkpoint.manual_trigger_failures={} recovery.checkpoint.pressure_skips={} recovery.checkpoint.manifest_parse_errors={} recovery.checkpoint.paused={} recovery.checkpoint.last_attempt_ms={} recovery.checkpoint.last_success_ms={} recovery.checkpoint.max_lag_entries={} recovery.checkpoint.blocked_groups={} recovery.checkpoint.last_run_reason={} recovery.checkpoint.last_free_bytes={} recovery.checkpoint.last_free_pct={} recovery.checkpoint.last_error={}",
+                    recovery.success_count,
+                    recovery.failure_count,
+                    recovery.manual_trigger_count,
+                    recovery.manual_trigger_failure_count,
+                    recovery.pressure_skip_count,
+                    recovery.manifest_parse_error_count,
+                    recovery.paused,
+                    recovery.last_attempt_ms,
+                    recovery.last_success_ms,
+                    recovery.max_lag_entries,
+                    recovery.blocked_groups,
+                    if recovery.last_run_reason.is_empty() {
+                        "-".to_string()
+                    } else {
+                        recovery.last_run_reason.replace(char::is_whitespace, "_")
+                    },
+                    recovery.last_free_bytes,
+                    format!("{:.2}", recovery.last_free_pct),
+                    recovery_last_error
+                ));
                 feed_resp(
                     &mut framed,
                     BytesFrame::BulkString(bytes::Bytes::from(msg.into_bytes())),
@@ -531,7 +559,9 @@ async fn handle_conn(socket: TcpStream, state: Arc<NodeState>) -> anyhow::Result
                     stuck_threshold_ms
                 ));
 
-                msg.push_str("# HELP holo_meta_lag_ops Metadata executed-prefix lag (ops) by meta index.\n");
+                msg.push_str(
+                    "# HELP holo_meta_lag_ops Metadata executed-prefix lag (ops) by meta index.\n",
+                );
                 msg.push_str("# TYPE holo_meta_lag_ops gauge\n");
                 for (idx, lag) in lag_by_index {
                     msg.push_str(&format!(
@@ -653,6 +683,74 @@ async fn handle_conn(socket: TcpStream, state: Arc<NodeState>) -> anyhow::Result
                         ));
                     }
                 }
+
+                let recovery = state.recovery_checkpoint_snapshot();
+                msg.push_str(
+                    "# HELP holo_recovery_checkpoint_successes_total Successful recovery checkpoints.\n",
+                );
+                msg.push_str("# TYPE holo_recovery_checkpoint_successes_total counter\n");
+                msg.push_str(&format!(
+                    "holo_recovery_checkpoint_successes_total {}\n",
+                    recovery.success_count
+                ));
+                msg.push_str(
+                    "# HELP holo_recovery_checkpoint_failures_total Failed recovery checkpoints.\n",
+                );
+                msg.push_str("# TYPE holo_recovery_checkpoint_failures_total counter\n");
+                msg.push_str(&format!(
+                    "holo_recovery_checkpoint_failures_total {}\n",
+                    recovery.failure_count
+                ));
+                msg.push_str(
+                    "# HELP holo_recovery_checkpoint_manual_triggers_total Manual checkpoint trigger requests.\n",
+                );
+                msg.push_str("# TYPE holo_recovery_checkpoint_manual_triggers_total counter\n");
+                msg.push_str(&format!(
+                    "holo_recovery_checkpoint_manual_triggers_total {}\n",
+                    recovery.manual_trigger_count
+                ));
+                msg.push_str(
+                    "# HELP holo_recovery_checkpoint_pressure_skips_total Checkpoint skips caused by disk pressure.\n",
+                );
+                msg.push_str("# TYPE holo_recovery_checkpoint_pressure_skips_total counter\n");
+                msg.push_str(&format!(
+                    "holo_recovery_checkpoint_pressure_skips_total {}\n",
+                    recovery.pressure_skip_count
+                ));
+                msg.push_str(
+                    "# HELP holo_recovery_checkpoint_manifest_parse_errors_total Recovery manifest parse/checksum errors.\n",
+                );
+                msg.push_str(
+                    "# TYPE holo_recovery_checkpoint_manifest_parse_errors_total counter\n",
+                );
+                msg.push_str(&format!(
+                    "holo_recovery_checkpoint_manifest_parse_errors_total {}\n",
+                    recovery.manifest_parse_error_count
+                ));
+                msg.push_str(
+                    "# HELP holo_recovery_checkpoint_paused Recovery checkpoint manager paused state.\n",
+                );
+                msg.push_str("# TYPE holo_recovery_checkpoint_paused gauge\n");
+                msg.push_str(&format!(
+                    "holo_recovery_checkpoint_paused {}\n",
+                    if recovery.paused { 1 } else { 0 }
+                ));
+                msg.push_str(
+                    "# HELP holo_recovery_checkpoint_last_free_bytes Last sampled free disk bytes for checkpoint path.\n",
+                );
+                msg.push_str("# TYPE holo_recovery_checkpoint_last_free_bytes gauge\n");
+                msg.push_str(&format!(
+                    "holo_recovery_checkpoint_last_free_bytes {}\n",
+                    recovery.last_free_bytes
+                ));
+                msg.push_str(
+                    "# HELP holo_recovery_checkpoint_last_free_pct Last sampled free disk percentage for checkpoint path.\n",
+                );
+                msg.push_str("# TYPE holo_recovery_checkpoint_last_free_pct gauge\n");
+                msg.push_str(&format!(
+                    "holo_recovery_checkpoint_last_free_pct {:.2}\n",
+                    recovery.last_free_pct
+                ));
 
                 feed_resp(
                     &mut framed,

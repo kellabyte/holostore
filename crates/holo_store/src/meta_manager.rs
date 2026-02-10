@@ -12,7 +12,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use holo_accord::accord::{ExecutedPrefix, NodeId};
 
-use crate::cluster::{ClusterCommand, ClusterState, MemberState, MetaRangeDesc, ReplicaMove, ReplicaMovePhase};
+use crate::cluster::{
+    ClusterCommand, ClusterState, MemberState, MetaRangeDesc, ReplicaMove, ReplicaMovePhase,
+};
 use crate::NodeState;
 
 /// Configuration for metadata-range autosplitting and balancing.
@@ -238,7 +240,9 @@ fn plan_meta_split(
     })
 }
 
-async fn plan_inflight_meta_move_step(state: Arc<NodeState>) -> anyhow::Result<Option<ClusterCommand>> {
+async fn plan_inflight_meta_move_step(
+    state: Arc<NodeState>,
+) -> anyhow::Result<Option<ClusterCommand>> {
     let snapshot = state.cluster_store.state();
     for (&meta_range_id, mv) in &snapshot.meta_rebalances {
         let Some(range) = snapshot
@@ -273,7 +277,9 @@ async fn plan_inflight_meta_move_step(state: Arc<NodeState>) -> anyhow::Result<O
                 if !meta_prefixes_converged(state.clone(), &range).await? {
                     continue;
                 }
-                return Ok(Some(ClusterCommand::PromoteMetaReplicaLearner { meta_range_id }));
+                return Ok(Some(ClusterCommand::PromoteMetaReplicaLearner {
+                    meta_range_id,
+                }));
             }
             ReplicaMovePhase::JointConfig => {
                 let target = resolve_target_meta_leaseholder(&range, mv).unwrap_or(mv.to_node);
@@ -283,7 +289,9 @@ async fn plan_inflight_meta_move_step(state: Arc<NodeState>) -> anyhow::Result<O
                 }));
             }
             ReplicaMovePhase::LeaseTransferred => {
-                return Ok(Some(ClusterCommand::FinalizeMetaReplicaMove { meta_range_id }));
+                return Ok(Some(ClusterCommand::FinalizeMetaReplicaMove {
+                    meta_range_id,
+                }));
             }
         }
     }
@@ -391,9 +399,7 @@ async fn plan_meta_balance_step(
         }
     }
 
-    if let Some((donor, receiver)) =
-        skew_pair(&replica_counts, cfg.replica_skew_threshold.max(1))
-    {
+    if let Some((donor, receiver)) = skew_pair(&replica_counts, cfg.replica_skew_threshold.max(1)) {
         for range in &snapshot.meta_ranges {
             if range.leaseholder != state.node_id {
                 continue;
@@ -416,9 +422,11 @@ async fn plan_meta_balance_step(
             } else {
                 None
             };
-            let planned = state
-                .cluster_store
-                .plan_meta_rebalance_command(range.meta_range_id, desired, target_leaseholder)?;
+            let planned = state.cluster_store.plan_meta_rebalance_command(
+                range.meta_range_id,
+                desired,
+                target_leaseholder,
+            )?;
             if let Some(cmd) = planned {
                 cooldown_until.insert(range.meta_range_id, Instant::now() + cfg.balance_cooldown);
                 state.propose_meta_command(cmd).await?;
@@ -471,10 +479,7 @@ async fn maybe_warn_meta_slo(
             continue;
         }
         let idle_ms = now.saturating_sub(last_progress);
-        let threshold_ms = cfg
-            .move_stuck_warn
-            .as_millis()
-            .min(u128::from(u64::MAX)) as u64;
+        let threshold_ms = cfg.move_stuck_warn.as_millis().min(u128::from(u64::MAX)) as u64;
         if idle_ms >= threshold_ms {
             let key = format!("stuck-meta-move-{meta_range_id}");
             if should_warn(last_warn, &key, warn_interval) {
@@ -626,9 +631,9 @@ async fn seed_meta_learner_prefixes_if_needed(
     }
 
     let target_prefixes = state.transport.last_executed_prefix(target, gid).await?;
-    let needs_seed = source_prefixes.iter().any(|src| {
-        prefix_counter(&target_prefixes, src.node_id) < src.counter
-    });
+    let needs_seed = source_prefixes
+        .iter()
+        .any(|src| prefix_counter(&target_prefixes, src.node_id) < src.counter);
     if !needs_seed {
         return Ok(true);
     }
@@ -648,14 +653,22 @@ async fn seed_meta_learner_prefixes_if_needed(
     Ok(true)
 }
 
-fn meta_membership_matches(state: Arc<NodeState>, snapshot: &ClusterState, range: &MetaRangeDesc) -> bool {
+fn meta_membership_matches(
+    state: Arc<NodeState>,
+    snapshot: &ClusterState,
+    range: &MetaRangeDesc,
+) -> bool {
     let gid = crate::meta_group_id_for_index(range.meta_index);
     let Some(group) = state.group(gid) else {
         return false;
     };
     let (members, voters) = crate::meta_membership_sets(snapshot, range);
 
-    let mut current_members = group.members().into_iter().map(|m| m.id).collect::<Vec<_>>();
+    let mut current_members = group
+        .members()
+        .into_iter()
+        .map(|m| m.id)
+        .collect::<Vec<_>>();
     current_members.sort_unstable();
     current_members.dedup();
     let mut current_voters = group.voters();
@@ -665,7 +678,10 @@ fn meta_membership_matches(state: Arc<NodeState>, snapshot: &ClusterState, range
     current_members == members && current_voters == voters
 }
 
-async fn meta_prefixes_converged(state: Arc<NodeState>, range: &MetaRangeDesc) -> anyhow::Result<bool> {
+async fn meta_prefixes_converged(
+    state: Arc<NodeState>,
+    range: &MetaRangeDesc,
+) -> anyhow::Result<bool> {
     let gid = crate::meta_group_id_for_index(range.meta_index);
     let mut snapshots = Vec::new();
     for node in &range.replicas {
@@ -690,7 +706,10 @@ async fn meta_prefixes_converged(state: Arc<NodeState>, range: &MetaRangeDesc) -
     Ok(snapshots.into_iter().all(|s| s == first))
 }
 
-async fn meta_group_prefix_lag(state: Arc<NodeState>, range: &MetaRangeDesc) -> anyhow::Result<u64> {
+async fn meta_group_prefix_lag(
+    state: Arc<NodeState>,
+    range: &MetaRangeDesc,
+) -> anyhow::Result<u64> {
     let gid = crate::meta_group_id_for_index(range.meta_index);
     let mut by_prefix = BTreeMap::<NodeId, (u64, u64)>::new();
     for node in &range.replicas {
@@ -809,7 +828,9 @@ mod tests {
         let cmd = plan_stalled_meta_move_step(&state, 1, Duration::from_secs(30))
             .expect("expected stalled command");
         match cmd {
-            ClusterCommand::FinalizeMetaReplicaMove { meta_range_id } => assert_eq!(meta_range_id, 1),
+            ClusterCommand::FinalizeMetaReplicaMove { meta_range_id } => {
+                assert_eq!(meta_range_id, 1)
+            }
             other => panic!("unexpected command: {other:?}"),
         }
     }

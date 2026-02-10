@@ -104,6 +104,19 @@ enum Command {
         #[arg(long, action = clap::ArgAction::Set, value_parser = clap::value_parser!(bool))]
         frozen: bool,
     },
+    /// Control durability checkpoint runtime (pause/resume/trigger/status).
+    Checkpoint {
+        #[command(subcommand)]
+        action: CheckpointAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum CheckpointAction {
+    Status,
+    Pause,
+    Resume,
+    Trigger,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -122,6 +135,8 @@ struct ClusterStateView {
     shard_merges: BTreeMap<String, RangeMergeView>,
     #[serde(default)]
     meta_health: MetaHealthView,
+    #[serde(default)]
+    recovery_health: RecoveryHealthView,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -206,6 +221,40 @@ struct MetaProposalIndexView {
     avg_us: f64,
     #[serde(default)]
     max_us: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct RecoveryHealthView {
+    #[serde(default)]
+    checkpoint_successes: u64,
+    #[serde(default)]
+    checkpoint_failures: u64,
+    #[serde(default)]
+    checkpoint_manual_triggers: u64,
+    #[serde(default)]
+    checkpoint_manual_trigger_failures: u64,
+    #[serde(default)]
+    checkpoint_pressure_skips: u64,
+    #[serde(default)]
+    checkpoint_manifest_parse_errors: u64,
+    #[serde(default)]
+    last_attempt_ms: u64,
+    #[serde(default)]
+    last_success_ms: u64,
+    #[serde(default)]
+    max_lag_entries: u64,
+    #[serde(default)]
+    blocked_groups: u64,
+    #[serde(default)]
+    paused: bool,
+    #[serde(default)]
+    last_run_reason: String,
+    #[serde(default)]
+    last_free_bytes: u64,
+    #[serde(default)]
+    last_free_pct: f64,
+    #[serde(default)]
+    last_error: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -408,6 +457,7 @@ async fn main() -> anyhow::Result<()> {
                         "-".to_string(),
                         "-".to_string(),
                         "-".to_string(),
+                        String::new(),
                     ]);
                 }
             }
@@ -512,6 +562,32 @@ async fn main() -> anyhow::Result<()> {
                     state.meta_health.proposal_total.avg_us,
                     state.meta_health.proposal_total.max_us
                 );
+                println!(
+                    "recovery checkpoints: success={} failures={} manual_triggers={} manual_failures={} pressure_skips={} manifest_parse_errors={} paused={} blocked_groups={} max_lag_entries={} last_attempt_ms={} last_success_ms={} last_run_reason={} last_free_bytes={} last_free_pct={:.2} last_error={}",
+                    state.recovery_health.checkpoint_successes,
+                    state.recovery_health.checkpoint_failures,
+                    state.recovery_health.checkpoint_manual_triggers,
+                    state.recovery_health.checkpoint_manual_trigger_failures,
+                    state.recovery_health.checkpoint_pressure_skips,
+                    state.recovery_health.checkpoint_manifest_parse_errors,
+                    state.recovery_health.paused,
+                    state.recovery_health.blocked_groups,
+                    state.recovery_health.max_lag_entries,
+                    state.recovery_health.last_attempt_ms,
+                    state.recovery_health.last_success_ms,
+                    if state.recovery_health.last_run_reason.is_empty() {
+                        "-"
+                    } else {
+                        &state.recovery_health.last_run_reason
+                    },
+                    state.recovery_health.last_free_bytes,
+                    state.recovery_health.last_free_pct,
+                    if state.recovery_health.last_error.is_empty() {
+                        "-"
+                    } else {
+                        &state.recovery_health.last_error
+                    }
+                );
             }
         }
         Command::ControllerStatus => {
@@ -545,7 +621,14 @@ async fn main() -> anyhow::Result<()> {
                 println!("no controller leases");
             } else {
                 print_ascii_table(
-                    &["DOMAIN", "HOLDER", "TERM", "LEASE_UNTIL_MS", "REMAINING_MS", "ACTIVE"],
+                    &[
+                        "DOMAIN",
+                        "HOLDER",
+                        "TERM",
+                        "LEASE_UNTIL_MS",
+                        "REMAINING_MS",
+                        "ACTIVE",
+                    ],
                     &rows,
                 );
             }
@@ -683,6 +766,55 @@ async fn main() -> anyhow::Result<()> {
                 .cluster_freeze(rpc::ClusterFreezeRequest { frozen })
                 .await?;
             println!("ok");
+        }
+        Command::Checkpoint { action } => {
+            let rpc_action = match action {
+                CheckpointAction::Status => {
+                    rpc::ClusterCheckpointAction::CLUSTER_CHECKPOINT_ACTION_STATUS
+                }
+                CheckpointAction::Pause => {
+                    rpc::ClusterCheckpointAction::CLUSTER_CHECKPOINT_ACTION_PAUSE
+                }
+                CheckpointAction::Resume => {
+                    rpc::ClusterCheckpointAction::CLUSTER_CHECKPOINT_ACTION_RESUME
+                }
+                CheckpointAction::Trigger => {
+                    rpc::ClusterCheckpointAction::CLUSTER_CHECKPOINT_ACTION_TRIGGER
+                }
+            };
+            let resp = client
+                .cluster_checkpoint_control(rpc::ClusterCheckpointControlRequest {
+                    action: rpc_action,
+                })
+                .await?
+                .into_inner();
+            println!(
+                "ok ({}) paused={} success={} failures={} manual_triggers={} manual_failures={} pressure_skips={} manifest_parse_errors={} blocked_groups={} max_lag_entries={} last_attempt_ms={} last_success_ms={} last_run_reason={} last_free_bytes={} last_free_pct={:.2} last_error={}",
+                resp.message,
+                resp.paused,
+                resp.checkpoint_successes,
+                resp.checkpoint_failures,
+                resp.checkpoint_manual_triggers,
+                resp.checkpoint_manual_trigger_failures,
+                resp.checkpoint_pressure_skips,
+                resp.checkpoint_manifest_parse_errors,
+                resp.blocked_groups,
+                resp.max_lag_entries,
+                resp.last_attempt_ms,
+                resp.last_success_ms,
+                if resp.last_run_reason.is_empty() {
+                    "-"
+                } else {
+                    &resp.last_run_reason
+                },
+                resp.last_free_bytes,
+                resp.last_free_pct,
+                if resp.last_error.is_empty() {
+                    "-"
+                } else {
+                    &resp.last_error
+                }
+            );
         }
     }
 

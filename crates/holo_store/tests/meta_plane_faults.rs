@@ -106,10 +106,18 @@ fn meta_split_recovers_after_leader_crash_during_command() {
     cleanup_dir(&base_dir);
 
     let redis_addrs: Vec<SocketAddr> = (0..3)
-        .map(|_| format!("127.0.0.1:{}", pick_free_port().unwrap()).parse().unwrap())
+        .map(|_| {
+            format!("127.0.0.1:{}", pick_free_port().unwrap())
+                .parse()
+                .unwrap()
+        })
         .collect();
     let grpc_addrs: Vec<SocketAddr> = (0..3)
-        .map(|_| format!("127.0.0.1:{}", pick_free_port().unwrap()).parse().unwrap())
+        .map(|_| {
+            format!("127.0.0.1:{}", pick_free_port().unwrap())
+                .parse()
+                .unwrap()
+        })
         .collect();
     let members = format!(
         "1@{},2@{},3@{}",
@@ -235,12 +243,23 @@ fn meta_rebalance_recovers_from_restart_during_lease_transfer() {
     cleanup_dir(&base_dir);
 
     let redis_addrs: Vec<SocketAddr> = (0..4)
-        .map(|_| format!("127.0.0.1:{}", pick_free_port().unwrap()).parse().unwrap())
+        .map(|_| {
+            format!("127.0.0.1:{}", pick_free_port().unwrap())
+                .parse()
+                .unwrap()
+        })
         .collect();
     let grpc_addrs: Vec<SocketAddr> = (0..4)
-        .map(|_| format!("127.0.0.1:{}", pick_free_port().unwrap()).parse().unwrap())
+        .map(|_| {
+            format!("127.0.0.1:{}", pick_free_port().unwrap())
+                .parse()
+                .unwrap()
+        })
         .collect();
-    let members_bootstrap = format!("1@{},2@{},3@{}", grpc_addrs[0], grpc_addrs[1], grpc_addrs[2]);
+    let members_bootstrap = format!(
+        "1@{},2@{},3@{}",
+        grpc_addrs[0], grpc_addrs[1], grpc_addrs[2]
+    );
     let members_with_4 = format!(
         "1@{},2@{},3@{},4@{}",
         grpc_addrs[0], grpc_addrs[1], grpc_addrs[2], grpc_addrs[3]
@@ -316,10 +335,7 @@ fn meta_rebalance_recovers_from_restart_during_lease_transfer() {
     );
     wait_for_port(grpc_addrs[3], LEASE_TRANSFER_TIMEOUT);
     wait_for_port(redis_addrs[3], LEASE_TRANSFER_TIMEOUT);
-    assert!(wait_for_redis_ready(
-        redis_addrs[3],
-        LEASE_TRANSFER_TIMEOUT
-    ));
+    assert!(wait_for_redis_ready(redis_addrs[3], LEASE_TRANSFER_TIMEOUT));
 
     // Move meta range 1 from node3 -> node4 and transfer lease to node2.
     run_holoctl(
@@ -363,11 +379,7 @@ fn meta_rebalance_recovers_from_restart_during_lease_transfer() {
         };
         let mut replicas = range["replicas"]
             .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_u64())
-                    .collect::<Vec<_>>()
-            })
+            .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect::<Vec<_>>())
             .unwrap_or_default();
         replicas.sort_unstable();
         replicas == vec![1, 2, 4] && range["leaseholder"].as_u64() == Some(2)
@@ -388,14 +400,14 @@ fn meta_rebalance_recovers_from_restart_during_lease_transfer() {
     );
     wait_for_port(grpc_addrs[1], LEASE_TRANSFER_TIMEOUT);
     wait_for_port(redis_addrs[1], LEASE_TRANSFER_TIMEOUT);
-    assert!(wait_for_redis_ready(
-        redis_addrs[1],
-        LEASE_TRANSFER_TIMEOUT
-    ));
+    assert!(wait_for_redis_ready(redis_addrs[1], LEASE_TRANSFER_TIMEOUT));
 
     wait_for_condition(LEASE_TRANSFER_TIMEOUT, || {
         let s = read_state(grpc_addrs[0]);
-        let done = s["meta_rebalances"].as_object().map(|m| m.is_empty()).unwrap_or(false);
+        let done = s["meta_rebalances"]
+            .as_object()
+            .map(|m| m.is_empty())
+            .unwrap_or(false);
         if !done {
             return false;
         }
@@ -407,11 +419,7 @@ fn meta_rebalance_recovers_from_restart_during_lease_transfer() {
         };
         let mut replicas = range["replicas"]
             .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_u64())
-                    .collect::<Vec<_>>()
-            })
+            .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect::<Vec<_>>())
             .unwrap_or_default();
         replicas.sort_unstable();
         replicas == vec![1, 2, 4] && range["leaseholder"].as_u64() == Some(2)
@@ -427,10 +435,18 @@ fn meta_plane_partition_heal_across_meta_groups() {
     cleanup_dir(&base_dir);
 
     let redis_addrs: Vec<SocketAddr> = (0..3)
-        .map(|_| format!("127.0.0.1:{}", pick_free_port().unwrap()).parse().unwrap())
+        .map(|_| {
+            format!("127.0.0.1:{}", pick_free_port().unwrap())
+                .parse()
+                .unwrap()
+        })
         .collect();
     let grpc_addrs: Vec<SocketAddr> = (0..3)
-        .map(|_| format!("127.0.0.1:{}", pick_free_port().unwrap()).parse().unwrap())
+        .map(|_| {
+            format!("127.0.0.1:{}", pick_free_port().unwrap())
+                .parse()
+                .unwrap()
+        })
         .collect();
     let members = format!(
         "1@{},2@{},3@{}",
@@ -541,7 +557,11 @@ fn meta_plane_partition_heal_across_meta_groups() {
         let healed = read_state(grpc_addrs[1]);
         leader["epoch"] == healed["epoch"]
             && healed["members"]["4"]["state"].as_str() == Some("Active")
-            && healed["meta_ranges"].as_array().map(|v| v.len()).unwrap_or(0) >= 3
+            && healed["meta_ranges"]
+                .as_array()
+                .map(|v| v.len())
+                .unwrap_or(0)
+                >= 3
     });
 
     let _ = (&mut node1, &mut node2, &mut node3);

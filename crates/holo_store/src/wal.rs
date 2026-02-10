@@ -3,9 +3,9 @@
 //! This module provides a file-backed `CommitLog` implementation that batches
 //! writes, optionally fsyncs, and supports compaction based on executed txns.
 
-#[cfg(feature = "raft-engine")]
-use std::collections::HashMap;
 use std::collections::HashSet;
+#[cfg(feature = "raft-engine")]
+use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -21,7 +21,7 @@ use anyhow::Context;
 use crc32fast::Hasher;
 #[cfg(feature = "raft-engine")]
 use holo_accord::accord::{txn_group_id, GroupId};
-use holo_accord::accord::{CommitLog, CommitLogEntry, TxnId};
+use holo_accord::accord::{CommitLog, CommitLogCheckpointStatus, CommitLogEntry, TxnId};
 
 #[cfg(feature = "raft-engine")]
 use raft_engine::{Config as RaftConfig, Engine as RaftEngine, LogBatch};
@@ -295,6 +295,10 @@ const WAL_META_GROUPS_KEY: &[u8] = b"meta/groups";
 #[cfg(feature = "raft-engine")]
 const WAL_META_LAST_INDEX_KEY: &[u8] = b"meta/last_index";
 #[cfg(feature = "raft-engine")]
+const WAL_META_COMPACTED_FLOOR_KEY: &[u8] = b"meta/compacted_floor";
+#[cfg(feature = "raft-engine")]
+const WAL_META_DURABLE_FLOOR_KEY: &[u8] = b"meta/durable_floor";
+#[cfg(feature = "raft-engine")]
 const WAL_ENTRY_PREFIX: u8 = b'e';
 
 #[cfg(feature = "raft-engine")]
@@ -302,8 +306,19 @@ const WAL_ENTRY_PREFIX: u8 = b'e';
 struct RaftWalState {
     last_index: HashMap<GroupId, u64>,
     groups: HashSet<GroupId>,
-    txn_index: HashMap<TxnId, u64>,
-    executed: HashSet<TxnId>,
+    txn_index: HashMap<TxnId, (GroupId, u64)>,
+    txn_by_index: HashMap<GroupId, HashMap<u64, TxnId>>,
+    // Highest contiguous executed log index by group.
+    executed_floor: HashMap<GroupId, u64>,
+    // Executed indices that are above the contiguous floor and waiting for gaps.
+    executed_pending: HashMap<GroupId, BTreeSet<u64>>,
+    // Highest log index durably compacted away by group.
+    compacted_floor: HashMap<GroupId, u64>,
+    // Highest log index known durable in KV/meta storage checkpoints.
+    durable_floor: HashMap<GroupId, u64>,
+    checkpoint_count: u64,
+    checkpoint_error_count: u64,
+    checkpoint_last_us: u64,
     pending_count: u64,
     last_persist_us: u64,
 }
@@ -315,7 +330,14 @@ impl RaftWalState {
             last_index: HashMap::new(),
             groups: HashSet::new(),
             txn_index: HashMap::new(),
-            executed: HashSet::new(),
+            txn_by_index: HashMap::new(),
+            executed_floor: HashMap::new(),
+            executed_pending: HashMap::new(),
+            compacted_floor: HashMap::new(),
+            durable_floor: HashMap::new(),
+            checkpoint_count: 0,
+            checkpoint_error_count: 0,
+            checkpoint_last_us: 0,
             pending_count: 0,
             last_persist_us: epoch_micros(),
         }
@@ -356,6 +378,12 @@ impl RaftEngineWal {
                 state.groups.insert(group_id);
                 if let Some(last) = read_last_index(&engine, group_id)? {
                     state.last_index.insert(group_id, last);
+                }
+                if let Some(floor) = read_compacted_floor(&engine, group_id)? {
+                    state.compacted_floor.insert(group_id, floor);
+                }
+                if let Some(floor) = read_durable_floor(&engine, group_id)? {
+                    state.durable_floor.insert(group_id, floor);
                 }
             }
         }
@@ -424,6 +452,12 @@ impl CommitLog for RaftEngineWal {
             if state.groups.insert(group_id) {
                 new_groups.push(group_id);
             }
+            state.compacted_floor.entry(group_id).or_insert(0);
+            let compacted_floor = state.compacted_floor.get(&group_id).copied().unwrap_or(0);
+            state
+                .durable_floor
+                .entry(group_id)
+                .or_insert(compacted_floor);
             assigned.push((group_id, next_index, entry));
         }
 
@@ -465,8 +499,13 @@ impl CommitLog for RaftEngineWal {
             return Err(err).context("raft wal write batch");
         }
 
-        for (_, index, entry) in assigned {
-            state.txn_index.insert(entry.txn_id, index);
+        for (group_id, index, entry) in assigned {
+            state.txn_index.insert(entry.txn_id, (group_id, index));
+            state
+                .txn_by_index
+                .entry(group_id)
+                .or_default()
+                .insert(index, entry.txn_id);
         }
         state.pending_count = pending_count;
         state.last_persist_us = last_persist_us;
@@ -475,7 +514,24 @@ impl CommitLog for RaftEngineWal {
 
     fn mark_executed(&self, txn_id: TxnId) -> anyhow::Result<()> {
         let mut state = self.state.lock().expect("raft wal state lock");
-        state.executed.insert(txn_id);
+        let Some((group_id, index)) = state.txn_index.get(&txn_id).copied() else {
+            return Ok(());
+        };
+        let base_floor = state.compacted_floor.get(&group_id).copied().unwrap_or(0);
+        let mut floor = state
+            .executed_floor
+            .get(&group_id)
+            .copied()
+            .unwrap_or(base_floor);
+        if index <= floor {
+            return Ok(());
+        }
+        let pending = state.executed_pending.entry(group_id).or_default();
+        pending.insert(index);
+        while pending.remove(&floor.saturating_add(1)) {
+            floor = floor.saturating_add(1);
+        }
+        state.executed_floor.insert(group_id, floor);
         Ok(())
     }
 
@@ -489,6 +545,11 @@ impl CommitLog for RaftEngineWal {
             }
         }
 
+        state.txn_index.clear();
+        state.txn_by_index.clear();
+        state.executed_floor.clear();
+        state.executed_pending.clear();
+
         let mut entries = Vec::new();
         let groups: Vec<GroupId> = state.groups.iter().copied().collect();
         for group_id in groups {
@@ -500,18 +561,48 @@ impl CommitLog for RaftEngineWal {
                     last
                 }
             };
+            let compacted_floor = match state.compacted_floor.get(&group_id).copied() {
+                Some(floor) => floor.min(last_index),
+                None => {
+                    let floor = read_compacted_floor(&self.engine, group_id)?
+                        .unwrap_or(0)
+                        .min(last_index);
+                    state.compacted_floor.insert(group_id, floor);
+                    floor
+                }
+            };
+            let durable_floor = match state.durable_floor.get(&group_id).copied() {
+                Some(floor) => floor.min(last_index),
+                None => {
+                    let floor = read_durable_floor(&self.engine, group_id)?
+                        .unwrap_or(compacted_floor)
+                        .max(compacted_floor)
+                        .min(last_index);
+                    state.durable_floor.insert(group_id, floor);
+                    floor
+                }
+            };
             if last_index == 0 {
                 continue;
             }
-            for index in 1..=last_index {
+            for index in compacted_floor.saturating_add(1)..=last_index {
                 let key = entry_key(index);
                 let Some(payload) = self.engine.get(group_id, &key) else {
                     continue;
                 };
                 let entry = decode_entry(&payload)?;
-                state.txn_index.insert(entry.txn_id, index);
+                state.txn_index.insert(entry.txn_id, (group_id, index));
+                state
+                    .txn_by_index
+                    .entry(group_id)
+                    .or_default()
+                    .insert(index, entry.txn_id);
                 entries.push(entry);
             }
+            state.executed_floor.insert(group_id, compacted_floor);
+            state
+                .durable_floor
+                .insert(group_id, durable_floor.max(compacted_floor));
         }
         Ok(entries)
     }
@@ -522,39 +613,179 @@ impl CommitLog for RaftEngineWal {
         }
 
         let mut state = self.state.lock().expect("raft wal state lock");
-        if state.executed.is_empty() {
-            return Ok(0);
-        }
+        let mut groups: Vec<GroupId> = state.groups.iter().copied().collect();
+        groups.sort_unstable();
 
-        let mut candidates = Vec::new();
-        for txn_id in &state.executed {
-            if let Some(index) = state.txn_index.get(txn_id).copied() {
-                candidates.push((index, *txn_id));
+        let mut removed = 0usize;
+        let mut compacted_updates = HashMap::<GroupId, u64>::new();
+        let mut progress = true;
+        while removed < max_delete && progress {
+            progress = false;
+            for group_id in &groups {
+                if removed >= max_delete {
+                    break;
+                }
+                let current_floor = compacted_updates
+                    .get(group_id)
+                    .copied()
+                    .unwrap_or_else(|| state.compacted_floor.get(group_id).copied().unwrap_or(0));
+                let executed_floor = state
+                    .executed_floor
+                    .get(group_id)
+                    .copied()
+                    .unwrap_or(current_floor);
+                let durable_floor = state
+                    .durable_floor
+                    .get(group_id)
+                    .copied()
+                    .unwrap_or(current_floor);
+                let gc_floor = executed_floor.min(durable_floor);
+                if gc_floor <= current_floor {
+                    continue;
+                }
+                compacted_updates.insert(*group_id, current_floor.saturating_add(1));
+                removed += 1;
+                progress = true;
             }
         }
-        candidates.sort_by_key(|(index, _)| *index);
-        let to_remove: Vec<(u64, TxnId)> = candidates.into_iter().take(max_delete).collect();
-        if to_remove.is_empty() {
+
+        if compacted_updates.is_empty() {
             return Ok(0);
         }
 
-        let mut batch = LogBatch::with_capacity(to_remove.len());
-        for (index, txn_id) in &to_remove {
-            let group_id = txn_group_id(*txn_id);
-            let key = entry_key(*index);
-            batch.delete(group_id, key.to_vec());
+        let mut batch =
+            LogBatch::with_capacity((removed * 2).saturating_add(compacted_updates.len()));
+        for (group_id, new_floor) in &compacted_updates {
+            let old_floor = state.compacted_floor.get(group_id).copied().unwrap_or(0);
+            for index in old_floor.saturating_add(1)..=*new_floor {
+                let key = entry_key(index);
+                batch.delete(*group_id, key.to_vec());
+            }
+            batch
+                .put(
+                    *group_id,
+                    WAL_META_COMPACTED_FLOOR_KEY.to_vec(),
+                    new_floor.to_be_bytes().to_vec(),
+                )
+                .context("raft wal batch put compacted floor")?;
         }
 
         self.engine
             .write(&mut batch, false)
             .context("raft wal compact write")?;
 
-        for (_, txn_id) in &to_remove {
-            state.executed.remove(txn_id);
-            state.txn_index.remove(txn_id);
+        for (group_id, new_floor) in &compacted_updates {
+            let old_floor = state.compacted_floor.get(group_id).copied().unwrap_or(0);
+            let mut removed_txns = Vec::new();
+            if let Some(by_index) = state.txn_by_index.get_mut(group_id) {
+                for index in old_floor.saturating_add(1)..=*new_floor {
+                    if let Some(txn_id) = by_index.remove(&index) {
+                        removed_txns.push(txn_id);
+                    }
+                }
+            }
+            for txn_id in removed_txns {
+                state.txn_index.remove(&txn_id);
+            }
+            if let Some(pending) = state.executed_pending.get_mut(group_id) {
+                for index in old_floor.saturating_add(1)..=*new_floor {
+                    pending.remove(&index);
+                }
+            }
+            state.compacted_floor.insert(*group_id, *new_floor);
+            let durable = state.durable_floor.entry(*group_id).or_insert(*new_floor);
+            if *durable < *new_floor {
+                *durable = *new_floor;
+            }
+            let executed = state.executed_floor.entry(*group_id).or_insert(*new_floor);
+            if *executed < *new_floor {
+                *executed = *new_floor;
+            }
         }
 
-        Ok(to_remove.len())
+        Ok(removed)
+    }
+
+    fn mark_durable_checkpoint(&self) -> anyhow::Result<()> {
+        let mut state = self.state.lock().expect("raft wal state lock");
+        if state.groups.is_empty() {
+            if let Some(buf) = self.engine.get(WAL_META_REGION_ID, WAL_META_GROUPS_KEY) {
+                for group_id in decode_groups(&buf)? {
+                    state.groups.insert(group_id);
+                }
+            }
+        }
+
+        let mut groups: Vec<GroupId> = state.groups.iter().copied().collect();
+        groups.sort_unstable();
+        if groups.is_empty() {
+            state.checkpoint_last_us = epoch_micros();
+            state.checkpoint_count = state.checkpoint_count.saturating_add(1);
+            return Ok(());
+        }
+
+        let mut updates = Vec::<(GroupId, u64)>::new();
+        for group_id in groups {
+            let compacted = state.compacted_floor.get(&group_id).copied().unwrap_or(0);
+            let executed = state
+                .executed_floor
+                .get(&group_id)
+                .copied()
+                .unwrap_or(compacted);
+            let durable = executed.max(compacted);
+            updates.push((group_id, durable));
+        }
+
+        let mut batch = LogBatch::with_capacity(updates.len());
+        for (group_id, floor) in &updates {
+            batch
+                .put(
+                    *group_id,
+                    WAL_META_DURABLE_FLOOR_KEY.to_vec(),
+                    floor.to_be_bytes().to_vec(),
+                )
+                .context("raft wal batch put durable floor")?;
+        }
+
+        if let Err(err) = self.engine.write(&mut batch, false) {
+            state.checkpoint_error_count = state.checkpoint_error_count.saturating_add(1);
+            return Err(err).context("raft wal durable checkpoint write");
+        }
+
+        for (group_id, floor) in updates {
+            state.durable_floor.insert(group_id, floor);
+        }
+        state.checkpoint_count = state.checkpoint_count.saturating_add(1);
+        state.checkpoint_last_us = epoch_micros();
+        Ok(())
+    }
+
+    fn checkpoint_status(&self) -> CommitLogCheckpointStatus {
+        let state = self.state.lock().expect("raft wal state lock");
+        let mut durable = std::collections::BTreeMap::new();
+        let mut executed = std::collections::BTreeMap::new();
+        let mut compacted = std::collections::BTreeMap::new();
+        let mut groups: Vec<GroupId> = state.groups.iter().copied().collect();
+        groups.sort_unstable();
+        for group_id in groups {
+            durable.insert(
+                group_id,
+                state.durable_floor.get(&group_id).copied().unwrap_or(0),
+            );
+            executed.insert(
+                group_id,
+                state.executed_floor.get(&group_id).copied().unwrap_or(0),
+            );
+            compacted.insert(
+                group_id,
+                state.compacted_floor.get(&group_id).copied().unwrap_or(0),
+            );
+        }
+        CommitLogCheckpointStatus {
+            durable_floor_by_group: durable,
+            executed_floor_by_group: executed,
+            compacted_floor_by_group: compacted,
+        }
     }
 }
 
@@ -976,6 +1207,22 @@ fn read_last_index(engine: &RaftEngine, group_id: GroupId) -> anyhow::Result<Opt
     Ok(Some(decode_u64(&buf)?))
 }
 
+#[cfg(feature = "raft-engine")]
+fn read_compacted_floor(engine: &RaftEngine, group_id: GroupId) -> anyhow::Result<Option<u64>> {
+    let Some(buf) = engine.get(group_id, WAL_META_COMPACTED_FLOOR_KEY) else {
+        return Ok(None);
+    };
+    Ok(Some(decode_u64(&buf)?))
+}
+
+#[cfg(feature = "raft-engine")]
+fn read_durable_floor(engine: &RaftEngine, group_id: GroupId) -> anyhow::Result<Option<u64>> {
+    let Some(buf) = engine.get(group_id, WAL_META_DURABLE_FLOOR_KEY) else {
+        return Ok(None);
+    };
+    Ok(Some(decode_u64(&buf)?))
+}
+
 /// Read an env var as u64 with a default.
 fn read_env_u64(name: &str, default: u64) -> u64 {
     env::var(name)
@@ -1047,4 +1294,98 @@ fn read_u32_at(data: &[u8], offset: &mut usize) -> anyhow::Result<u32> {
     buf.copy_from_slice(&data[*offset..*offset + 4]);
     *offset += 4;
     Ok(u32::from_be_bytes(buf))
+}
+
+#[cfg(all(test, feature = "raft-engine"))]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use holo_accord::accord::TXN_COUNTER_SHARD_SHIFT;
+
+    static TEST_ID: AtomicU64 = AtomicU64::new(1);
+
+    fn temp_wal_dir(name: &str) -> PathBuf {
+        let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("holostore-{name}-{id}"));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("create temp wal dir");
+        path
+    }
+
+    fn make_txn(group_id: GroupId, seq: u64) -> TxnId {
+        TxnId {
+            node_id: 1,
+            counter: (group_id << TXN_COUNTER_SHARD_SHIFT) | seq,
+        }
+    }
+
+    fn make_entry(group_id: GroupId, seq: u64) -> CommitLogEntry {
+        CommitLogEntry {
+            txn_id: make_txn(group_id, seq),
+            seq,
+            deps: Vec::new(),
+            command: format!("set:{seq}").into_bytes(),
+        }
+    }
+
+    #[test]
+    fn raft_wal_persists_compaction_floor_across_restart() {
+        let dir = temp_wal_dir("wal-floor");
+        let group_id = 7;
+
+        let wal = RaftEngineWal::open_dir(&dir).expect("open raft wal");
+        let entries: Vec<CommitLogEntry> = (1..=8).map(|i| make_entry(group_id, i)).collect();
+        wal.append_commits(entries).expect("append entries");
+
+        for seq in 1..=5 {
+            wal.mark_executed(make_txn(group_id, seq))
+                .expect("mark executed");
+        }
+        wal.mark_durable_checkpoint()
+            .expect("mark durable checkpoint");
+        let removed = wal.compact(100).expect("compact");
+        assert_eq!(
+            removed, 5,
+            "expected prefix compaction to remove first 5 entries"
+        );
+        assert_eq!(
+            read_compacted_floor(&wal.engine, group_id).expect("read compacted floor"),
+            Some(5)
+        );
+        drop(wal);
+
+        let wal = RaftEngineWal::open_dir(&dir).expect("re-open raft wal");
+        {
+            let state = wal.state.lock().expect("state lock");
+            assert_eq!(state.compacted_floor.get(&group_id).copied(), Some(5));
+        }
+        let loaded = wal.load().expect("load entries");
+        let mut seqs: Vec<u64> = loaded
+            .into_iter()
+            .filter(|entry| txn_group_id(entry.txn_id) == group_id)
+            .map(|entry| entry.txn_id.counter & ((1u64 << TXN_COUNTER_SHARD_SHIFT) - 1))
+            .collect();
+        seqs.sort_unstable();
+        assert_eq!(
+            seqs,
+            vec![6, 7, 8],
+            "replay must start at compacted floor + 1"
+        );
+
+        for seq in 6..=8 {
+            wal.mark_executed(make_txn(group_id, seq))
+                .expect("mark executed after restart");
+        }
+        wal.mark_durable_checkpoint()
+            .expect("mark durable checkpoint after restart");
+        let removed = wal.compact(100).expect("second compact");
+        assert_eq!(removed, 3);
+        assert_eq!(
+            read_compacted_floor(&wal.engine, group_id).expect("read compacted floor"),
+            Some(8)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

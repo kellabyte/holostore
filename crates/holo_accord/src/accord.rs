@@ -10,8 +10,9 @@ mod types;
 
 pub use group::{DebugStats, Group, Handle, ProposalResult};
 pub use types::{
-    txn_group_id, AcceptRequest, AcceptResponse, Ballot, CommandKeys, CommitLog, CommitLogEntry,
-    CommitRequest, CommitResponse, Config, ExecMeta, ExecutedPrefix, GroupId, Member, NodeId,
-    PreAcceptRequest, PreAcceptResponse, RecoverRequest, RecoverResponse, ReportExecutedRequest,
-    ReportExecutedResponse, StateMachine, Transport, TxnId, TxnStatus, TXN_COUNTER_SHARD_SHIFT,
+    txn_group_id, AcceptRequest, AcceptResponse, Ballot, CommandKeys, CommitLog,
+    CommitLogCheckpointStatus, CommitLogEntry, CommitRequest, CommitResponse, Config, ExecMeta,
+    ExecutedPrefix, GroupId, Member, NodeId, PreAcceptRequest, PreAcceptResponse, RecoverRequest,
+    RecoverResponse, ReportExecutedRequest, ReportExecutedResponse, StateMachine, Transport, TxnId,
+    TxnStatus, TXN_COUNTER_SHARD_SHIFT,
 };

@@ -3,6 +3,7 @@
 //! These types are kept in a small, dependency-light module because they are
 //! used by both the consensus engine and the transport/state-machine layers.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -159,6 +160,17 @@ pub struct CommitLogEntry {
     pub command: Vec<u8>,
 }
 
+/// WAL floor snapshot used for checkpoint/compaction observability.
+#[derive(Clone, Debug, Default)]
+pub struct CommitLogCheckpointStatus {
+    /// Highest index that a durable storage checkpoint guarantees.
+    pub durable_floor_by_group: BTreeMap<GroupId, u64>,
+    /// Highest contiguous executed index tracked by the WAL.
+    pub executed_floor_by_group: BTreeMap<GroupId, u64>,
+    /// Highest index already removed from WAL storage.
+    pub compacted_floor_by_group: BTreeMap<GroupId, u64>,
+}
+
 /// Durable commit log interface (WAL).
 ///
 /// Implementations are responsible for persisting committed entries and
@@ -174,6 +186,17 @@ pub trait CommitLog: Send + Sync + 'static {
     fn mark_executed(&self, txn_id: TxnId) -> anyhow::Result<()>;
     fn load(&self) -> anyhow::Result<Vec<CommitLogEntry>>;
     fn compact(&self, max_delete: usize) -> anyhow::Result<usize>;
+    /// Mark that KV/meta state has been durably checkpointed.
+    ///
+    /// WAL implementations can use this to safely gate log compaction.
+    fn mark_durable_checkpoint(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Return checkpoint/compaction floor state for monitoring.
+    fn checkpoint_status(&self) -> CommitLogCheckpointStatus {
+        CommitLogCheckpointStatus::default()
+    }
 }
 
 #[derive(Clone, Debug)]

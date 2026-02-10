@@ -100,17 +100,17 @@ This keeps recovery logic identical to the file WAL: Accord replays and executes
 HoloStore already tracks `mark_executed(txn_id)` and periodically calls `compact(max_delete)`.
 
 In the `raft-engine` WAL:
-- `mark_executed` records the txn in an in-memory set.
+- `mark_executed` advances a per-group executed-prefix floor (contiguous executed indices).
 - `compact(max_delete)`:
-  - maps executed txn ids to their log indices,
-  - sorts by index,
-  - deletes up to `max_delete` entries via a `LogBatch`.
+  - deletes only contiguous executed-prefix entries (never sparse/out-of-order entries),
+  - persists each group's new compacted floor to `meta/compacted_floor` in the same batch.
+- `load()` uses the persisted compacted floor and starts replay from `compacted_floor + 1`.
 
-This mimics the file WAL’s “drop executed commits” behavior.
+This couples replay and GC boundaries: after restart we do not rescan already-compacted index space.
 
 ## Tradeoffs and Known Limitations
 
-- **Executed tracking is in-memory**: on crash/restart, executed markers are lost and entries may be retained longer until replay re-executes and re-marks them.
+- **Executed pending gaps are in-memory**: we persist the contiguous compacted floor, but out-of-order executed indices above that floor are rebuilt from replay after restart.
 - **Sequential index allocation**: indices are per-group and strictly monotonic, which is required by `raft-engine`.
 - **No protobuf entry**: we store encoded bytes directly (simpler and consistent with the file WAL).
 - **Sync mapping is conservative**: we map both `sync_data` and `sync_all` to `sync=true` in `raft-engine`.

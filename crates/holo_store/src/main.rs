@@ -8,17 +8,18 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, OpenOptions};
 use std::io::{BufWriter, IsTerminal, Write};
 use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
-use fjall::{Keyspace, PartitionCreateOptions};
+use fjall::{Keyspace, PartitionCreateOptions, PersistMode};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use holo_accord::accord::{self, GroupId, NodeId, TxnId};
-use sysinfo::{Pid, System};
+use serde::{Deserialize, Serialize};
+use sysinfo::{Disks, Pid, System};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 
 include!(concat!(env!("OUT_DIR"), "/volo_gen.rs"));
@@ -300,6 +301,53 @@ struct NodeArgs {
     #[arg(long, env = "HOLO_FJALL_FSYNC_MS")]
     fjall_fsync_ms: Option<u16>,
 
+    /// Enable periodic durable checkpoints that gate WAL GC.
+    #[arg(long, env = "HOLO_RECOVERY_CHECKPOINT_ENABLED", default_value_t = true)]
+    recovery_checkpoint_enabled: bool,
+
+    /// Interval for durability checkpoints that couple snapshots to WAL GC (ms).
+    #[arg(
+        long,
+        env = "HOLO_RECOVERY_CHECKPOINT_INTERVAL_MS",
+        default_value_t = 5000
+    )]
+    recovery_checkpoint_interval_ms: u64,
+
+    /// Warn when executed-vs-durable lag exceeds this many WAL entries.
+    #[arg(
+        long,
+        env = "HOLO_RECOVERY_CHECKPOINT_WARN_LAG_ENTRIES",
+        default_value_t = 50000
+    )]
+    recovery_checkpoint_warn_lag_entries: u64,
+
+    /// Skip checkpoint advancement when free disk bytes are below this threshold.
+    ///
+    /// This is a safety circuit-breaker: if checkpoints are skipped, WAL GC
+    /// naturally stalls because durable floors stop advancing.
+    #[arg(
+        long,
+        env = "HOLO_RECOVERY_CHECKPOINT_MIN_FREE_BYTES",
+        default_value_t = 268_435_456
+    )]
+    recovery_checkpoint_min_free_bytes: u64,
+
+    /// Skip checkpoint advancement when free disk percentage is below this threshold.
+    #[arg(
+        long,
+        env = "HOLO_RECOVERY_CHECKPOINT_MIN_FREE_PCT",
+        default_value_t = 1.0
+    )]
+    recovery_checkpoint_min_free_pct: f64,
+
+    /// Durability mode used when checkpointing Fjall state.
+    #[arg(
+        long,
+        env = "HOLO_RECOVERY_CHECKPOINT_PERSIST_MODE",
+        default_value = "sync-data"
+    )]
+    recovery_checkpoint_persist_mode: RecoveryCheckpointPersistMode,
+
     /// RPC timeout for pre-accept/accept/recover (milliseconds).
     #[arg(long, env = "HOLO_RPC_TIMEOUT_MS", default_value_t = 2000)]
     rpc_timeout_ms: u64,
@@ -492,6 +540,8 @@ struct NodeState {
     split_lock: Arc<std::sync::RwLock<()>>,
     shard_load: ShardLoadTracker,
     range_stats: Arc<LocalRangeStats>,
+    recovery_checkpoints: Arc<RecoveryCheckpointStats>,
+    recovery_checkpoint_controller: Option<RecoveryCheckpointController>,
 }
 
 #[derive(Clone, Debug)]
@@ -640,6 +690,185 @@ impl LocalRangeStats {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct RecoveryCheckpointSnapshot {
+    success_count: u64,
+    failure_count: u64,
+    manual_trigger_count: u64,
+    manual_trigger_failure_count: u64,
+    pressure_skip_count: u64,
+    manifest_parse_error_count: u64,
+    last_attempt_ms: u64,
+    last_success_ms: u64,
+    max_lag_entries: u64,
+    blocked_groups: u64,
+    paused: bool,
+    last_run_reason: String,
+    last_free_bytes: u64,
+    last_free_pct: f64,
+    last_error: String,
+}
+
+#[derive(Default)]
+struct RecoveryCheckpointStats {
+    success_count: AtomicU64,
+    failure_count: AtomicU64,
+    manual_trigger_count: AtomicU64,
+    manual_trigger_failure_count: AtomicU64,
+    pressure_skip_count: AtomicU64,
+    manifest_parse_error_count: AtomicU64,
+    last_attempt_ms: AtomicU64,
+    last_success_ms: AtomicU64,
+    max_lag_entries: AtomicU64,
+    blocked_groups: AtomicU64,
+    paused: AtomicBool,
+    last_free_bytes: AtomicU64,
+    last_free_pct_x100: AtomicU64,
+    last_run_reason: std::sync::Mutex<String>,
+    last_error: std::sync::Mutex<String>,
+}
+
+impl RecoveryCheckpointStats {
+    fn record_success(
+        &self,
+        now_ms: u64,
+        max_lag_entries: u64,
+        blocked_groups: u64,
+        run_reason: &str,
+    ) {
+        self.success_count.fetch_add(1, Ordering::Relaxed);
+        self.last_attempt_ms.store(now_ms, Ordering::Relaxed);
+        self.last_success_ms.store(now_ms, Ordering::Relaxed);
+        self.max_lag_entries
+            .store(max_lag_entries, Ordering::Relaxed);
+        self.blocked_groups.store(blocked_groups, Ordering::Relaxed);
+        if let Ok(mut reason) = self.last_run_reason.lock() {
+            *reason = run_reason.to_string();
+        }
+        if let Ok(mut err) = self.last_error.lock() {
+            err.clear();
+        }
+    }
+
+    fn record_failure(&self, now_ms: u64, err: &str, run_reason: &str) {
+        self.failure_count.fetch_add(1, Ordering::Relaxed);
+        self.last_attempt_ms.store(now_ms, Ordering::Relaxed);
+        if let Ok(mut reason) = self.last_run_reason.lock() {
+            *reason = run_reason.to_string();
+        }
+        if let Ok(mut last) = self.last_error.lock() {
+            *last = err.to_string();
+        }
+    }
+
+    fn record_manual_trigger(&self, ok: bool) {
+        self.manual_trigger_count.fetch_add(1, Ordering::Relaxed);
+        if !ok {
+            self.manual_trigger_failure_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_pressure_skip(&self) {
+        self.pressure_skip_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_manifest_parse_error(&self) {
+        self.manifest_parse_error_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Relaxed);
+    }
+
+    fn set_last_disk_sample(&self, free_bytes: u64, free_pct: f64) {
+        self.last_free_bytes.store(free_bytes, Ordering::Relaxed);
+        let pct_x100 = if free_pct.is_finite() && free_pct > 0.0 {
+            (free_pct * 100.0).round() as u64
+        } else {
+            0
+        };
+        self.last_free_pct_x100.store(pct_x100, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> RecoveryCheckpointSnapshot {
+        let last_error = self
+            .last_error
+            .lock()
+            .map(|v| v.clone())
+            .unwrap_or_else(|_| "lock-poisoned".to_string());
+        let last_run_reason = self
+            .last_run_reason
+            .lock()
+            .map(|v| v.clone())
+            .unwrap_or_else(|_| "lock-poisoned".to_string());
+        RecoveryCheckpointSnapshot {
+            success_count: self.success_count.load(Ordering::Relaxed),
+            failure_count: self.failure_count.load(Ordering::Relaxed),
+            manual_trigger_count: self.manual_trigger_count.load(Ordering::Relaxed),
+            manual_trigger_failure_count: self.manual_trigger_failure_count.load(Ordering::Relaxed),
+            pressure_skip_count: self.pressure_skip_count.load(Ordering::Relaxed),
+            manifest_parse_error_count: self.manifest_parse_error_count.load(Ordering::Relaxed),
+            last_attempt_ms: self.last_attempt_ms.load(Ordering::Relaxed),
+            last_success_ms: self.last_success_ms.load(Ordering::Relaxed),
+            max_lag_entries: self.max_lag_entries.load(Ordering::Relaxed),
+            blocked_groups: self.blocked_groups.load(Ordering::Relaxed),
+            paused: self.paused.load(Ordering::Relaxed),
+            last_run_reason,
+            last_free_bytes: self.last_free_bytes.load(Ordering::Relaxed),
+            last_free_pct: self.last_free_pct_x100.load(Ordering::Relaxed) as f64 / 100.0,
+            last_error,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RecoveryCheckpointConfig {
+    persist_mode: PersistMode,
+    warn_lag_entries: u64,
+    min_free_bytes: u64,
+    min_free_pct: f64,
+}
+
+#[derive(Clone)]
+struct RecoveryCheckpointController {
+    tx: mpsc::UnboundedSender<RecoveryCheckpointControl>,
+}
+
+enum RecoveryCheckpointControl {
+    SetPaused {
+        paused: bool,
+        done: oneshot::Sender<()>,
+    },
+    Trigger {
+        done: oneshot::Sender<anyhow::Result<()>>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RecoveryCheckpointManifest {
+    version: u8,
+    updated_unix_ms: u64,
+    persist_mode: String,
+    wal_count: usize,
+    success_count: u64,
+    failure_count: u64,
+    blocked_groups: u64,
+    max_lag_entries: u64,
+    durable_floor_by_group: BTreeMap<u64, u64>,
+    executed_floor_by_group: BTreeMap<u64, u64>,
+    compacted_floor_by_group: BTreeMap<u64, u64>,
+    last_error: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RecoveryCheckpointManifestEnvelope {
+    version: u8,
+    checksum_crc32: u32,
+    payload: RecoveryCheckpointManifest,
+}
+
 /// Read mode options for GETs.
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum ReadMode {
@@ -660,6 +889,24 @@ enum RoutingMode {
 enum WalEngine {
     File,
     RaftEngine,
+}
+
+/// Persistence mode for periodic recovery checkpoints.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum RecoveryCheckpointPersistMode {
+    #[value(alias = "sync_data")]
+    SyncData,
+    #[value(alias = "sync_all")]
+    SyncAll,
+}
+
+impl RecoveryCheckpointPersistMode {
+    fn to_fjall(self) -> PersistMode {
+        match self {
+            RecoveryCheckpointPersistMode::SyncData => PersistMode::SyncData,
+            RecoveryCheckpointPersistMode::SyncAll => PersistMode::SyncAll,
+        }
+    }
 }
 
 /// Classification of proposals for stats aggregation.
@@ -1173,13 +1420,17 @@ impl NodeState {
 
     fn controller_fence_for_domain(&self, domain: ControllerDomain) -> Option<ControllerFence> {
         let now = unix_time_ms();
-        self.cluster_store.controller_lease(domain).and_then(|lease| {
-            (lease.holder == self.node_id && lease.lease_until_ms > now).then_some(ControllerFence {
-                domain,
-                holder: lease.holder,
-                term: lease.term,
+        self.cluster_store
+            .controller_lease(domain)
+            .and_then(|lease| {
+                (lease.holder == self.node_id && lease.lease_until_ms > now).then_some(
+                    ControllerFence {
+                        domain,
+                        holder: lease.holder,
+                        term: lease.term,
+                    },
+                )
             })
-        })
     }
 
     pub(crate) async fn propose_meta_command_guarded(
@@ -1207,6 +1458,39 @@ impl NodeState {
 
     pub(crate) fn meta_proposal_stats_peek(&self) -> MetaProposalStatsSnapshot {
         self.meta_proposal_stats.snapshot()
+    }
+
+    pub(crate) fn recovery_checkpoint_snapshot(&self) -> RecoveryCheckpointSnapshot {
+        self.recovery_checkpoints.snapshot()
+    }
+
+    pub(crate) async fn recovery_checkpoint_set_paused(&self, paused: bool) -> anyhow::Result<()> {
+        let controller = self
+            .recovery_checkpoint_controller
+            .as_ref()
+            .ok_or_else(|| anyhow!("recovery checkpoint manager is disabled"))?;
+        let (tx, rx) = oneshot::channel();
+        controller
+            .tx
+            .send(RecoveryCheckpointControl::SetPaused { paused, done: tx })
+            .map_err(|_| anyhow!("recovery checkpoint manager is unavailable"))?;
+        rx.await
+            .map_err(|_| anyhow!("recovery checkpoint manager did not acknowledge pause update"))?;
+        Ok(())
+    }
+
+    pub(crate) async fn recovery_checkpoint_trigger(&self) -> anyhow::Result<()> {
+        let controller = self
+            .recovery_checkpoint_controller
+            .as_ref()
+            .ok_or_else(|| anyhow!("recovery checkpoint manager is disabled"))?;
+        let (tx, rx) = oneshot::channel();
+        controller
+            .tx
+            .send(RecoveryCheckpointControl::Trigger { done: tx })
+            .map_err(|_| anyhow!("recovery checkpoint manager is unavailable"))?;
+        rx.await
+            .map_err(|_| anyhow!("recovery checkpoint manager trigger did not complete"))?
     }
 
     pub(crate) fn meta_move_stuck_warn_ms(&self) -> u64 {
@@ -1242,7 +1526,9 @@ impl NodeState {
             let range_lag = if complete {
                 by_source
                     .into_iter()
-                    .fold(0u64, |acc, (_, (min_c, max_c))| acc.saturating_add(max_c.saturating_sub(min_c)))
+                    .fold(0u64, |acc, (_, (min_c, max_c))| {
+                        acc.saturating_add(max_c.saturating_sub(min_c))
+                    })
             } else {
                 0
             };
@@ -1266,10 +1552,11 @@ impl NodeState {
         if !Self::controller_lease_eligible_for_domain(&snapshot, domain, self.node_id) {
             return false;
         }
-        if self
-            .cluster_store
-            .is_controller_leader(domain, self.node_id, now.saturating_add(renew_margin))
-        {
+        if self.cluster_store.is_controller_leader(
+            domain,
+            self.node_id,
+            now.saturating_add(renew_margin),
+        ) {
             return true;
         }
 
@@ -1337,53 +1624,54 @@ impl NodeState {
             .is_controller_leader(domain, self.node_id, unix_time_ms())
     }
 
-fn controller_lease_eligible_for_domain(
-    snapshot: &ClusterState,
-    domain: ControllerDomain,
-    node_id: NodeId,
-) -> bool {
-    match domain {
-        ControllerDomain::Rebalance => {
-            if let Some((&shard_id, _)) = snapshot.shard_rebalances.iter().next() {
-                let Some(shard) = snapshot.shards.iter().find(|s| s.shard_id == shard_id) else {
-                    return false;
-                };
-                if !shard.replicas.contains(&node_id) {
-                    return false;
+    fn controller_lease_eligible_for_domain(
+        snapshot: &ClusterState,
+        domain: ControllerDomain,
+        node_id: NodeId,
+    ) -> bool {
+        match domain {
+            ControllerDomain::Rebalance => {
+                if let Some((&shard_id, _)) = snapshot.shard_rebalances.iter().next() {
+                    let Some(shard) = snapshot.shards.iter().find(|s| s.shard_id == shard_id)
+                    else {
+                        return false;
+                    };
+                    if !shard.replicas.contains(&node_id) {
+                        return false;
+                    }
+                    let role = snapshot
+                        .shard_replica_roles
+                        .get(&shard_id)
+                        .and_then(|roles| roles.get(&node_id))
+                        .copied()
+                        .unwrap_or(ReplicaRole::Voter);
+                    return role != ReplicaRole::Learner;
                 }
-                let role = snapshot
-                    .shard_replica_roles
-                    .get(&shard_id)
-                    .and_then(|roles| roles.get(&node_id))
-                    .copied()
-                    .unwrap_or(ReplicaRole::Voter);
-                return role != ReplicaRole::Learner;
-            }
 
-            if let Some((&meta_range_id, _)) = snapshot.meta_rebalances.iter().next() {
-                let Some(range) = snapshot
-                    .meta_ranges
-                    .iter()
-                    .find(|r| r.meta_range_id == meta_range_id)
-                else {
-                    return false;
-                };
-                if !range.replicas.contains(&node_id) {
-                    return false;
+                if let Some((&meta_range_id, _)) = snapshot.meta_rebalances.iter().next() {
+                    let Some(range) = snapshot
+                        .meta_ranges
+                        .iter()
+                        .find(|r| r.meta_range_id == meta_range_id)
+                    else {
+                        return false;
+                    };
+                    if !range.replicas.contains(&node_id) {
+                        return false;
+                    }
+                    let role = snapshot
+                        .meta_replica_roles
+                        .get(&meta_range_id)
+                        .and_then(|roles| roles.get(&node_id))
+                        .copied()
+                        .unwrap_or(ReplicaRole::Voter);
+                    return role != ReplicaRole::Learner;
                 }
-                let role = snapshot
-                    .meta_replica_roles
-                    .get(&meta_range_id)
-                    .and_then(|roles| roles.get(&node_id))
-                    .copied()
-                    .unwrap_or(ReplicaRole::Voter);
-                return role != ReplicaRole::Learner;
+                true
             }
-            true
+            _ => true,
         }
-        _ => true,
     }
-}
 
     /// Apply control-plane replica membership to runtime Accord data groups.
     fn refresh_group_memberships(&self) -> anyhow::Result<()> {
@@ -3133,6 +3421,337 @@ fn avg_us_per(total_us: u64, count: u64) -> f64 {
     (total_us as f64 / count as f64) / 1000.0
 }
 
+fn manifest_payload_checksum(manifest: &RecoveryCheckpointManifest) -> anyhow::Result<u32> {
+    let payload = serde_json::to_vec(manifest).context("serialize recovery manifest payload")?;
+    Ok(crc32fast::hash(&payload))
+}
+
+fn load_recovery_manifest(path: &Path) -> anyhow::Result<Option<RecoveryCheckpointManifest>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes =
+        fs::read(path).with_context(|| format!("read recovery manifest: {}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse recovery manifest json: {}", path.display()))?;
+
+    if value.get("payload").is_some() && value.get("checksum_crc32").is_some() {
+        let envelope: RecoveryCheckpointManifestEnvelope = serde_json::from_value(value)
+            .with_context(|| format!("parse recovery manifest envelope: {}", path.display()))?;
+        if envelope.version != 2 {
+            anyhow::bail!(
+                "unsupported recovery manifest envelope version {} at {}",
+                envelope.version,
+                path.display()
+            );
+        }
+        let actual = manifest_payload_checksum(&envelope.payload)?;
+        if actual != envelope.checksum_crc32 {
+            anyhow::bail!(
+                "recovery manifest checksum mismatch at {} (expected={}, actual={})",
+                path.display(),
+                envelope.checksum_crc32,
+                actual
+            );
+        }
+        return Ok(Some(envelope.payload));
+    }
+
+    let manifest: RecoveryCheckpointManifest = serde_json::from_value(value)
+        .with_context(|| format!("parse legacy recovery manifest: {}", path.display()))?;
+    Ok(Some(manifest))
+}
+
+fn write_recovery_manifest(
+    path: &Path,
+    manifest: &RecoveryCheckpointManifest,
+) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("invalid recovery manifest path: {}", path.display()))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create recovery manifest dir: {}", parent.display()))?;
+    let envelope = RecoveryCheckpointManifestEnvelope {
+        version: 2,
+        checksum_crc32: manifest_payload_checksum(manifest)?,
+        payload: manifest.clone(),
+    };
+    let bytes = serde_json::to_vec_pretty(&envelope).context("serialize recovery manifest")?;
+    let tmp_path = path.with_extension("json.tmp");
+    fs::write(&tmp_path, bytes)
+        .with_context(|| format!("write recovery manifest temp: {}", tmp_path.display()))?;
+    fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "replace recovery manifest {} -> {}",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn disk_space_for_path(path: &Path) -> anyhow::Result<(u64, f64)> {
+    let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let disks = Disks::new_with_refreshed_list();
+    let mut best: Option<(usize, u64, u64)> = None;
+    for disk in disks.list() {
+        let mount = disk.mount_point();
+        if !resolved.starts_with(mount) {
+            continue;
+        }
+        let depth = mount.components().count();
+        let free = disk.available_space();
+        let total = disk.total_space();
+        match best {
+            Some((best_depth, _, _)) if depth < best_depth => {}
+            _ => best = Some((depth, free, total)),
+        }
+    }
+    let (_, free_bytes, total_bytes) = best.ok_or_else(|| {
+        anyhow!(
+            "unable to resolve disk space for checkpoint path {}",
+            resolved.display()
+        )
+    })?;
+    let free_pct = if total_bytes == 0 {
+        0.0
+    } else {
+        (free_bytes as f64 * 100.0) / total_bytes as f64
+    };
+    Ok((free_bytes, free_pct))
+}
+
+fn checkpoint_lag_snapshot(
+    statuses: &[accord::CommitLogCheckpointStatus],
+) -> (
+    BTreeMap<u64, u64>,
+    BTreeMap<u64, u64>,
+    BTreeMap<u64, u64>,
+    u64,
+    u64,
+) {
+    let mut durable = BTreeMap::<u64, u64>::new();
+    let mut executed = BTreeMap::<u64, u64>::new();
+    let mut compacted = BTreeMap::<u64, u64>::new();
+    for status in statuses {
+        for (group, floor) in &status.durable_floor_by_group {
+            durable.insert(
+                *group,
+                (*floor).max(durable.get(group).copied().unwrap_or(0)),
+            );
+        }
+        for (group, floor) in &status.executed_floor_by_group {
+            executed.insert(
+                *group,
+                (*floor).max(executed.get(group).copied().unwrap_or(0)),
+            );
+        }
+        for (group, floor) in &status.compacted_floor_by_group {
+            compacted.insert(
+                *group,
+                (*floor).max(compacted.get(group).copied().unwrap_or(0)),
+            );
+        }
+    }
+
+    let mut max_lag = 0u64;
+    let mut blocked = 0u64;
+    for (group, exec_floor) in &executed {
+        let durable_floor = durable.get(group).copied().unwrap_or(0);
+        let lag = exec_floor.saturating_sub(durable_floor);
+        max_lag = max_lag.max(lag);
+        if lag > 0 {
+            blocked = blocked.saturating_add(1);
+        }
+    }
+    (durable, executed, compacted, blocked, max_lag)
+}
+
+fn run_recovery_checkpoint_once(
+    keyspace: &Arc<Keyspace>,
+    wals: &[Arc<dyn accord::CommitLog>],
+    config: RecoveryCheckpointConfig,
+    disk_path: &Path,
+    manifest_path: &Path,
+    stats: &Arc<RecoveryCheckpointStats>,
+    run_reason: &str,
+) -> anyhow::Result<()> {
+    let (free_bytes, free_pct) = disk_space_for_path(disk_path)?;
+    stats.set_last_disk_sample(free_bytes, free_pct);
+    let low_bytes = config.min_free_bytes > 0 && free_bytes < config.min_free_bytes;
+    let low_pct = config.min_free_pct > 0.0 && free_pct < config.min_free_pct;
+    if low_bytes || low_pct {
+        stats.record_pressure_skip();
+        anyhow::bail!(
+            "disk pressure: free_bytes={} min_free_bytes={} free_pct={:.2} min_free_pct={:.2}",
+            free_bytes,
+            config.min_free_bytes,
+            free_pct,
+            config.min_free_pct
+        );
+    }
+
+    keyspace
+        .persist(config.persist_mode)
+        .context("persist keyspace during recovery checkpoint")?;
+
+    for wal in wals {
+        wal.mark_durable_checkpoint()
+            .context("mark durable checkpoint on wal")?;
+    }
+
+    let statuses = wals
+        .iter()
+        .map(|w| w.checkpoint_status())
+        .collect::<Vec<_>>();
+    let (durable, executed, compacted, blocked, max_lag) = checkpoint_lag_snapshot(&statuses);
+    if max_lag >= config.warn_lag_entries.max(1) {
+        tracing::warn!(
+            max_lag_entries = max_lag,
+            blocked_groups = blocked,
+            warn_lag_entries = config.warn_lag_entries,
+            "recovery checkpoint lag is above warning threshold"
+        );
+    }
+
+    let snapshot = stats.snapshot();
+    let now_ms = unix_time_ms();
+    let manifest = RecoveryCheckpointManifest {
+        version: 1,
+        updated_unix_ms: now_ms,
+        persist_mode: match config.persist_mode {
+            PersistMode::Buffer => "buffer".to_string(),
+            PersistMode::SyncData => "sync_data".to_string(),
+            PersistMode::SyncAll => "sync_all".to_string(),
+        },
+        wal_count: wals.len(),
+        success_count: snapshot.success_count.saturating_add(1),
+        failure_count: snapshot.failure_count,
+        blocked_groups: blocked,
+        max_lag_entries: max_lag,
+        durable_floor_by_group: durable,
+        executed_floor_by_group: executed,
+        compacted_floor_by_group: compacted,
+        last_error: String::new(),
+    };
+    write_recovery_manifest(manifest_path, &manifest)?;
+    stats.record_success(now_ms, max_lag, blocked, run_reason);
+    Ok(())
+}
+
+fn spawn_recovery_checkpoint_manager(
+    keyspace: Arc<Keyspace>,
+    wals: Vec<Arc<dyn accord::CommitLog>>,
+    config: RecoveryCheckpointConfig,
+    interval: Duration,
+    disk_path: PathBuf,
+    manifest_path: PathBuf,
+    stats: Arc<RecoveryCheckpointStats>,
+) -> RecoveryCheckpointController {
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+    let controller = RecoveryCheckpointController { tx: cmd_tx };
+    if let Err(err) = load_recovery_manifest(&manifest_path) {
+        stats.record_manifest_parse_error();
+        let now_ms = unix_time_ms();
+        stats.record_failure(now_ms, &err.to_string(), "startup");
+        tracing::warn!(error = ?err, path = %manifest_path.display(), "recovery manifest parse failed");
+    }
+
+    stats.set_paused(false);
+    tokio::spawn(async move {
+        let mut paused = false;
+        let mut ticker = tokio::time::interval(interval.max(Duration::from_millis(100)));
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    if paused {
+                        continue;
+                    }
+                    let keyspace = keyspace.clone();
+                    let wals = wals.clone();
+                    let path = manifest_path.clone();
+                    let stats_ref = stats.clone();
+                    let disk_path = disk_path.clone();
+                    let cfg = config.clone();
+                    let res = tokio::task::spawn_blocking(move || {
+                        run_recovery_checkpoint_once(
+                            &keyspace,
+                            &wals,
+                            cfg,
+                            &disk_path,
+                            &path,
+                            &stats_ref,
+                            "interval",
+                        )
+                    })
+                    .await;
+
+                    match res {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            let now_ms = unix_time_ms();
+                            stats.record_failure(now_ms, &err.to_string(), "interval");
+                            tracing::warn!(error = ?err, "recovery checkpoint iteration failed");
+                        }
+                        Err(err) => {
+                            let now_ms = unix_time_ms();
+                            stats.record_failure(now_ms, &err.to_string(), "interval");
+                            tracing::warn!(error = ?err, "recovery checkpoint task join failure");
+                        }
+                    }
+                }
+                Some(cmd) = cmd_rx.recv() => {
+                    match cmd {
+                        RecoveryCheckpointControl::SetPaused { paused: new_paused, done } => {
+                            paused = new_paused;
+                            stats.set_paused(new_paused);
+                            let _ = done.send(());
+                        }
+                        RecoveryCheckpointControl::Trigger { done } => {
+                            let keyspace = keyspace.clone();
+                            let wals = wals.clone();
+                            let path = manifest_path.clone();
+                            let stats_ref = stats.clone();
+                            let disk_path = disk_path.clone();
+                            let cfg = config.clone();
+                            let res = tokio::task::spawn_blocking(move || {
+                                run_recovery_checkpoint_once(
+                                    &keyspace,
+                                    &wals,
+                                    cfg,
+                                    &disk_path,
+                                    &path,
+                                    &stats_ref,
+                                    "manual",
+                                )
+                            })
+                            .await;
+
+                            let outcome = match res {
+                                Ok(Ok(())) => Ok(()),
+                                Ok(Err(err)) => {
+                                    let now_ms = unix_time_ms();
+                                    stats.record_failure(now_ms, &err.to_string(), "manual");
+                                    Err(err)
+                                }
+                                Err(err) => {
+                                    let now_ms = unix_time_ms();
+                                    let msg = err.to_string();
+                                    stats.record_failure(now_ms, &msg, "manual");
+                                    Err(anyhow!(msg))
+                                }
+                            };
+                            stats.record_manual_trigger(outcome.is_ok());
+                            let _ = done.send(outcome);
+                        }
+                    }
+                }
+            }
+        }
+    });
+    controller
+}
+
 #[tokio::main]
 /// Parse CLI args, initialize logging, and run the requested subcommand.
 async fn main() -> anyhow::Result<()> {
@@ -3193,6 +3812,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
             }
         }
     };
+    let mut checkpoint_wals: Vec<Arc<dyn accord::CommitLog>> = vec![shared_wal.clone()];
     let kv_engine_impl = Arc::new(FjallEngine::open(keyspace.clone())?);
 
     if args.bootstrap == args.join.is_some() {
@@ -3517,6 +4137,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
     for meta_index in 0..meta_group_count {
         let group_id = meta_group_id_for_index(meta_index);
         let meta_wal = open_meta_wal(meta_index)?;
+        checkpoint_wals.push(meta_wal.clone());
         let meta_group = Arc::new(accord::Group::new(
             mk_cfg(group_id),
             transport.clone(),
@@ -3588,10 +4209,9 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
     }
 
     for (meta_index, group_id, meta_group) in &meta_groups {
-        let _ = meta_group
-            .replay_commits()
-            .await
-            .with_context(|| format!("replay meta commit log (meta_index={meta_index}, group={group_id})"))?;
+        let _ = meta_group.replay_commits().await.with_context(|| {
+            format!("replay meta commit log (meta_index={meta_index}, group={group_id})")
+        })?;
         meta_group.spawn_executor();
     }
 
@@ -3616,6 +4236,28 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
 
     let client_batch_stats = Arc::new(ClientBatchStats::default());
     let meta_proposal_stats = Arc::new(MetaProposalStats::default());
+    let recovery_checkpoint_stats = Arc::new(RecoveryCheckpointStats::default());
+    let recovery_checkpoint_controller = if args.recovery_checkpoint_enabled {
+        let interval = Duration::from_millis(args.recovery_checkpoint_interval_ms.max(100));
+        let manifest_path = data_dir.join("meta").join("recovery_checkpoints.json");
+        let config = RecoveryCheckpointConfig {
+            persist_mode: args.recovery_checkpoint_persist_mode.to_fjall(),
+            warn_lag_entries: args.recovery_checkpoint_warn_lag_entries,
+            min_free_bytes: args.recovery_checkpoint_min_free_bytes,
+            min_free_pct: args.recovery_checkpoint_min_free_pct.max(0.0),
+        };
+        Some(spawn_recovery_checkpoint_manager(
+            keyspace.clone(),
+            checkpoint_wals.clone(),
+            config,
+            interval,
+            data_dir.clone(),
+            manifest_path,
+            recovery_checkpoint_stats.clone(),
+        ))
+    } else {
+        None
+    };
     let client_batch_queue = args.client_batch_queue.max(1);
     let (client_set_tx, client_set_rx) = mpsc::channel(client_batch_queue);
     let (client_get_tx, client_get_rx) = mpsc::channel(client_batch_queue);
@@ -3666,6 +4308,8 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         split_lock: split_lock.clone(),
         shard_load: ShardLoadTracker::new(data_shards),
         range_stats,
+        recovery_checkpoints: recovery_checkpoint_stats.clone(),
+        recovery_checkpoint_controller,
     });
 
     let refresh_state = state.clone();
