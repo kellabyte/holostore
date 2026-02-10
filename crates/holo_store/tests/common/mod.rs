@@ -515,11 +515,11 @@ pub fn write_keys(addr: SocketAddr, keys: &[(String, String)]) -> Result<(), Str
 /// Read keys back from the Redis port and return their values.
 pub fn read_keys(addr: SocketAddr, keys: &[String]) -> Vec<Option<String>> {
     let mut out = Vec::with_capacity(keys.len());
+    let mut conn = RespConn::connect(addr);
     for k in keys {
         let mut attempt = 0usize;
         let max_attempts = 3usize;
         loop {
-            let mut conn = RespConn::connect(addr);
             match conn.send_command(&["GET", k]) {
                 Ok(resp) => {
                     out.push(parse_bulk_string(&resp));
@@ -533,7 +533,22 @@ pub fn read_keys(addr: SocketAddr, keys: &[String]) -> Vec<Option<String>> {
                     if attempt >= max_attempts {
                         panic!("GET failed: resp read timed out");
                     }
+                    // Reconnect to clear any half-open socket state before retrying.
+                    conn = RespConn::connect(addr);
                     std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::AddrNotAvailable
+                        || err.kind() == std::io::ErrorKind::ConnectionRefused
+                        || err.kind() == std::io::ErrorKind::ConnectionReset
+                        || err.kind() == std::io::ErrorKind::BrokenPipe =>
+                {
+                    attempt += 1;
+                    if attempt >= max_attempts {
+                        panic!("GET failed: {err}");
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                    conn = RespConn::connect(addr);
                 }
                 Err(err) => panic!("GET failed: {err}"),
             }

@@ -202,7 +202,11 @@ fn meta_plane_ops_survive_bootstrap_crash_and_recovery() {
         "member 4 should be active after add-node"
     );
     assert!(
-        state["meta_ranges"].as_array().map(|v| v.len()).unwrap_or(0) >= 2,
+        state["meta_ranges"]
+            .as_array()
+            .map(|v| v.len())
+            .unwrap_or(0)
+            >= 2,
         "meta ranges should split under split-meta command"
     );
     assert!(

@@ -7,10 +7,10 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::time::Duration;
-use std::sync::mpsc as std_mpsc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -22,14 +22,35 @@ use super::state::{
 };
 use super::types::{
     txn_group_id, AcceptRequest, AcceptResponse, Ballot, CommandKeys, CommitLog, CommitLogEntry,
-    CommitRequest, CommitResponse, Config, ExecMeta, ExecutedPrefix, Member, NodeId, PreAcceptRequest,
-    PreAcceptResponse, RecoverRequest, RecoverResponse, ReportExecutedRequest,
-    ReportExecutedResponse, StateMachine, Transport, TxnId, TxnStatus,
-    TXN_COUNTER_SHARD_SHIFT,
+    CommitRequest, CommitResponse, Config, ExecMeta, ExecutedPrefix, Member, NodeId,
+    PreAcceptRequest, PreAcceptResponse, RecoverRequest, RecoverResponse, ReportExecutedRequest,
+    ReportExecutedResponse, StateMachine, Transport, TxnId, TxnStatus, TXN_COUNTER_SHARD_SHIFT,
 };
 
 const COMPACT_EVERY_APPLIED: u64 = 1024;
 const COMPACT_MAX_DELETE: usize = 4096;
+
+fn txn_local_mask() -> u64 {
+    if TXN_COUNTER_SHARD_SHIFT >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << TXN_COUNTER_SHARD_SHIFT) - 1
+    }
+}
+
+fn txn_local_counter(counter: u64) -> u64 {
+    counter & txn_local_mask()
+}
+
+fn initial_txn_counter_seed() -> u64 {
+    let now_us = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros()
+        .min(u128::from(u64::MAX)) as u64;
+    txn_local_counter(now_us)
+}
+
 fn command_digest(command: &[u8]) -> [u8; 32] {
     *blake3::hash(command).as_bytes()
 }
@@ -318,10 +339,8 @@ impl GroupMetrics {
     fn record_exec_progress(&self, dur: Duration, ok: Option<bool>) {
         let us = dur.as_micros().min(u128::from(u64::MAX)) as u64;
         self.exec_progress_count.fetch_add(1, Ordering::Relaxed);
-        self.exec_progress_total_us
-            .fetch_add(us, Ordering::Relaxed);
-        self.exec_progress_max_us
-            .fetch_max(us, Ordering::Relaxed);
+        self.exec_progress_total_us.fetch_add(us, Ordering::Relaxed);
+        self.exec_progress_max_us.fetch_max(us, Ordering::Relaxed);
         match ok {
             Some(true) => {
                 self.exec_progress_true.fetch_add(1, Ordering::Relaxed);
@@ -341,8 +360,7 @@ impl GroupMetrics {
     fn record_exec_recover(&self, dur: Duration, ok: Option<bool>) {
         let us = dur.as_micros().min(u128::from(u64::MAX)) as u64;
         self.exec_recover_count.fetch_add(1, Ordering::Relaxed);
-        self.exec_recover_total_us
-            .fetch_add(us, Ordering::Relaxed);
+        self.exec_recover_total_us.fetch_add(us, Ordering::Relaxed);
         self.exec_recover_max_us.fetch_max(us, Ordering::Relaxed);
         match ok {
             Some(true) => {
@@ -360,40 +378,35 @@ impl GroupMetrics {
     fn record_apply_write(&self, dur: Duration) {
         let us = dur.as_micros().min(u128::from(u64::MAX)) as u64;
         self.apply_write_count.fetch_add(1, Ordering::Relaxed);
-        self.apply_write_total_us
-            .fetch_add(us, Ordering::Relaxed);
+        self.apply_write_total_us.fetch_add(us, Ordering::Relaxed);
         self.apply_write_max_us.fetch_max(us, Ordering::Relaxed);
     }
 
     fn record_apply_read(&self, dur: Duration) {
         let us = dur.as_micros().min(u128::from(u64::MAX)) as u64;
         self.apply_read_count.fetch_add(1, Ordering::Relaxed);
-        self.apply_read_total_us
-            .fetch_add(us, Ordering::Relaxed);
+        self.apply_read_total_us.fetch_add(us, Ordering::Relaxed);
         self.apply_read_max_us.fetch_max(us, Ordering::Relaxed);
     }
 
     fn record_apply_batch(&self, dur: Duration) {
         let us = dur.as_micros().min(u128::from(u64::MAX)) as u64;
         self.apply_batch_count.fetch_add(1, Ordering::Relaxed);
-        self.apply_batch_total_us
-            .fetch_add(us, Ordering::Relaxed);
+        self.apply_batch_total_us.fetch_add(us, Ordering::Relaxed);
         self.apply_batch_max_us.fetch_max(us, Ordering::Relaxed);
     }
 
     fn record_mark_visible(&self, dur: Duration) {
         let us = dur.as_micros().min(u128::from(u64::MAX)) as u64;
         self.mark_visible_count.fetch_add(1, Ordering::Relaxed);
-        self.mark_visible_total_us
-            .fetch_add(us, Ordering::Relaxed);
+        self.mark_visible_total_us.fetch_add(us, Ordering::Relaxed);
         self.mark_visible_max_us.fetch_max(us, Ordering::Relaxed);
     }
 
     fn record_state_update(&self, dur: Duration) {
         let us = dur.as_micros().min(u128::from(u64::MAX)) as u64;
         self.state_update_count.fetch_add(1, Ordering::Relaxed);
-        self.state_update_total_us
-            .fetch_add(us, Ordering::Relaxed);
+        self.state_update_total_us.fetch_add(us, Ordering::Relaxed);
         self.state_update_max_us.fetch_max(us, Ordering::Relaxed);
     }
 
@@ -485,10 +498,8 @@ impl Group {
                     while let Ok(work) = rx.recv() {
                         let apply_start = std::time::Instant::now();
                         sm.apply_batch(&work.batch);
-                        let apply_us = apply_start
-                            .elapsed()
-                            .as_micros()
-                            .min(u128::from(u64::MAX)) as u64;
+                        let apply_us =
+                            apply_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
 
                         let visible_start = std::time::Instant::now();
                         for (command, meta) in &work.batch {
@@ -497,7 +508,8 @@ impl Group {
                         let visible_us = visible_start
                             .elapsed()
                             .as_micros()
-                            .min(u128::from(u64::MAX)) as u64;
+                            .min(u128::from(u64::MAX))
+                            as u64;
 
                         let _ = work.tx.send(ApplyResult {
                             apply_us,
@@ -513,6 +525,11 @@ impl Group {
         initial_voters.sort_unstable();
         initial_voters.dedup();
 
+        let mut state = State::new();
+        // Seed txn counters from wall-clock lower bits so restarts do not
+        // immediately reuse low txns before replay can advance the floor.
+        state.next_txn_counter = initial_txn_counter_seed();
+
         Self {
             members: RwLock::new(config.members.clone()),
             voters: RwLock::new(initial_voters),
@@ -522,7 +539,7 @@ impl Group {
             commit_log,
             commit_log_tx,
             apply_tx,
-            state: Mutex::new(State::new()),
+            state: Mutex::new(state),
             execute_lock: Mutex::new(()),
             executor_notify: Notify::new(),
             executor_started: AtomicBool::new(false),
@@ -558,10 +575,7 @@ impl Group {
         if voters.is_empty() {
             anyhow::bail!("group voter set cannot be empty");
         }
-        let member_set = members
-            .iter()
-            .map(|m| m.id)
-            .collect::<HashSet<_>>();
+        let member_set = members.iter().map(|m| m.id).collect::<HashSet<_>>();
         for voter in &voters {
             if !member_set.contains(voter) {
                 anyhow::bail!("voter {voter} must also be present in group members");
@@ -663,21 +677,14 @@ impl Group {
         }
     }
 
-    pub async fn last_committed_for_keys(
-        &self,
-        keys: &[Vec<u8>],
-    ) -> Vec<Option<(TxnId, u64)>> {
+    pub async fn last_committed_for_keys(&self, keys: &[Vec<u8>]) -> Vec<Option<(TxnId, u64)>> {
         let state = self.state.lock().await;
         keys.iter()
             .map(|k| state.last_committed_write_by_key.get(k).copied())
             .collect()
     }
 
-    pub async fn observe_last_committed(
-        &self,
-        keys: &[Vec<u8>],
-        values: &[Option<(TxnId, u64)>],
-    ) {
+    pub async fn observe_last_committed(&self, keys: &[Vec<u8>], values: &[Option<(TxnId, u64)>]) {
         let mut state = self.state.lock().await;
         for (key, item) in keys.iter().zip(values.iter()) {
             let Some((txn_id, seq)) = item else { continue };
@@ -782,17 +789,20 @@ impl Group {
 
         {
             let mut state = self.state.lock().await;
+            let mut max_local_counter_seen = 0u64;
             for entry in &entries {
                 if txn_group_id(entry.txn_id) != self.config.group_id {
                     continue;
+                }
+                if entry.txn_id.node_id == self.config.node_id {
+                    max_local_counter_seen =
+                        max_local_counter_seen.max(txn_local_counter(entry.txn_id.counter));
                 }
                 let deps = entry.deps.iter().copied().collect::<BTreeSet<_>>();
                 let keys = if entry.command.is_empty() {
                     CommandKeys::default()
                 } else {
-                    self.sm
-                        .command_keys(&entry.command)
-                        .unwrap_or_default()
+                    self.sm.command_keys(&entry.command).unwrap_or_default()
                 };
 
                 let rec = state.records.entry(entry.txn_id).or_insert_with(|| Record {
@@ -828,6 +838,7 @@ impl Group {
                 state.update_frontier(entry.txn_id, &keys, &deps);
                 state.insert_committed(entry.txn_id, rec_seq);
             }
+            state.next_txn_counter = state.next_txn_counter.max(max_local_counter_seen);
         }
 
         loop {
@@ -1485,7 +1496,11 @@ impl Group {
                         .unwrap_or(false);
                     let req_deps = deps_vec.iter().copied().collect::<BTreeSet<_>>();
                     let same_commit = r.seq == seq && r.deps == req_deps && cmd_matches;
-                    (r.status, r.seq, r.status >= Status::Committed && same_commit)
+                    (
+                        r.status,
+                        r.seq,
+                        r.status >= Status::Committed && same_commit,
+                    )
                 })
                 .expect("record must exist");
 
@@ -2129,8 +2144,7 @@ impl Group {
             oks.push(local);
         }
 
-        let (tx, mut rx) =
-            mpsc::channel::<anyhow::Result<PreAcceptResponse>>(peers.len().max(1));
+        let (tx, mut rx) = mpsc::channel::<anyhow::Result<PreAcceptResponse>>(peers.len().max(1));
         for peer in peers.iter().copied() {
             let transport = self.transport.clone();
             let tx = tx.clone();
@@ -2179,8 +2193,7 @@ impl Group {
                 break;
             }
         }
-        pre_accept_us =
-            pre_accept_us.saturating_add(pre_accept_start.elapsed().as_micros() as u64);
+        pre_accept_us = pre_accept_us.saturating_add(pre_accept_start.elapsed().as_micros() as u64);
 
         if ok < read_quorum {
             if max_promised > ballot {
@@ -2272,8 +2285,7 @@ impl Group {
         if needs_execution {
             let exec_start = time::Instant::now();
             if let Err(err) = self.execute_until(txn_id).await {
-                execute_us =
-                    execute_us.saturating_add(exec_start.elapsed().as_micros() as u64);
+                execute_us = execute_us.saturating_add(exec_start.elapsed().as_micros() as u64);
                 if log_phases {
                     tracing::warn!(
                         txn_id = ?txn_id,
@@ -2361,11 +2373,7 @@ impl Group {
             for peer in peers {
                 let transport = self.transport.clone();
                 let group_id = self.config.group_id;
-                futs.push(async move {
-                    transport
-                        .executed(peer, group_id, txn_id)
-                        .await
-                });
+                futs.push(async move { transport.executed(peer, group_id, txn_id).await });
             }
 
             let mut ok = 0usize;
@@ -2401,7 +2409,10 @@ impl Group {
         let deadline = time::Instant::now() + self.config.propose_timeout;
         loop {
             if time::Instant::now() > deadline {
-                anyhow::bail!("timed out waiting for all replicas to mark visible {:?}", txn_id);
+                anyhow::bail!(
+                    "timed out waiting for all replicas to mark visible {:?}",
+                    txn_id
+                );
             }
 
             let local_ok = self.mark_visible(txn_id).await?;
@@ -2500,8 +2511,7 @@ impl Group {
             });
         }
 
-        let (tx, mut rx) =
-            mpsc::channel::<anyhow::Result<AcceptResponse>>(peers.len().max(1));
+        let (tx, mut rx) = mpsc::channel::<anyhow::Result<AcceptResponse>>(peers.len().max(1));
         for peer in peers.iter().copied() {
             let transport = self.transport.clone();
             let tx = tx.clone();
@@ -2761,7 +2771,8 @@ impl Group {
                 let blocking = first_blocking_dep(&chain);
                 let mut recover_target: Option<TxnId> = None;
                 if let Some((dep, status, missing)) = blocking {
-                    let should_consider = matches!(status, Some(Status::PreAccepted | Status::Accepted));
+                    let should_consider =
+                        matches!(status, Some(Status::PreAccepted | Status::Accepted));
                     if !missing && should_consider {
                         let count = {
                             let entry = state.stalled_preaccept_counts.entry(dep).or_insert(0);
@@ -2769,11 +2780,7 @@ impl Group {
                             *entry
                         };
                         if count >= preaccept_stall_threshold
-                            && self.record_recovery_attempt(
-                                &mut state,
-                                dep,
-                                time::Instant::now(),
-                            )
+                            && self.record_recovery_attempt(&mut state, dep, time::Instant::now())
                         {
                             state.stalled_preaccept_counts.insert(dep, 0);
                             recover_target = Some(dep);
@@ -2836,8 +2843,9 @@ impl Group {
 
             if !progress {
                 if start.elapsed() < RECOVERY_GRACE {
-                    let _ = time::timeout(Duration::from_millis(1), self.executor_notify.notified())
-                        .await;
+                    let _ =
+                        time::timeout(Duration::from_millis(1), self.executor_notify.notified())
+                            .await;
                     continue;
                 }
 
@@ -2848,8 +2856,8 @@ impl Group {
                     }
                 }
 
-                let _ = time::timeout(Duration::from_millis(1), self.executor_notify.notified())
-                    .await;
+                let _ =
+                    time::timeout(Duration::from_millis(1), self.executor_notify.notified()).await;
             }
         }
     }
@@ -2941,10 +2949,7 @@ impl Group {
     fn should_log_exec_stall(&self) -> bool {
         const STALL_LOG_INTERVAL_US: u64 = 5_000_000;
         let now_us = self.start_at.elapsed().as_micros() as u64;
-        let last = self
-            .metrics
-            .exec_stall_log_at_us
-            .load(Ordering::Relaxed);
+        let last = self.metrics.exec_stall_log_at_us.load(Ordering::Relaxed);
         if now_us.saturating_sub(last) < STALL_LOG_INTERVAL_US {
             return false;
         }
@@ -3306,10 +3311,7 @@ impl Group {
             let apply_inline = |batch: &[(Vec<u8>, ExecMeta)]| -> ApplyResult {
                 let apply_start = time::Instant::now();
                 self.sm.apply_batch(batch);
-                let apply_us = apply_start
-                    .elapsed()
-                    .as_micros()
-                    .min(u128::from(u64::MAX)) as u64;
+                let apply_us = apply_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
 
                 let visible_start = time::Instant::now();
                 for (command, meta) in batch {
@@ -3400,7 +3402,9 @@ impl Group {
         }
 
         if let Some(log) = &self.commit_log {
-            let applied = self.compact_counter.fetch_add(to_apply.len() as u64, Ordering::Relaxed);
+            let applied = self
+                .compact_counter
+                .fetch_add(to_apply.len() as u64, Ordering::Relaxed);
             for item in &to_apply {
                 if let Err(err) = log.mark_executed(item.id) {
                     tracing::warn!(error = ?err, txn_id = ?item.id, "commit log mark-executed failed");
@@ -3575,8 +3579,7 @@ impl Group {
                 ok = 1;
             }
 
-            let (tx, mut rx) =
-                mpsc::channel::<anyhow::Result<RecoverResponse>>(peers.len().max(1));
+            let (tx, mut rx) = mpsc::channel::<anyhow::Result<RecoverResponse>>(peers.len().max(1));
             for peer in peers.iter().copied() {
                 let transport = self.transport.clone();
                 let tx = tx.clone();
@@ -3690,7 +3693,6 @@ impl Group {
             node_id: self.config.node_id,
         }
     }
-
 }
 
 fn build_blocking_chain(state: &State) -> (Option<TxnId>, Vec<BlockedStep>) {
@@ -3722,21 +3724,15 @@ fn build_blocking_chain(state: &State) -> (Option<TxnId>, Vec<BlockedStep>) {
         if !seen.insert(current) {
             break;
         }
-        let (status, blocking_dep, blocking_status, blocking_missing) = match state
-            .records
-            .get(&current)
-        {
-            Some(rec) => {
-                let dep = rec
-                    .deps
-                    .iter()
-                    .find(|dep| !state.is_executed(dep))
-                    .copied();
-                let dep_status = dep.and_then(|d| state.records.get(&d).map(|r| r.status));
-                (rec.status, dep, dep_status, false)
-            }
-            None => (Status::None, None, None, true),
-        };
+        let (status, blocking_dep, blocking_status, blocking_missing) =
+            match state.records.get(&current) {
+                Some(rec) => {
+                    let dep = rec.deps.iter().find(|dep| !state.is_executed(dep)).copied();
+                    let dep_status = dep.and_then(|d| state.records.get(&d).map(|r| r.status));
+                    (rec.status, dep, dep_status, false)
+                }
+                None => (Status::None, None, None, true),
+            };
 
         chain.push(BlockedStep {
             id: current,
@@ -3764,21 +3760,15 @@ fn build_blocking_chain_from(state: &State, root: TxnId, limit: usize) -> Vec<Bl
         if !seen.insert(current) {
             break;
         }
-        let (status, blocking_dep, blocking_status, blocking_missing) = match state
-            .records
-            .get(&current)
-        {
-            Some(rec) => {
-                let dep = rec
-                    .deps
-                    .iter()
-                    .find(|dep| !state.is_executed(dep))
-                    .copied();
-                let dep_status = dep.and_then(|d| state.records.get(&d).map(|r| r.status));
-                (rec.status, dep, dep_status, false)
-            }
-            None => (Status::None, None, None, true),
-        };
+        let (status, blocking_dep, blocking_status, blocking_missing) =
+            match state.records.get(&current) {
+                Some(rec) => {
+                    let dep = rec.deps.iter().find(|dep| !state.is_executed(dep)).copied();
+                    let dep_status = dep.and_then(|d| state.records.get(&d).map(|r| r.status));
+                    (rec.status, dep, dep_status, false)
+                }
+                None => (Status::None, None, None, true),
+            };
 
         chain.push(BlockedStep {
             id: current,
@@ -4015,10 +4005,12 @@ fn pick_ready_scc(snapshot: &ExecSnapshot, candidates: &[TxnId]) -> Vec<TxnId> {
     let sccs = kosaraju_scc_from_deps(candidates, &snapshot.deps);
     let mut ready = Vec::<Vec<TxnId>>::new();
     for scc in sccs {
-        if scc
-            .iter()
-            .all(|id| snapshot.status.get(id).is_some_and(|s| *s == Status::Committed))
-            && scc.iter().all(|id| scc_ready_snapshot(snapshot, &scc, *id))
+        if scc.iter().all(|id| {
+            snapshot
+                .status
+                .get(id)
+                .is_some_and(|s| *s == Status::Committed)
+        }) && scc.iter().all(|id| scc_ready_snapshot(snapshot, &scc, *id))
         {
             ready.push(scc);
         }
@@ -4043,10 +4035,7 @@ fn pick_ready_scc(snapshot: &ExecSnapshot, candidates: &[TxnId]) -> Vec<TxnId> {
     picked
 }
 
-fn kosaraju_scc_from_deps(
-    nodes: &[TxnId],
-    deps: &HashMap<TxnId, Vec<TxnId>>,
-) -> Vec<Vec<TxnId>> {
+fn kosaraju_scc_from_deps(nodes: &[TxnId], deps: &HashMap<TxnId, Vec<TxnId>>) -> Vec<Vec<TxnId>> {
     let n = nodes.len();
     if n == 0 {
         return Vec::new();

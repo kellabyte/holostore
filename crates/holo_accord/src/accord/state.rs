@@ -294,8 +294,7 @@ impl State {
             if let Some((last_committed, committed_seq)) =
                 self.last_committed_write_by_key.get(key).copied()
             {
-                if last_committed != txn_id
-                {
+                if last_committed != txn_id {
                     deps.insert(last_committed);
                     max_seq = max_seq.max(committed_seq);
                 }

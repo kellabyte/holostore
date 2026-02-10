@@ -1197,9 +1197,7 @@ impl ClusterStateStore {
             state
                 .meta_ranges
                 .iter()
-                .find(|range| {
-                    key_hash >= range.start_hash && key_hash <= range.end_hash
-                })
+                .find(|range| key_hash >= range.start_hash && key_hash <= range.end_hash)
                 .map(|range| range.meta_index)
                 .unwrap_or(0)
         };
@@ -1772,7 +1770,9 @@ impl ClusterStateStore {
                 target_meta_index,
             } => {
                 if !state.meta_rebalances.is_empty() {
-                    anyhow::bail!("cannot split meta ranges while meta replica moves are in-flight");
+                    anyhow::bail!(
+                        "cannot split meta ranges while meta replica moves are in-flight"
+                    );
                 }
                 let target_in_use = state
                     .meta_ranges
@@ -1784,7 +1784,9 @@ impl ClusterStateStore {
                 let idx = state
                     .meta_ranges
                     .iter()
-                    .position(|range| split_hash >= range.start_hash && split_hash <= range.end_hash)
+                    .position(|range| {
+                        split_hash >= range.start_hash && split_hash <= range.end_hash
+                    })
                     .ok_or_else(|| anyhow::anyhow!("split hash does not map to any meta range"))?;
 
                 let src = state.meta_ranges[idx].clone();
@@ -1853,10 +1855,14 @@ impl ClusterStateStore {
                     anyhow::bail!("from_node and to_node must differ");
                 }
                 if !replicas.contains(&from_node) {
-                    anyhow::bail!("from_node {from_node} is not a replica of meta range {meta_range_id}");
+                    anyhow::bail!(
+                        "from_node {from_node} is not a replica of meta range {meta_range_id}"
+                    );
                 }
                 if replicas.contains(&to_node) {
-                    anyhow::bail!("to_node {to_node} is already a replica of meta range {meta_range_id}");
+                    anyhow::bail!(
+                        "to_node {to_node} is already a replica of meta range {meta_range_id}"
+                    );
                 }
                 let Some(member) = state.members.get(&to_node) else {
                     anyhow::bail!("to_node {to_node} does not exist");
@@ -2022,7 +2028,9 @@ impl ClusterStateStore {
                 if should_take {
                     let changed = current
                         .map(|cur| {
-                            cur.holder != node_id || cur.term != term || cur.lease_until_ms != lease_until_ms
+                            cur.holder != node_id
+                                || cur.term != term
+                                || cur.lease_until_ms != lease_until_ms
                         })
                         .unwrap_or(true);
                     state.controller_leases.insert(
@@ -2062,7 +2070,9 @@ impl ClusterStateStore {
                 if should_take {
                     let changed = current
                         .map(|cur| {
-                            cur.holder != node_id || cur.term != term || cur.lease_until_ms != lease_until_ms
+                            cur.holder != node_id
+                                || cur.term != term
+                                || cur.lease_until_ms != lease_until_ms
                         })
                         .unwrap_or(true);
                     state.controller_leases.insert(
@@ -2318,7 +2328,9 @@ fn normalize_controller_leases(state: &mut ClusterState) {
         .retain(|_, lease| lease.lease_until_ms > 0);
     if state.controller_leases.is_empty() {
         if let Some(legacy) = state.meta_controller_lease.clone() {
-            state.controller_leases.insert(ControllerDomain::Meta, legacy);
+            state
+                .controller_leases
+                .insert(ControllerDomain::Meta, legacy);
         }
     }
     state.meta_controller_lease = state
@@ -2406,7 +2418,8 @@ pub fn cluster_command_key(cmd: &ClusterCommand) -> Vec<u8> {
         | ClusterCommand::MergeRange { left_shard_id } => {
             format!("merge/{left_shard_id:020}").into_bytes()
         }
-        ClusterCommand::SetShardFence { shard_id, .. } | ClusterCommand::GcRetiredRange { shard_id } => {
+        ClusterCommand::SetShardFence { shard_id, .. }
+        | ClusterCommand::GcRetiredRange { shard_id } => {
             format!("range/{shard_id:020}").into_bytes()
         }
         ClusterCommand::SplitRange { split_key, .. } => {

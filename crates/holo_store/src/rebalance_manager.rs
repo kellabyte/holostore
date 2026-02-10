@@ -637,14 +637,8 @@ async fn plan_inflight_move_step(
                 .target_leaseholder
                 .filter(|id| *id != mv.from_node && shard.replicas.contains(id));
             let desired_leaseholder = requested.unwrap_or(mv.to_node);
-            if !target_has_lease_state(
-                state.clone(),
-                shard.shard_id,
-                mv,
-                desired_leaseholder,
-                true,
-            )
-            .await
+            if !target_has_lease_state(state.clone(), shard.shard_id, mv, desired_leaseholder, true)
+                .await
             {
                 return Ok(None);
             }
