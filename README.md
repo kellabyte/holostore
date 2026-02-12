@@ -27,12 +27,12 @@ In this repository we implement:
 - A Redis protocol surface for easy benchmarking.
 
 **Documentation**
-- [Design overview](docs/DESIGN.md)
-- [Storage engine](docs/STORAGE.md)
-- [Read modes](docs/READ_MODES.md)
-- [Linearizability testing](docs/LINEARIZABILITY.md)
-- [Cluster membership](docs/CLUSTER_MEMBERSHIP.md)
-- [Testing TODOs](docs/TESTING_TODO.md)
+- [Design overview](crates/holo_store/docs/DESIGN.md)
+- [Storage engine](crates/holo_store/docs/STORAGE.md)
+- [Read modes](crates/holo_store/docs/READ_MODES.md)
+- [Linearizability testing](crates/holo_store/docs/LINEARIZABILITY.md)
+- [Cluster membership](crates/holo_store/docs/CLUSTER_MEMBERSHIP.md)
+- [Testing TODOs](crates/holo_store/docs/TESTING_TODO.md)
 
 **Build**
 ```bash

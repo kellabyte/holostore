@@ -17,7 +17,7 @@ Writes (`SET`):
 - Committed transactions are executed asynchronously by the executor loop.
 
 Reads (`GET`):
-- Reads can go through the protocol or other modes (see `docs/READ_MODES.md`).
+- Reads can go through the protocol or other modes (see `READ_MODES.md`).
 
 ## Concurrency Model
 
@@ -96,7 +96,7 @@ These metrics are the primary tool for diagnosing stalls, batching behavior, and
 - Larger batches increase throughput but raise tail latency.
 - More shards reduce per-group contention but increase parallelism and memory.
 - WAL persistence settings directly affect durability and performance.
-- Read mode choices affect consistency (see `docs/READ_MODES.md`).
+- Read mode choices affect consistency (see `READ_MODES.md`).
 
 ## Running Linearizability Checks
 

@@ -645,7 +645,7 @@ pub(crate) fn encode_key_prefix(key: &[u8]) -> Vec<u8> {
 }
 
 /// Encode the composite key used in the versions partition.
-fn encode_version_key(key: &[u8], version: Version) -> Vec<u8> {
+pub(crate) fn encode_version_key(key: &[u8], version: Version) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + key.len() + 8 + 8 + 8);
     out.extend_from_slice(&(key.len() as u32).to_be_bytes());
     out.extend_from_slice(key);
@@ -681,7 +681,7 @@ fn decode_version_from_key(key: &[u8], entry_key: &[u8]) -> Option<Version> {
 }
 
 /// Encode a versioned value with an explicit visibility flag.
-fn encode_version_value(visible: bool, value: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_version_value(visible: bool, value: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + 4 + value.len());
     out.push(visible as u8);
     out.extend_from_slice(&(value.len() as u32).to_be_bytes());
@@ -699,7 +699,7 @@ fn decode_version_value(data: &[u8]) -> anyhow::Result<(bool, Vec<u8>)> {
 }
 
 /// Encode the "latest" index value (version + value bytes).
-fn encode_latest_value(version: Version, value: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_latest_value(version: Version, value: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 + 8 + 8 + 4 + value.len());
     out.extend_from_slice(&version.seq.to_be_bytes());
     out.extend_from_slice(&version.txn_id.node_id.to_be_bytes());

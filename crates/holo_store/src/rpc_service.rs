@@ -1366,11 +1366,92 @@ impl rpc::HoloRpc for RpcService {
         }))
     }
 
+    async fn range_write_latest(
+        &self,
+        req: volo_grpc::Request<rpc::RangeWriteLatestRequest>,
+    ) -> Result<volo_grpc::Response<rpc::RangeWriteLatestResponse>, volo_grpc::Status> {
+        let req = req.into_inner();
+        let mut entries = Vec::with_capacity(req.entries.len());
+        for entry in req.entries {
+            entries.push(crate::RangeWriteEntry {
+                key: entry.key.to_vec(),
+                value: entry.value.to_vec(),
+            });
+        }
+
+        let applied = self
+            .state
+            .write_range_latest_replicated(
+                req.shard_index as usize,
+                req.start_key.as_ref(),
+                req.end_key.as_ref(),
+                &entries,
+            )
+            .await
+            .map_err(|e| volo_grpc::Status::internal(format!("range write failed: {e}")))?;
+
+        Ok(volo_grpc::Response::new(rpc::RangeWriteLatestResponse {
+            applied,
+        }))
+    }
+
+    async fn range_write_latest_conditional(
+        &self,
+        req: volo_grpc::Request<rpc::RangeWriteLatestConditionalRequest>,
+    ) -> Result<volo_grpc::Response<rpc::RangeWriteLatestConditionalResponse>, volo_grpc::Status>
+    {
+        let req = req.into_inner();
+        let mut entries = Vec::with_capacity(req.entries.len());
+        for entry in req.entries {
+            let expected_version = from_rpc_version_required(entry.expected_version)?;
+            entries.push(crate::RangeConditionalWriteEntry {
+                key: entry.key.to_vec(),
+                value: entry.value.to_vec(),
+                expected_version,
+            });
+        }
+
+        let result = self
+            .state
+            .write_range_latest_conditional_replicated(
+                req.shard_index as usize,
+                req.start_key.as_ref(),
+                req.end_key.as_ref(),
+                &entries,
+            )
+            .await
+            .map_err(|e| {
+                volo_grpc::Status::internal(format!("range conditional write failed: {e}"))
+            })?;
+
+        let applied_versions = result
+            .applied_versions
+            .into_iter()
+            .map(|item| rpc::RangeWriteLatestConditionalAppliedVersion {
+                key: item.key.into(),
+                version: Some(to_rpc_version(item.version)),
+            })
+            .collect();
+
+        Ok(volo_grpc::Response::new(
+            rpc::RangeWriteLatestConditionalResponse {
+                applied: result.applied,
+                conflicts: result.conflicts,
+                applied_versions,
+            },
+        ))
+    }
+
     async fn range_apply_latest(
         &self,
         req: volo_grpc::Request<rpc::RangeApplyLatestRequest>,
     ) -> Result<volo_grpc::Response<rpc::RangeApplyLatestResponse>, volo_grpc::Status> {
         let req = req.into_inner();
+        if !req.admin {
+            return Err(volo_grpc::Status::permission_denied(
+                "range_apply_latest is reserved for admin/backfill",
+            ));
+        }
         let mut entries = Vec::with_capacity(req.entries.len());
         for entry in req.entries {
             let version = from_rpc_version_required(entry.version)?;
@@ -1392,6 +1473,49 @@ impl rpc::HoloRpc for RpcService {
         Ok(volo_grpc::Response::new(rpc::RangeApplyLatestResponse {
             applied,
         }))
+    }
+
+    async fn range_apply_latest_conditional(
+        &self,
+        req: volo_grpc::Request<rpc::RangeApplyLatestConditionalRequest>,
+    ) -> Result<volo_grpc::Response<rpc::RangeApplyLatestConditionalResponse>, volo_grpc::Status>
+    {
+        let req = req.into_inner();
+        if !req.admin {
+            return Err(volo_grpc::Status::permission_denied(
+                "range_apply_latest_conditional is reserved for admin/backfill",
+            ));
+        }
+        let mut entries = Vec::with_capacity(req.entries.len());
+        for entry in req.entries {
+            let version = from_rpc_version_required(entry.version)?;
+            let expected_version = from_rpc_version_required(entry.expected_version)?;
+            entries.push(crate::RangeConditionalLatestEntry {
+                key: entry.key.to_vec(),
+                value: entry.value.to_vec(),
+                version,
+                expected_version,
+            });
+        }
+
+        let result = self
+            .state
+            .apply_range_latest_page_conditional(
+                req.shard_index as usize,
+                req.start_key.as_ref(),
+                req.end_key.as_ref(),
+                &entries,
+            )
+            .map_err(|e| {
+                volo_grpc::Status::internal(format!("range conditional apply failed: {e}"))
+            })?;
+
+        Ok(volo_grpc::Response::new(
+            rpc::RangeApplyLatestConditionalResponse {
+                applied: result.applied,
+                conflicts: result.conflicts,
+            },
+        ))
     }
 
     async fn cluster_freeze(

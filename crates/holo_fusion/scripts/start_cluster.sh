@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+CLUSTER_DIR="${CLUSTER_DIR:-"$ROOT_DIR/.cluster"}"
+HF_CLUSTER_DIR="${CLUSTER_DIR}/holo_fusion"
+PIDS_FILE="${HF_CLUSTER_DIR}/pids"
+LOG_DIR="${HF_CLUSTER_DIR}/logs"
+DATA_DIR="${HF_CLUSTER_DIR}/data"
+
+PG_HOST="${HOLO_FUSION_PG_HOST:-127.0.0.1}"
+HEALTH_HOST="${HOLO_FUSION_HEALTH_HOST:-127.0.0.1}"
+REDIS_HOST="${HOLO_FUSION_HOLOSTORE_REDIS_HOST:-127.0.0.1}"
+GRPC_HOST="${HOLO_FUSION_HOLOSTORE_GRPC_HOST:-127.0.0.1}"
+
+NODE1_ID="${NODE1_ID:-1}"
+NODE2_ID="${NODE2_ID:-2}"
+NODE3_ID="${NODE3_ID:-3}"
+
+NODE1_PG_PORT="${NODE1_PG_PORT:-55432}"
+NODE2_PG_PORT="${NODE2_PG_PORT:-55433}"
+NODE3_PG_PORT="${NODE3_PG_PORT:-55434}"
+
+NODE1_HEALTH_PORT="${NODE1_HEALTH_PORT:-18081}"
+NODE2_HEALTH_PORT="${NODE2_HEALTH_PORT:-18082}"
+NODE3_HEALTH_PORT="${NODE3_HEALTH_PORT:-18083}"
+
+NODE1_REDIS_PORT="${NODE1_REDIS_PORT:-16379}"
+NODE2_REDIS_PORT="${NODE2_REDIS_PORT:-16380}"
+NODE3_REDIS_PORT="${NODE3_REDIS_PORT:-16381}"
+
+NODE1_GRPC_PORT="${NODE1_GRPC_PORT:-15051}"
+NODE2_GRPC_PORT="${NODE2_GRPC_PORT:-15052}"
+NODE3_GRPC_PORT="${NODE3_GRPC_PORT:-15053}"
+
+HOLO_FUSION_ENABLE_BALLISTA_SQL="${HOLO_FUSION_ENABLE_BALLISTA_SQL:-false}"
+HOLO_FUSION_DML_PREWRITE_DELAY_MS="${HOLO_FUSION_DML_PREWRITE_DELAY_MS:-0}"
+HOLO_FUSION_HOLOSTORE_MAX_SHARDS="${HOLO_FUSION_HOLOSTORE_MAX_SHARDS:-3}"
+HOLO_FUSION_HOLOSTORE_INITIAL_RANGES="${HOLO_FUSION_HOLOSTORE_INITIAL_RANGES:-1}"
+HOLO_FUSION_HOLOSTORE_ROUTING_MODE="${HOLO_FUSION_HOLOSTORE_ROUTING_MODE:-range}"
+
+HOLO_FUSION_CLEANUP="${HOLO_FUSION_CLEANUP:-1}"
+HOLO_FUSION_BUILD="${HOLO_FUSION_BUILD:-1}"
+HOLO_FUSION_BUILD_PROFILE="${HOLO_FUSION_BUILD_PROFILE:-debug}"
+HOLO_FUSION_READY_TIMEOUT_SEC="${HOLO_FUSION_READY_TIMEOUT_SEC:-45}"
+
+if [[ -z "${HOLO_FUSION_BIN:-}" ]]; then
+  if [[ "$HOLO_FUSION_BUILD_PROFILE" == "release" ]]; then
+    HOLO_FUSION_BIN="$ROOT_DIR/target/release/holo-fusion"
+  else
+    HOLO_FUSION_BIN="$ROOT_DIR/target/debug/holo-fusion"
+  fi
+fi
+
+check_port_free() {
+  local port="$1"
+  if ! command -v lsof >/dev/null 2>&1; then
+    return 0
+  fi
+  if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "error: port already in use: $port" >&2
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN >&2 || true
+    return 1
+  fi
+}
+
+cleanup_previous() {
+  if [[ -f "$PIDS_FILE" ]]; then
+    while IFS= read -r pid; do
+      [[ -z "$pid" ]] && continue
+      if kill -0 "$pid" >/dev/null 2>&1; then
+        kill "$pid" >/dev/null 2>&1 || true
+      fi
+    done <"$PIDS_FILE"
+
+    sleep 1
+
+    while IFS= read -r pid; do
+      [[ -z "$pid" ]] && continue
+      if kill -0 "$pid" >/dev/null 2>&1; then
+        kill -9 "$pid" >/dev/null 2>&1 || true
+      fi
+    done <"$PIDS_FILE"
+  fi
+
+  rm -rf "$HF_CLUSTER_DIR"
+}
+
+wait_for_ready() {
+  local node_name="$1"
+  local host="$2"
+  local port="$3"
+  local ready_url="http://${host}:${port}/ready"
+
+  if command -v curl >/dev/null 2>&1; then
+    local deadline=$((SECONDS + HOLO_FUSION_READY_TIMEOUT_SEC))
+    while (( SECONDS < deadline )); do
+      if curl --silent --fail --max-time 1 "$ready_url" >/dev/null 2>&1; then
+        return 0
+      fi
+      sleep 0.2
+    done
+    echo "error: timed out waiting for ${node_name} readiness at ${ready_url}" >&2
+    return 1
+  fi
+
+  if command -v nc >/dev/null 2>&1; then
+    local deadline=$((SECONDS + HOLO_FUSION_READY_TIMEOUT_SEC))
+    while (( SECONDS < deadline )); do
+      if nc -z "$host" "$port" >/dev/null 2>&1; then
+        return 0
+      fi
+      sleep 0.2
+    done
+    echo "error: timed out waiting for ${node_name} health port ${host}:${port}" >&2
+    return 1
+  fi
+
+  echo "warning: neither curl nor nc found; skipping readiness checks" >&2
+  return 0
+}
+
+if [[ "$HOLO_FUSION_CLEANUP" != "0" ]]; then
+  cleanup_previous
+fi
+
+check_port_free "$NODE1_PG_PORT"
+check_port_free "$NODE2_PG_PORT"
+check_port_free "$NODE3_PG_PORT"
+check_port_free "$NODE1_HEALTH_PORT"
+check_port_free "$NODE2_HEALTH_PORT"
+check_port_free "$NODE3_HEALTH_PORT"
+check_port_free "$NODE1_REDIS_PORT"
+check_port_free "$NODE2_REDIS_PORT"
+check_port_free "$NODE3_REDIS_PORT"
+check_port_free "$NODE1_GRPC_PORT"
+check_port_free "$NODE2_GRPC_PORT"
+check_port_free "$NODE3_GRPC_PORT"
+
+mkdir -p "$LOG_DIR" "$DATA_DIR"
+: >"$PIDS_FILE"
+
+if [[ "$HOLO_FUSION_BUILD" != "0" ]]; then
+  if [[ "$HOLO_FUSION_BUILD_PROFILE" == "release" ]]; then
+    cargo build -p holo_fusion --release
+  else
+    cargo build -p holo_fusion
+  fi
+fi
+
+if [[ ! -x "$HOLO_FUSION_BIN" ]]; then
+  echo "error: holo_fusion binary not found/executable at: $HOLO_FUSION_BIN" >&2
+  echo "set HOLO_FUSION_BIN or run with HOLO_FUSION_BUILD=1" >&2
+  exit 1
+fi
+
+INITIAL_MEMBERS="${NODE1_ID}@${GRPC_HOST}:${NODE1_GRPC_PORT},${NODE2_ID}@${GRPC_HOST}:${NODE2_GRPC_PORT},${NODE3_ID}@${GRPC_HOST}:${NODE3_GRPC_PORT}"
+
+start_node() {
+  local node_id="$1"
+  local pg_port="$2"
+  local health_port="$3"
+  local redis_port="$4"
+  local grpc_port="$5"
+  local bootstrap="$6"
+  local join_addr="$7"
+
+  local node_name="node${node_id}"
+  local node_log="${LOG_DIR}/${node_name}.log"
+  local node_data_dir="${DATA_DIR}/${node_name}"
+  mkdir -p "$node_data_dir"
+
+  local -a cmd=(
+    env
+    HOLO_FUSION_PG_HOST="$PG_HOST"
+    HOLO_FUSION_PG_PORT="$pg_port"
+    HOLO_FUSION_HEALTH_ADDR="${HEALTH_HOST}:${health_port}"
+    HOLO_FUSION_ENABLE_BALLISTA_SQL="$HOLO_FUSION_ENABLE_BALLISTA_SQL"
+    HOLO_FUSION_DML_PREWRITE_DELAY_MS="$HOLO_FUSION_DML_PREWRITE_DELAY_MS"
+    HOLO_FUSION_NODE_ID="$node_id"
+    HOLO_FUSION_HOLOSTORE_REDIS_ADDR="${REDIS_HOST}:${redis_port}"
+    HOLO_FUSION_HOLOSTORE_GRPC_ADDR="${GRPC_HOST}:${grpc_port}"
+    HOLO_FUSION_BOOTSTRAP="$bootstrap"
+    HOLO_FUSION_INITIAL_MEMBERS="$INITIAL_MEMBERS"
+    HOLO_FUSION_HOLOSTORE_DATA_DIR="$node_data_dir"
+    HOLO_FUSION_HOLOSTORE_MAX_SHARDS="$HOLO_FUSION_HOLOSTORE_MAX_SHARDS"
+    HOLO_FUSION_HOLOSTORE_INITIAL_RANGES="$HOLO_FUSION_HOLOSTORE_INITIAL_RANGES"
+    HOLO_FUSION_HOLOSTORE_ROUTING_MODE="$HOLO_FUSION_HOLOSTORE_ROUTING_MODE"
+  )
+
+  if [[ -n "$join_addr" ]]; then
+    cmd+=(HOLO_FUSION_JOIN_ADDR="$join_addr")
+  fi
+
+  cmd+=("$HOLO_FUSION_BIN")
+
+  "${cmd[@]}" >"$node_log" 2>&1 &
+  echo "$!" >>"$PIDS_FILE"
+}
+
+start_node "$NODE1_ID" "$NODE1_PG_PORT" "$NODE1_HEALTH_PORT" "$NODE1_REDIS_PORT" "$NODE1_GRPC_PORT" "true" ""
+start_node "$NODE2_ID" "$NODE2_PG_PORT" "$NODE2_HEALTH_PORT" "$NODE2_REDIS_PORT" "$NODE2_GRPC_PORT" "false" "${GRPC_HOST}:${NODE1_GRPC_PORT}"
+start_node "$NODE3_ID" "$NODE3_PG_PORT" "$NODE3_HEALTH_PORT" "$NODE3_REDIS_PORT" "$NODE3_GRPC_PORT" "false" "${GRPC_HOST}:${NODE1_GRPC_PORT}"
+
+wait_for_ready "node1" "$HEALTH_HOST" "$NODE1_HEALTH_PORT"
+wait_for_ready "node2" "$HEALTH_HOST" "$NODE2_HEALTH_PORT"
+wait_for_ready "node3" "$HEALTH_HOST" "$NODE3_HEALTH_PORT"
+
+cat <<EOF
+holo_fusion 3-node cluster started
+
+cluster dir:
+  $HF_CLUSTER_DIR
+
+pid file:
+  $PIDS_FILE
+
+pg endpoints:
+  node1: ${PG_HOST}:${NODE1_PG_PORT}
+  node2: ${PG_HOST}:${NODE2_PG_PORT}
+  node3: ${PG_HOST}:${NODE3_PG_PORT}
+
+health endpoints:
+  node1: http://${HEALTH_HOST}:${NODE1_HEALTH_PORT}/ready
+  node2: http://${HEALTH_HOST}:${NODE2_HEALTH_PORT}/ready
+  node3: http://${HEALTH_HOST}:${NODE3_HEALTH_PORT}/ready
+
+logs:
+  ${LOG_DIR}/node${NODE1_ID}.log
+  ${LOG_DIR}/node${NODE2_ID}.log
+  ${LOG_DIR}/node${NODE3_ID}.log
+
+stop:
+  ${ROOT_DIR}/crates/holo_fusion/scripts/stop_cluster.sh
+EOF
