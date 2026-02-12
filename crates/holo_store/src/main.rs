@@ -1,8 +1,8 @@
-//! HoloStore node binary entry point.
-//!
-//! This file wires together the Accord consensus groups, KV engine, WAL, gRPC
-//! transport, and Redis protocol server. It also hosts the CLI and runtime
-//! configuration, as well as performance/statistics logging.
+// HoloStore node binary entry point.
+//
+// This file wires together the Accord consensus groups, KV engine, WAL, gRPC
+// transport, and Redis protocol server. It also hosts the CLI and runtime
+// configuration, as well as performance/statistics logging.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, OpenOptions};
@@ -85,7 +85,7 @@ enum Command {
 
 /// CLI options for running a node.
 #[derive(Parser, Debug)]
-struct NodeArgs {
+pub struct NodeArgs {
     #[arg(long)]
     node_id: u64,
 
@@ -538,6 +538,7 @@ struct NodeState {
     controller_lease_renew_margin: Duration,
     meta_move_stuck_warn: Duration,
     split_lock: Arc<std::sync::RwLock<()>>,
+    sql_write_lock: Arc<tokio::sync::Mutex<()>>,
     shard_load: ShardLoadTracker,
     range_stats: Arc<LocalRangeStats>,
     recovery_checkpoints: Arc<RecoveryCheckpointStats>,
@@ -560,11 +561,58 @@ pub(crate) struct RangeSnapshotLatestEntry {
     pub version: kv::Version,
 }
 
+/// One conditional latest-visible KV write with optimistic version checking.
+#[derive(Clone, Debug)]
+pub(crate) struct RangeConditionalLatestEntry {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+    pub version: kv::Version,
+    pub expected_version: kv::Version,
+}
+
+/// Result from a conditional range-apply operation.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct RangeConditionalApplyResult {
+    pub applied: u64,
+    pub conflicts: u64,
+}
+
+/// One replicated range-write entry used by SQL mutation paths.
+#[derive(Clone, Debug)]
+pub(crate) struct RangeWriteEntry {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+}
+
+/// One conditional replicated range-write entry.
+#[derive(Clone, Debug)]
+pub(crate) struct RangeConditionalWriteEntry {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+    pub expected_version: kv::Version,
+}
+
+/// A key/version pair applied during a successful conditional range write.
+#[derive(Clone, Debug)]
+pub(crate) struct RangeConditionalAppliedVersion {
+    pub key: Vec<u8>,
+    pub version: kv::Version,
+}
+
+/// Result from a replicated conditional range-write operation.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RangeConditionalWriteResult {
+    pub applied: u64,
+    pub conflicts: u64,
+    pub applied_versions: Vec<RangeConditionalAppliedVersion>,
+}
+
 /// Local range statistics provider backed by Fjall latest-index partitions.
 #[derive(Clone)]
 struct LocalRangeStats {
     keyspace: Arc<Keyspace>,
     max_shards: usize,
+    apply_lock: Arc<std::sync::Mutex<()>>,
 }
 
 impl LocalRangeStats {
@@ -572,6 +620,7 @@ impl LocalRangeStats {
         Self {
             keyspace,
             max_shards: max_shards.max(1),
+            apply_lock: Arc::new(std::sync::Mutex::new(())),
         }
     }
 
@@ -580,6 +629,14 @@ impl LocalRangeStats {
             "kv_latest".to_string()
         } else {
             format!("kv_latest_{shard_index}")
+        }
+    }
+
+    fn versions_partition_name(&self, shard_index: usize) -> String {
+        if self.max_shards <= 1 {
+            "kv_versions".to_string()
+        } else {
+            format!("kv_versions_{shard_index}")
         }
     }
 
@@ -670,6 +727,10 @@ impl LocalRangeStats {
         end_key: &[u8],
         entries: &[RangeSnapshotLatestEntry],
     ) -> anyhow::Result<u64> {
+        let _guard = self
+            .apply_lock
+            .lock()
+            .map_err(|_| anyhow!("range apply lock poisoned"))?;
         let engine: Arc<dyn KvEngine> = if self.max_shards <= 1 {
             Arc::new(FjallEngine::open(self.keyspace.clone())?)
         } else {
@@ -687,6 +748,89 @@ impl LocalRangeStats {
             applied = applied.saturating_add(1);
         }
         Ok(applied)
+    }
+
+    /// Apply rows only if each key still matches the expected latest version.
+    ///
+    /// This operation is all-or-nothing for the shard request:
+    /// - if any key conflicts, no writes are applied and `conflicts > 0`.
+    /// - otherwise all in-range entries are committed in one batch.
+    fn apply_latest_entries_conditional(
+        &self,
+        shard_index: usize,
+        start_key: &[u8],
+        end_key: &[u8],
+        entries: &[RangeConditionalLatestEntry],
+    ) -> anyhow::Result<RangeConditionalApplyResult> {
+        let _guard = self
+            .apply_lock
+            .lock()
+            .map_err(|_| anyhow!("range apply lock poisoned"))?;
+
+        let latest_name = self.latest_partition_name(shard_index);
+        let latest = self
+            .keyspace
+            .open_partition(&latest_name, PartitionCreateOptions::default())?;
+        let versions_name = self.versions_partition_name(shard_index);
+        let versions = self
+            .keyspace
+            .open_partition(&versions_name, PartitionCreateOptions::default())?;
+
+        let in_range = entries
+            .iter()
+            .filter(|entry| {
+                let in_start = start_key.is_empty() || entry.key.as_slice() >= start_key;
+                let in_end = end_key.is_empty() || entry.key.as_slice() < end_key;
+                in_start && in_end
+            })
+            .collect::<Vec<_>>();
+
+        if in_range.is_empty() {
+            return Ok(RangeConditionalApplyResult::default());
+        }
+
+        let mut conflicts = 0u64;
+        for entry in &in_range {
+            let Some(cur_bytes) = latest.get(entry.key.as_slice())? else {
+                // Allow insert-on-missing when the caller expects the zero version.
+                if entry.expected_version != kv::Version::zero() {
+                    conflicts = conflicts.saturating_add(1);
+                }
+                continue;
+            };
+            let (cur_version, _) = kv::decode_latest_value(&cur_bytes)?;
+            if cur_version != entry.expected_version {
+                conflicts = conflicts.saturating_add(1);
+            }
+        }
+
+        if conflicts > 0 {
+            return Ok(RangeConditionalApplyResult {
+                applied: 0,
+                conflicts,
+            });
+        }
+
+        let mut batch = self.keyspace.batch();
+        for entry in &in_range {
+            let version_key = kv::encode_version_key(entry.key.as_slice(), entry.version);
+            batch.insert(
+                &versions,
+                version_key,
+                kv::encode_version_value(true, entry.value.as_slice()),
+            );
+            batch.insert(
+                &latest,
+                entry.key.clone(),
+                kv::encode_latest_value(entry.version, entry.value.as_slice()),
+            );
+        }
+
+        batch.commit()?;
+        Ok(RangeConditionalApplyResult {
+            applied: in_range.len() as u64,
+            conflicts: 0,
+        })
     }
 }
 
@@ -1887,6 +2031,203 @@ impl NodeState {
     ) -> anyhow::Result<u64> {
         self.range_stats
             .apply_latest_entries(shard_index, start_key, end_key, entries)
+    }
+
+    /// Apply one page of latest rows conditionally into a local shard range.
+    fn apply_range_latest_page_conditional(
+        &self,
+        shard_index: usize,
+        start_key: &[u8],
+        end_key: &[u8],
+        entries: &[RangeConditionalLatestEntry],
+    ) -> anyhow::Result<RangeConditionalApplyResult> {
+        self.range_stats
+            .apply_latest_entries_conditional(shard_index, start_key, end_key, entries)
+    }
+
+    fn ensure_keys_route_to_shard(
+        &self,
+        shard_index: usize,
+        keys: &[Vec<u8>],
+    ) -> anyhow::Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+
+        let _guard = self.split_lock.read().unwrap();
+        let range_snapshot = if matches!(self.routing_mode, RoutingMode::Range) {
+            Some(self.cluster_store.shards_snapshot())
+        } else {
+            None
+        };
+        let ranges = range_snapshot.as_deref();
+
+        for key in keys {
+            let actual = self.shard_for_key_with_snapshot(key, ranges);
+            anyhow::ensure!(
+                actual == shard_index,
+                "key routed to shard {actual}, but request targeted shard {shard_index}"
+            );
+        }
+        Ok(())
+    }
+
+    async fn write_range_latest_replicated(
+        &self,
+        shard_index: usize,
+        start_key: &[u8],
+        end_key: &[u8],
+        entries: &[RangeWriteEntry],
+    ) -> anyhow::Result<u64> {
+        let in_range = entries
+            .iter()
+            .filter(|entry| {
+                let in_start = start_key.is_empty() || entry.key.as_slice() >= start_key;
+                let in_end = end_key.is_empty() || entry.key.as_slice() < end_key;
+                in_start && in_end
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if in_range.is_empty() {
+            return Ok(0);
+        }
+
+        let _write_guard = self.sql_write_lock.lock().await;
+
+        let keys = in_range
+            .iter()
+            .map(|entry| entry.key.clone())
+            .collect::<Vec<_>>();
+        self.ensure_keys_route_to_shard(shard_index, &keys)?;
+
+        let items = in_range
+            .iter()
+            .map(|entry| (entry.key.clone(), entry.value.clone()))
+            .collect::<Vec<_>>();
+        self.execute_batch_set_direct(items).await?;
+        let committed = in_range
+            .iter()
+            .map(|entry| (entry.key.clone(), entry.value.clone()))
+            .collect::<Vec<_>>();
+        let _ = self.wait_for_latest_values(&committed).await?;
+        Ok(in_range.len() as u64)
+    }
+
+    async fn write_range_latest_conditional_replicated(
+        &self,
+        shard_index: usize,
+        start_key: &[u8],
+        end_key: &[u8],
+        entries: &[RangeConditionalWriteEntry],
+    ) -> anyhow::Result<RangeConditionalWriteResult> {
+        let in_range = entries
+            .iter()
+            .filter(|entry| {
+                let in_start = start_key.is_empty() || entry.key.as_slice() >= start_key;
+                let in_end = end_key.is_empty() || entry.key.as_slice() < end_key;
+                in_start && in_end
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if in_range.is_empty() {
+            return Ok(RangeConditionalWriteResult::default());
+        }
+
+        let _write_guard = self.sql_write_lock.lock().await;
+
+        let keys = in_range
+            .iter()
+            .map(|entry| entry.key.clone())
+            .collect::<Vec<_>>();
+        self.ensure_keys_route_to_shard(shard_index, &keys)?;
+
+        let mut conflicts = 0u64;
+        for entry in &in_range {
+            match self.kv_latest(entry.key.as_slice()) {
+                Some((_, version)) => {
+                    if version != entry.expected_version {
+                        conflicts = conflicts.saturating_add(1);
+                    }
+                }
+                None => {
+                    if entry.expected_version != kv::Version::zero() {
+                        conflicts = conflicts.saturating_add(1);
+                    }
+                }
+            }
+        }
+
+        if conflicts > 0 {
+            return Ok(RangeConditionalWriteResult {
+                applied: 0,
+                conflicts,
+                applied_versions: Vec::new(),
+            });
+        }
+
+        let items = in_range
+            .iter()
+            .map(|entry| (entry.key.clone(), entry.value.clone()))
+            .collect::<Vec<_>>();
+        self.execute_batch_set_direct(items).await?;
+        let committed = in_range
+            .iter()
+            .map(|entry| (entry.key.clone(), entry.value.clone()))
+            .collect::<Vec<_>>();
+        let latest_versions = self.wait_for_latest_values(&committed).await?;
+        let mut applied_versions = Vec::with_capacity(in_range.len());
+        for (entry, version) in in_range.iter().zip(latest_versions.into_iter()) {
+            applied_versions.push(RangeConditionalAppliedVersion {
+                key: entry.key.clone(),
+                version,
+            });
+        }
+
+        Ok(RangeConditionalWriteResult {
+            applied: in_range.len() as u64,
+            conflicts: 0,
+            applied_versions,
+        })
+    }
+
+    async fn wait_for_latest_values(
+        &self,
+        items: &[(Vec<u8>, Vec<u8>)],
+    ) -> anyhow::Result<Vec<kv::Version>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let keys = items.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let latest = self.kv_latest_batch(&keys);
+            let mut versions = Vec::with_capacity(items.len());
+            let mut complete = true;
+
+            for ((_, expected_value), latest_item) in items.iter().zip(latest.into_iter()) {
+                match latest_item {
+                    Some((value, version)) if value == *expected_value => {
+                        versions.push(version);
+                    }
+                    _ => {
+                        complete = false;
+                        break;
+                    }
+                }
+            }
+
+            if complete {
+                return Ok(versions);
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!("timed out waiting for replicated write visibility");
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
     }
 
     /// Snapshot and reset client batch stats.
@@ -3773,7 +4114,16 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Initialize storage, transport, consensus groups, and servers for a node.
-async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
+pub async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
+    run_node_with_shutdown(args, tokio::signal::ctrl_c()).await
+}
+
+/// Initialize storage, transport, consensus groups, and servers for a node,
+/// and run until `shutdown` resolves.
+pub async fn run_node_with_shutdown<F>(args: NodeArgs, shutdown: F) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = Result<(), std::io::Error>> + Send,
+{
     let data_dir = PathBuf::from(&args.data_dir);
     fs::create_dir_all(&data_dir).context("create data dir")?;
     let storage_dir = data_dir.join("storage");
@@ -4306,6 +4656,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         ),
         meta_move_stuck_warn: Duration::from_millis(args.meta_move_stuck_warn_ms.max(1)),
         split_lock: split_lock.clone(),
+        sql_write_lock: Arc::new(tokio::sync::Mutex::new(())),
         shard_load: ShardLoadTracker::new(data_shards),
         range_stats,
         recovery_checkpoints: recovery_checkpoint_stats.clone(),
@@ -4472,7 +4823,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         "node started"
     );
 
-    tokio::signal::ctrl_c().await?;
+    shutdown.await?;
     Ok(())
 }
 

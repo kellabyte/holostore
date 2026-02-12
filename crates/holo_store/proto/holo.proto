@@ -31,7 +31,10 @@ service HoloRpc {
   rpc RangeRebalance(RangeRebalanceRequest) returns (RangeRebalanceResponse);
   rpc RangeStats(RangeStatsRequest) returns (RangeStatsResponse);
   rpc RangeSnapshotLatest(RangeSnapshotLatestRequest) returns (RangeSnapshotLatestResponse);
+  rpc RangeWriteLatest(RangeWriteLatestRequest) returns (RangeWriteLatestResponse);
+  rpc RangeWriteLatestConditional(RangeWriteLatestConditionalRequest) returns (RangeWriteLatestConditionalResponse);
   rpc RangeApplyLatest(RangeApplyLatestRequest) returns (RangeApplyLatestResponse);
+  rpc RangeApplyLatestConditional(RangeApplyLatestConditionalRequest) returns (RangeApplyLatestConditionalResponse);
   rpc ClusterFreeze(ClusterFreezeRequest) returns (ClusterFreezeResponse);
   rpc ClusterCheckpointControl(ClusterCheckpointControlRequest) returns (ClusterCheckpointControlResponse);
 }
@@ -375,15 +378,76 @@ message RangeSnapshotLatestResponse {
   bool done = 3;
 }
 
+message RangeWriteLatestEntry {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message RangeWriteLatestRequest {
+  uint64 shard_index = 1;
+  bytes start_key = 2;
+  bytes end_key = 3;
+  repeated RangeWriteLatestEntry entries = 4;
+}
+
+message RangeWriteLatestResponse {
+  uint64 applied = 1;
+}
+
+message RangeWriteLatestConditionalEntry {
+  bytes key = 1;
+  bytes value = 2;
+  Version expected_version = 3;
+}
+
+message RangeWriteLatestConditionalAppliedVersion {
+  bytes key = 1;
+  Version version = 2;
+}
+
+message RangeWriteLatestConditionalRequest {
+  uint64 shard_index = 1;
+  bytes start_key = 2;
+  bytes end_key = 3;
+  repeated RangeWriteLatestConditionalEntry entries = 4;
+}
+
+message RangeWriteLatestConditionalResponse {
+  uint64 applied = 1;
+  uint64 conflicts = 2;
+  repeated RangeWriteLatestConditionalAppliedVersion applied_versions = 3;
+}
+
 message RangeApplyLatestRequest {
   uint64 shard_index = 1;
   bytes start_key = 2;
   bytes end_key = 3;
   repeated RangeSnapshotLatestEntry entries = 4;
+  bool admin = 5;
 }
 
 message RangeApplyLatestResponse {
   uint64 applied = 1;
+}
+
+message RangeApplyLatestConditionalEntry {
+  bytes key = 1;
+  bytes value = 2;
+  Version version = 3;
+  Version expected_version = 4;
+}
+
+message RangeApplyLatestConditionalRequest {
+  uint64 shard_index = 1;
+  bytes start_key = 2;
+  bytes end_key = 3;
+  repeated RangeApplyLatestConditionalEntry entries = 4;
+  bool admin = 5;
+}
+
+message RangeApplyLatestConditionalResponse {
+  uint64 applied = 1;
+  uint64 conflicts = 2;
 }
 
 message ClusterFreezeRequest {

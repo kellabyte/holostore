@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "crates/holo_accord",
+  "crates/holo_fusion",
   "crates/holo_store",
   "crates/holo_workload",
 ]

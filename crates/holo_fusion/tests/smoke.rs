@@ -1,0 +1,893 @@
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use holo_fusion::metadata::find_table_metadata_by_name;
+use holo_fusion::metrics::PushdownMetrics;
+use holo_fusion::provider::{HoloStoreTableProvider, OrdersSeedRow};
+use holo_fusion::{run_with_shutdown, HoloFusionConfig};
+use holo_store::{EmbeddedNodeConfig, HoloStoreClient};
+use tempfile::TempDir;
+use tokio::sync::oneshot;
+use tokio_postgres::NoTls;
+
+const ORDERS_TABLE_DDL: &str = "CREATE TABLE IF NOT EXISTS orders (
+    order_id BIGINT NOT NULL,
+    customer_id BIGINT NOT NULL,
+    status TEXT,
+    total_cents BIGINT NOT NULL,
+    created_at TIMESTAMP NOT NULL,
+    PRIMARY KEY (order_id)
+);";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase1_smoke_select_1() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    let row = client
+        .query_one("SELECT 1", &[])
+        .await
+        .context("run SELECT 1")?;
+    let value: i64 = row.try_get(0).context("decode SELECT 1 result as i64")?;
+    assert_eq!(value, 1);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase1_pg_postmaster_start_time_available() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    let row = client
+        .query_one(
+            "SELECT pg_catalog.pg_postmaster_start_time() IS NOT NULL",
+            &[],
+        )
+        .await
+        .context("query pg_postmaster_start_time compatibility function")?;
+    let is_present: bool = row.try_get(0)?;
+    assert!(is_present, "pg_postmaster_start_time should return a value");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase2_seeded_orders_scan_and_filter() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let holostore_client = harness.holostore_client();
+
+    let rows = vec![
+        OrdersSeedRow::new(1001, 42, Some("paid"), 1299, 1_707_654_000_000_000_000),
+        OrdersSeedRow::new(1002, 42, Some("shipped"), 2599, 1_707_654_100_000_000_000),
+        OrdersSeedRow::new(1003, 99, Some("pending"), 399, 1_707_654_200_000_000_000),
+    ];
+
+    let table = find_table_metadata_by_name(&holostore_client, "orders")
+        .await
+        .context("read metadata for orders table")?
+        .context("orders table metadata should exist")?;
+    let provider = HoloStoreTableProvider::from_table_metadata(
+        &table,
+        holostore_client.clone(),
+        Arc::new(PushdownMetrics::default()),
+    )
+    .context("build provider for seeded orders test")?;
+    let applied = provider
+        .upsert_orders_rows(&rows)
+        .await
+        .context("seed orders through provider upsert path")?;
+    assert_eq!(applied, rows.len() as u64);
+
+    let (client, _guard) = harness.connect_pg().await?;
+    let result = client
+        .query(
+            "SELECT order_id, customer_id, status, total_cents FROM orders ORDER BY order_id",
+            &[],
+        )
+        .await
+        .context("query seeded orders")?;
+    assert_eq!(result.len(), 3);
+    assert_eq!(result[0].try_get::<_, i64>(0)?, 1001);
+    assert_eq!(result[0].try_get::<_, i64>(1)?, 42);
+    assert_eq!(result[0].try_get::<_, String>(2)?, "paid");
+    assert_eq!(result[0].try_get::<_, i64>(3)?, 1299);
+
+    let filtered = client
+        .query(
+            "SELECT order_id FROM orders WHERE order_id >= 1002 AND order_id < 1003 ORDER BY order_id",
+            &[],
+        )
+        .await
+        .context("query filtered orders by pushed PK bounds")?;
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].try_get::<_, i64>(0)?, 1002);
+
+    let metrics = harness.metrics_body().context("fetch pushdown metrics")?;
+    assert!(
+        metrics.contains("pushdown_support_exact="),
+        "missing exact pushdown metric in body: {metrics}"
+    );
+    assert!(
+        metrics.contains("scan_requests="),
+        "missing scan request metric in body: {metrics}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase4_insert_values_round_trip() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    client
+        .batch_execute(
+            "INSERT INTO orders (order_id, customer_id, status, total_cents, created_at) VALUES
+             (2001, 77, 'paid', 1999, TIMESTAMP '2026-02-11 10:00:00'),
+             (2002, 88, 'pending', 499, TIMESTAMP '2026-02-11 10:01:00');",
+        )
+        .await
+        .context("insert rows through postgres wire")?;
+
+    let rows = client
+        .query(
+            "SELECT order_id, customer_id, status, total_cents FROM orders WHERE order_id >= 2001 ORDER BY order_id",
+            &[],
+        )
+        .await
+        .context("select inserted rows")?;
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].try_get::<_, i64>(0)?, 2001);
+    assert_eq!(rows[0].try_get::<_, i64>(1)?, 77);
+    assert_eq!(rows[0].try_get::<_, String>(2)?, "paid");
+    assert_eq!(rows[0].try_get::<_, i64>(3)?, 1999);
+    assert_eq!(rows[1].try_get::<_, i64>(0)?, 2002);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase4_insert_select_generate_series_round_trip() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    let before = client
+        .query_one("SELECT COUNT(*)::BIGINT FROM orders", &[])
+        .await
+        .context("count rows before insert-select")?
+        .try_get::<_, i64>(0)?;
+    assert_eq!(before, 0);
+
+    let inserted = client
+        .execute(
+            "INSERT INTO orders (order_id, customer_id, status, total_cents, created_at)
+             SELECT
+               1000000 + i,
+               2000 + (i % 500),
+               CASE
+                 WHEN i % 4 = 0 THEN 'paid'
+                 WHEN i % 4 = 1 THEN 'pending'
+                 WHEN i % 4 = 2 THEN 'shipped'
+                 ELSE 'cancelled'
+               END,
+               500 + ((i * 37) % 50000),
+               TIMESTAMP '2026-02-11 00:00:00' + (i || ' seconds')::interval
+             FROM generate_series(1, 10000) AS g(i)",
+            &[],
+        )
+        .await
+        .context("run insert-select generate_series")?;
+    assert_eq!(inserted, 10_000);
+
+    let after_first = client
+        .query_one("SELECT COUNT(*)::BIGINT FROM orders", &[])
+        .await
+        .context("count rows after first insert-select")?
+        .try_get::<_, i64>(0)?;
+    assert_eq!(after_first, 10_000);
+
+    let inserted_again = client
+        .execute(
+            "INSERT INTO orders (order_id, customer_id, status, total_cents, created_at)
+             SELECT
+               1000000 + i,
+               2000 + (i % 500),
+               CASE
+                 WHEN i % 4 = 0 THEN 'paid'
+                 WHEN i % 4 = 1 THEN 'pending'
+                 WHEN i % 4 = 2 THEN 'shipped'
+                 ELSE 'cancelled'
+               END,
+               500 + ((i * 37) % 50000),
+               TIMESTAMP '2026-02-11 00:00:00' + (i || ' seconds')::interval
+             FROM generate_series(1, 10000) AS g(i)",
+            &[],
+        )
+        .await
+        .context("run second insert-select generate_series")?;
+    assert_eq!(inserted_again, 10_000);
+
+    let after_second = client
+        .query_one("SELECT COUNT(*)::BIGINT FROM orders", &[])
+        .await
+        .context("count rows after second insert-select")?
+        .try_get::<_, i64>(0)?;
+    assert_eq!(after_second, 10_000);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase4_create_table_registers_metadata_and_supports_insert_select() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    client
+        .batch_execute(
+            "CREATE TABLE orders_custom (
+                order_id BIGINT NOT NULL,
+                customer_id BIGINT NOT NULL,
+                status TEXT,
+                total_cents BIGINT NOT NULL,
+                created_at TIMESTAMP NOT NULL,
+                PRIMARY KEY (order_id)
+            );",
+        )
+        .await
+        .context("create orders_custom table")?;
+
+    client
+        .batch_execute(
+            "INSERT INTO orders_custom (order_id, customer_id, status, total_cents, created_at) VALUES
+             (81001, 31, 'paid', 900, TIMESTAMP '2026-02-11 19:00:00'),
+             (81002, 32, 'pending', 1900, TIMESTAMP '2026-02-11 19:00:01');",
+        )
+        .await
+        .context("insert rows into created table")?;
+
+    let count = client
+        .query_one("SELECT COUNT(*)::BIGINT FROM orders_custom", &[])
+        .await
+        .context("count rows from created table")?
+        .try_get::<_, i64>(0)?;
+    assert_eq!(count, 2);
+
+    let updated = client
+        .execute(
+            "UPDATE orders_custom SET status = 'settled' WHERE order_id = 81001",
+            &[],
+        )
+        .await
+        .context("update row in created table")?;
+    assert_eq!(updated, 1);
+
+    let deleted = client
+        .execute("DELETE FROM orders_custom WHERE order_id = 81002", &[])
+        .await
+        .context("delete row in created table")?;
+    assert_eq!(deleted, 1);
+
+    let duplicate_err = client
+        .batch_execute(
+            "CREATE TABLE orders_custom (
+                order_id BIGINT NOT NULL,
+                customer_id BIGINT NOT NULL,
+                status TEXT,
+                total_cents BIGINT NOT NULL,
+                created_at TIMESTAMP NOT NULL,
+                PRIMARY KEY (order_id)
+            );",
+        )
+        .await
+        .expect_err("duplicate create table should fail");
+    assert_sqlstate(&duplicate_err, "42P07");
+
+    client
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS orders_custom (
+                order_id BIGINT NOT NULL,
+                customer_id BIGINT NOT NULL,
+                status TEXT,
+                total_cents BIGINT NOT NULL,
+                created_at TIMESTAMP NOT NULL,
+                PRIMARY KEY (order_id)
+            );",
+        )
+        .await
+        .context("create table if not exists should succeed")?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase5_update_delete_strict_semantics_and_prepared_retry() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    client
+        .batch_execute(
+            "INSERT INTO orders (order_id, customer_id, status, total_cents, created_at) VALUES
+             (3001, 11, 'new', 100, TIMESTAMP '2026-02-11 12:00:00'),
+             (3002, 11, 'new', 200, TIMESTAMP '2026-02-11 12:01:00'),
+             (3003, 22, 'new', 300, TIMESTAMP '2026-02-11 12:02:00');",
+        )
+        .await
+        .context("seed rows for update/delete")?;
+
+    let updated = client
+        .execute(
+            "UPDATE orders SET status = $1, total_cents = $2 WHERE order_id = $3",
+            &[&"paid", &150i64, &3001i64],
+        )
+        .await
+        .context("run prepared UPDATE")?;
+    assert_eq!(updated, 1);
+
+    let retried_update = client
+        .execute(
+            "UPDATE orders SET status = $1, total_cents = $2 WHERE order_id = $3",
+            &[&"paid", &150i64, &3001i64],
+        )
+        .await
+        .context("retry prepared UPDATE")?;
+    assert_eq!(retried_update, 1);
+
+    let row = client
+        .query_one(
+            "SELECT status, total_cents FROM orders WHERE order_id = 3001",
+            &[],
+        )
+        .await
+        .context("read updated row")?;
+    assert_eq!(row.try_get::<_, String>(0)?, "paid");
+    assert_eq!(row.try_get::<_, i64>(1)?, 150);
+
+    let deleted = client
+        .execute("DELETE FROM orders WHERE order_id = $1", &[&3002i64])
+        .await
+        .context("delete with prepared statement")?;
+    assert_eq!(deleted, 1);
+
+    let retried_delete = client
+        .execute("DELETE FROM orders WHERE order_id = $1", &[&3002i64])
+        .await
+        .context("retry delete with prepared statement")?;
+    assert_eq!(retried_delete, 0);
+
+    let remaining = client
+        .query(
+            "SELECT order_id FROM orders WHERE order_id >= 3001 ORDER BY order_id",
+            &[],
+        )
+        .await
+        .context("read remaining rows after delete")?;
+    assert_eq!(remaining.len(), 2);
+    assert_eq!(remaining[0].try_get::<_, i64>(0)?, 3001);
+    assert_eq!(remaining[1].try_get::<_, i64>(0)?, 3003);
+
+    let full_update_err = client
+        .execute("UPDATE orders SET status = 'x'", &[])
+        .await
+        .expect_err("full table UPDATE must fail");
+    assert_sqlstate(&full_update_err, "0A000");
+
+    let non_pk_update_err = client
+        .execute("UPDATE orders SET status = 'x' WHERE customer_id = 11", &[])
+        .await
+        .expect_err("non-PK UPDATE must fail");
+    assert_sqlstate(&non_pk_update_err, "0A000");
+
+    let full_delete_err = client
+        .execute("DELETE FROM orders", &[])
+        .await
+        .expect_err("full table DELETE must fail");
+    assert_sqlstate(&full_delete_err, "0A000");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase5_concurrent_update_conflict_reports_40001() -> Result<()> {
+    let harness = TestHarness::start_with_dml_prewrite_delay(Duration::from_millis(200)).await?;
+    let (seed_client, _seed_guard) = harness.connect_pg().await?;
+
+    seed_client
+        .batch_execute(
+            "INSERT INTO orders (order_id, customer_id, status, total_cents, created_at) VALUES
+             (4001, 33, 'open', 500, TIMESTAMP '2026-02-11 13:00:00');",
+        )
+        .await
+        .context("seed row for concurrent conflict test")?;
+
+    let (client_a, _guard_a) = harness.connect_pg().await?;
+    let (client_b, _guard_b) = harness.connect_pg().await?;
+
+    let update_a = client_a.execute(
+        "UPDATE orders SET status = 'alpha' WHERE order_id = 4001",
+        &[],
+    );
+    let update_b = client_b.execute(
+        "UPDATE orders SET status = 'beta' WHERE order_id = 4001",
+        &[],
+    );
+    let (res_a, res_b) = tokio::join!(update_a, update_b);
+
+    let mut applied = 0usize;
+    let mut conflicts = 0usize;
+    for result in [res_a, res_b] {
+        match result {
+            Ok(rows) => {
+                assert_eq!(rows, 1);
+                applied += 1;
+            }
+            Err(err) => {
+                assert_sqlstate(&err, "40001");
+                conflicts += 1;
+            }
+        }
+    }
+
+    assert_eq!(applied, 1, "expected exactly one successful update");
+    assert_eq!(conflicts, 1, "expected exactly one write-write conflict");
+
+    let row = seed_client
+        .query_one("SELECT status FROM orders WHERE order_id = 4001", &[])
+        .await
+        .context("read row after concurrent conflict")?;
+    let status = row.try_get::<_, String>(0)?;
+    assert!(
+        status == "alpha" || status == "beta",
+        "unexpected final status after concurrent conflict: {status}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase6_begin_commit_snapshot_and_read_your_writes() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client_a, _guard_a) = harness.connect_pg().await?;
+    let (client_b, _guard_b) = harness.connect_pg().await?;
+
+    let commit_without_tx = client_a
+        .execute("COMMIT", &[])
+        .await
+        .expect_err("COMMIT without BEGIN should fail");
+    assert_sqlstate(&commit_without_tx, "25P01");
+
+    let rollback_without_tx = client_a
+        .execute("ROLLBACK", &[])
+        .await
+        .expect_err("ROLLBACK without BEGIN should fail");
+    assert_sqlstate(&rollback_without_tx, "25P01");
+
+    client_a
+        .execute("BEGIN", &[])
+        .await
+        .context("start explicit transaction")?;
+    client_a
+        .execute(
+            "INSERT INTO orders (order_id, customer_id, status, total_cents, created_at)
+             VALUES (6001, 61, 'txn_visible', 100, TIMESTAMP '2026-02-11 14:00:00')",
+            &[],
+        )
+        .await
+        .context("insert row inside transaction")?;
+
+    let in_tx_count = client_a
+        .query_one(
+            "SELECT COUNT(*)::BIGINT FROM orders WHERE order_id = 6001",
+            &[],
+        )
+        .await
+        .context("read own writes inside transaction")?
+        .try_get::<_, i64>(0)?;
+    assert_eq!(in_tx_count, 1);
+
+    let outside_count_before_commit = client_b
+        .query_one(
+            "SELECT COUNT(*)::BIGINT FROM orders WHERE order_id = 6001",
+            &[],
+        )
+        .await
+        .context("outside session read before commit")?
+        .try_get::<_, i64>(0)?;
+    assert_eq!(outside_count_before_commit, 0);
+
+    client_b
+        .execute(
+            "INSERT INTO orders (order_id, customer_id, status, total_cents, created_at)
+             VALUES (6002, 62, 'outside', 200, TIMESTAMP '2026-02-11 14:01:00')",
+            &[],
+        )
+        .await
+        .context("insert concurrent row outside transaction")?;
+
+    let snapshot_count = client_a
+        .query_one(
+            "SELECT COUNT(*)::BIGINT FROM orders WHERE order_id = 6002",
+            &[],
+        )
+        .await
+        .context("snapshot read should not see post-BEGIN row")?
+        .try_get::<_, i64>(0)?;
+    assert_eq!(snapshot_count, 0);
+
+    client_a
+        .execute("COMMIT", &[])
+        .await
+        .context("commit transaction")?;
+
+    let outside_count_after_commit = client_b
+        .query_one(
+            "SELECT COUNT(*)::BIGINT FROM orders WHERE order_id = 6001",
+            &[],
+        )
+        .await
+        .context("outside session read after commit")?
+        .try_get::<_, i64>(0)?;
+    assert_eq!(outside_count_after_commit, 1);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase6_rollback_discards_uncommitted_changes() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    client
+        .execute(
+            "INSERT INTO orders (order_id, customer_id, status, total_cents, created_at)
+             VALUES (6101, 71, 'seed', 300, TIMESTAMP '2026-02-11 15:00:00')",
+            &[],
+        )
+        .await
+        .context("seed rollback test row")?;
+
+    client
+        .execute("BEGIN", &[])
+        .await
+        .context("start rollback test transaction")?;
+    client
+        .execute(
+            "UPDATE orders SET status = 'updated_in_tx' WHERE order_id = 6101",
+            &[],
+        )
+        .await
+        .context("update row inside transaction")?;
+    client
+        .execute(
+            "INSERT INTO orders (order_id, customer_id, status, total_cents, created_at)
+             VALUES (6102, 72, 'inserted_in_tx', 400, TIMESTAMP '2026-02-11 15:01:00')",
+            &[],
+        )
+        .await
+        .context("insert row inside transaction")?;
+
+    let in_tx_rows = client
+        .query(
+            "SELECT order_id, status FROM orders WHERE order_id BETWEEN 6101 AND 6102 ORDER BY order_id",
+            &[],
+        )
+        .await
+        .context("read rows inside transaction before rollback")?;
+    assert_eq!(in_tx_rows.len(), 2);
+
+    client
+        .execute("ROLLBACK", &[])
+        .await
+        .context("rollback transaction")?;
+
+    let base_row = client
+        .query_one("SELECT status FROM orders WHERE order_id = 6101", &[])
+        .await
+        .context("read base row after rollback")?;
+    assert_eq!(base_row.try_get::<_, String>(0)?, "seed");
+
+    let rolled_back_insert = client
+        .query_one(
+            "SELECT COUNT(*)::BIGINT FROM orders WHERE order_id = 6102",
+            &[],
+        )
+        .await
+        .context("verify inserted row is gone after rollback")?
+        .try_get::<_, i64>(0)?;
+    assert_eq!(rolled_back_insert, 0);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase6_commit_conflict_aborts_transaction_until_rollback() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client_a, _guard_a) = harness.connect_pg().await?;
+    let (client_b, _guard_b) = harness.connect_pg().await?;
+
+    client_a
+        .execute(
+            "INSERT INTO orders (order_id, customer_id, status, total_cents, created_at)
+             VALUES (6201, 81, 'open', 500, TIMESTAMP '2026-02-11 16:00:00')",
+            &[],
+        )
+        .await
+        .context("seed conflict row")?;
+
+    client_a
+        .execute("BEGIN", &[])
+        .await
+        .context("start transaction A")?;
+    client_b
+        .execute("BEGIN", &[])
+        .await
+        .context("start transaction B")?;
+
+    client_a
+        .execute(
+            "UPDATE orders SET status = 'winner' WHERE order_id = 6201",
+            &[],
+        )
+        .await
+        .context("stage update in transaction A")?;
+    client_b
+        .execute(
+            "UPDATE orders SET status = 'loser' WHERE order_id = 6201",
+            &[],
+        )
+        .await
+        .context("stage update in transaction B")?;
+
+    client_a
+        .execute("COMMIT", &[])
+        .await
+        .context("commit transaction A")?;
+
+    let conflict = client_b
+        .execute("COMMIT", &[])
+        .await
+        .expect_err("transaction B commit should conflict");
+    assert_sqlstate(&conflict, "40001");
+
+    let aborted = client_b
+        .execute("SELECT 1", &[])
+        .await
+        .expect_err("aborted transaction should block statements");
+    assert_sqlstate(&aborted, "25P02");
+
+    client_b
+        .execute("ROLLBACK", &[])
+        .await
+        .context("clear aborted transaction state with rollback")?;
+
+    let select_after_rollback = client_b
+        .query_one("SELECT 1", &[])
+        .await
+        .context("session should be usable after rollback")?;
+    assert_eq!(select_after_rollback.try_get::<_, i64>(0)?, 1);
+
+    let final_row = client_a
+        .query_one("SELECT status FROM orders WHERE order_id = 6201", &[])
+        .await
+        .context("read winner row after conflict")?;
+    assert_eq!(final_row.try_get::<_, String>(0)?, "winner");
+
+    Ok(())
+}
+
+fn free_port() -> Result<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0").context("bind ephemeral port")?;
+    Ok(listener.local_addr()?.port())
+}
+
+fn wait_for_ready(addr: SocketAddr, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(status) = health_status(addr, "/ready") {
+            if status == 200 {
+                return Ok(());
+            }
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for /ready on {addr}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn health_status(addr: SocketAddr, path: &str) -> Result<u16> {
+    let mut stream = TcpStream::connect(addr).context("connect health server")?;
+    let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .context("write health request")?;
+
+    let mut resp = String::new();
+    stream
+        .read_to_string(&mut resp)
+        .context("read health response")?;
+    let status = resp
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .ok_or_else(|| anyhow::anyhow!("invalid health response: {resp}"))?
+        .parse::<u16>()
+        .context("parse health status code")?;
+    Ok(status)
+}
+
+fn health_body(addr: SocketAddr, path: &str) -> Result<String> {
+    let mut stream = TcpStream::connect(addr).context("connect health server")?;
+    let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .context("write health request")?;
+
+    let mut resp = String::new();
+    stream
+        .read_to_string(&mut resp)
+        .context("read health response")?;
+    let split = resp
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| anyhow::anyhow!("invalid health response: {resp}"))?;
+    Ok(split.1.to_string())
+}
+
+fn assert_sqlstate(err: &tokio_postgres::Error, expected: &str) {
+    let actual = err.code().map(|code| code.code());
+    assert_eq!(
+        actual,
+        Some(expected),
+        "unexpected SQLSTATE for error: {err}"
+    );
+}
+
+async fn ensure_orders_table(host: &str, port: u16) -> Result<()> {
+    let conn = format!("host={host} port={port} user=postgres dbname=datafusion");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut last_err = anyhow::anyhow!("orders table bootstrap failed");
+
+    loop {
+        match tokio_postgres::connect(&conn, NoTls).await {
+            Ok((client, connection)) => {
+                let guard = tokio::spawn(async move {
+                    let _ = connection.await;
+                });
+                match client.batch_execute(ORDERS_TABLE_DDL).await {
+                    Ok(_) => {
+                        guard.abort();
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        last_err = err.into();
+                        guard.abort();
+                    }
+                }
+            }
+            Err(err) => {
+                last_err = err.into();
+            }
+        }
+
+        if Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    Err(last_err).context("bootstrap orders table for smoke tests")
+}
+
+struct TestHarness {
+    pg_host: String,
+    pg_port: u16,
+    health_addr: SocketAddr,
+    grpc_addr: SocketAddr,
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    runtime_task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    _temp_dir: TempDir,
+}
+
+impl TestHarness {
+    async fn start() -> Result<Self> {
+        Self::start_with_dml_prewrite_delay(Duration::ZERO).await
+    }
+
+    async fn start_with_dml_prewrite_delay(dml_prewrite_delay: Duration) -> Result<Self> {
+        let temp_dir = TempDir::new().context("create temp dir")?;
+
+        let pg_port = free_port()?;
+        let health_port = free_port()?;
+        let redis_port = free_port()?;
+        let grpc_port = free_port()?;
+
+        let pg_host = "127.0.0.1".to_string();
+        let health_addr: SocketAddr = format!("127.0.0.1:{health_port}").parse()?;
+        let redis_addr: SocketAddr = format!("127.0.0.1:{redis_port}").parse()?;
+        let grpc_addr: SocketAddr = format!("127.0.0.1:{grpc_port}").parse()?;
+
+        let config = HoloFusionConfig {
+            pg_host: pg_host.clone(),
+            pg_port,
+            health_addr,
+            enable_ballista_sql: false,
+            dml_prewrite_delay,
+            holostore: EmbeddedNodeConfig {
+                node_id: 1,
+                listen_redis: redis_addr,
+                listen_grpc: grpc_addr,
+                bootstrap: true,
+                join: None,
+                initial_members: format!("1@{grpc_addr}"),
+                data_dir: temp_dir.path().join("node-1"),
+                ready_timeout: Duration::from_secs(30),
+                max_shards: 1,
+                initial_ranges: 1,
+                routing_mode: None,
+            },
+        };
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let runtime_task = tokio::spawn(async move {
+            run_with_shutdown(config, async move {
+                let _ = shutdown_rx.await;
+                Ok::<(), std::io::Error>(())
+            })
+            .await
+        });
+
+        wait_for_ready(health_addr, Duration::from_secs(30))
+            .context("wait for runtime readiness")?;
+        ensure_orders_table(pg_host.as_str(), pg_port)
+            .await
+            .context("bootstrap orders table for smoke tests")?;
+
+        Ok(Self {
+            pg_host,
+            pg_port,
+            health_addr,
+            grpc_addr,
+            shutdown_tx: Some(shutdown_tx),
+            runtime_task: Some(runtime_task),
+            _temp_dir: temp_dir,
+        })
+    }
+
+    async fn connect_pg(&self) -> Result<(tokio_postgres::Client, tokio::task::JoinHandle<()>)> {
+        let conn = format!(
+            "host={} port={} user=postgres dbname=datafusion",
+            self.pg_host, self.pg_port
+        );
+        let (client, connection) = tokio_postgres::connect(&conn, NoTls)
+            .await
+            .context("connect to pg wire server")?;
+        let guard = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        Ok((client, guard))
+    }
+
+    fn holostore_client(&self) -> HoloStoreClient {
+        HoloStoreClient::new(self.grpc_addr)
+    }
+
+    fn metrics_body(&self) -> Result<String> {
+        health_body(self.health_addr, "/metrics")
+    }
+}
+
+impl Drop for TestHarness {
+    fn drop(&mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+
+        if let Some(task) = self.runtime_task.take() {
+            task.abort();
+        }
+    }
+}

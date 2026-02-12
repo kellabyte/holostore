@@ -931,6 +931,7 @@ impl GrpcTransport {
             start_key: start_key.to_vec().into(),
             end_key: end_key.to_vec().into(),
             entries: rpc_entries,
+            admin: true,
         };
         let resp = time::timeout(self.rpc_timeout, peer.read_client.range_apply_latest(req)).await;
         match resp {
