@@ -41,6 +41,7 @@ pub mod topology;
 
 use ballista_codec::HoloFusionLogicalExtensionCodec;
 use catalog::{bootstrap_catalog, sync_catalog_from_metadata};
+use metadata::ensure_metadata_migration;
 use metrics::PushdownMetrics;
 use mutation::{DmlHook, DmlRuntimeConfig};
 use pg_catalog_ext::install_pg_locks_table;
@@ -325,6 +326,34 @@ where
         postmaster_start_time_ns,
         dml_hook.txn_introspection(),
     );
+    health
+        .set(
+            HealthState::Bootstrapping,
+            "running metadata migration/backfill",
+        )
+        .await;
+    let metadata_migration = ensure_metadata_migration(&holostore_client)
+        .await
+        .context("run metadata migration/backfill")?;
+    if metadata_migration.migrated_tables > 0
+        || metadata_migration.from_schema_version != metadata_migration.to_schema_version
+    {
+        info!(
+            from_schema_version = metadata_migration.from_schema_version,
+            to_schema_version = metadata_migration.to_schema_version,
+            resumed_from_checkpoint = metadata_migration
+                .resumed_from_checkpoint
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            scanned_tables = metadata_migration.scanned_tables,
+            migrated_tables = metadata_migration.migrated_tables,
+            "metadata migration completed"
+        );
+    }
+
+    health
+        .set(HealthState::Bootstrapping, "bootstrapping SQL catalog")
+        .await;
     let bootstrap = bootstrap_catalog(
         session_context.as_ref(),
         holostore_client.clone(),

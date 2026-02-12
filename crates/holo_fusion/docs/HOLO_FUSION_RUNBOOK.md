@@ -233,7 +233,11 @@ Rolling upgrade guidance:
 - Wait for `/ready` = `200`.
 - Validate `holoctl topology` convergence.
 - Run a write + read smoke check via `psql`.
+- Confirm metadata migration state reached current schema version (`v2`) with no pending checkpoint.
 4. Continue to next node only after stabilization.
+
+For metadata migration state model and rollout details, see:
+- `crates/holo_fusion/docs/METADATA_MIGRATION.md`
 
 ## Rollback Checklist
 
