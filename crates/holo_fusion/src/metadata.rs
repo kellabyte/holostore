@@ -3,7 +3,7 @@
 //! Metadata rows describe logical SQL tables and are used to bootstrap
 //! `TableProvider` instances on each HoloFusion node.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -20,6 +20,8 @@ const DEFAULT_DB_ID: u64 = 1;
 const DEFAULT_SCHEMA_ID: u64 = 1;
 /// Storage model tag for the current orders table layout.
 const TABLE_MODEL_ORDERS_V1: &str = "orders_v1";
+/// Storage model tag for generic row-oriented table layout.
+const TABLE_MODEL_ROW_V1: &str = "row_v1";
 /// Page size used when scanning metadata rows.
 const DEFAULT_SCAN_PAGE_SIZE: usize = 1024;
 /// Visibility wait timeout after metadata writes.
@@ -38,6 +40,77 @@ pub struct CreateTableMetadataOutcome {
     pub created: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+/// Physical column codec used by schema-driven table metadata.
+pub enum TableColumnType {
+    Int8,
+    Int16,
+    Int32,
+    Int64,
+    UInt8,
+    UInt16,
+    UInt32,
+    UInt64,
+    Float64,
+    Boolean,
+    Utf8,
+    TimestampNanosecond,
+}
+
+impl TableColumnType {
+    /// Returns `true` when values of this type can act as signed integer PKs.
+    pub fn is_signed_integer(&self) -> bool {
+        matches!(self, Self::Int8 | Self::Int16 | Self::Int32 | Self::Int64)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One logical SQL column persisted in table metadata.
+pub struct TableColumnRecord {
+    /// SQL-visible column name.
+    pub name: String,
+    /// Persisted codec type used for row encoding/decoding.
+    pub column_type: TableColumnType,
+    /// Whether this column allows SQL `NULL`.
+    #[serde(default)]
+    pub nullable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Input contract for creating one metadata table row.
+pub struct CreateTableMetadataSpec {
+    /// Storage model to assign to the newly created table.
+    pub table_model: String,
+    /// Persisted logical columns.
+    pub columns: Vec<TableColumnRecord>,
+    /// Name of single-column primary key used for row-key encoding.
+    pub primary_key_column: String,
+    /// Optional shard affinity for scans and writes.
+    pub preferred_shards: Vec<usize>,
+    /// Suggested page size for scan pagination.
+    pub page_size: usize,
+}
+
+impl CreateTableMetadataSpec {
+    /// Validates user-provided metadata before persistence.
+    pub fn validate(&self) -> Result<()> {
+        if self.table_model.trim().is_empty() {
+            return Err(anyhow!("table metadata spec has empty table_model"));
+        }
+        if self.columns.is_empty() {
+            return Err(anyhow!("table metadata spec has no columns"));
+        }
+        if self.primary_key_column.trim().is_empty() {
+            return Err(anyhow!("table metadata spec has empty primary_key_column"));
+        }
+        if self.page_size == 0 {
+            return Err(anyhow!("table metadata spec has invalid page_size=0"));
+        }
+        Ok(())
+    }
+}
+
 /// Persisted metadata row describing one logical SQL table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableMetadataRecord {
@@ -51,6 +124,12 @@ pub struct TableMetadataRecord {
     pub table_name: String,
     /// Storage model discriminator used by provider factory.
     pub table_model: String,
+    /// Persisted logical column list used to construct provider schema.
+    #[serde(default)]
+    pub columns: Vec<TableColumnRecord>,
+    /// Name of single-column primary key used for row-key encoding.
+    #[serde(default)]
+    pub primary_key_column: Option<String>,
     /// Optional shard affinity for scans and writes.
     #[serde(default)]
     pub preferred_shards: Vec<usize>,
@@ -83,6 +162,73 @@ impl TableMetadataRecord {
         if self.table_model.trim().is_empty() {
             return Err(anyhow!(
                 "table metadata has empty table_model for table {}",
+                self.table_name
+            ));
+        }
+
+        // Decision: legacy metadata rows may not include explicit column
+        // specs; keep them valid for backward compatibility.
+        if self.columns.is_empty() {
+            if self.table_model == TABLE_MODEL_ROW_V1 {
+                return Err(anyhow!(
+                    "table metadata has empty columns for row_v1 table {}",
+                    self.table_name
+                ));
+            }
+            return Ok(());
+        }
+
+        let mut seen = BTreeSet::<String>::new();
+        for column in &self.columns {
+            if column.name.trim().is_empty() {
+                return Err(anyhow!(
+                    "table metadata has empty column name for table {}",
+                    self.table_name
+                ));
+            }
+            let normalized = column.name.to_ascii_lowercase();
+            if !seen.insert(normalized.clone()) {
+                return Err(anyhow!(
+                    "table metadata has duplicate column '{}' for table {}",
+                    normalized,
+                    self.table_name
+                ));
+            }
+        }
+
+        let primary_key_column = self
+            .primary_key_column
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                anyhow!(
+                    "table metadata has empty primary_key_column for table {}",
+                    self.table_name
+                )
+            })?;
+        let pk = self
+            .columns
+            .iter()
+            .find(|column| column.name == primary_key_column)
+            .ok_or_else(|| {
+                anyhow!(
+                    "table metadata primary key column '{}' not found in table {}",
+                    primary_key_column,
+                    self.table_name
+                )
+            })?;
+        if pk.nullable {
+            return Err(anyhow!(
+                "table metadata primary key column '{}' cannot be nullable in table {}",
+                primary_key_column,
+                self.table_name
+            ));
+        }
+        if !pk.column_type.is_signed_integer() {
+            return Err(anyhow!(
+                "table metadata primary key column '{}' must be signed integer in table {}",
+                primary_key_column,
                 self.table_name
             ));
         }
@@ -197,12 +343,14 @@ pub async fn create_table_metadata(
     client: &HoloStoreClient,
     table_name: &str,
     if_not_exists: bool,
+    spec: &CreateTableMetadataSpec,
 ) -> Result<CreateTableMetadataOutcome> {
     let table_name = table_name.trim();
     // Decision: fail early on empty names to avoid creating unreachable entries.
     if table_name.is_empty() {
         return Err(anyhow!("table metadata create has empty table_name"));
     }
+    spec.validate()?;
 
     let deadline = tokio::time::Instant::now() + METADATA_CREATE_TIMEOUT;
 
@@ -245,9 +393,11 @@ pub async fn create_table_metadata(
             schema_id: DEFAULT_SCHEMA_ID,
             table_id: next_table_id,
             table_name: table_name.to_string(),
-            table_model: TABLE_MODEL_ORDERS_V1.to_string(),
-            preferred_shards: Vec::new(),
-            page_size: default_page_size(),
+            table_model: spec.table_model.clone(),
+            columns: spec.columns.clone(),
+            primary_key_column: Some(spec.primary_key_column.clone()),
+            preferred_shards: spec.preferred_shards.clone(),
+            page_size: spec.page_size.max(1),
         };
         record.validate()?;
 
@@ -326,12 +476,17 @@ pub async fn create_table_metadata(
 
 /// Returns whether a table model tag is recognized by this binary.
 pub fn is_supported_table_model(table_model: &str) -> bool {
-    matches!(table_model, TABLE_MODEL_ORDERS_V1)
+    matches!(table_model, TABLE_MODEL_ORDERS_V1 | TABLE_MODEL_ROW_V1)
 }
 
 /// Returns the canonical `orders_v1` model tag.
 pub fn table_model_orders_v1() -> &'static str {
     TABLE_MODEL_ORDERS_V1
+}
+
+/// Returns the canonical `row_v1` model tag.
+pub fn table_model_row_v1() -> &'static str {
+    TABLE_MODEL_ROW_V1
 }
 
 /// Encodes metadata key as `{prefix}{db_id}{schema_id}{table_id}`.

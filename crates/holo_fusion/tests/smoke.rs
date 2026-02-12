@@ -503,6 +503,127 @@ async fn phase4_create_table_registers_metadata_and_supports_insert_select() -> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase8_generic_row_model_create_insert_select() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    client
+        .batch_execute(
+            "CREATE TABLE app_events (
+                event_id BIGINT NOT NULL,
+                user_name TEXT NOT NULL,
+                payload_size DOUBLE PRECISION NOT NULL,
+                processed BOOLEAN NOT NULL,
+                created_at TIMESTAMP NOT NULL,
+                PRIMARY KEY (event_id)
+            );",
+        )
+        .await
+        .context("create app_events row_v1 table")?;
+
+    client
+        .batch_execute(
+            "INSERT INTO app_events (event_id, user_name, payload_size, processed, created_at) VALUES
+             (1, 'alice', 42.5, true, TIMESTAMP '2026-02-12 00:00:00'),
+             (2, 'bob', 13.0, false, TIMESTAMP '2026-02-12 00:00:01');",
+        )
+        .await
+        .context("insert rows into app_events")?;
+
+    let rows = client
+        .query(
+            "SELECT event_id, user_name, payload_size, processed
+             FROM app_events
+             ORDER BY event_id",
+            &[],
+        )
+        .await
+        .context("select rows from app_events")?;
+    assert_eq!(rows.len(), 2);
+
+    let first_id: i64 = rows[0].try_get(0)?;
+    let first_name: String = rows[0].try_get(1)?;
+    let first_payload: f64 = rows[0].try_get(2)?;
+    let first_processed: bool = rows[0].try_get(3)?;
+    assert_eq!(first_id, 1);
+    assert_eq!(first_name, "alice");
+    assert!((first_payload - 42.5f64).abs() < f64::EPSILON);
+    assert!(first_processed);
+
+    let second_id: i64 = rows[1].try_get(0)?;
+    let second_name: String = rows[1].try_get(1)?;
+    let second_payload: f64 = rows[1].try_get(2)?;
+    let second_processed: bool = rows[1].try_get(3)?;
+    assert_eq!(second_id, 2);
+    assert_eq!(second_name, "bob");
+    assert!((second_payload - 13.0f64).abs() < f64::EPSILON);
+    assert!(!second_processed);
+
+    let updated = client
+        .execute(
+            "UPDATE app_events
+             SET payload_size = 99.75, processed = true
+             WHERE event_id = 2",
+            &[],
+        )
+        .await
+        .context("update row_v1 row in app_events")?;
+    assert_eq!(updated, 1);
+
+    let updated_row = client
+        .query_one(
+            "SELECT payload_size, processed FROM app_events WHERE event_id = 2",
+            &[],
+        )
+        .await
+        .context("verify updated row_v1 row in app_events")?;
+    let updated_payload: f64 = updated_row.try_get(0)?;
+    let updated_processed: bool = updated_row.try_get(1)?;
+    assert!((updated_payload - 99.75f64).abs() < f64::EPSILON);
+    assert!(updated_processed);
+
+    let deleted = client
+        .execute("DELETE FROM app_events WHERE event_id = 1", &[])
+        .await
+        .context("delete row_v1 row from app_events")?;
+    assert_eq!(deleted, 1);
+
+    let remaining = client
+        .query_one("SELECT COUNT(*)::BIGINT FROM app_events", &[])
+        .await
+        .context("count remaining row_v1 rows in app_events")?
+        .try_get::<_, i64>(0)?;
+    assert_eq!(remaining, 1);
+
+    client
+        .execute("BEGIN", &[])
+        .await
+        .context("begin explicit transaction for row_v1 DML boundary check")?;
+
+    let tx_update_err = client
+        .execute(
+            "UPDATE app_events SET payload_size = 50.0 WHERE event_id = 2",
+            &[],
+        )
+        .await
+        .expect_err("row_v1 UPDATE inside explicit transaction must fail until supported");
+    assert_sqlstate(&tx_update_err, "0A000");
+
+    let tx_delete_err = client
+        .execute("DELETE FROM app_events WHERE event_id = 2", &[])
+        .await
+        .expect_err("row_v1 DELETE inside explicit transaction must fail until supported");
+    assert_sqlstate(&tx_delete_err, "0A000");
+
+    client
+        .execute("ROLLBACK", &[])
+        .await
+        .context("rollback explicit transaction for row_v1 DML boundary check")?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn phase5_update_delete_strict_semantics_and_prepared_retry() -> Result<()> {
     let harness = TestHarness::start().await?;
     let (client, _guard) = harness.connect_pg().await?;

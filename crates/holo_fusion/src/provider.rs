@@ -12,7 +12,11 @@ use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use datafusion::arrow::array::{ArrayRef, Int64Builder, StringBuilder, TimestampNanosecondBuilder};
+use datafusion::arrow::array::{
+    ArrayRef, BooleanBuilder, Float64Builder, Int16Builder, Int32Builder, Int64Builder,
+    Int8Builder, StringBuilder, TimestampNanosecondBuilder, UInt16Builder, UInt32Builder,
+    UInt64Builder, UInt8Builder,
+};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::memory::MemTable;
@@ -33,7 +37,9 @@ use holo_store::{
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, info_span, warn, Instrument};
 
-use crate::metadata::TableMetadataRecord;
+use crate::metadata::{
+    table_model_row_v1, TableColumnRecord, TableColumnType, TableMetadataRecord,
+};
 use crate::metrics::PushdownMetrics;
 use crate::topology::{fetch_topology, require_non_empty_topology, route_key, scan_targets};
 
@@ -45,6 +51,7 @@ pub const ORDERS_SHARD_INDEX: usize = 0;
 const DATA_PREFIX_PRIMARY_ROW: u8 = 0x20;
 const TUPLE_TAG_INT64: u8 = 0x02;
 const ROW_FORMAT_VERSION_V1: u8 = 1;
+const ROW_FORMAT_VERSION_V2: u8 = 2;
 const ROW_FLAG_TOMBSTONE: u8 = 0x01;
 const SIGN_FLIP_MASK: u64 = 1u64 << 63;
 const DEFAULT_MAX_SCAN_ROWS: usize = 100_000;
@@ -108,6 +115,23 @@ pub struct ConditionalOrderWrite {
     pub rollback_value: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+/// Generic conditional write keyed by normalized signed-integer primary key.
+pub struct ConditionalPrimaryWrite {
+    pub primary_key: i64,
+    pub expected_version: RpcVersion,
+    pub value: Vec<u8>,
+    pub rollback_value: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+/// Generic row decoded from a row_v1 table scan with storage version.
+pub struct VersionedGenericRow {
+    pub primary_key: i64,
+    pub values: Vec<ScalarValue>,
+    pub version: RpcVersion,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Enumerates states/variants for `ConditionalWriteOutcome`.
 pub enum ConditionalWriteOutcome {
@@ -121,6 +145,10 @@ pub struct HoloProviderCodecSpec {
     pub table_name: String,
     pub table_id: u64,
     pub table_model: String,
+    #[serde(default)]
+    pub columns: Vec<TableColumnRecord>,
+    #[serde(default)]
+    pub primary_key_column: Option<String>,
     pub preferred_shards: Vec<usize>,
     pub page_size: usize,
     #[serde(default = "default_max_scan_rows")]
@@ -141,6 +169,37 @@ pub fn orders_schema() -> SchemaRef {
             false,
         ),
     ]))
+}
+
+/// Returns canonical column metadata for the legacy orders row model.
+fn orders_columns() -> Vec<TableColumnRecord> {
+    vec![
+        TableColumnRecord {
+            name: "order_id".to_string(),
+            column_type: TableColumnType::Int64,
+            nullable: false,
+        },
+        TableColumnRecord {
+            name: "customer_id".to_string(),
+            column_type: TableColumnType::Int64,
+            nullable: false,
+        },
+        TableColumnRecord {
+            name: "status".to_string(),
+            column_type: TableColumnType::Utf8,
+            nullable: true,
+        },
+        TableColumnRecord {
+            name: "total_cents".to_string(),
+            column_type: TableColumnType::Int64,
+            nullable: false,
+        },
+        TableColumnRecord {
+            name: "created_at".to_string(),
+            column_type: TableColumnType::TimestampNanosecond,
+            nullable: false,
+        },
+    ]
 }
 
 /// Executes `encode orders latest entry` for this component.
@@ -227,13 +286,22 @@ pub fn encode_orders_tombstone_value() -> Vec<u8> {
     vec![ROW_FORMAT_VERSION_V1, ROW_FLAG_TOMBSTONE]
 }
 
+/// Executes `encode generic tombstone value` for this component.
+fn encode_generic_tombstone_value() -> Vec<u8> {
+    vec![ROW_FORMAT_VERSION_V2, ROW_FLAG_TOMBSTONE]
+}
+
 #[derive(Debug, Clone)]
 /// Represents the `HoloStoreTableProvider` component used by the holo_fusion runtime.
 pub struct HoloStoreTableProvider {
     schema: SchemaRef,
+    columns: Vec<TableColumnRecord>,
     table_name: String,
     table_id: u64,
     table_model: String,
+    row_codec_mode: RowCodecMode,
+    primary_key_column: String,
+    primary_key_index: usize,
     preferred_shards: Vec<usize>,
     page_size: usize,
     max_scan_rows: usize,
@@ -242,15 +310,178 @@ pub struct HoloStoreTableProvider {
     metrics: Arc<PushdownMetrics>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Row codec discriminator selected from table metadata model.
+enum RowCodecMode {
+    OrdersV1,
+    RowV1,
+}
+
+/// Builds a DataFusion schema from persisted metadata columns.
+fn schema_from_columns(columns: &[TableColumnRecord]) -> Result<SchemaRef> {
+    if columns.is_empty() {
+        return Err(anyhow!("table metadata has no columns"));
+    }
+
+    let mut fields = Vec::with_capacity(columns.len());
+    for column in columns {
+        if column.name.trim().is_empty() {
+            return Err(anyhow!("table metadata has empty column name"));
+        }
+        fields.push(Field::new(
+            column.name.as_str(),
+            arrow_data_type_for_column(column.column_type),
+            column.nullable,
+        ));
+    }
+    Ok(Arc::new(Schema::new(fields)))
+}
+
+/// Maps persisted metadata column type to Arrow logical type.
+fn arrow_data_type_for_column(column_type: TableColumnType) -> DataType {
+    match column_type {
+        TableColumnType::Int8 => DataType::Int8,
+        TableColumnType::Int16 => DataType::Int16,
+        TableColumnType::Int32 => DataType::Int32,
+        TableColumnType::Int64 => DataType::Int64,
+        TableColumnType::UInt8 => DataType::UInt8,
+        TableColumnType::UInt16 => DataType::UInt16,
+        TableColumnType::UInt32 => DataType::UInt32,
+        TableColumnType::UInt64 => DataType::UInt64,
+        TableColumnType::Float64 => DataType::Float64,
+        TableColumnType::Boolean => DataType::Boolean,
+        TableColumnType::Utf8 => DataType::Utf8,
+        TableColumnType::TimestampNanosecond => DataType::Timestamp(TimeUnit::Nanosecond, None),
+    }
+}
+
+/// Resolves primary key index from column list and persisted pk column name.
+fn primary_key_index_for_columns(
+    columns: &[TableColumnRecord],
+    primary_key_column: &str,
+) -> Result<usize> {
+    columns
+        .iter()
+        .position(|column| column.name == primary_key_column)
+        .ok_or_else(|| {
+            anyhow!(
+                "primary key column '{}' not found in table columns",
+                primary_key_column
+            )
+        })
+}
+
+/// Derives provider layout from persisted table metadata.
+fn provider_layout_from_metadata(
+    table: &TableMetadataRecord,
+) -> Result<(
+    SchemaRef,
+    Vec<TableColumnRecord>,
+    RowCodecMode,
+    String,
+    usize,
+)> {
+    if table.table_model == ORDERS_TABLE_MODEL {
+        let columns = orders_columns();
+        return Ok((
+            orders_schema(),
+            columns,
+            RowCodecMode::OrdersV1,
+            "order_id".to_string(),
+            0,
+        ));
+    }
+    if table.table_model == table_model_row_v1() {
+        let columns = table.columns.clone();
+        let primary_key_column = table.primary_key_column.clone().ok_or_else(|| {
+            anyhow!(
+                "row_v1 table '{}' missing primary key metadata",
+                table.table_name
+            )
+        })?;
+        let primary_key_index =
+            primary_key_index_for_columns(columns.as_slice(), primary_key_column.as_str())?;
+        let schema = schema_from_columns(columns.as_slice())?;
+        return Ok((
+            schema,
+            columns,
+            RowCodecMode::RowV1,
+            primary_key_column,
+            primary_key_index,
+        ));
+    }
+    Err(anyhow!(
+        "unsupported table model '{}' for table '{}'",
+        table.table_model,
+        table.table_name
+    ))
+}
+
+/// Derives provider layout from serialized Ballista provider codec spec.
+fn provider_layout_from_codec(
+    spec: &HoloProviderCodecSpec,
+) -> Result<(
+    SchemaRef,
+    Vec<TableColumnRecord>,
+    RowCodecMode,
+    String,
+    usize,
+)> {
+    if spec.table_model == ORDERS_TABLE_MODEL {
+        let columns = orders_columns();
+        return Ok((
+            orders_schema(),
+            columns,
+            RowCodecMode::OrdersV1,
+            "order_id".to_string(),
+            0,
+        ));
+    }
+    if spec.table_model == table_model_row_v1() {
+        let columns = spec.columns.clone();
+        if columns.is_empty() {
+            return Err(anyhow!(
+                "row_v1 provider codec for table '{}' is missing columns",
+                spec.table_name
+            ));
+        }
+        let primary_key_column = spec.primary_key_column.clone().ok_or_else(|| {
+            anyhow!(
+                "row_v1 provider codec for table '{}' missing primary key column",
+                spec.table_name
+            )
+        })?;
+        let primary_key_index =
+            primary_key_index_for_columns(columns.as_slice(), primary_key_column.as_str())?;
+        let schema = schema_from_columns(columns.as_slice())?;
+        return Ok((
+            schema,
+            columns,
+            RowCodecMode::RowV1,
+            primary_key_column,
+            primary_key_index,
+        ));
+    }
+    Err(anyhow!(
+        "unsupported table model '{}' in provider codec",
+        spec.table_model
+    ))
+}
+
 impl HoloStoreTableProvider {
     /// Executes `orders` for this component.
     pub fn orders(client: HoloStoreClient, metrics: Arc<PushdownMetrics>) -> Self {
         let local_grpc_addr = client.target();
+        let columns = orders_columns();
         Self {
             schema: orders_schema(),
+            columns,
             table_name: ORDERS_TABLE_NAME.to_string(),
             table_id: ORDERS_TABLE_ID,
             table_model: ORDERS_TABLE_MODEL.to_string(),
+            row_codec_mode: RowCodecMode::OrdersV1,
+            primary_key_column: "order_id".to_string(),
+            primary_key_index: 0,
             preferred_shards: vec![ORDERS_SHARD_INDEX],
             page_size: 2048,
             max_scan_rows: configured_max_scan_rows(),
@@ -267,21 +498,19 @@ impl HoloStoreTableProvider {
         metrics: Arc<PushdownMetrics>,
     ) -> Result<Self> {
         table.validate()?;
-        // Decision: evaluate `table.table_model != ORDERS_TABLE_MODEL` to choose the correct SQL/storage control path.
-        if table.table_model != ORDERS_TABLE_MODEL {
-            return Err(anyhow!(
-                "unsupported table model '{}' for table '{}'",
-                table.table_model,
-                table.table_name
-            ));
-        }
+        let (schema, columns, row_codec_mode, primary_key_column, primary_key_index) =
+            provider_layout_from_metadata(table)?;
 
         let local_grpc_addr = client.target();
         Ok(Self {
-            schema: orders_schema(),
+            schema,
+            columns,
             table_name: table.table_name.clone(),
             table_id: table.table_id,
             table_model: table.table_model.clone(),
+            row_codec_mode,
+            primary_key_column,
+            primary_key_index,
             preferred_shards: table.preferred_shards.clone(),
             page_size: table.page_size.max(1),
             max_scan_rows: configured_max_scan_rows(),
@@ -297,6 +526,8 @@ impl HoloStoreTableProvider {
             table_name: self.table_name.clone(),
             table_id: self.table_id,
             table_model: self.table_model.clone(),
+            columns: self.columns.clone(),
+            primary_key_column: Some(self.primary_key_column.clone()),
             preferred_shards: self.preferred_shards.clone(),
             page_size: self.page_size,
             max_scan_rows: self.max_scan_rows,
@@ -309,13 +540,8 @@ impl HoloStoreTableProvider {
         spec: HoloProviderCodecSpec,
         metrics: Arc<PushdownMetrics>,
     ) -> Result<Self> {
-        // Decision: evaluate `spec.table_model != ORDERS_TABLE_MODEL` to choose the correct SQL/storage control path.
-        if spec.table_model != ORDERS_TABLE_MODEL {
-            return Err(anyhow!(
-                "unsupported table model '{}' in provider codec",
-                spec.table_model
-            ));
-        }
+        let (schema, columns, row_codec_mode, primary_key_column, primary_key_index) =
+            provider_layout_from_codec(&spec)?;
 
         let local_grpc_addr = spec
             .local_grpc_addr
@@ -328,10 +554,14 @@ impl HoloStoreTableProvider {
             })?;
         let client = HoloStoreClient::new(local_grpc_addr);
         Ok(Self {
-            schema: orders_schema(),
+            schema,
+            columns,
             table_name: spec.table_name,
             table_id: spec.table_id,
             table_model: spec.table_model,
+            row_codec_mode,
+            primary_key_column,
+            primary_key_index,
             preferred_shards: spec.preferred_shards,
             page_size: spec.page_size.max(1),
             max_scan_rows: spec.max_scan_rows.max(1),
@@ -346,6 +576,31 @@ impl HoloStoreTableProvider {
         self.table_name.as_str()
     }
 
+    /// Executes `table model` for this component.
+    pub fn table_model(&self) -> &str {
+        self.table_model.as_str()
+    }
+
+    /// Executes `primary key column` for this component.
+    pub fn primary_key_column(&self) -> &str {
+        self.primary_key_column.as_str()
+    }
+
+    /// Executes `column definitions` for this component.
+    pub fn columns(&self) -> &[TableColumnRecord] {
+        self.columns.as_slice()
+    }
+
+    /// Executes `is orders v1 table` for this component.
+    pub fn is_orders_v1_table(&self) -> bool {
+        self.row_codec_mode == RowCodecMode::OrdersV1
+    }
+
+    /// Executes `is row v1 table` for this component.
+    pub fn is_row_v1_table(&self) -> bool {
+        self.row_codec_mode == RowCodecMode::RowV1
+    }
+
     /// Executes `scan orders by order id bounds` for this component.
     pub async fn scan_orders_by_order_id_bounds(
         &self,
@@ -353,6 +608,11 @@ impl HoloStoreTableProvider {
         upper: Option<(i64, bool)>,
         limit: Option<usize>,
     ) -> Result<Vec<OrdersSeedRow>> {
+        if self.row_codec_mode != RowCodecMode::OrdersV1 {
+            return Err(anyhow!(
+                "orders mutation helpers are only available for orders_v1 table model"
+            ));
+        }
         let rows = self
             .scan_orders_with_versions_by_order_id_bounds(lower, upper, limit)
             .await?;
@@ -366,6 +626,11 @@ impl HoloStoreTableProvider {
         upper: Option<(i64, bool)>,
         limit: Option<usize>,
     ) -> Result<Vec<VersionedOrdersRow>> {
+        if self.row_codec_mode != RowCodecMode::OrdersV1 {
+            return Err(anyhow!(
+                "orders mutation helpers are only available for orders_v1 table model"
+            ));
+        }
         let mut bounds = PkBounds::default();
         // Decision: evaluate `let Some((value, inclusive)) = lower` to choose the correct SQL/storage control path.
         if let Some((value, inclusive)) = lower {
@@ -395,23 +660,70 @@ impl HoloStoreTableProvider {
             .await
     }
 
+    /// Scans row_v1 rows by primary-key bounds and returns values with versions.
+    pub async fn scan_generic_rows_with_versions_by_primary_key_bounds(
+        &self,
+        lower: Option<(i64, bool)>,
+        upper: Option<(i64, bool)>,
+        limit: Option<usize>,
+    ) -> Result<Vec<VersionedGenericRow>> {
+        if self.row_codec_mode != RowCodecMode::RowV1 {
+            return Err(anyhow!(
+                "generic row scan is only available for row_v1 table model"
+            ));
+        }
+        let mut bounds = PkBounds::default();
+        if let Some((value, inclusive)) = lower {
+            bounds.apply(
+                if inclusive {
+                    Operator::GtEq
+                } else {
+                    Operator::Gt
+                },
+                value,
+            );
+        }
+        if let Some((value, inclusive)) = upper {
+            bounds.apply(
+                if inclusive {
+                    Operator::LtEq
+                } else {
+                    Operator::Lt
+                },
+                value,
+            );
+        }
+        self.scan_rows_with_bounds_with_versions_generic(bounds, limit, 1)
+            .await
+    }
+
     /// Executes `upsert orders rows` for this component.
     pub async fn upsert_orders_rows(&self, rows: &[OrdersSeedRow]) -> Result<u64> {
+        if self.row_codec_mode != RowCodecMode::OrdersV1 {
+            return Err(anyhow!(
+                "orders mutation helpers are only available for orders_v1 table model"
+            ));
+        }
         let entries = rows
             .iter()
             .map(|row| (row.order_id, encode_orders_row_value(row)))
             .collect::<Vec<_>>();
-        self.write_order_entries(entries, "upsert").await
+        self.write_primary_entries(entries, "upsert").await
     }
 
     /// Executes `tombstone orders by order id` for this component.
     pub async fn tombstone_orders_by_order_id(&self, order_ids: &[i64]) -> Result<u64> {
+        if self.row_codec_mode != RowCodecMode::OrdersV1 {
+            return Err(anyhow!(
+                "orders mutation helpers are only available for orders_v1 table model"
+            ));
+        }
         let tombstone = encode_orders_tombstone_value();
         let entries = order_ids
             .iter()
             .map(|order_id| (*order_id, tombstone.clone()))
             .collect::<Vec<_>>();
-        self.write_order_entries(entries, "delete").await
+        self.write_primary_entries(entries, "delete").await
     }
 
     /// Executes `apply orders writes conditional` for this component.
@@ -420,7 +732,79 @@ impl HoloStoreTableProvider {
         writes: &[ConditionalOrderWrite],
         op: &'static str,
     ) -> Result<ConditionalWriteOutcome> {
+        if self.row_codec_mode != RowCodecMode::OrdersV1 {
+            return Err(anyhow!(
+                "orders mutation helpers are only available for orders_v1 table model"
+            ));
+        }
         // Decision: evaluate `writes.is_empty()` to choose the correct SQL/storage control path.
+        if writes.is_empty() {
+            return Ok(ConditionalWriteOutcome::Applied(0));
+        }
+
+        let generic_writes = writes
+            .iter()
+            .map(|write| ConditionalPrimaryWrite {
+                primary_key: write.order_id,
+                expected_version: write.expected_version,
+                value: write.value.clone(),
+                rollback_value: write.rollback_value.clone(),
+            })
+            .collect::<Vec<_>>();
+        self.apply_primary_writes_conditional(generic_writes.as_slice(), op)
+            .await
+    }
+
+    /// Applies conditional writes for row_v1 table rows keyed by primary key.
+    pub async fn apply_generic_writes_conditional(
+        &self,
+        writes: &[ConditionalPrimaryWrite],
+        op: &'static str,
+    ) -> Result<ConditionalWriteOutcome> {
+        if self.row_codec_mode != RowCodecMode::RowV1 {
+            return Err(anyhow!(
+                "generic conditional writes are only available for row_v1 table model"
+            ));
+        }
+        self.apply_primary_writes_conditional(writes, op).await
+    }
+
+    /// Encodes one row payload according to this table's row codec.
+    pub fn encode_row_payload(&self, values: &[ScalarValue]) -> Result<Vec<u8>> {
+        if self.row_codec_mode != RowCodecMode::RowV1 {
+            return Err(anyhow!(
+                "generic row payload encoding is only available for row_v1 table model"
+            ));
+        }
+        if values.len() != self.columns.len() {
+            return Err(anyhow!(
+                "row payload column count mismatch for table '{}': expected {}, got {}",
+                self.table_name,
+                self.columns.len(),
+                values.len()
+            ));
+        }
+        let mut payloads = Vec::with_capacity(values.len());
+        for (column, value) in self.columns.iter().zip(values.iter()) {
+            payloads.push(encode_scalar_payload(value.clone(), column)?);
+        }
+        Ok(encode_generic_row_value(payloads))
+    }
+
+    /// Encodes the tombstone marker payload for this table model.
+    pub fn encode_tombstone_payload(&self) -> Vec<u8> {
+        match self.row_codec_mode {
+            RowCodecMode::OrdersV1 => encode_orders_tombstone_value(),
+            RowCodecMode::RowV1 => encode_generic_tombstone_value(),
+        }
+    }
+
+    /// Applies conditional writes keyed by normalized primary key.
+    async fn apply_primary_writes_conditional(
+        &self,
+        writes: &[ConditionalPrimaryWrite],
+        op: &'static str,
+    ) -> Result<ConditionalWriteOutcome> {
         if writes.is_empty() {
             return Ok(ConditionalWriteOutcome::Applied(0));
         }
@@ -432,7 +816,7 @@ impl HoloStoreTableProvider {
 
         let mut by_target = BTreeMap::<WriteTarget, Vec<PreparedConditionalEntry>>::new();
         for write in writes {
-            let key = encode_primary_key(self.table_id, write.order_id);
+            let key = encode_primary_key(self.table_id, write.primary_key);
             let route = route_key(
                 &topology,
                 self.local_grpc_addr,
@@ -441,9 +825,9 @@ impl HoloStoreTableProvider {
             )
             .ok_or_else(|| {
                 anyhow!(
-                    "no shard route found for key table={} order_id={}",
+                    "no shard route found for key table={} primary_key={}",
                     self.table_name,
-                    write.order_id
+                    write.primary_key
                 )
             })?;
 
@@ -571,7 +955,9 @@ impl HoloStoreTableProvider {
         let mut bounds = PkBounds::default();
         for filter in pushed_filters {
             // Decision: evaluate `let Some(predicates) = extract_supported_predicates(filter)` to choose the correct SQL/storage control path.
-            if let Some(predicates) = extract_supported_predicates(filter) {
+            if let Some(predicates) =
+                extract_supported_predicates(filter, self.primary_key_column.as_str())
+            {
                 for predicate in predicates {
                     bounds.apply(predicate.op, predicate.value);
                 }
@@ -745,6 +1131,182 @@ impl HoloStoreTableProvider {
         Ok(rows)
     }
 
+    /// Executes `scan rows generic` for this component.
+    async fn scan_rows_generic(
+        &self,
+        pushed_filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Result<Vec<Vec<ScalarValue>>> {
+        let mut bounds = PkBounds::default();
+        for filter in pushed_filters {
+            if let Some(predicates) =
+                extract_supported_predicates(filter, self.primary_key_column.as_str())
+            {
+                for predicate in predicates {
+                    bounds.apply(predicate.op, predicate.value);
+                }
+            }
+        }
+
+        let rows = self
+            .scan_rows_with_bounds_with_versions_generic(bounds, limit, pushed_filters.len())
+            .await?;
+        Ok(rows.into_iter().map(|entry| entry.values).collect())
+    }
+
+    /// Executes `scan rows with bounds with versions generic` for this component.
+    async fn scan_rows_with_bounds_with_versions_generic(
+        &self,
+        bounds: PkBounds,
+        limit: Option<usize>,
+        pushed_filter_count: usize,
+    ) -> Result<Vec<VersionedGenericRow>> {
+        if bounds.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let (start_key, end_key) = bounds.as_scan_range(self.table_id)?;
+        if !end_key.is_empty() && start_key >= end_key {
+            return Ok(Vec::new());
+        }
+
+        let targets = match fetch_topology(&self.client).await {
+            Ok(topology) => {
+                if let Err(err) = require_non_empty_topology(&topology) {
+                    warn!(error = %err, "empty topology; falling back to local scan target");
+                    vec![LocalScanTarget {
+                        shard_index: self.preferred_shards.first().copied().unwrap_or(0),
+                        grpc_addr: self.local_grpc_addr,
+                        start_key: start_key.clone(),
+                        end_key: end_key.clone(),
+                    }]
+                } else {
+                    scan_targets(
+                        &topology,
+                        self.local_grpc_addr,
+                        &start_key,
+                        &end_key,
+                        &self.preferred_shards,
+                    )
+                    .into_iter()
+                    .map(LocalScanTarget::from)
+                    .collect()
+                }
+            }
+            Err(err) => {
+                warn!(error = %err, "topology fetch failed; falling back to local scan target");
+                vec![LocalScanTarget {
+                    shard_index: self.preferred_shards.first().copied().unwrap_or(0),
+                    grpc_addr: self.local_grpc_addr,
+                    start_key: start_key.clone(),
+                    end_key: end_key.clone(),
+                }]
+            }
+        };
+
+        let mut rows = Vec::new();
+        let mut rpc_pages = 0u64;
+        let mut rows_scanned = 0u64;
+        let mut bytes_scanned = 0u64;
+
+        for target in targets {
+            let scan_client = self.client_for(target.grpc_addr);
+            let mut cursor = Vec::new();
+            loop {
+                let remaining = limit.map(|limit| limit.saturating_sub(rows.len()));
+                if matches!(remaining, Some(0)) {
+                    break;
+                }
+
+                let page_limit = remaining
+                    .map(|remaining| remaining.min(self.page_size).max(1))
+                    .unwrap_or(self.page_size);
+
+                let (entries, next_cursor, done) = scan_client
+                    .range_snapshot_latest(
+                        target.shard_index,
+                        target.start_key.as_slice(),
+                        target.end_key.as_slice(),
+                        cursor.as_slice(),
+                        page_limit,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "snapshot table={} shard={} target={} start={} end={} cursor={} limit={}",
+                            self.table_name,
+                            target.shard_index,
+                            target.grpc_addr,
+                            hex::encode(&target.start_key),
+                            hex::encode(&target.end_key),
+                            hex::encode(&cursor),
+                            page_limit
+                        )
+                    })?;
+
+                rpc_pages = rpc_pages.saturating_add(1);
+                for entry in entries {
+                    rows_scanned = rows_scanned.saturating_add(1);
+                    bytes_scanned = bytes_scanned
+                        .saturating_add(entry.key.len() as u64)
+                        .saturating_add(entry.value.len() as u64);
+
+                    let row = decode_generic_entry_with_version(
+                        self.table_id,
+                        self.columns.as_slice(),
+                        self.primary_key_index,
+                        &entry,
+                    )?;
+                    if let Some(row) = row {
+                        if bounds.matches(row.primary_key) {
+                            rows.push(row);
+                            if rows.len() > self.max_scan_rows {
+                                self.metrics.record_scan_row_limit_reject();
+                                return Err(anyhow!(
+                                    "scan row limit exceeded for table '{}': max_scan_rows={}, rows_returned_so_far={}",
+                                    self.table_name,
+                                    self.max_scan_rows,
+                                    rows.len()
+                                ));
+                            }
+                            if let Some(limit) = limit {
+                                if rows.len() >= limit {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if done
+                    || next_cursor.is_empty()
+                    || matches!(limit, Some(limit) if rows.len() >= limit)
+                {
+                    break;
+                }
+                cursor = next_cursor;
+            }
+
+            if matches!(limit, Some(limit) if rows.len() >= limit) {
+                break;
+            }
+        }
+
+        self.metrics
+            .record_scan(rpc_pages, rows_scanned, rows.len() as u64, bytes_scanned);
+        info!(
+            table = %self.table_name,
+            target_count = self.preferred_shards.len(),
+            pushed_filter_count,
+            rpc_pages,
+            rows_scanned,
+            rows_returned = rows.len(),
+            bytes_scanned,
+            "holofusion scan completed"
+        );
+        Ok(rows)
+    }
+
     /// Executes `rollback conditional targets` for this component.
     async fn rollback_conditional_targets(
         &self,
@@ -856,6 +1418,18 @@ impl HoloStoreTableProvider {
             return Ok(0);
         }
 
+        if self.row_codec_mode == RowCodecMode::RowV1 {
+            let mut entries = Vec::new();
+            for batch in batches {
+                entries.extend(decode_generic_rows(
+                    batch,
+                    self.columns.as_slice(),
+                    self.primary_key_index,
+                )?);
+            }
+            return self.write_primary_entries(entries, "upsert").await;
+        }
+
         let mut rows = Vec::new();
         for batch in batches {
             rows.extend(decode_orders_rows(batch)?);
@@ -863,8 +1437,8 @@ impl HoloStoreTableProvider {
         self.upsert_orders_rows(&rows).await
     }
 
-    /// Executes `write order entries` for this component.
-    async fn write_order_entries(
+    /// Executes `write primary entries` for this component.
+    async fn write_primary_entries(
         &self,
         rows: Vec<(i64, Vec<u8>)>,
         op: &'static str,
@@ -882,8 +1456,8 @@ impl HoloStoreTableProvider {
         let mut writes = BTreeMap::<WriteTarget, Vec<ReplicatedWriteEntry>>::new();
         let row_count = rows.len() as u64;
 
-        for (order_id, value) in rows {
-            let key = encode_primary_key(self.table_id, order_id);
+        for (primary_key, value) in rows {
+            let key = encode_primary_key(self.table_id, primary_key);
             let route = route_key(
                 &topology,
                 self.local_grpc_addr,
@@ -892,9 +1466,9 @@ impl HoloStoreTableProvider {
             )
             .ok_or_else(|| {
                 anyhow!(
-                    "no shard route found for key table={} order_id={}",
+                    "no shard route found for key table={} primary_key={}",
                     self.table_name,
-                    order_id
+                    primary_key
                 )
             })?;
 
@@ -1020,8 +1594,16 @@ impl TableProvider for HoloStoreTableProvider {
             "starting holofusion table scan"
         );
 
-        let rows = self.scan_rows(filters, limit).await.map_err(df_external)?;
-        let batch = rows_to_batch(self.schema(), &rows).map_err(df_external)?;
+        let batch = if self.row_codec_mode == RowCodecMode::RowV1 {
+            let rows = self
+                .scan_rows_generic(filters, limit)
+                .await
+                .map_err(df_external)?;
+            rows_to_batch_generic(self.schema(), rows.as_slice()).map_err(df_external)?
+        } else {
+            let rows = self.scan_rows(filters, limit).await.map_err(df_external)?;
+            rows_to_batch(self.schema(), &rows).map_err(df_external)?
+        };
         let mem = MemTable::try_new(self.schema(), vec![vec![batch]])?;
         mem.scan(state, projection, &[], limit).await
     }
@@ -1051,7 +1633,8 @@ impl TableProvider for HoloStoreTableProvider {
     ) -> DFResult<Vec<TableProviderFilterPushDown>> {
         let mut support = Vec::with_capacity(filters.len());
         for filter in filters {
-            let exact = extract_supported_predicates(filter).is_some();
+            let exact =
+                extract_supported_predicates(filter, self.primary_key_column.as_str()).is_some();
             self.metrics.record_filter_support(exact);
             support.push(if exact {
                 TableProviderFilterPushDown::Exact
@@ -1196,6 +1779,235 @@ fn rows_to_batch(schema: SchemaRef, rows: &[OrdersSeedRow]) -> Result<RecordBatc
     RecordBatch::try_new(schema, arrays).map_err(Into::into)
 }
 
+/// Executes `rows to batch generic` for this component.
+fn rows_to_batch_generic(schema: SchemaRef, rows: &[Vec<ScalarValue>]) -> Result<RecordBatch> {
+    let field_count = schema.fields().len();
+    for row in rows {
+        if row.len() != field_count {
+            return Err(anyhow!(
+                "generic scan row has {} columns but schema has {}",
+                row.len(),
+                field_count
+            ));
+        }
+    }
+
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(field_count);
+    for col_idx in 0..field_count {
+        let field = schema.field(col_idx);
+        let array: ArrayRef = match field.data_type() {
+            DataType::Int8 => {
+                let mut builder = Int8Builder::new();
+                for row in rows {
+                    match row[col_idx].clone() {
+                        ScalarValue::Int8(Some(v)) => builder.append_value(v),
+                        ScalarValue::Null | ScalarValue::Int8(None) => builder.append_null(),
+                        other => {
+                            return Err(anyhow!(
+                                "row value type mismatch for column '{}': expected Int8, got {other:?}",
+                                field.name()
+                            ));
+                        }
+                    }
+                }
+                Arc::new(builder.finish())
+            }
+            DataType::Int16 => {
+                let mut builder = Int16Builder::new();
+                for row in rows {
+                    match row[col_idx].clone() {
+                        ScalarValue::Int16(Some(v)) => builder.append_value(v),
+                        ScalarValue::Null | ScalarValue::Int16(None) => builder.append_null(),
+                        other => {
+                            return Err(anyhow!(
+                                "row value type mismatch for column '{}': expected Int16, got {other:?}",
+                                field.name()
+                            ));
+                        }
+                    }
+                }
+                Arc::new(builder.finish())
+            }
+            DataType::Int32 => {
+                let mut builder = Int32Builder::new();
+                for row in rows {
+                    match row[col_idx].clone() {
+                        ScalarValue::Int32(Some(v)) => builder.append_value(v),
+                        ScalarValue::Null | ScalarValue::Int32(None) => builder.append_null(),
+                        other => {
+                            return Err(anyhow!(
+                                "row value type mismatch for column '{}': expected Int32, got {other:?}",
+                                field.name()
+                            ));
+                        }
+                    }
+                }
+                Arc::new(builder.finish())
+            }
+            DataType::Int64 => {
+                let mut builder = Int64Builder::new();
+                for row in rows {
+                    match row[col_idx].clone() {
+                        ScalarValue::Int64(Some(v)) => builder.append_value(v),
+                        ScalarValue::Null | ScalarValue::Int64(None) => builder.append_null(),
+                        other => {
+                            return Err(anyhow!(
+                                "row value type mismatch for column '{}': expected Int64, got {other:?}",
+                                field.name()
+                            ));
+                        }
+                    }
+                }
+                Arc::new(builder.finish())
+            }
+            DataType::UInt8 => {
+                let mut builder = UInt8Builder::new();
+                for row in rows {
+                    match row[col_idx].clone() {
+                        ScalarValue::UInt8(Some(v)) => builder.append_value(v),
+                        ScalarValue::Null | ScalarValue::UInt8(None) => builder.append_null(),
+                        other => {
+                            return Err(anyhow!(
+                                "row value type mismatch for column '{}': expected UInt8, got {other:?}",
+                                field.name()
+                            ));
+                        }
+                    }
+                }
+                Arc::new(builder.finish())
+            }
+            DataType::UInt16 => {
+                let mut builder = UInt16Builder::new();
+                for row in rows {
+                    match row[col_idx].clone() {
+                        ScalarValue::UInt16(Some(v)) => builder.append_value(v),
+                        ScalarValue::Null | ScalarValue::UInt16(None) => builder.append_null(),
+                        other => {
+                            return Err(anyhow!(
+                                "row value type mismatch for column '{}': expected UInt16, got {other:?}",
+                                field.name()
+                            ));
+                        }
+                    }
+                }
+                Arc::new(builder.finish())
+            }
+            DataType::UInt32 => {
+                let mut builder = UInt32Builder::new();
+                for row in rows {
+                    match row[col_idx].clone() {
+                        ScalarValue::UInt32(Some(v)) => builder.append_value(v),
+                        ScalarValue::Null | ScalarValue::UInt32(None) => builder.append_null(),
+                        other => {
+                            return Err(anyhow!(
+                                "row value type mismatch for column '{}': expected UInt32, got {other:?}",
+                                field.name()
+                            ));
+                        }
+                    }
+                }
+                Arc::new(builder.finish())
+            }
+            DataType::UInt64 => {
+                let mut builder = UInt64Builder::new();
+                for row in rows {
+                    match row[col_idx].clone() {
+                        ScalarValue::UInt64(Some(v)) => builder.append_value(v),
+                        ScalarValue::Null | ScalarValue::UInt64(None) => builder.append_null(),
+                        other => {
+                            return Err(anyhow!(
+                                "row value type mismatch for column '{}': expected UInt64, got {other:?}",
+                                field.name()
+                            ));
+                        }
+                    }
+                }
+                Arc::new(builder.finish())
+            }
+            DataType::Float64 => {
+                let mut builder = Float64Builder::new();
+                for row in rows {
+                    match row[col_idx].clone() {
+                        ScalarValue::Float64(Some(v)) => builder.append_value(v),
+                        ScalarValue::Null | ScalarValue::Float64(None) => builder.append_null(),
+                        other => {
+                            return Err(anyhow!(
+                                "row value type mismatch for column '{}': expected Float64, got {other:?}",
+                                field.name()
+                            ));
+                        }
+                    }
+                }
+                Arc::new(builder.finish())
+            }
+            DataType::Boolean => {
+                let mut builder = BooleanBuilder::new();
+                for row in rows {
+                    match row[col_idx].clone() {
+                        ScalarValue::Boolean(Some(v)) => builder.append_value(v),
+                        ScalarValue::Null | ScalarValue::Boolean(None) => builder.append_null(),
+                        other => {
+                            return Err(anyhow!(
+                                "row value type mismatch for column '{}': expected Boolean, got {other:?}",
+                                field.name()
+                            ));
+                        }
+                    }
+                }
+                Arc::new(builder.finish())
+            }
+            DataType::Utf8 => {
+                let mut builder = StringBuilder::new();
+                for row in rows {
+                    match row[col_idx].clone() {
+                        ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) => {
+                            builder.append_value(v)
+                        }
+                        ScalarValue::Null
+                        | ScalarValue::Utf8(None)
+                        | ScalarValue::LargeUtf8(None) => builder.append_null(),
+                        other => {
+                            return Err(anyhow!(
+                                "row value type mismatch for column '{}': expected Utf8, got {other:?}",
+                                field.name()
+                            ));
+                        }
+                    }
+                }
+                Arc::new(builder.finish())
+            }
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                let mut builder = TimestampNanosecondBuilder::new();
+                for row in rows {
+                    match row[col_idx].clone() {
+                        ScalarValue::TimestampNanosecond(Some(v), _) => builder.append_value(v),
+                        ScalarValue::Null | ScalarValue::TimestampNanosecond(None, _) => {
+                            builder.append_null()
+                        }
+                        other => {
+                            return Err(anyhow!(
+                                "row value type mismatch for column '{}': expected TimestampNanosecond, got {other:?}",
+                                field.name()
+                            ));
+                        }
+                    }
+                }
+                Arc::new(builder.finish())
+            }
+            other => {
+                return Err(anyhow!(
+                    "unsupported field type '{}' for column '{}' in row_v1 table",
+                    other,
+                    field.name()
+                ));
+            }
+        };
+        arrays.push(array);
+    }
+
+    RecordBatch::try_new(schema, arrays).map_err(Into::into)
+}
+
 /// Executes `decode orders rows` for this component.
 fn decode_orders_rows(batch: &RecordBatch) -> Result<Vec<OrdersSeedRow>> {
     // Decision: evaluate `batch.num_columns() != 5` to choose the correct SQL/storage control path.
@@ -1236,6 +2048,46 @@ fn decode_orders_rows(batch: &RecordBatch) -> Result<Vec<OrdersSeedRow>> {
             total_cents,
             created_at_ns,
         });
+    }
+    Ok(rows)
+}
+
+/// Executes `decode generic rows` for this component.
+fn decode_generic_rows(
+    batch: &RecordBatch,
+    columns: &[TableColumnRecord],
+    primary_key_index: usize,
+) -> Result<Vec<(i64, Vec<u8>)>> {
+    if batch.num_columns() != columns.len() {
+        return Err(anyhow!(
+            "row_v1 insert expects {} columns, got {}",
+            columns.len(),
+            batch.num_columns()
+        ));
+    }
+    if primary_key_index >= columns.len() {
+        return Err(anyhow!(
+            "primary key index {} is out of bounds for {} columns",
+            primary_key_index,
+            columns.len()
+        ));
+    }
+
+    let mut rows = Vec::with_capacity(batch.num_rows());
+    for row_idx in 0..batch.num_rows() {
+        let mut encoded = Vec::with_capacity(columns.len());
+        let mut primary_key: Option<i64> = None;
+        for (col_idx, column) in columns.iter().enumerate() {
+            let scalar = ScalarValue::try_from_array(batch.column(col_idx).as_ref(), row_idx)?;
+            let payload = encode_scalar_payload(scalar.clone(), column)?;
+            if col_idx == primary_key_index {
+                let key = scalar_to_primary_key_i64(scalar, column)?;
+                primary_key = Some(key);
+            }
+            encoded.push(payload);
+        }
+        let primary_key = primary_key.ok_or_else(|| anyhow!("missing primary key value"))?;
+        rows.push((primary_key, encode_generic_row_value(encoded)));
     }
     Ok(rows)
 }
@@ -1289,6 +2141,411 @@ fn scalar_to_required_timestamp_ns(value: ScalarValue, field: &str) -> Result<i6
             .map(|v| v.saturating_mul(1_000_000_000))
             .ok_or_else(|| anyhow!("null value for required field {field}")),
         _ => Err(anyhow!("invalid {field} value type for timestamp")),
+    }
+}
+
+/// Encodes one generic row payload in row_v1 format.
+fn encode_generic_row_value(payloads: Vec<Option<Vec<u8>>>) -> Vec<u8> {
+    let column_count = payloads.len() as u16;
+    let null_bitmap_len = payloads.len().div_ceil(8);
+    let mut null_bitmap = vec![0u8; null_bitmap_len];
+    for (idx, payload) in payloads.iter().enumerate() {
+        if payload.is_none() {
+            let byte_idx = idx / 8;
+            let bit_idx = idx % 8;
+            null_bitmap[byte_idx] |= 1u8 << bit_idx;
+        }
+    }
+
+    let mut out = Vec::new();
+    out.push(ROW_FORMAT_VERSION_V2);
+    out.push(0);
+    out.extend_from_slice(&column_count.to_be_bytes());
+    out.extend_from_slice(&(null_bitmap_len as u16).to_be_bytes());
+    out.extend_from_slice(&null_bitmap);
+    for payload in payloads {
+        if let Some(payload) = payload {
+            out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            out.extend_from_slice(&payload);
+        }
+    }
+    out
+}
+
+/// Encodes one typed scalar payload according to metadata column type.
+fn encode_scalar_payload(
+    value: ScalarValue,
+    column: &TableColumnRecord,
+) -> Result<Option<Vec<u8>>> {
+    if matches!(value, ScalarValue::Null) {
+        if !column.nullable {
+            return Err(anyhow!(
+                "null value violates not-null constraint for column '{}'",
+                column.name
+            ));
+        }
+        return Ok(None);
+    }
+
+    let payload = match column.column_type {
+        TableColumnType::Int8 => scalar_to_i64(value)
+            .and_then(|v| i8::try_from(v).ok())
+            .map(|v| vec![v as u8])
+            .ok_or_else(|| anyhow!("invalid value type for Int8 column '{}'", column.name))?,
+        TableColumnType::Int16 => scalar_to_i64(value)
+            .and_then(|v| i16::try_from(v).ok())
+            .map(|v| v.to_be_bytes().to_vec())
+            .ok_or_else(|| anyhow!("invalid value type for Int16 column '{}'", column.name))?,
+        TableColumnType::Int32 => scalar_to_i64(value)
+            .and_then(|v| i32::try_from(v).ok())
+            .map(|v| v.to_be_bytes().to_vec())
+            .ok_or_else(|| anyhow!("invalid value type for Int32 column '{}'", column.name))?,
+        TableColumnType::Int64 => scalar_to_i64(value)
+            .map(|v| v.to_be_bytes().to_vec())
+            .ok_or_else(|| anyhow!("invalid value type for Int64 column '{}'", column.name))?,
+        TableColumnType::UInt8 => scalar_to_i64(value)
+            .and_then(|v| u8::try_from(v).ok())
+            .map(|v| vec![v])
+            .ok_or_else(|| anyhow!("invalid value type for UInt8 column '{}'", column.name))?,
+        TableColumnType::UInt16 => scalar_to_i64(value)
+            .and_then(|v| u16::try_from(v).ok())
+            .map(|v| v.to_be_bytes().to_vec())
+            .ok_or_else(|| anyhow!("invalid value type for UInt16 column '{}'", column.name))?,
+        TableColumnType::UInt32 => scalar_to_i64(value)
+            .and_then(|v| u32::try_from(v).ok())
+            .map(|v| v.to_be_bytes().to_vec())
+            .ok_or_else(|| anyhow!("invalid value type for UInt32 column '{}'", column.name))?,
+        TableColumnType::UInt64 => match value {
+            ScalarValue::UInt64(Some(v)) => v.to_be_bytes().to_vec(),
+            ScalarValue::UInt32(Some(v)) => (v as u64).to_be_bytes().to_vec(),
+            ScalarValue::UInt16(Some(v)) => (v as u64).to_be_bytes().to_vec(),
+            ScalarValue::UInt8(Some(v)) => (v as u64).to_be_bytes().to_vec(),
+            ScalarValue::Int64(Some(v)) if v >= 0 => (v as u64).to_be_bytes().to_vec(),
+            ScalarValue::Int32(Some(v)) if v >= 0 => (v as u64).to_be_bytes().to_vec(),
+            ScalarValue::Int16(Some(v)) if v >= 0 => (v as u64).to_be_bytes().to_vec(),
+            ScalarValue::Int8(Some(v)) if v >= 0 => (v as u64).to_be_bytes().to_vec(),
+            _ => {
+                return Err(anyhow!(
+                    "invalid value type for UInt64 column '{}'",
+                    column.name
+                ))
+            }
+        },
+        TableColumnType::Float64 => match value {
+            ScalarValue::Float64(Some(v)) => v.to_be_bytes().to_vec(),
+            ScalarValue::Float32(Some(v)) => (v as f64).to_be_bytes().to_vec(),
+            ScalarValue::Int64(Some(v)) => (v as f64).to_be_bytes().to_vec(),
+            ScalarValue::Int32(Some(v)) => (v as f64).to_be_bytes().to_vec(),
+            ScalarValue::Int16(Some(v)) => (v as f64).to_be_bytes().to_vec(),
+            ScalarValue::Int8(Some(v)) => (v as f64).to_be_bytes().to_vec(),
+            _ => {
+                return Err(anyhow!(
+                    "invalid value type for Float64 column '{}'",
+                    column.name
+                ))
+            }
+        },
+        TableColumnType::Boolean => match value {
+            ScalarValue::Boolean(Some(v)) => vec![u8::from(v)],
+            _ => {
+                return Err(anyhow!(
+                    "invalid value type for Boolean column '{}'",
+                    column.name
+                ))
+            }
+        },
+        TableColumnType::Utf8 => match value {
+            ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) => v.into_bytes(),
+            _ => {
+                return Err(anyhow!(
+                    "invalid value type for Utf8 column '{}'",
+                    column.name
+                ))
+            }
+        },
+        TableColumnType::TimestampNanosecond => {
+            let nanos = scalar_to_required_timestamp_ns(value, column.name.as_str())?;
+            nanos.to_be_bytes().to_vec()
+        }
+    };
+    Ok(Some(payload))
+}
+
+/// Converts one scalar into normalized `i64` primary-key value.
+fn scalar_to_primary_key_i64(value: ScalarValue, column: &TableColumnRecord) -> Result<i64> {
+    let value = scalar_to_i64(value).ok_or_else(|| {
+        anyhow!(
+            "invalid primary key value type for column '{}'",
+            column.name
+        )
+    })?;
+    match column.column_type {
+        TableColumnType::Int8 => i8::try_from(value).map(|v| i64::from(v)).map_err(|_| {
+            anyhow!(
+                "primary key value out of range for Int8 column '{}'",
+                column.name
+            )
+        }),
+        TableColumnType::Int16 => i16::try_from(value).map(|v| i64::from(v)).map_err(|_| {
+            anyhow!(
+                "primary key value out of range for Int16 column '{}'",
+                column.name
+            )
+        }),
+        TableColumnType::Int32 => i32::try_from(value).map(|v| i64::from(v)).map_err(|_| {
+            anyhow!(
+                "primary key value out of range for Int32 column '{}'",
+                column.name
+            )
+        }),
+        TableColumnType::Int64 => Ok(value),
+        _ => Err(anyhow!(
+            "primary key column '{}' must be a signed integer",
+            column.name
+        )),
+    }
+}
+
+/// Decodes one storage entry for a generic row_v1 table.
+fn decode_generic_entry_with_version(
+    expected_table_id: u64,
+    columns: &[TableColumnRecord],
+    primary_key_index: usize,
+    entry: &LatestEntry,
+) -> Result<Option<VersionedGenericRow>> {
+    let primary_key = decode_primary_key(entry.key.as_slice(), expected_table_id)?;
+    let decoded = decode_generic_row_value(
+        entry.value.as_slice(),
+        columns,
+        primary_key_index,
+        primary_key,
+    )?;
+    Ok(decoded.map(|values| VersionedGenericRow {
+        primary_key,
+        values,
+        version: entry.version,
+    }))
+}
+
+/// Decodes generic row_v1 payload into typed scalar values.
+fn decode_generic_row_value(
+    bytes: &[u8],
+    columns: &[TableColumnRecord],
+    primary_key_index: usize,
+    primary_key: i64,
+) -> Result<Option<Vec<ScalarValue>>> {
+    if bytes.len() < 2 {
+        return Err(anyhow!("row value too short"));
+    }
+
+    let format = bytes[0];
+    if format != ROW_FORMAT_VERSION_V2 {
+        return Err(anyhow!(
+            "unsupported row format version {format} for row_v1"
+        ));
+    }
+    let flags = bytes[1];
+    if flags & ROW_FLAG_TOMBSTONE != 0 {
+        return Ok(None);
+    }
+
+    let mut cursor = 2usize;
+    let column_count = read_u16(bytes, &mut cursor)? as usize;
+    if column_count != columns.len() {
+        return Err(anyhow!(
+            "row_v1 column count mismatch: payload={}, metadata={}",
+            column_count,
+            columns.len()
+        ));
+    }
+    let null_bitmap_len = read_u16(bytes, &mut cursor)? as usize;
+    let null_bitmap = read_bytes(bytes, &mut cursor, null_bitmap_len)?;
+
+    let mut payloads: Vec<Option<Vec<u8>>> = Vec::with_capacity(column_count);
+    for column_idx in 0..column_count {
+        if is_null(null_bitmap, column_idx) {
+            payloads.push(None);
+            continue;
+        }
+        let payload_len = read_u32(bytes, &mut cursor)? as usize;
+        let payload = read_bytes(bytes, &mut cursor, payload_len)?;
+        payloads.push(Some(payload.to_vec()));
+    }
+
+    let mut values = Vec::with_capacity(columns.len());
+    for (idx, column) in columns.iter().enumerate() {
+        if idx == primary_key_index {
+            values.push(primary_key_scalar(column, primary_key)?);
+            continue;
+        }
+        values.push(payload_to_scalar(payloads[idx].as_deref(), column)?);
+    }
+    Ok(Some(values))
+}
+
+/// Converts one persisted payload into typed ScalarValue.
+fn payload_to_scalar(payload: Option<&[u8]>, column: &TableColumnRecord) -> Result<ScalarValue> {
+    let Some(payload) = payload else {
+        if column.nullable {
+            return Ok(ScalarValue::Null);
+        }
+        return Err(anyhow!(
+            "missing non-nullable payload for column '{}'",
+            column.name
+        ));
+    };
+
+    match column.column_type {
+        TableColumnType::Int8 => {
+            if payload.len() != 1 {
+                return Err(anyhow!("invalid Int8 payload length for '{}'", column.name));
+            }
+            Ok(ScalarValue::Int8(Some(payload[0] as i8)))
+        }
+        TableColumnType::Int16 => {
+            if payload.len() != 2 {
+                return Err(anyhow!(
+                    "invalid Int16 payload length for '{}'",
+                    column.name
+                ));
+            }
+            let mut bytes = [0u8; 2];
+            bytes.copy_from_slice(payload);
+            Ok(ScalarValue::Int16(Some(i16::from_be_bytes(bytes))))
+        }
+        TableColumnType::Int32 => {
+            if payload.len() != 4 {
+                return Err(anyhow!(
+                    "invalid Int32 payload length for '{}'",
+                    column.name
+                ));
+            }
+            let mut bytes = [0u8; 4];
+            bytes.copy_from_slice(payload);
+            Ok(ScalarValue::Int32(Some(i32::from_be_bytes(bytes))))
+        }
+        TableColumnType::Int64 => {
+            if payload.len() != 8 {
+                return Err(anyhow!(
+                    "invalid Int64 payload length for '{}'",
+                    column.name
+                ));
+            }
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(payload);
+            Ok(ScalarValue::Int64(Some(i64::from_be_bytes(bytes))))
+        }
+        TableColumnType::UInt8 => {
+            if payload.len() != 1 {
+                return Err(anyhow!(
+                    "invalid UInt8 payload length for '{}'",
+                    column.name
+                ));
+            }
+            Ok(ScalarValue::UInt8(Some(payload[0])))
+        }
+        TableColumnType::UInt16 => {
+            if payload.len() != 2 {
+                return Err(anyhow!(
+                    "invalid UInt16 payload length for '{}'",
+                    column.name
+                ));
+            }
+            let mut bytes = [0u8; 2];
+            bytes.copy_from_slice(payload);
+            Ok(ScalarValue::UInt16(Some(u16::from_be_bytes(bytes))))
+        }
+        TableColumnType::UInt32 => {
+            if payload.len() != 4 {
+                return Err(anyhow!(
+                    "invalid UInt32 payload length for '{}'",
+                    column.name
+                ));
+            }
+            let mut bytes = [0u8; 4];
+            bytes.copy_from_slice(payload);
+            Ok(ScalarValue::UInt32(Some(u32::from_be_bytes(bytes))))
+        }
+        TableColumnType::UInt64 => {
+            if payload.len() != 8 {
+                return Err(anyhow!(
+                    "invalid UInt64 payload length for '{}'",
+                    column.name
+                ));
+            }
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(payload);
+            Ok(ScalarValue::UInt64(Some(u64::from_be_bytes(bytes))))
+        }
+        TableColumnType::Float64 => {
+            if payload.len() != 8 {
+                return Err(anyhow!(
+                    "invalid Float64 payload length for '{}'",
+                    column.name
+                ));
+            }
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(payload);
+            Ok(ScalarValue::Float64(Some(f64::from_be_bytes(bytes))))
+        }
+        TableColumnType::Boolean => {
+            if payload.len() != 1 {
+                return Err(anyhow!(
+                    "invalid Boolean payload length for '{}'",
+                    column.name
+                ));
+            }
+            Ok(ScalarValue::Boolean(Some(payload[0] != 0)))
+        }
+        TableColumnType::Utf8 => {
+            let value = std::str::from_utf8(payload)
+                .with_context(|| format!("invalid Utf8 payload for '{}'", column.name))?;
+            Ok(ScalarValue::Utf8(Some(value.to_string())))
+        }
+        TableColumnType::TimestampNanosecond => {
+            if payload.len() != 8 {
+                return Err(anyhow!(
+                    "invalid Timestamp payload length for '{}'",
+                    column.name
+                ));
+            }
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(payload);
+            Ok(ScalarValue::TimestampNanosecond(
+                Some(i64::from_be_bytes(bytes)),
+                None,
+            ))
+        }
+    }
+}
+
+/// Converts normalized primary-key i64 into the column's scalar variant.
+fn primary_key_scalar(column: &TableColumnRecord, value: i64) -> Result<ScalarValue> {
+    match column.column_type {
+        TableColumnType::Int8 => i8::try_from(value)
+            .map(|v| ScalarValue::Int8(Some(v)))
+            .map_err(|_| anyhow!("primary key out of range for Int8 column '{}'", column.name)),
+        TableColumnType::Int16 => i16::try_from(value)
+            .map(|v| ScalarValue::Int16(Some(v)))
+            .map_err(|_| {
+                anyhow!(
+                    "primary key out of range for Int16 column '{}'",
+                    column.name
+                )
+            }),
+        TableColumnType::Int32 => i32::try_from(value)
+            .map(|v| ScalarValue::Int32(Some(v)))
+            .map_err(|_| {
+                anyhow!(
+                    "primary key out of range for Int32 column '{}'",
+                    column.name
+                )
+            }),
+        TableColumnType::Int64 => Ok(ScalarValue::Int64(Some(value))),
+        _ => Err(anyhow!(
+            "primary key column '{}' must be a signed integer",
+            column.name
+        )),
     }
 }
 
@@ -1445,10 +2702,10 @@ impl PkBounds {
 }
 
 /// Executes `extract supported predicates` for this component.
-fn extract_supported_predicates(expr: &Expr) -> Option<Vec<PkPredicate>> {
+fn extract_supported_predicates(expr: &Expr, primary_key_column: &str) -> Option<Vec<PkPredicate>> {
     let mut predicates = Vec::new();
     // Decision: evaluate `collect_supported_predicates(expr, &mut predicates)` to choose the correct SQL/storage control path.
-    if collect_supported_predicates(expr, &mut predicates) {
+    if collect_supported_predicates(expr, primary_key_column, &mut predicates) {
         Some(predicates)
     } else {
         None
@@ -1456,12 +2713,16 @@ fn extract_supported_predicates(expr: &Expr) -> Option<Vec<PkPredicate>> {
 }
 
 /// Executes `collect supported predicates` for this component.
-fn collect_supported_predicates(expr: &Expr, out: &mut Vec<PkPredicate>) -> bool {
+fn collect_supported_predicates(
+    expr: &Expr,
+    primary_key_column: &str,
+    out: &mut Vec<PkPredicate>,
+) -> bool {
     // Decision: evaluate `expr` to choose the correct SQL/storage control path.
     match expr {
         Expr::BinaryExpr(binary) if binary.op == Operator::And => {
-            collect_supported_predicates(binary.left.as_ref(), out)
-                && collect_supported_predicates(binary.right.as_ref(), out)
+            collect_supported_predicates(binary.left.as_ref(), primary_key_column, out)
+                && collect_supported_predicates(binary.right.as_ref(), primary_key_column, out)
         }
         Expr::BinaryExpr(binary) => {
             // Decision: evaluate `(` to choose the correct SQL/storage control path.
@@ -1479,8 +2740,8 @@ fn collect_supported_predicates(expr: &Expr, out: &mut Vec<PkPredicate>) -> bool
                 },
             };
 
-            // Decision: evaluate `column != "order_id"` to choose the correct SQL/storage control path.
-            if column != "order_id" {
+            // Decision: evaluate `column != primary_key_column` to choose the correct SQL/storage control path.
+            if !column.eq_ignore_ascii_case(primary_key_column) {
                 return false;
             }
 
@@ -1860,7 +3121,8 @@ mod tests {
         let expr = col("order_id")
             .gt_eq(lit(1000i64))
             .and(col("order_id").lt(lit(2000i64)));
-        let predicates = extract_supported_predicates(&expr).expect("supported predicate");
+        let predicates =
+            extract_supported_predicates(&expr, "order_id").expect("supported predicate");
         assert_eq!(predicates.len(), 2);
     }
 }
