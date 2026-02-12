@@ -4,7 +4,7 @@
 //! `TableProvider` instances on each HoloFusion node.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use holo_store::{HoloStoreClient, ReplicatedConditionalWriteEntry, RpcVersion};
@@ -14,6 +14,10 @@ use crate::topology::{fetch_topology, require_non_empty_topology, route_key, sca
 
 /// Keyspace prefix for table metadata records.
 const META_PREFIX_TABLE: u8 = 0x03;
+/// Keyspace prefix for metadata-control records (schema version/checkpoints).
+const META_PREFIX_CONTROL: u8 = 0x09;
+/// Static key suffix for metadata schema migration state.
+const META_KEY_SCHEMA_STATE_SUFFIX: u8 = 0x01;
 /// Default catalog/database id currently used by HoloFusion.
 const DEFAULT_DB_ID: u64 = 1;
 /// Default schema id currently used by HoloFusion.
@@ -30,6 +34,14 @@ const METADATA_VISIBILITY_TIMEOUT: Duration = Duration::from_secs(5);
 const METADATA_CREATE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Delay between metadata creation retries under contention.
 const METADATA_CREATE_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+/// Maximum number of attempts for one conditional metadata migration write.
+const METADATA_MIGRATION_WRITE_RETRY_LIMIT: usize = 8;
+/// Batch size for checkpoint updates during metadata backfill.
+const METADATA_MIGRATION_BATCH_SIZE: usize = 128;
+/// Legacy metadata schema version used when no migration state exists yet.
+const METADATA_SCHEMA_VERSION_BASELINE: u32 = 1;
+/// Current metadata schema version expected by this binary.
+const METADATA_SCHEMA_VERSION_CURRENT: u32 = 2;
 
 /// Result of attempting to create table metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +50,50 @@ pub struct CreateTableMetadataOutcome {
     pub record: TableMetadataRecord,
     /// Whether this call created a new record (`true`) vs observed existing (`false`).
     pub created: bool,
+}
+
+/// Summary of one metadata migration/backfill execution pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataMigrationOutcome {
+    /// Schema version observed at migration start.
+    pub from_schema_version: u32,
+    /// Schema version after migration completion.
+    pub to_schema_version: u32,
+    /// Resume checkpoint loaded from prior incomplete migration, if any.
+    pub resumed_from_checkpoint: Option<u64>,
+    /// Number of table metadata rows scanned by this pass.
+    pub scanned_tables: usize,
+    /// Number of metadata rows rewritten/backfilled by this pass.
+    pub migrated_tables: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Persisted metadata schema migration state/checkpoint record.
+struct MetadataSchemaStateRecord {
+    /// Completed schema version for table metadata format.
+    #[serde(default = "default_metadata_schema_version")]
+    schema_version: u32,
+    /// Last processed table id checkpoint for resumable backfill.
+    #[serde(default)]
+    checkpoint_table_id: Option<u64>,
+    /// Last update timestamp (Unix epoch millis).
+    #[serde(default)]
+    updated_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+/// Loaded metadata schema state paired with latest storage version.
+struct MetadataSchemaStateSnapshot {
+    version: RpcVersion,
+    state: MetadataSchemaStateRecord,
+}
+
+#[derive(Debug, Clone)]
+/// Internal metadata entry including storage key/version for backfill writes.
+struct TableMetadataEntry {
+    key: Vec<u8>,
+    version: RpcVersion,
+    record: TableMetadataRecord,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,6 +199,11 @@ fn default_page_size() -> usize {
     2048
 }
 
+/// Default metadata schema version assumed for pre-migration clusters.
+fn default_metadata_schema_version() -> u32 {
+    METADATA_SCHEMA_VERSION_BASELINE
+}
+
 impl TableMetadataRecord {
     /// Validates required metadata fields before registration or persistence.
     pub fn validate(&self) -> Result<()> {
@@ -236,6 +297,394 @@ impl TableMetadataRecord {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// Legacy table metadata shape used before schema-driven column metadata.
+struct LegacyTableMetadataRecordV0 {
+    db_id: u64,
+    schema_id: u64,
+    table_id: u64,
+    table_name: String,
+    #[serde(default)]
+    table_model: Option<String>,
+    #[serde(default)]
+    preferred_shards: Vec<usize>,
+    #[serde(default)]
+    page_size: Option<usize>,
+}
+
+impl LegacyTableMetadataRecordV0 {
+    /// Converts legacy metadata into current in-memory representation.
+    fn into_current(self) -> TableMetadataRecord {
+        TableMetadataRecord {
+            db_id: self.db_id,
+            schema_id: self.schema_id,
+            table_id: self.table_id,
+            table_name: self.table_name,
+            table_model: self
+                .table_model
+                .unwrap_or_else(|| TABLE_MODEL_ORDERS_V1.to_string()),
+            columns: Vec::new(),
+            primary_key_column: None,
+            preferred_shards: self.preferred_shards,
+            page_size: self.page_size.unwrap_or_else(default_page_size).max(1),
+        }
+    }
+}
+
+/// Applies metadata schema migrations and resumable backfills for existing clusters.
+pub async fn ensure_metadata_migration(
+    client: &HoloStoreClient,
+) -> Result<MetadataMigrationOutcome> {
+    let mut state_snapshot = load_metadata_schema_state(client).await?;
+    let from_schema_version = state_snapshot.state.schema_version;
+    let resumed_from_checkpoint = state_snapshot.state.checkpoint_table_id;
+
+    // Decision: return fast when metadata schema already satisfies this binary.
+    if state_snapshot.state.schema_version >= METADATA_SCHEMA_VERSION_CURRENT {
+        return Ok(MetadataMigrationOutcome {
+            from_schema_version,
+            to_schema_version: state_snapshot.state.schema_version,
+            resumed_from_checkpoint,
+            scanned_tables: 0,
+            migrated_tables: 0,
+        });
+    }
+
+    let (scanned_tables, migrated_tables, checkpoint_after_backfill) =
+        backfill_orders_metadata_rows(client, resumed_from_checkpoint).await?;
+
+    // Decision: on fresh clusters with no migration candidates, avoid writing a
+    // schema-state marker during bootstrap so single-node startup in a larger
+    // quorum configuration does not fail before peers join.
+    if scanned_tables == 0 && migrated_tables == 0 && resumed_from_checkpoint.is_none() {
+        return Ok(MetadataMigrationOutcome {
+            from_schema_version,
+            to_schema_version: state_snapshot.state.schema_version,
+            resumed_from_checkpoint,
+            scanned_tables,
+            migrated_tables,
+        });
+    }
+
+    // Decision: persist a completion checkpoint with upgraded schema version.
+    let desired_state = MetadataSchemaStateRecord {
+        schema_version: METADATA_SCHEMA_VERSION_CURRENT,
+        checkpoint_table_id: None,
+        updated_at_unix_ms: now_unix_epoch_millis(),
+    };
+    state_snapshot = persist_metadata_schema_state_with_retry(client, state_snapshot, &desired_state)
+        .await
+        .with_context(|| {
+            format!(
+                "persist metadata schema version={} after backfill (checkpoint={checkpoint_after_backfill:?})",
+                METADATA_SCHEMA_VERSION_CURRENT
+            )
+        })?;
+
+    Ok(MetadataMigrationOutcome {
+        from_schema_version,
+        to_schema_version: state_snapshot.state.schema_version,
+        resumed_from_checkpoint,
+        scanned_tables,
+        migrated_tables,
+    })
+}
+
+/// Executes the Phase 8 #3 backfill for legacy `orders_v1` metadata rows.
+async fn backfill_orders_metadata_rows(
+    client: &HoloStoreClient,
+    checkpoint: Option<u64>,
+) -> Result<(usize, usize, Option<u64>)> {
+    let mut entries = list_table_metadata_entries(client).await?;
+    entries.sort_by_key(|entry| entry.record.table_id);
+
+    // Decision: resume from stored checkpoint to avoid rescanning completed ids.
+    let resume_after = checkpoint.unwrap_or(0);
+    let mut candidates = entries
+        .into_iter()
+        .filter(|entry| {
+            entry.record.table_id > resume_after && needs_orders_metadata_backfill(&entry.record)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|entry| entry.record.table_id);
+
+    let mut scanned_tables = 0usize;
+    let mut migrated_tables = 0usize;
+    let mut latest_checkpoint = checkpoint;
+
+    for batch in candidates.chunks(METADATA_MIGRATION_BATCH_SIZE.max(1)) {
+        for entry in batch {
+            scanned_tables = scanned_tables.saturating_add(1);
+            let migrated = backfill_orders_metadata_entry(client, entry).await?;
+            if migrated {
+                migrated_tables = migrated_tables.saturating_add(1);
+            }
+            latest_checkpoint = Some(entry.record.table_id);
+        }
+
+        // Decision: checkpoint batch progress under baseline schema version so
+        // restart can resume from last processed table id.
+        let checkpoint_state = MetadataSchemaStateRecord {
+            schema_version: METADATA_SCHEMA_VERSION_BASELINE,
+            checkpoint_table_id: latest_checkpoint,
+            updated_at_unix_ms: now_unix_epoch_millis(),
+        };
+        let snapshot = load_metadata_schema_state(client).await?;
+        let snapshot =
+            persist_metadata_schema_state_with_retry(client, snapshot, &checkpoint_state)
+                .await
+                .context("persist metadata migration checkpoint")?;
+        // Decision: stop early when another node already published completion.
+        if snapshot.state.schema_version >= METADATA_SCHEMA_VERSION_CURRENT {
+            return Ok((scanned_tables, migrated_tables, latest_checkpoint));
+        }
+    }
+
+    Ok((scanned_tables, migrated_tables, latest_checkpoint))
+}
+
+/// Backfills one legacy `orders_v1` metadata row with canonical schema fields.
+async fn backfill_orders_metadata_entry(
+    client: &HoloStoreClient,
+    entry: &TableMetadataEntry,
+) -> Result<bool> {
+    // Decision: skip no-op rows to keep writes bounded and idempotent.
+    if !needs_orders_metadata_backfill(&entry.record) {
+        return Ok(false);
+    }
+
+    let upgraded = upgraded_orders_metadata_record(&entry.record);
+    upgraded.validate()?;
+    let value = serde_json::to_vec(&upgraded)
+        .with_context(|| format!("encode upgraded metadata for table {}", upgraded.table_name))?;
+
+    let mut expected_version = entry.version;
+    for _ in 0..METADATA_MIGRATION_WRITE_RETRY_LIMIT.max(1) {
+        let topology = fetch_topology(client).await?;
+        require_non_empty_topology(&topology)?;
+
+        // Decision: route each attempt so rebalances during migration do not
+        // pin retries to stale leaseholders.
+        let route = route_key(&topology, client.target(), &entry.key, &[]).ok_or_else(|| {
+            anyhow!(
+                "failed to route metadata backfill key for table {}",
+                entry.record.table_name
+            )
+        })?;
+        let write_client = HoloStoreClient::new(route.grpc_addr);
+
+        let result = write_client
+            .range_write_latest_conditional(
+                route.shard_index,
+                route.start_key.as_slice(),
+                route.end_key.as_slice(),
+                vec![ReplicatedConditionalWriteEntry {
+                    key: entry.key.clone(),
+                    value: value.clone(),
+                    expected_version,
+                }],
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "apply metadata backfill for table '{}' shard={} target={}",
+                    entry.record.table_name, route.shard_index, route.grpc_addr
+                )
+            })?;
+
+        // Decision: conditional apply succeeded; row is now backfilled.
+        if result.applied == 1 && result.conflicts == 0 {
+            return Ok(true);
+        }
+
+        // Decision: on conflict, reload latest row and stop retrying if row is
+        // already upgraded by another concurrent migrator.
+        let latest = find_table_metadata_by_name(client, entry.record.table_name.as_str())
+            .await
+            .with_context(|| format!("reload metadata row {}", entry.record.table_name))?;
+        if let Some(record) = latest {
+            if !needs_orders_metadata_backfill(&record) {
+                return Ok(false);
+            }
+            let latest_entry = find_table_metadata_entry_by_id(
+                client,
+                record.db_id,
+                record.schema_id,
+                record.table_id,
+            )
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "reloaded metadata entry missing for table {}",
+                    record.table_name
+                )
+            })?;
+            expected_version = latest_entry.version;
+            continue;
+        }
+    }
+
+    Err(anyhow!(
+        "metadata backfill retries exhausted for table '{}'",
+        entry.record.table_name
+    ))
+}
+
+/// Returns `true` when one `orders_v1` metadata row needs schema backfill.
+fn needs_orders_metadata_backfill(record: &TableMetadataRecord) -> bool {
+    // Decision: only legacy `orders_v1` rows are migrated in this phase.
+    if record.table_model != TABLE_MODEL_ORDERS_V1 {
+        return false;
+    }
+    let canonical_columns = canonical_orders_columns();
+    if record.columns != canonical_columns {
+        return true;
+    }
+    match record.primary_key_column.as_deref().map(str::trim) {
+        Some("order_id") => {}
+        _ => return true,
+    }
+    record.page_size == 0
+}
+
+/// Produces canonical post-migration metadata payload for `orders_v1`.
+fn upgraded_orders_metadata_record(record: &TableMetadataRecord) -> TableMetadataRecord {
+    let mut upgraded = record.clone();
+    upgraded.columns = canonical_orders_columns();
+    upgraded.primary_key_column = Some("order_id".to_string());
+    upgraded.page_size = upgraded.page_size.max(default_page_size());
+    upgraded
+}
+
+/// Canonical persisted column metadata for legacy `orders_v1` layout.
+fn canonical_orders_columns() -> Vec<TableColumnRecord> {
+    vec![
+        TableColumnRecord {
+            name: "order_id".to_string(),
+            column_type: TableColumnType::Int64,
+            nullable: false,
+        },
+        TableColumnRecord {
+            name: "customer_id".to_string(),
+            column_type: TableColumnType::Int64,
+            nullable: false,
+        },
+        TableColumnRecord {
+            name: "status".to_string(),
+            column_type: TableColumnType::Utf8,
+            nullable: true,
+        },
+        TableColumnRecord {
+            name: "total_cents".to_string(),
+            column_type: TableColumnType::Int64,
+            nullable: false,
+        },
+        TableColumnRecord {
+            name: "created_at".to_string(),
+            column_type: TableColumnType::TimestampNanosecond,
+            nullable: false,
+        },
+    ]
+}
+
+/// Loads persisted metadata schema state with default fallback for legacy clusters.
+async fn load_metadata_schema_state(
+    client: &HoloStoreClient,
+) -> Result<MetadataSchemaStateSnapshot> {
+    let state_key = metadata_schema_state_key();
+    let latest = read_exact_latest_entry(client, state_key.as_slice())
+        .await
+        .context("read metadata schema state key")?;
+    if let Some(entry) = latest {
+        let state: MetadataSchemaStateRecord =
+            serde_json::from_slice(&entry.value).context("decode metadata schema state value")?;
+        return Ok(MetadataSchemaStateSnapshot {
+            version: entry.version,
+            state,
+        });
+    }
+
+    Ok(MetadataSchemaStateSnapshot {
+        version: RpcVersion::zero(),
+        state: MetadataSchemaStateRecord {
+            schema_version: METADATA_SCHEMA_VERSION_BASELINE,
+            checkpoint_table_id: None,
+            updated_at_unix_ms: now_unix_epoch_millis(),
+        },
+    })
+}
+
+/// Persists metadata schema state via conditional write and conflict reload.
+async fn persist_metadata_schema_state_with_retry(
+    client: &HoloStoreClient,
+    mut snapshot: MetadataSchemaStateSnapshot,
+    desired_state: &MetadataSchemaStateRecord,
+) -> Result<MetadataSchemaStateSnapshot> {
+    // Decision: avoid redundant writes when observed state already satisfies or
+    // exceeds desired version.
+    if snapshot.state.schema_version >= desired_state.schema_version
+        && snapshot.state.schema_version >= METADATA_SCHEMA_VERSION_CURRENT
+    {
+        return Ok(snapshot);
+    }
+
+    let desired_value =
+        serde_json::to_vec(desired_state).context("encode metadata schema state value")?;
+    let state_key = metadata_schema_state_key();
+
+    for _ in 0..METADATA_MIGRATION_WRITE_RETRY_LIMIT.max(1) {
+        let topology = fetch_topology(client).await?;
+        require_non_empty_topology(&topology)?;
+        let route = route_key(&topology, client.target(), state_key.as_slice(), &[])
+            .ok_or_else(|| anyhow!("failed to route metadata schema state key"))?;
+        let write_client = HoloStoreClient::new(route.grpc_addr);
+        let result = write_client
+            .range_write_latest_conditional(
+                route.shard_index,
+                route.start_key.as_slice(),
+                route.end_key.as_slice(),
+                vec![ReplicatedConditionalWriteEntry {
+                    key: state_key.clone(),
+                    value: desired_value.clone(),
+                    expected_version: snapshot.version,
+                }],
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "persist metadata schema state shard={} target={}",
+                    route.shard_index, route.grpc_addr
+                )
+            })?;
+
+        // Decision: apply success means this caller advanced migration state.
+        if result.applied == 1 && result.conflicts == 0 {
+            let new_version = result
+                .applied_versions
+                .iter()
+                .find(|version| version.key == state_key)
+                .map(|version| version.version)
+                .unwrap_or(snapshot.version);
+            return Ok(MetadataSchemaStateSnapshot {
+                version: new_version,
+                state: desired_state.clone(),
+            });
+        }
+
+        // Decision: on conflict, reload latest state and stop retrying if
+        // another node already advanced to current schema version.
+        snapshot = load_metadata_schema_state(client).await?;
+        if snapshot.state.schema_version >= METADATA_SCHEMA_VERSION_CURRENT {
+            return Ok(snapshot);
+        }
+    }
+
+    Err(anyhow!(
+        "metadata schema state update retries exhausted (desired_version={})",
+        desired_state.schema_version
+    ))
+}
+
 /// Ensures metadata keyspace is reachable and returns current records.
 pub async fn ensure_table_metadata(client: &HoloStoreClient) -> Result<Vec<TableMetadataRecord>> {
     list_table_metadata(client)
@@ -245,6 +694,12 @@ pub async fn ensure_table_metadata(client: &HoloStoreClient) -> Result<Vec<Table
 
 /// Lists all table metadata records across relevant topology targets.
 pub async fn list_table_metadata(client: &HoloStoreClient) -> Result<Vec<TableMetadataRecord>> {
+    let entries = list_table_metadata_entries(client).await?;
+    Ok(entries.into_iter().map(|entry| entry.record).collect())
+}
+
+/// Lists metadata entries with storage key/version for migration workflows.
+async fn list_table_metadata_entries(client: &HoloStoreClient) -> Result<Vec<TableMetadataEntry>> {
     let topology = fetch_topology(client).await?;
     require_non_empty_topology(&topology)?;
 
@@ -252,7 +707,7 @@ pub async fn list_table_metadata(client: &HoloStoreClient) -> Result<Vec<TableMe
     let end_key = prefix_end(&start_key).unwrap_or_default();
     let targets = scan_targets(&topology, client.target(), &start_key, &end_key, &[]);
 
-    let mut by_key = BTreeMap::<(u64, u64, u64), TableMetadataRecord>::new();
+    let mut by_key = BTreeMap::<(u64, u64, u64), TableMetadataEntry>::new();
     for target in targets {
         let scan_client = HoloStoreClient::new(target.grpc_addr);
         let mut cursor = Vec::new();
@@ -282,8 +737,8 @@ pub async fn list_table_metadata(client: &HoloStoreClient) -> Result<Vec<TableMe
                 }
                 let (db_id, schema_id, table_id) = decode_table_metadata_key(entry.key.as_slice())
                     .ok_or_else(|| anyhow!("invalid metadata key: {}", hex::encode(&entry.key)))?;
-                let record: TableMetadataRecord = serde_json::from_slice(&entry.value)
-                    .with_context(|| {
+                let record =
+                    decode_table_metadata_value(entry.value.as_slice()).with_context(|| {
                         format!(
                             "decode table metadata value key={}",
                             hex::encode(&entry.key)
@@ -306,7 +761,22 @@ pub async fn list_table_metadata(client: &HoloStoreClient) -> Result<Vec<TableMe
                     ));
                 }
                 record.validate()?;
-                by_key.insert((db_id, schema_id, table_id), record);
+                let identity = (db_id, schema_id, table_id);
+                // Decision: choose the highest-version row when multiple shard
+                // scans race during replication convergence.
+                match by_key.get(&identity) {
+                    Some(current) if current.version >= entry.version => {}
+                    _ => {
+                        by_key.insert(
+                            identity,
+                            TableMetadataEntry {
+                                key: entry.key,
+                                version: entry.version,
+                                record,
+                            },
+                        );
+                    }
+                }
             }
 
             // Decision: finish paging when server indicates completion or when
@@ -489,6 +959,48 @@ pub fn table_model_row_v1() -> &'static str {
     TABLE_MODEL_ROW_V1
 }
 
+/// Decodes one table metadata value, including legacy pre-schema payloads.
+fn decode_table_metadata_value(value: &[u8]) -> Result<TableMetadataRecord> {
+    // Decision: prefer current schema decode for modern payloads.
+    match serde_json::from_slice::<TableMetadataRecord>(value) {
+        Ok(record) => Ok(record),
+        Err(current_err) => {
+            // Decision: fallback to legacy schema to keep existing clusters
+            // readable during migration rollout.
+            match serde_json::from_slice::<LegacyTableMetadataRecordV0>(value) {
+                Ok(legacy) => Ok(legacy.into_current()),
+                Err(legacy_err) => Err(anyhow!(
+                    "decode metadata value failed (current={current_err}; legacy={legacy_err})"
+                )),
+            }
+        }
+    }
+}
+
+/// Looks up one metadata entry by identity key.
+async fn find_table_metadata_entry_by_id(
+    client: &HoloStoreClient,
+    db_id: u64,
+    schema_id: u64,
+    table_id: u64,
+) -> Result<Option<TableMetadataEntry>> {
+    let key = encode_table_metadata_key(db_id, schema_id, table_id);
+    if let Some(entry) = read_exact_latest_entry(client, key.as_slice()).await? {
+        let record = decode_table_metadata_value(entry.value.as_slice()).with_context(|| {
+            format!(
+                "decode metadata value for table key={}",
+                hex::encode(key.as_slice())
+            )
+        })?;
+        return Ok(Some(TableMetadataEntry {
+            key,
+            version: entry.version,
+            record,
+        }));
+    }
+    Ok(None)
+}
+
 /// Encodes metadata key as `{prefix}{db_id}{schema_id}{table_id}`.
 fn encode_table_metadata_key(db_id: u64, schema_id: u64, table_id: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + 8 + 8 + 8);
@@ -520,6 +1032,11 @@ fn decode_table_metadata_key(key: &[u8]) -> Option<(u64, u64, u64)> {
     ))
 }
 
+/// Returns the metadata schema-state control key.
+fn metadata_schema_state_key() -> Vec<u8> {
+    vec![META_PREFIX_CONTROL, META_KEY_SCHEMA_STATE_SUFFIX]
+}
+
 /// Computes exclusive end key for a prefix scan.
 fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
     let mut out = prefix.to_vec();
@@ -534,6 +1051,66 @@ fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
         }
     }
     None
+}
+
+/// Computes exclusive end bound for an exact-key scan.
+fn exact_key_end(key: &[u8]) -> Vec<u8> {
+    let mut end = key.to_vec();
+    end.push(0x00);
+    end
+}
+
+/// Reads the newest visible value for one exact key across scan targets.
+async fn read_exact_latest_entry(
+    client: &HoloStoreClient,
+    key: &[u8],
+) -> Result<Option<holo_store::LatestEntry>> {
+    let topology = fetch_topology(client).await?;
+    require_non_empty_topology(&topology)?;
+
+    let end = exact_key_end(key);
+    let targets = scan_targets(&topology, client.target(), key, end.as_slice(), &[]);
+
+    let mut latest: Option<holo_store::LatestEntry> = None;
+    for target in targets {
+        let scan_client = HoloStoreClient::new(target.grpc_addr);
+        let (entries, _, _) = scan_client
+            .range_snapshot_latest(
+                target.shard_index,
+                target.start_key.as_slice(),
+                target.end_key.as_slice(),
+                &[],
+                DEFAULT_SCAN_PAGE_SIZE,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "scan exact metadata key={} shard={} target={}",
+                    hex::encode(key),
+                    target.shard_index,
+                    target.grpc_addr
+                )
+            })?;
+        for entry in entries {
+            if entry.key != key {
+                continue;
+            }
+            match &latest {
+                Some(current) if current.version >= entry.version => {}
+                _ => latest = Some(entry),
+            }
+        }
+    }
+
+    Ok(latest)
+}
+
+/// Returns current Unix epoch milliseconds.
+fn now_unix_epoch_millis() -> u64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis().min(u64::MAX as u128) as u64,
+        Err(_) => 0,
+    }
 }
 
 /// Polls until metadata for `table_name` is observable or timeout elapses.
@@ -575,4 +1152,175 @@ async fn wait_for_table_metadata_by_name(
         ));
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{SocketAddr, TcpListener};
+    use std::time::Duration;
+
+    use anyhow::{Context, Result};
+    use holo_store::{start_embedded_node, EmbeddedNodeConfig, ReplicatedWriteEntry};
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[test]
+    fn decode_legacy_metadata_defaults_orders_model() -> Result<()> {
+        let payload = serde_json::json!({
+            "db_id": 1u64,
+            "schema_id": 1u64,
+            "table_id": 42u64,
+            "table_name": "orders_legacy"
+        });
+        let decoded = decode_table_metadata_value(payload.to_string().as_bytes())?;
+        assert_eq!(decoded.table_model, table_model_orders_v1());
+        assert!(decoded.columns.is_empty());
+        assert!(decoded.primary_key_column.is_none());
+        assert_eq!(decoded.page_size, default_page_size());
+        Ok(())
+    }
+
+    #[test]
+    fn upgraded_orders_metadata_sets_canonical_fields() -> Result<()> {
+        let legacy = TableMetadataRecord {
+            db_id: 1,
+            schema_id: 1,
+            table_id: 7,
+            table_name: "orders".to_string(),
+            table_model: table_model_orders_v1().to_string(),
+            columns: Vec::new(),
+            primary_key_column: None,
+            preferred_shards: Vec::new(),
+            page_size: 0,
+        };
+        assert!(needs_orders_metadata_backfill(&legacy));
+        let upgraded = upgraded_orders_metadata_record(&legacy);
+        assert_eq!(upgraded.columns, canonical_orders_columns());
+        assert_eq!(upgraded.primary_key_column.as_deref(), Some("order_id"));
+        assert!(upgraded.page_size >= default_page_size());
+        upgraded.validate()?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metadata_migration_backfills_legacy_orders_rows() -> Result<()> {
+        let temp_dir = TempDir::new().context("create temp dir for metadata migration test")?;
+        let redis_addr: SocketAddr = format!("127.0.0.1:{}", free_port()?)
+            .parse()
+            .context("parse redis addr")?;
+        let grpc_addr: SocketAddr = format!("127.0.0.1:{}", free_port()?)
+            .parse()
+            .context("parse grpc addr")?;
+
+        let node = start_embedded_node(EmbeddedNodeConfig {
+            node_id: 1,
+            listen_redis: redis_addr,
+            listen_grpc: grpc_addr,
+            bootstrap: true,
+            join: None,
+            initial_members: format!("1@{grpc_addr}"),
+            data_dir: temp_dir.path().join("node-1"),
+            ready_timeout: Duration::from_secs(20),
+            max_shards: 1,
+            initial_ranges: 1,
+            routing_mode: Some("range".to_string()),
+        })
+        .await
+        .context("start embedded holostore for migration test")?;
+
+        let client = HoloStoreClient::new(grpc_addr);
+        let created = create_table_metadata(
+            &client,
+            "orders",
+            false,
+            &CreateTableMetadataSpec {
+                table_model: table_model_orders_v1().to_string(),
+                columns: canonical_orders_columns(),
+                primary_key_column: "order_id".to_string(),
+                preferred_shards: Vec::new(),
+                page_size: default_page_size(),
+            },
+        )
+        .await
+        .context("create baseline orders metadata")?;
+
+        let legacy_payload = serde_json::json!({
+            "db_id": created.record.db_id,
+            "schema_id": created.record.schema_id,
+            "table_id": created.record.table_id,
+            "table_name": created.record.table_name,
+            "table_model": table_model_orders_v1()
+        })
+        .to_string()
+        .into_bytes();
+        let metadata_key = encode_table_metadata_key(
+            created.record.db_id,
+            created.record.schema_id,
+            created.record.table_id,
+        );
+        let topology = fetch_topology(&client).await?;
+        let route = route_key(&topology, client.target(), metadata_key.as_slice(), &[])
+            .context("route legacy metadata rewrite key")?;
+        let write_client = HoloStoreClient::new(route.grpc_addr);
+        let rewritten = write_client
+            .range_write_latest(
+                route.shard_index,
+                route.start_key.as_slice(),
+                route.end_key.as_slice(),
+                vec![ReplicatedWriteEntry {
+                    key: metadata_key.clone(),
+                    value: legacy_payload,
+                }],
+            )
+            .await
+            .context("rewrite metadata row to legacy payload")?;
+        assert_eq!(rewritten, 1);
+
+        let before = find_table_metadata_by_name(&client, "orders")
+            .await?
+            .context("orders metadata should exist before migration")?;
+        assert!(needs_orders_metadata_backfill(&before));
+
+        let first = ensure_metadata_migration(&client)
+            .await
+            .context("run first metadata migration pass")?;
+        assert_eq!(
+            first.to_schema_version, METADATA_SCHEMA_VERSION_CURRENT,
+            "metadata migration should advance schema version"
+        );
+        assert!(
+            first.migrated_tables >= 1,
+            "expected at least one migrated row, got {}",
+            first.migrated_tables
+        );
+
+        let after = find_table_metadata_by_name(&client, "orders")
+            .await?
+            .context("orders metadata should exist after migration")?;
+        assert_eq!(after.columns, canonical_orders_columns());
+        assert_eq!(after.primary_key_column.as_deref(), Some("order_id"));
+
+        let second = ensure_metadata_migration(&client)
+            .await
+            .context("run second metadata migration pass")?;
+        assert_eq!(second.migrated_tables, 0);
+        assert_eq!(
+            second.to_schema_version, METADATA_SCHEMA_VERSION_CURRENT,
+            "second pass should stay on current schema version"
+        );
+
+        node.shutdown()
+            .await
+            .context("shutdown migration test node")?;
+        Ok(())
+    }
+
+    fn free_port() -> Result<u16> {
+        let listener = TcpListener::bind("127.0.0.1:0").context("bind ephemeral port")?;
+        Ok(listener
+            .local_addr()
+            .context("read ephemeral port addr")?
+            .port())
+    }
 }

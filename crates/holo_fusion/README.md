@@ -174,5 +174,6 @@ Key test files:
 - `crates/holo_fusion/docs/HOLO_FUSION_STORAGE_MODEL.md`
 - `crates/holo_fusion/docs/HOLO_FUSION_SQL_SCOPE.md`
 - `crates/holo_fusion/docs/DATA_FUSION_TODO.md`
+- `crates/holo_fusion/docs/METADATA_MIGRATION.md`
 - `crates/holo_fusion/docs/PHASE7_BENCHMARK_SLO.md`
 - `crates/holo_fusion/docs/HOLO_FUSION_RUNBOOK.md`

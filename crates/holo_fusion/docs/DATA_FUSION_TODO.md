@@ -69,5 +69,9 @@
   - Add schema-driven `row_v1` delete execution with PK-bounded scans and conditional writes.
   - Preserve distributed optimistic-concurrency semantics (`40001` on write-write conflict) with rollback payloads.
   - Return deterministic `0A000` for explicit-transaction `row_v1` UPDATE/DELETE until generic transactional DML staging lands.
-- [ ] #3 Explicit metadata migration/backfill plan for existing clusters.
+- [x] #3 Explicit metadata migration/backfill plan for existing clusters.
+  - Add persisted metadata schema-state record with resumable backfill checkpointing.
+  - Add startup migration runner that upgrades legacy `orders_v1` metadata rows in-place.
+  - Add idempotent conflict-safe conditional writes for concurrent migrators across nodes.
+  - Add migration tests covering legacy decode, canonical backfill, and idempotent reruns.
 - [ ] #4 Extended type coverage and SQL defaults/check constraints roadmap.
