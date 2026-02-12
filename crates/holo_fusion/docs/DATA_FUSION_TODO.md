@@ -57,3 +57,17 @@
   - Operational runbook for incident triage (conflict spikes, degraded mode, shard imbalance).
   - Capacity planning notes and tuning knobs.
   - Release checklist for safe upgrades and rollback steps.
+
+9. [ ] Complete Phase 8 generic storage model expansion.
+- [x] #1 Generic CREATE TABLE + schema-driven provider:
+  - Persist table columns and primary-key metadata in HoloStore (`row_v1`).
+  - Remove CREATE TABLE hard requirement on the fixed `orders_v1` column set.
+  - Add schema-driven scan/insert codec path for non-`orders` tables.
+  - Keep `orders_v1` codec path for backward compatibility and existing transactional DML semantics.
+- [x] #2 Generic UPDATE/DELETE across row_v1 tables.
+  - Add schema-driven `row_v1` mutation parsing and typed assignment coercion for `UPDATE`.
+  - Add schema-driven `row_v1` delete execution with PK-bounded scans and conditional writes.
+  - Preserve distributed optimistic-concurrency semantics (`40001` on write-write conflict) with rollback payloads.
+  - Return deterministic `0A000` for explicit-transaction `row_v1` UPDATE/DELETE until generic transactional DML staging lands.
+- [ ] #3 Explicit metadata migration/backfill plan for existing clusters.
+- [ ] #4 Extended type coverage and SQL defaults/check constraints roadmap.

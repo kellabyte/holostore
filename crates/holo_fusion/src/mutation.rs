@@ -36,11 +36,15 @@ use tokio::sync::Semaphore;
 use tracing::{info_span, Instrument};
 
 use crate::catalog::register_table_from_metadata;
-use crate::metadata::create_table_metadata;
+use crate::metadata::{
+    create_table_metadata, table_model_orders_v1, table_model_row_v1, CreateTableMetadataSpec,
+    TableColumnRecord, TableColumnType,
+};
 use crate::metrics::PushdownMetrics;
 use crate::provider::{
     encode_orders_row_value, encode_orders_tombstone_value, orders_schema, ConditionalOrderWrite,
-    ConditionalWriteOutcome, HoloStoreTableProvider, OrdersSeedRow, VersionedOrdersRow,
+    ConditionalPrimaryWrite, ConditionalWriteOutcome, HoloStoreTableProvider, OrdersSeedRow,
+    VersionedOrdersRow,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -911,12 +915,16 @@ async fn execute_create_table(
 ) -> PgWireResult<Response> {
     validate_supported_create_table(create)?;
     let table_name = parse_create_table_name(&create.name)?;
-    validate_orders_v1_table_definition(create, table_name.as_str())?;
+    let spec = compile_create_table_metadata_spec(create, table_name.as_str())?;
 
-    let outcome =
-        create_table_metadata(&holostore_client, table_name.as_str(), create.if_not_exists)
-            .await
-            .map_err(map_create_table_metadata_error)?;
+    let outcome = create_table_metadata(
+        &holostore_client,
+        table_name.as_str(),
+        create.if_not_exists,
+        &spec,
+    )
+    .await
+    .map_err(map_create_table_metadata_error)?;
 
     register_table_from_metadata(
         session_context,
@@ -1094,45 +1102,34 @@ fn normalize_ident(ident: &datafusion::sql::sqlparser::ast::Ident) -> String {
     }
 }
 
-/// Executes `validate orders v1 table definition` for this component.
-fn validate_orders_v1_table_definition(create: &CreateTable, table_name: &str) -> PgWireResult<()> {
+/// Compiles CREATE TABLE AST into persisted metadata specification.
+fn compile_create_table_metadata_spec(
+    create: &CreateTable,
+    table_name: &str,
+) -> PgWireResult<CreateTableMetadataSpec> {
     let mut pk_columns = BTreeSet::<String>::new();
-    let mut by_name = BTreeMap::<String, &ColumnDef>::new();
+    let mut by_name = BTreeMap::<String, usize>::new();
+    let mut columns = Vec::<TableColumnRecord>::with_capacity(create.columns.len());
 
     for column in &create.columns {
         let column_name = normalize_ident(&column.name);
-        // Decision: evaluate `by_name.insert(column_name.clone(), column).is_some()` to choose the correct SQL/storage control path.
-        if by_name.insert(column_name.clone(), column).is_some() {
+        // Decision: evaluate `by_name.contains_key(column_name.as_str())` to choose the correct SQL/storage control path.
+        if by_name.contains_key(column_name.as_str()) {
             return Err(to_user_error(
                 "42701",
                 format!("column '{}' specified more than once", column_name),
             ));
         }
-        for option in &column.options {
-            // Decision: evaluate `&option.option` to choose the correct SQL/storage control path.
-            match &option.option {
-                ColumnOption::Null | ColumnOption::NotNull => {}
-                ColumnOption::Unique { is_primary, .. } if *is_primary => {
-                    pk_columns.insert(column_name.clone());
-                }
-                ColumnOption::Comment(_) => {}
-                ColumnOption::Unique { .. } => {
-                    return Err(to_user_error(
-                        "0A000",
-                        "UNIQUE constraints are not supported; only PRIMARY KEY(order_id) is allowed",
-                    ));
-                }
-                _ => {
-                    return Err(to_user_error(
-                        "0A000",
-                        format!(
-                            "column option '{}' is not supported in CREATE TABLE",
-                            option.option
-                        ),
-                    ));
-                }
-            }
-        }
+
+        let nullable = column_nullable(column, &column_name, &mut pk_columns)?;
+        let column_type = sql_data_type_to_column_type(&column.data_type)?;
+        let index = columns.len();
+        columns.push(TableColumnRecord {
+            name: column_name.clone(),
+            column_type,
+            nullable,
+        });
+        by_name.insert(column_name, index);
     }
 
     for constraint in &create.constraints {
@@ -1167,140 +1164,96 @@ fn validate_orders_v1_table_definition(create: &CreateTable, table_name: &str) -
         pk_columns.insert(column);
     }
 
-    let required_columns = [
-        "order_id",
-        "customer_id",
-        "status",
-        "total_cents",
-        "created_at",
-    ];
-    // Decision: evaluate `by_name.len() != required_columns.len()` to choose the correct SQL/storage control path.
-    if by_name.len() != required_columns.len()
-        || required_columns
-            .iter()
-            .any(|name| !by_name.contains_key(*name))
-    {
+    // Decision: evaluate `pk_columns.is_empty()` to choose the correct SQL/storage control path.
+    if pk_columns.is_empty() {
         return Err(to_user_error(
             "0A000",
+            format!("CREATE TABLE '{table_name}' requires a PRIMARY KEY"),
+        ));
+    }
+    // Decision: evaluate `pk_columns.len() != 1` to choose the correct SQL/storage control path.
+    if pk_columns.len() != 1 {
+        return Err(to_user_error(
+            "0A000",
+            format!("CREATE TABLE '{table_name}' supports only single-column PRIMARY KEY"),
+        ));
+    }
+
+    let primary_key_column = pk_columns.into_iter().next().unwrap_or_default();
+    let Some(pk_index) = by_name.get(primary_key_column.as_str()).copied() else {
+        return Err(to_user_error(
+            "42703",
             format!(
-                "CREATE TABLE '{}' must use the orders_v1 column set: (order_id, customer_id, status, total_cents, created_at)",
-                table_name
+                "PRIMARY KEY column '{}' does not exist in CREATE TABLE '{}'",
+                primary_key_column, table_name
+            ),
+        ));
+    };
+
+    if columns[pk_index].nullable {
+        return Err(to_user_error(
+            "23502",
+            format!(
+                "PRIMARY KEY column '{}' must be declared NOT NULL",
+                primary_key_column
+            ),
+        ));
+    }
+    if !columns[pk_index].column_type.is_signed_integer() {
+        return Err(to_user_error(
+            "42804",
+            format!(
+                "PRIMARY KEY column '{}' must be BIGINT/INTEGER/SMALLINT/TINYINT",
+                primary_key_column
             ),
         ));
     }
 
-    let order_id = by_name
-        .get("order_id")
-        .ok_or_else(|| to_user_error("42601", "missing column order_id"))?;
-    // Decision: evaluate `!is_bigint_data_type(&order_id.data_type)` to choose the correct SQL/storage control path.
-    if !is_bigint_data_type(&order_id.data_type) {
-        return Err(to_user_error("42804", "column 'order_id' must be BIGINT"));
-    }
-    // Decision: evaluate `column_nullable(order_id)?` to choose the correct SQL/storage control path.
-    if column_nullable(order_id)? {
-        return Err(to_user_error(
-            "23502",
-            "column 'order_id' must be declared NOT NULL",
-        ));
-    }
+    let table_model = if is_orders_v1_layout(columns.as_slice(), primary_key_column.as_str()) {
+        table_model_orders_v1().to_string()
+    } else {
+        table_model_row_v1().to_string()
+    };
 
-    let customer_id = by_name
-        .get("customer_id")
-        .ok_or_else(|| to_user_error("42601", "missing column customer_id"))?;
-    // Decision: evaluate `!is_bigint_data_type(&customer_id.data_type)` to choose the correct SQL/storage control path.
-    if !is_bigint_data_type(&customer_id.data_type) {
-        return Err(to_user_error(
-            "42804",
-            "column 'customer_id' must be BIGINT",
-        ));
-    }
-    // Decision: evaluate `column_nullable(customer_id)?` to choose the correct SQL/storage control path.
-    if column_nullable(customer_id)? {
-        return Err(to_user_error(
-            "23502",
-            "column 'customer_id' must be declared NOT NULL",
-        ));
-    }
-
-    let status = by_name
-        .get("status")
-        .ok_or_else(|| to_user_error("42601", "missing column status"))?;
-    // Decision: evaluate `!is_status_data_type(&status.data_type)` to choose the correct SQL/storage control path.
-    if !is_status_data_type(&status.data_type) {
-        return Err(to_user_error(
-            "42804",
-            "column 'status' must be TEXT/VARCHAR",
-        ));
-    }
-    // Decision: evaluate `!column_nullable(status)?` to choose the correct SQL/storage control path.
-    if !column_nullable(status)? {
-        return Err(to_user_error(
-            "0A000",
-            "column 'status' must allow NULL for orders_v1 table model",
-        ));
-    }
-
-    let total_cents = by_name
-        .get("total_cents")
-        .ok_or_else(|| to_user_error("42601", "missing column total_cents"))?;
-    // Decision: evaluate `!is_bigint_data_type(&total_cents.data_type)` to choose the correct SQL/storage control path.
-    if !is_bigint_data_type(&total_cents.data_type) {
-        return Err(to_user_error(
-            "42804",
-            "column 'total_cents' must be BIGINT",
-        ));
-    }
-    // Decision: evaluate `column_nullable(total_cents)?` to choose the correct SQL/storage control path.
-    if column_nullable(total_cents)? {
-        return Err(to_user_error(
-            "23502",
-            "column 'total_cents' must be declared NOT NULL",
-        ));
-    }
-
-    let created_at = by_name
-        .get("created_at")
-        .ok_or_else(|| to_user_error("42601", "missing column created_at"))?;
-    // Decision: evaluate `!is_created_at_data_type(&created_at.data_type)` to choose the correct SQL/storage control path.
-    if !is_created_at_data_type(&created_at.data_type) {
-        return Err(to_user_error(
-            "42804",
-            "column 'created_at' must be TIMESTAMP [WITHOUT TIME ZONE]",
-        ));
-    }
-    // Decision: evaluate `column_nullable(created_at)?` to choose the correct SQL/storage control path.
-    if column_nullable(created_at)? {
-        return Err(to_user_error(
-            "23502",
-            "column 'created_at' must be declared NOT NULL",
-        ));
-    }
-
-    // Decision: evaluate `pk_columns.len() != 1 || !pk_columns.contains("order_id")` to choose the correct SQL/storage control path.
-    if pk_columns.len() != 1 || !pk_columns.contains("order_id") {
-        return Err(to_user_error(
-            "0A000",
-            "CREATE TABLE requires PRIMARY KEY(order_id)",
-        ));
-    }
-
-    Ok(())
+    Ok(CreateTableMetadataSpec {
+        table_model,
+        columns,
+        primary_key_column,
+        preferred_shards: Vec::new(),
+        page_size: 2048,
+    })
 }
 
 /// Executes `column nullable` for this component.
-fn column_nullable(column: &ColumnDef) -> PgWireResult<bool> {
+fn column_nullable(
+    column: &ColumnDef,
+    column_name: &str,
+    pk_columns: &mut BTreeSet<String>,
+) -> PgWireResult<bool> {
     let mut nullable = true;
     for option in &column.options {
         // Decision: evaluate `&option.option` to choose the correct SQL/storage control path.
         match &option.option {
             ColumnOption::Null => nullable = true,
             ColumnOption::NotNull => nullable = false,
-            ColumnOption::Unique { is_primary, .. } if *is_primary => nullable = false,
+            ColumnOption::Unique { is_primary, .. } if *is_primary => {
+                pk_columns.insert(column_name.to_string());
+                nullable = false;
+            }
             ColumnOption::Comment(_) => {}
+            ColumnOption::Default(_) => {
+                return Err(to_user_error(
+                    "0A000",
+                    format!(
+                        "column '{}' uses DEFAULT, which is not supported yet",
+                        column_name
+                    ),
+                ));
+            }
             ColumnOption::Unique { .. } => {
                 return Err(to_user_error(
                     "0A000",
-                    "UNIQUE constraints are not supported; only PRIMARY KEY(order_id) is allowed",
+                    "UNIQUE constraints are not supported; only PRIMARY KEY is allowed",
                 ));
             }
             _ => {
@@ -1317,40 +1270,116 @@ fn column_nullable(column: &ColumnDef) -> PgWireResult<bool> {
     Ok(nullable)
 }
 
-/// Executes `is bigint data type` for this component.
-fn is_bigint_data_type(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
+/// Maps SQL parser type to persisted metadata column type.
+fn sql_data_type_to_column_type(data_type: &DataType) -> PgWireResult<TableColumnType> {
+    let mapped = match data_type {
         DataType::BigInt(_)
-            | DataType::Int8(_)
-            | DataType::Int64
-            | DataType::Integer(_)
-            | DataType::Int(_)
-            | DataType::Int4(_)
-    )
-}
-
-/// Executes `is status data type` for this component.
-fn is_status_data_type(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Text
-            | DataType::Varchar(_)
-            | DataType::CharVarying(_)
-            | DataType::CharacterVarying(_)
-    )
-}
-
-/// Executes `is created at data type` for this component.
-fn is_created_at_data_type(data_type: &DataType) -> bool {
-    // Decision: evaluate `data_type` to choose the correct SQL/storage control path.
-    match data_type {
-        DataType::Timestamp(_, tz) => {
-            matches!(tz, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone)
+        | DataType::Int8(_)
+        | DataType::Int64
+        | DataType::Integer(_)
+        | DataType::Int(_)
+        | DataType::Int4(_)
+        | DataType::MediumInt(_)
+        | DataType::Signed
+        | DataType::SignedInteger => Some(TableColumnType::Int64),
+        DataType::Int32 => Some(TableColumnType::Int32),
+        DataType::SmallInt(_) | DataType::Int2(_) | DataType::Int16 => Some(TableColumnType::Int16),
+        DataType::TinyInt(_) => Some(TableColumnType::Int8),
+        DataType::BigIntUnsigned(_)
+        | DataType::UBigInt
+        | DataType::Int8Unsigned(_)
+        | DataType::IntUnsigned(_)
+        | DataType::Int4Unsigned(_)
+        | DataType::IntegerUnsigned(_)
+        | DataType::MediumIntUnsigned(_)
+        | DataType::Unsigned
+        | DataType::UnsignedInteger
+        | DataType::UInt64 => Some(TableColumnType::UInt64),
+        DataType::SmallIntUnsigned(_)
+        | DataType::Int2Unsigned(_)
+        | DataType::USmallInt
+        | DataType::UInt16 => Some(TableColumnType::UInt16),
+        DataType::TinyIntUnsigned(_) | DataType::UTinyInt | DataType::UInt8 => {
+            Some(TableColumnType::UInt8)
         }
-        DataType::TimestampNtz | DataType::Datetime(_) => true,
-        _ => false,
+        DataType::UInt32 => Some(TableColumnType::UInt32),
+        DataType::Text
+        | DataType::Varchar(_)
+        | DataType::CharVarying(_)
+        | DataType::CharacterVarying(_)
+        | DataType::Character(_)
+        | DataType::Char(_) => Some(TableColumnType::Utf8),
+        DataType::Boolean | DataType::Bool => Some(TableColumnType::Boolean),
+        DataType::Float(_)
+        | DataType::Float4
+        | DataType::Float8
+        | DataType::Float64
+        | DataType::Float32
+        | DataType::Real
+        | DataType::Double(_)
+        | DataType::DoublePrecision => Some(TableColumnType::Float64),
+        DataType::Timestamp(_, tz) => {
+            if matches!(tz, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) {
+                Some(TableColumnType::TimestampNanosecond)
+            } else {
+                None
+            }
+        }
+        DataType::TimestampNtz | DataType::Datetime(_) | DataType::Datetime64(_, _) => {
+            Some(TableColumnType::TimestampNanosecond)
+        }
+        _ => None,
+    };
+    mapped.ok_or_else(|| {
+        to_user_error(
+            "0A000",
+            format!("column data type '{}' is not supported", data_type),
+        )
+    })
+}
+
+/// Returns `true` when compiled column layout matches the legacy orders model.
+fn is_orders_v1_layout(columns: &[TableColumnRecord], primary_key_column: &str) -> bool {
+    if primary_key_column != "order_id" {
+        return false;
     }
+    if columns.len() != 5 {
+        return false;
+    }
+    matches!(
+        columns,
+        [
+            TableColumnRecord {
+                name,
+                column_type: TableColumnType::Int64,
+                nullable: false,
+            },
+            TableColumnRecord {
+                name: customer_name,
+                column_type: TableColumnType::Int64,
+                nullable: false,
+            },
+            TableColumnRecord {
+                name: status_name,
+                column_type: TableColumnType::Utf8,
+                nullable: true,
+            },
+            TableColumnRecord {
+                name: total_name,
+                column_type: TableColumnType::Int64,
+                nullable: false,
+            },
+            TableColumnRecord {
+                name: created_name,
+                column_type: TableColumnType::TimestampNanosecond,
+                nullable: false,
+            },
+        ] if name == "order_id"
+            && customer_name == "customer_id"
+            && status_name == "status"
+            && total_name == "total_cents"
+            && created_name == "created_at"
+    )
 }
 
 /// Executes `index column name` for this component.
@@ -1405,6 +1434,19 @@ async fn execute_update(
     }
 
     let table_name = extract_mutation_target_table_name(table, "UPDATE")?;
+    let provider = get_provider_for_table(session_context, table_name.as_str()).await?;
+    if provider.is_row_v1_table() {
+        return execute_update_row_v1(
+            assignments,
+            selection,
+            params,
+            config,
+            pushdown_metrics,
+            &provider,
+        )
+        .await;
+    }
+
     let selection = selection.ok_or_else(|| {
         to_user_error(
             "0A000",
@@ -1421,7 +1463,6 @@ async fn execute_update(
     }
 
     let patch = parse_update_patch(assignments, params)?;
-    let provider = get_provider_for_table(session_context, table_name.as_str()).await?;
     let scan_limit = config.max_scan_rows.max(1);
 
     let rows = provider
@@ -1520,6 +1561,17 @@ async fn execute_delete(
 
     let table = extract_single_delete_table(&delete.from)?;
     let table_name = extract_mutation_target_table_name(table, "DELETE")?;
+    let provider = get_provider_for_table(session_context, table_name.as_str()).await?;
+    if provider.is_row_v1_table() {
+        return execute_delete_row_v1(
+            delete.selection.as_ref(),
+            params,
+            config,
+            pushdown_metrics,
+            &provider,
+        )
+        .await;
+    }
 
     let selection = delete.selection.as_ref().ok_or_else(|| {
         to_user_error(
@@ -1536,7 +1588,6 @@ async fn execute_delete(
         ));
     }
 
-    let provider = get_provider_for_table(session_context, table_name.as_str()).await?;
     let scan_limit = config.max_scan_rows.max(1);
     let rows = provider
         .scan_orders_with_versions_by_order_id_bounds(
@@ -1572,6 +1623,168 @@ async fn execute_delete(
     // Decision: evaluate `provider` to choose the correct SQL/storage control path.
     match provider
         .apply_orders_writes_conditional(&writes, "delete")
+        .await
+        .map_err(|err| api_error(err.to_string()))?
+    {
+        ConditionalWriteOutcome::Applied(_) => {}
+        ConditionalWriteOutcome::Conflict => {
+            return Err(to_user_error(
+                "40001",
+                "write conflict detected during DELETE; retry statement",
+            ));
+        }
+    }
+
+    Ok(Response::Execution(
+        Tag::new("DELETE").with_rows(writes.len()),
+    ))
+}
+
+/// Executes `execute update row v1` for this component.
+async fn execute_update_row_v1(
+    assignments: &[Assignment],
+    selection: Option<&SqlExpr>,
+    params: &ParamValues,
+    config: DmlRuntimeConfig,
+    pushdown_metrics: &PushdownMetrics,
+    provider: &HoloStoreTableProvider,
+) -> PgWireResult<Response> {
+    let pk_column = provider.primary_key_column().to_string();
+    let selection = selection.ok_or_else(|| {
+        to_user_error(
+            "0A000",
+            format!("UPDATE requires a PK-bounded WHERE clause on {pk_column}"),
+        )
+    })?;
+    let bounds = parse_pk_bounds_for_column(selection, params, pk_column.as_str())?;
+    if bounds.is_unbounded() {
+        return Err(to_user_error(
+            "0A000",
+            format!("UPDATE requires a PK-bounded WHERE clause on {pk_column}"),
+        ));
+    }
+
+    let patch =
+        parse_row_v1_update_patch(assignments, params, provider.columns(), pk_column.as_str())?;
+    let scan_limit = config.max_scan_rows.max(1);
+    let rows = provider
+        .scan_generic_rows_with_versions_by_primary_key_bounds(
+            bounds.lower,
+            bounds.upper,
+            Some(scan_limit.saturating_add(1)),
+        )
+        .await
+        .map_err(|err| api_error(err.to_string()))?;
+    enforce_scan_row_limit(
+        rows.len(),
+        scan_limit,
+        pushdown_metrics,
+        "UPDATE matching row count",
+    )?;
+    if rows.is_empty() {
+        return Ok(Response::Execution(Tag::new("UPDATE").with_rows(0)));
+    }
+
+    let mut writes = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let updated = patch.apply(row.values.as_slice());
+        if updated != row.values {
+            let value = provider
+                .encode_row_payload(updated.as_slice())
+                .map_err(|err| api_error(err.to_string()))?;
+            let rollback_value = provider
+                .encode_row_payload(row.values.as_slice())
+                .map_err(|err| api_error(err.to_string()))?;
+            writes.push(ConditionalPrimaryWrite {
+                primary_key: row.primary_key,
+                expected_version: row.version,
+                value,
+                rollback_value,
+            });
+        }
+    }
+
+    if !writes.is_empty() {
+        maybe_prewrite_delay(config).await;
+        match provider
+            .apply_generic_writes_conditional(&writes, "update")
+            .await
+            .map_err(|err| api_error(err.to_string()))?
+        {
+            ConditionalWriteOutcome::Applied(_) => {}
+            ConditionalWriteOutcome::Conflict => {
+                return Err(to_user_error(
+                    "40001",
+                    "write conflict detected during UPDATE; retry statement",
+                ));
+            }
+        }
+    }
+
+    Ok(Response::Execution(
+        Tag::new("UPDATE").with_rows(rows.len()),
+    ))
+}
+
+/// Executes `execute delete row v1` for this component.
+async fn execute_delete_row_v1(
+    selection: Option<&SqlExpr>,
+    params: &ParamValues,
+    config: DmlRuntimeConfig,
+    pushdown_metrics: &PushdownMetrics,
+    provider: &HoloStoreTableProvider,
+) -> PgWireResult<Response> {
+    let pk_column = provider.primary_key_column().to_string();
+    let selection = selection.ok_or_else(|| {
+        to_user_error(
+            "0A000",
+            format!("DELETE requires a PK-bounded WHERE clause on {pk_column}"),
+        )
+    })?;
+    let bounds = parse_pk_bounds_for_column(selection, params, pk_column.as_str())?;
+    if bounds.is_unbounded() {
+        return Err(to_user_error(
+            "0A000",
+            format!("DELETE requires a PK-bounded WHERE clause on {pk_column}"),
+        ));
+    }
+
+    let scan_limit = config.max_scan_rows.max(1);
+    let rows = provider
+        .scan_generic_rows_with_versions_by_primary_key_bounds(
+            bounds.lower,
+            bounds.upper,
+            Some(scan_limit.saturating_add(1)),
+        )
+        .await
+        .map_err(|err| api_error(err.to_string()))?;
+    enforce_scan_row_limit(
+        rows.len(),
+        scan_limit,
+        pushdown_metrics,
+        "DELETE matching row count",
+    )?;
+    if rows.is_empty() {
+        return Ok(Response::Execution(Tag::new("DELETE").with_rows(0)));
+    }
+
+    let tombstone = provider.encode_tombstone_payload();
+    let mut writes = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let rollback_value = provider
+            .encode_row_payload(row.values.as_slice())
+            .map_err(|err| api_error(err.to_string()))?;
+        writes.push(ConditionalPrimaryWrite {
+            primary_key: row.primary_key,
+            expected_version: row.version,
+            value: tombstone.clone(),
+            rollback_value,
+        });
+    }
+
+    maybe_prewrite_delay(config).await;
+    match provider
+        .apply_generic_writes_conditional(&writes, "delete")
         .await
         .map_err(|err| api_error(err.to_string()))?
     {
@@ -1627,6 +1840,13 @@ async fn execute_update_in_transaction(
     }
 
     let table_name = extract_mutation_target_table_name(table, "UPDATE")?;
+    let provider = get_provider_for_table(session_context, table_name.as_str()).await?;
+    if provider.is_row_v1_table() {
+        return Err(to_user_error(
+            "0A000",
+            "UPDATE on row_v1 tables inside explicit transactions is not supported yet",
+        ));
+    }
     ensure_txn_snapshot_for_table(
         tx_manager,
         session_id,
@@ -1723,6 +1943,13 @@ async fn execute_delete_in_transaction(
 
     let table = extract_single_delete_table(&delete.from)?;
     let table_name = extract_mutation_target_table_name(table, "DELETE")?;
+    let provider = get_provider_for_table(session_context, table_name.as_str()).await?;
+    if provider.is_row_v1_table() {
+        return Err(to_user_error(
+            "0A000",
+            "DELETE on row_v1 tables inside explicit transactions is not supported yet",
+        ));
+    }
     ensure_txn_snapshot_for_table(
         tx_manager,
         session_id,
@@ -2370,13 +2597,22 @@ impl OrderIdBounds {
 
 /// Executes `parse pk bounds` for this component.
 fn parse_pk_bounds(selection: &SqlExpr, params: &ParamValues) -> PgWireResult<OrderIdBounds> {
+    parse_pk_bounds_for_column(selection, params, "order_id")
+}
+
+/// Parses bounded PK predicates for the requested primary-key column.
+fn parse_pk_bounds_for_column(
+    selection: &SqlExpr,
+    params: &ParamValues,
+    primary_key_column: &str,
+) -> PgWireResult<OrderIdBounds> {
     let mut bounds = OrderIdBounds::default();
-    collect_pk_bounds(selection, params, &mut bounds)?;
+    collect_pk_bounds(selection, params, primary_key_column, &mut bounds)?;
     // Decision: evaluate `bounds.predicate_count == 0` to choose the correct SQL/storage control path.
     if bounds.predicate_count == 0 {
         return Err(to_user_error(
             "0A000",
-            "WHERE clause must include order_id predicates",
+            format!("WHERE clause must include {primary_key_column} predicates"),
         ));
     }
     Ok(bounds)
@@ -2386,13 +2622,14 @@ fn parse_pk_bounds(selection: &SqlExpr, params: &ParamValues) -> PgWireResult<Or
 fn collect_pk_bounds(
     expr: &SqlExpr,
     params: &ParamValues,
+    primary_key_column: &str,
     bounds: &mut OrderIdBounds,
 ) -> PgWireResult<()> {
     // Decision: evaluate `expr` to choose the correct SQL/storage control path.
     match expr {
         SqlExpr::BinaryOp { left, op, right } if *op == BinaryOperator::And => {
-            collect_pk_bounds(left, params, bounds)?;
-            collect_pk_bounds(right, params, bounds)?;
+            collect_pk_bounds(left, params, primary_key_column, bounds)?;
+            collect_pk_bounds(right, params, primary_key_column, bounds)?;
             Ok(())
         }
         SqlExpr::BinaryOp { left, op, right } => {
@@ -2409,18 +2646,20 @@ fn collect_pk_bounds(
                     (Some(column), Some(value)) => (column, reverse_comparison(op), value),
                     _ => {
                         return Err(to_user_error(
-                            "0A000",
-                            "WHERE clause must contain only order_id comparisons joined by AND",
-                        ));
+                                "0A000",
+                                format!(
+                                    "WHERE clause must contain only {primary_key_column} comparisons joined by AND"
+                                ),
+                            ));
                     }
                 },
             };
 
-            // Decision: evaluate `column != "order_id"` to choose the correct SQL/storage control path.
-            if column != "order_id" {
+            // Decision: evaluate `column != primary_key_column` to choose the correct SQL/storage control path.
+            if !column.eq_ignore_ascii_case(primary_key_column) {
                 return Err(to_user_error(
                     "0A000",
-                    "WHERE clause must contain only order_id comparisons",
+                    format!("WHERE clause must contain only {primary_key_column} comparisons"),
                 ));
             }
             // Decision: evaluate `!matches!(` to choose the correct SQL/storage control path.
@@ -2434,17 +2673,19 @@ fn collect_pk_bounds(
             ) {
                 return Err(to_user_error(
                     "0A000",
-                    "WHERE clause supports only =, >, >=, <, <= on order_id",
+                    format!("WHERE clause supports only =, >, >=, <, <= on {primary_key_column}"),
                 ));
             }
 
             bounds.apply(op, literal);
             Ok(())
         }
-        SqlExpr::Nested(inner) => collect_pk_bounds(inner, params, bounds),
+        SqlExpr::Nested(inner) => collect_pk_bounds(inner, params, primary_key_column, bounds),
         _ => Err(to_user_error(
             "0A000",
-            "WHERE clause must contain only order_id comparisons joined by AND",
+            format!(
+                "WHERE clause must contain only {primary_key_column} comparisons joined by AND"
+            ),
         )),
     }
 }
@@ -2480,6 +2721,25 @@ impl UpdatePatch {
             total_cents: self.total_cents.unwrap_or(row.total_cents),
             created_at_ns: self.created_at_ns.unwrap_or(row.created_at_ns),
         }
+    }
+}
+
+#[derive(Debug, Default)]
+/// Represents a generic row_v1 update patch keyed by column index.
+struct RowV1UpdatePatch {
+    assignments: BTreeMap<usize, ScalarValue>,
+}
+
+impl RowV1UpdatePatch {
+    /// Applies row_v1 patch assignments to one existing row.
+    fn apply(&self, row: &[ScalarValue]) -> Vec<ScalarValue> {
+        let mut updated = row.to_vec();
+        for (index, value) in &self.assignments {
+            if let Some(slot) = updated.get_mut(*index) {
+                *slot = value.clone();
+            }
+        }
+        updated
     }
 }
 
@@ -2545,6 +2805,280 @@ fn parse_update_patch(
     }
 
     Ok(patch)
+}
+
+/// Parses a generic row_v1 UPDATE patch from assignments.
+fn parse_row_v1_update_patch(
+    assignments: &[Assignment],
+    params: &ParamValues,
+    columns: &[TableColumnRecord],
+    primary_key_column: &str,
+) -> PgWireResult<RowV1UpdatePatch> {
+    if assignments.is_empty() {
+        return Err(to_user_error(
+            "42601",
+            "UPDATE requires at least one assignment",
+        ));
+    }
+    if columns.is_empty() {
+        return Err(api_error("row_v1 table has empty column metadata"));
+    }
+
+    let mut by_name = HashMap::<String, usize>::new();
+    for (idx, column) in columns.iter().enumerate() {
+        by_name.insert(column.name.to_ascii_lowercase(), idx);
+    }
+
+    let mut patch = RowV1UpdatePatch::default();
+    let mut seen = HashSet::<String>::new();
+    for assignment in assignments {
+        let column = extract_assignment_column(&assignment.target)?.to_ascii_lowercase();
+        if !seen.insert(column.clone()) {
+            return Err(to_user_error(
+                "42601",
+                format!("duplicate assignment for column '{column}'"),
+            ));
+        }
+        if column == primary_key_column.to_ascii_lowercase() {
+            return Err(to_user_error(
+                "0A000",
+                format!(
+                    "updating primary key column '{}' is not supported",
+                    primary_key_column
+                ),
+            ));
+        }
+
+        let Some(column_index) = by_name.get(column.as_str()).copied() else {
+            return Err(to_user_error(
+                "0A000",
+                format!("updating column '{column}' is not supported"),
+            ));
+        };
+        let value =
+            parse_update_scalar_for_column(&assignment.value, params, &columns[column_index])?;
+        patch.assignments.insert(column_index, value);
+    }
+
+    Ok(patch)
+}
+
+/// Parses one UPDATE assignment expression into a typed scalar for a row_v1 column.
+fn parse_update_scalar_for_column(
+    expr: &SqlExpr,
+    params: &ParamValues,
+    column: &TableColumnRecord,
+) -> PgWireResult<ScalarValue> {
+    let nullable_error = || {
+        to_user_error(
+            "23502",
+            format!(
+                "null value in column '{}' violates not-null constraint",
+                column.name
+            ),
+        )
+    };
+
+    match column.column_type {
+        TableColumnType::Int8 => {
+            let value = match extract_i64_expr(expr, params)? {
+                Some(value) => value,
+                None => {
+                    return null_assignment_or_type_error(
+                        expr,
+                        params,
+                        column,
+                        "invalid int8 assignment",
+                    )
+                }
+            };
+            let narrowed = i8::try_from(value).map_err(|_| {
+                to_user_error(
+                    "22003",
+                    format!("value out of range for column '{}'", column.name),
+                )
+            })?;
+            Ok(ScalarValue::Int8(Some(narrowed)))
+        }
+        TableColumnType::Int16 => {
+            let value = match extract_i64_expr(expr, params)? {
+                Some(value) => value,
+                None => {
+                    return null_assignment_or_type_error(
+                        expr,
+                        params,
+                        column,
+                        "invalid int16 assignment",
+                    )
+                }
+            };
+            let narrowed = i16::try_from(value).map_err(|_| {
+                to_user_error(
+                    "22003",
+                    format!("value out of range for column '{}'", column.name),
+                )
+            })?;
+            Ok(ScalarValue::Int16(Some(narrowed)))
+        }
+        TableColumnType::Int32 => {
+            let value = match extract_i64_expr(expr, params)? {
+                Some(value) => value,
+                None => {
+                    return null_assignment_or_type_error(
+                        expr,
+                        params,
+                        column,
+                        "invalid int32 assignment",
+                    )
+                }
+            };
+            let narrowed = i32::try_from(value).map_err(|_| {
+                to_user_error(
+                    "22003",
+                    format!("value out of range for column '{}'", column.name),
+                )
+            })?;
+            Ok(ScalarValue::Int32(Some(narrowed)))
+        }
+        TableColumnType::Int64 => {
+            let value = match extract_i64_expr(expr, params)? {
+                Some(value) => value,
+                None => {
+                    return null_assignment_or_type_error(
+                        expr,
+                        params,
+                        column,
+                        "invalid int64 assignment",
+                    )
+                }
+            };
+            Ok(ScalarValue::Int64(Some(value)))
+        }
+        TableColumnType::UInt8 => {
+            let value = match extract_i64_expr(expr, params)? {
+                Some(value) => value,
+                None => {
+                    return null_assignment_or_type_error(
+                        expr,
+                        params,
+                        column,
+                        "invalid uint8 assignment",
+                    )
+                }
+            };
+            let narrowed = u8::try_from(value).map_err(|_| {
+                to_user_error(
+                    "22003",
+                    format!("value out of range for column '{}'", column.name),
+                )
+            })?;
+            Ok(ScalarValue::UInt8(Some(narrowed)))
+        }
+        TableColumnType::UInt16 => {
+            let value = match extract_i64_expr(expr, params)? {
+                Some(value) => value,
+                None => {
+                    return null_assignment_or_type_error(
+                        expr,
+                        params,
+                        column,
+                        "invalid uint16 assignment",
+                    )
+                }
+            };
+            let narrowed = u16::try_from(value).map_err(|_| {
+                to_user_error(
+                    "22003",
+                    format!("value out of range for column '{}'", column.name),
+                )
+            })?;
+            Ok(ScalarValue::UInt16(Some(narrowed)))
+        }
+        TableColumnType::UInt32 => {
+            let value = match extract_i64_expr(expr, params)? {
+                Some(value) => value,
+                None => {
+                    return null_assignment_or_type_error(
+                        expr,
+                        params,
+                        column,
+                        "invalid uint32 assignment",
+                    )
+                }
+            };
+            let narrowed = u32::try_from(value).map_err(|_| {
+                to_user_error(
+                    "22003",
+                    format!("value out of range for column '{}'", column.name),
+                )
+            })?;
+            Ok(ScalarValue::UInt32(Some(narrowed)))
+        }
+        TableColumnType::UInt64 => {
+            let value = match extract_i64_expr(expr, params)? {
+                Some(value) => value,
+                None => {
+                    return null_assignment_or_type_error(
+                        expr,
+                        params,
+                        column,
+                        "invalid uint64 assignment",
+                    )
+                }
+            };
+            let narrowed = u64::try_from(value).map_err(|_| {
+                to_user_error(
+                    "22003",
+                    format!("value out of range for column '{}'", column.name),
+                )
+            })?;
+            Ok(ScalarValue::UInt64(Some(narrowed)))
+        }
+        TableColumnType::Float64 => {
+            let value = match extract_f64_expr(expr, params)? {
+                Some(value) => value,
+                None => {
+                    return null_assignment_or_type_error(
+                        expr,
+                        params,
+                        column,
+                        "invalid float64 assignment",
+                    )
+                }
+            };
+            Ok(ScalarValue::Float64(Some(value)))
+        }
+        TableColumnType::Boolean => {
+            let value = match extract_bool_expr(expr, params)? {
+                Some(value) => value,
+                None => {
+                    return null_assignment_or_type_error(
+                        expr,
+                        params,
+                        column,
+                        "invalid boolean assignment",
+                    )
+                }
+            };
+            Ok(ScalarValue::Boolean(Some(value)))
+        }
+        TableColumnType::Utf8 => {
+            let value = extract_optional_string_expr(expr, params)?;
+            match value {
+                Some(v) => Ok(ScalarValue::Utf8(Some(v))),
+                None if column.nullable => Ok(ScalarValue::Null),
+                None => Err(nullable_error()),
+            }
+        }
+        TableColumnType::TimestampNanosecond => {
+            let value = extract_optional_timestamp_ns_expr(expr, params)?;
+            match value {
+                Some(v) => Ok(ScalarValue::TimestampNanosecond(Some(v), None)),
+                None if column.nullable => Ok(ScalarValue::Null),
+                None => Err(nullable_error()),
+            }
+        }
+    }
 }
 
 /// Executes `extract single delete table` for this component.
@@ -2751,6 +3285,107 @@ fn extract_i64_expr(expr: &SqlExpr, params: &ParamValues) -> PgWireResult<Option
     }
 }
 
+/// Executes `extract f64 expr` for this component.
+fn extract_f64_expr(expr: &SqlExpr, params: &ParamValues) -> PgWireResult<Option<f64>> {
+    match expr {
+        SqlExpr::Value(value) => scalar_to_f64(resolve_sql_value(value, params)?)
+            .ok_or_else(|| to_user_error("22023", "invalid float literal"))
+            .map(Some),
+        SqlExpr::UnaryOp { op, expr } => {
+            let Some(value) = extract_f64_expr(expr, params)? else {
+                return Ok(None);
+            };
+            match op {
+                UnaryOperator::Plus => Ok(Some(value)),
+                UnaryOperator::Minus => Ok(Some(-value)),
+                _ => Ok(None),
+            }
+        }
+        SqlExpr::Nested(inner) => extract_f64_expr(inner, params),
+        SqlExpr::Cast { expr, .. } => extract_f64_expr(expr, params),
+        _ => Ok(None),
+    }
+}
+
+/// Executes `extract bool expr` for this component.
+fn extract_bool_expr(expr: &SqlExpr, params: &ParamValues) -> PgWireResult<Option<bool>> {
+    match expr {
+        SqlExpr::Value(value) => scalar_to_bool(resolve_sql_value(value, params)?)
+            .ok_or_else(|| to_user_error("22023", "invalid boolean literal"))
+            .map(Some),
+        SqlExpr::Nested(inner) => extract_bool_expr(inner, params),
+        SqlExpr::Cast { expr, .. } => extract_bool_expr(expr, params),
+        _ => Ok(None),
+    }
+}
+
+/// Executes `extract optional timestamp ns expr` for this component.
+fn extract_optional_timestamp_ns_expr(
+    expr: &SqlExpr,
+    params: &ParamValues,
+) -> PgWireResult<Option<i64>> {
+    match expr {
+        SqlExpr::Value(value) => {
+            let resolved = resolve_sql_value(value, params)?;
+            if matches!(resolved, ScalarValue::Null) {
+                Ok(None)
+            } else {
+                scalar_to_timestamp_ns(resolved).map(Some)
+            }
+        }
+        SqlExpr::TypedString { data_type, value } => {
+            if !is_timestamp_data_type(data_type) {
+                return Err(to_user_error(
+                    "22023",
+                    format!("unsupported typed literal for timestamp: {data_type}"),
+                ));
+            }
+            parse_timestamp_ns_from_string(value.value.to_string().trim_matches('\'')).map(Some)
+        }
+        SqlExpr::Nested(inner) => extract_optional_timestamp_ns_expr(inner, params),
+        SqlExpr::Cast { expr, .. } => extract_optional_timestamp_ns_expr(expr, params),
+        _ => Err(to_user_error(
+            "22023",
+            "timestamp assignment must be a timestamp literal",
+        )),
+    }
+}
+
+/// Resolves null-assignment behavior for typed row_v1 UPDATE expressions.
+fn null_assignment_or_type_error(
+    expr: &SqlExpr,
+    params: &ParamValues,
+    column: &TableColumnRecord,
+    type_error_message: &'static str,
+) -> PgWireResult<ScalarValue> {
+    if is_null_assignment_expr(expr, params)? {
+        if column.nullable {
+            return Ok(ScalarValue::Null);
+        }
+        return Err(to_user_error(
+            "23502",
+            format!(
+                "null value in column '{}' violates not-null constraint",
+                column.name
+            ),
+        ));
+    }
+    Err(to_user_error("22023", type_error_message))
+}
+
+/// Returns `true` when assignment expression resolves to SQL NULL.
+fn is_null_assignment_expr(expr: &SqlExpr, params: &ParamValues) -> PgWireResult<bool> {
+    match expr {
+        SqlExpr::Value(value) => Ok(matches!(
+            resolve_sql_value(value, params)?,
+            ScalarValue::Null
+        )),
+        SqlExpr::Nested(inner) => is_null_assignment_expr(inner, params),
+        SqlExpr::Cast { expr, .. } => is_null_assignment_expr(expr, params),
+        _ => Ok(false),
+    }
+}
+
 /// Executes `extract optional string expr` for this component.
 fn extract_optional_string_expr(
     expr: &SqlExpr,
@@ -2848,6 +3483,39 @@ fn scalar_to_i64(value: ScalarValue) -> Option<i64> {
         ScalarValue::UInt16(v) => v.map(i64::from),
         ScalarValue::UInt8(v) => v.map(i64::from),
         ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) => v.parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+/// Executes `scalar to f64` for this component.
+fn scalar_to_f64(value: ScalarValue) -> Option<f64> {
+    match value {
+        ScalarValue::Float64(v) => v,
+        ScalarValue::Float32(v) => v.map(f64::from),
+        ScalarValue::Int64(v) => v.map(|v| v as f64),
+        ScalarValue::Int32(v) => v.map(|v| v as f64),
+        ScalarValue::Int16(v) => v.map(|v| v as f64),
+        ScalarValue::Int8(v) => v.map(|v| v as f64),
+        ScalarValue::UInt64(v) => v.map(|v| v as f64),
+        ScalarValue::UInt32(v) => v.map(|v| v as f64),
+        ScalarValue::UInt16(v) => v.map(|v| v as f64),
+        ScalarValue::UInt8(v) => v.map(|v| v as f64),
+        ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) => v.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+/// Executes `scalar to bool` for this component.
+fn scalar_to_bool(value: ScalarValue) -> Option<bool> {
+    match value {
+        ScalarValue::Boolean(v) => v,
+        ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) => {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "true" | "t" | "1" => Some(true),
+                "false" | "f" | "0" => Some(false),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
