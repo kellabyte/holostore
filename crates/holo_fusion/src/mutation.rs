@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{ArrayRef, Int64Builder, StringBuilder, TimestampNanosecondBuilder};
@@ -22,7 +22,7 @@ use datafusion::sql::sqlparser::ast::{
     Assignment, AssignmentTarget, BinaryOperator, ColumnDef, ColumnOption, CreateTable,
     CreateTableOptions, DataType, Delete, Expr as SqlExpr, FromTable, IndexColumn, Insert,
     ObjectName, SetExpr, Statement, TableConstraint, TableFactor, TableObject, TableWithJoins,
-    TimezoneInfo, UnaryOperator, ValueWithSpan,
+    TimezoneInfo, UnaryOperator, Value, ValueWithSpan,
 };
 use datafusion_postgres::arrow_pg::datatypes::df;
 use datafusion_postgres::hooks::QueryHook;
@@ -37,8 +37,10 @@ use tracing::{info_span, Instrument};
 
 use crate::catalog::register_table_from_metadata;
 use crate::metadata::{
-    create_table_metadata, table_model_orders_v1, table_model_row_v1, CreateTableMetadataSpec,
-    TableColumnRecord, TableColumnType,
+    apply_column_defaults_for_missing, create_table_metadata, table_model_orders_v1,
+    table_model_row_v1, validate_row_against_metadata, validate_table_constraints,
+    CheckBinaryOperator, CheckExpression, ColumnDefaultValue, CreateTableMetadataSpec,
+    TableCheckConstraintRecord, TableColumnRecord, TableColumnType,
 };
 use crate::metrics::PushdownMetrics;
 use crate::provider::{
@@ -235,6 +237,24 @@ impl DmlHook {
                         self.pushdown_metrics.clone(),
                     )
                     .await
+                })
+                .await,
+            );
+        }
+
+        if let Statement::Insert(insert) = statement {
+            let values_insert = insert
+                .source
+                .as_ref()
+                .map(|source| matches!(source.body.as_ref(), SetExpr::Values(_)))
+                .unwrap_or(false);
+            if !values_insert {
+                return None;
+            }
+
+            return Some(
+                self.run_statement_with_controls(statement, session_id.as_str(), protocol, async {
+                    execute_insert(insert, params, session_context).await
                 })
                 .await,
             );
@@ -806,6 +826,15 @@ impl QueryHook for DmlHook {
         _session_context: &SessionContext,
         _client: &(dyn ClientInfo + Send + Sync),
     ) -> Option<PgWireResult<LogicalPlan>> {
+        let insert_values = match statement {
+            Statement::Insert(insert) => insert
+                .source
+                .as_ref()
+                .map(|source| matches!(source.body.as_ref(), SetExpr::Values(_)))
+                .unwrap_or(false),
+            _ => false,
+        };
+
         // Decision: evaluate `matches!(` to choose the correct SQL/storage control path.
         if matches!(
             statement,
@@ -815,7 +844,8 @@ impl QueryHook for DmlHook {
                 | Statement::StartTransaction { .. }
                 | Statement::Commit { .. }
                 | Statement::Rollback { .. }
-        ) {
+        ) || insert_values
+        {
             Some(dml_placeholder_plan(statement))
         } else {
             None
@@ -904,6 +934,158 @@ async fn execute_dml(
             "unsupported dml statement in hook",
         )))),
     }
+}
+
+/// Executes INSERT statements in the SQL hook path for VALUES-based inserts.
+async fn execute_insert(
+    insert: &Insert,
+    params: &ParamValues,
+    session_context: &SessionContext,
+) -> PgWireResult<Response> {
+    if insert.returning.is_some() {
+        return Err(to_user_error(
+            "0A000",
+            "INSERT ... RETURNING is not supported",
+        ));
+    }
+    if insert.on.is_some() || insert.ignore || insert.or.is_some() || insert.replace_into {
+        return Err(to_user_error(
+            "0A000",
+            "INSERT conflict clauses are not supported",
+        ));
+    }
+    if !insert.assignments.is_empty() {
+        return Err(to_user_error(
+            "0A000",
+            "INSERT ... SET syntax is not supported",
+        ));
+    }
+
+    let source = insert.source.as_ref().ok_or_else(|| {
+        to_user_error(
+            "0A000",
+            "INSERT source is required; only VALUES inserts are supported",
+        )
+    })?;
+    let SetExpr::Values(values) = source.body.as_ref() else {
+        return Err(to_user_error(
+            "0A000",
+            "INSERT INTO ... SELECT is routed through DataFusion execution",
+        ));
+    };
+    if values.rows.is_empty() {
+        return Ok(Response::Execution(
+            Tag::new("INSERT").with_oid(0).with_rows(0),
+        ));
+    }
+
+    let table_name = insert_table_name(&insert.table)?;
+    let provider = get_provider_for_table(session_context, table_name.as_str()).await?;
+
+    if provider.is_orders_v1_table() {
+        let columns = if insert.columns.is_empty() {
+            vec![
+                "order_id".to_string(),
+                "customer_id".to_string(),
+                "status".to_string(),
+                "total_cents".to_string(),
+                "created_at".to_string(),
+            ]
+        } else {
+            insert
+                .columns
+                .iter()
+                .map(normalize_ident)
+                .collect::<Vec<_>>()
+        };
+        let rows = values
+            .rows
+            .iter()
+            .map(|exprs| decode_insert_orders_row(exprs, &columns, params))
+            .collect::<PgWireResult<Vec<_>>>()?;
+        let written = provider
+            .upsert_orders_rows(rows.as_slice())
+            .await
+            .map_err(|err| api_error(err.to_string()))?;
+        return Ok(Response::Execution(
+            Tag::new("INSERT").with_oid(0).with_rows(written as usize),
+        ));
+    }
+
+    let columns = provider.columns();
+    if columns.is_empty() {
+        return Err(api_error("row_v1 table has empty column metadata"));
+    }
+
+    let mut by_name = HashMap::<String, usize>::new();
+    for (idx, column) in columns.iter().enumerate() {
+        by_name.insert(column.name.to_ascii_lowercase(), idx);
+    }
+
+    let target_indexes = if insert.columns.is_empty() {
+        (0..columns.len()).collect::<Vec<_>>()
+    } else {
+        let mut seen = HashSet::<String>::new();
+        let mut indexes = Vec::with_capacity(insert.columns.len());
+        for ident in &insert.columns {
+            let normalized = normalize_ident(ident).to_ascii_lowercase();
+            if !seen.insert(normalized.clone()) {
+                return Err(to_user_error(
+                    "42601",
+                    format!("column '{}' specified more than once", normalized),
+                ));
+            }
+            let Some(index) = by_name.get(normalized.as_str()).copied() else {
+                return Err(to_user_error(
+                    "42703",
+                    format!("column '{}' does not exist", normalized),
+                ));
+            };
+            indexes.push(index);
+        }
+        indexes
+    };
+
+    let now_timestamp_ns = now_timestamp_nanos();
+    let mut generic_rows = Vec::<Vec<ScalarValue>>::with_capacity(values.rows.len());
+    for exprs in &values.rows {
+        if exprs.len() != target_indexes.len() {
+            return Err(to_user_error(
+                "42601",
+                format!(
+                    "INSERT row has {} expressions but {} target columns",
+                    exprs.len(),
+                    target_indexes.len()
+                ),
+            ));
+        }
+
+        let mut row = vec![ScalarValue::Null; columns.len()];
+        let mut missing_mask = vec![true; columns.len()];
+        for (expr, column_idx) in exprs.iter().zip(target_indexes.iter()) {
+            row[*column_idx] = parse_update_scalar_for_column(expr, params, &columns[*column_idx])?;
+            missing_mask[*column_idx] = false;
+        }
+
+        apply_column_defaults_for_missing(
+            columns,
+            row.as_mut_slice(),
+            missing_mask.as_slice(),
+            now_timestamp_ns,
+        )
+        .map_err(row_constraint_error)?;
+        validate_row_against_metadata(columns, provider.check_constraints(), row.as_slice())
+            .map_err(row_constraint_error)?;
+        generic_rows.push(row);
+    }
+
+    let written = provider
+        .upsert_generic_rows(generic_rows.as_slice())
+        .await
+        .map_err(|err| api_error(err.to_string()))?;
+    Ok(Response::Execution(
+        Tag::new("INSERT").with_oid(0).with_rows(written as usize),
+    ))
 }
 
 /// Executes `execute create table` for this component.
@@ -1102,6 +1284,20 @@ fn normalize_ident(ident: &datafusion::sql::sqlparser::ast::Ident) -> String {
     }
 }
 
+#[derive(Debug, Clone)]
+struct PendingCheckConstraint {
+    explicit_name: Option<String>,
+    generated_name_seed: String,
+    expr: CheckExpression,
+}
+
+#[derive(Debug)]
+struct CompiledColumnOptions {
+    nullable: bool,
+    default_value: Option<ColumnDefaultValue>,
+    pending_checks: Vec<PendingCheckConstraint>,
+}
+
 /// Compiles CREATE TABLE AST into persisted metadata specification.
 fn compile_create_table_metadata_spec(
     create: &CreateTable,
@@ -1110,6 +1306,7 @@ fn compile_create_table_metadata_spec(
     let mut pk_columns = BTreeSet::<String>::new();
     let mut by_name = BTreeMap::<String, usize>::new();
     let mut columns = Vec::<TableColumnRecord>::with_capacity(create.columns.len());
+    let mut pending_checks = Vec::<PendingCheckConstraint>::new();
 
     for column in &create.columns {
         let column_name = normalize_ident(&column.name);
@@ -1121,13 +1318,16 @@ fn compile_create_table_metadata_spec(
             ));
         }
 
-        let nullable = column_nullable(column, &column_name, &mut pk_columns)?;
         let column_type = sql_data_type_to_column_type(&column.data_type)?;
+        let options =
+            compile_column_options(column, column_name.as_str(), table_name, &mut pk_columns)?;
+        pending_checks.extend(options.pending_checks);
         let index = columns.len();
         columns.push(TableColumnRecord {
             name: column_name.clone(),
             column_type,
-            nullable,
+            nullable: options.nullable,
+            default_value: options.default_value,
         });
         by_name.insert(column_name, index);
     }
@@ -1143,19 +1343,35 @@ fn compile_create_table_metadata_spec(
                     pk_columns.insert(column);
                 }
             }
+            TableConstraint::Check {
+                name,
+                expr,
+                enforced,
+            } => {
+                if matches!(enforced, Some(false)) {
+                    return Err(to_user_error(
+                        "0A000",
+                        "CHECK constraints declared NOT ENFORCED are not supported",
+                    ));
+                }
+                pending_checks.push(PendingCheckConstraint {
+                    explicit_name: name.as_ref().map(normalize_ident),
+                    generated_name_seed: generated_check_name_seed(table_name, None),
+                    expr: compile_check_expression(expr.as_ref())?,
+                });
+            }
             _ => {
                 return Err(to_user_error(
                     "0A000",
-                    "table constraints other than PRIMARY KEY are not supported",
+                    "table constraints other than PRIMARY KEY/CHECK are not supported",
                 ));
             }
         }
     }
     // Decision: evaluate `let Some(primary_key_expr) = &create.primary_key` to choose the correct SQL/storage control path.
     if let Some(primary_key_expr) = &create.primary_key {
-        let column = extract_column_name(primary_key_expr.as_ref())
-            .map(|value| value.to_ascii_lowercase())
-            .ok_or_else(|| {
+        let column =
+            extract_column_name_normalized(primary_key_expr.as_ref()).ok_or_else(|| {
                 to_user_error(
                     "0A000",
                     "PRIMARY KEY expression must reference a plain column name",
@@ -1209,7 +1425,14 @@ fn compile_create_table_metadata_spec(
         ));
     }
 
-    let table_model = if is_orders_v1_layout(columns.as_slice(), primary_key_column.as_str()) {
+    let check_constraints = finalize_check_constraints(pending_checks)?;
+    validate_table_constraints(columns.as_slice(), check_constraints.as_slice())
+        .map_err(row_constraint_error)?;
+
+    let table_model = if check_constraints.is_empty()
+        && columns.iter().all(|column| column.default_value.is_none())
+        && is_orders_v1_layout(columns.as_slice(), primary_key_column.as_str())
+    {
         table_model_orders_v1().to_string()
     } else {
         table_model_row_v1().to_string()
@@ -1218,19 +1441,24 @@ fn compile_create_table_metadata_spec(
     Ok(CreateTableMetadataSpec {
         table_model,
         columns,
+        check_constraints,
         primary_key_column,
         preferred_shards: Vec::new(),
         page_size: 2048,
     })
 }
 
-/// Executes `column nullable` for this component.
-fn column_nullable(
+/// Compiles supported column options into metadata fields.
+fn compile_column_options(
     column: &ColumnDef,
     column_name: &str,
+    table_name: &str,
     pk_columns: &mut BTreeSet<String>,
-) -> PgWireResult<bool> {
+) -> PgWireResult<CompiledColumnOptions> {
     let mut nullable = true;
+    let mut default_value = None::<ColumnDefaultValue>;
+    let mut pending_checks = Vec::<PendingCheckConstraint>::new();
+
     for option in &column.options {
         // Decision: evaluate `&option.option` to choose the correct SQL/storage control path.
         match &option.option {
@@ -1241,14 +1469,21 @@ fn column_nullable(
                 nullable = false;
             }
             ColumnOption::Comment(_) => {}
-            ColumnOption::Default(_) => {
-                return Err(to_user_error(
-                    "0A000",
-                    format!(
-                        "column '{}' uses DEFAULT, which is not supported yet",
-                        column_name
-                    ),
-                ));
+            ColumnOption::Default(expr) => {
+                if default_value.is_some() {
+                    return Err(to_user_error(
+                        "42601",
+                        format!("column '{}' specifies DEFAULT more than once", column_name),
+                    ));
+                }
+                default_value = Some(compile_default_expression(expr, column_name)?);
+            }
+            ColumnOption::Check(expr) => {
+                pending_checks.push(PendingCheckConstraint {
+                    explicit_name: option.name.as_ref().map(normalize_ident),
+                    generated_name_seed: generated_check_name_seed(table_name, Some(column_name)),
+                    expr: compile_check_expression(expr)?,
+                });
             }
             ColumnOption::Unique { .. } => {
                 return Err(to_user_error(
@@ -1267,7 +1502,360 @@ fn column_nullable(
             }
         }
     }
-    Ok(nullable)
+
+    Ok(CompiledColumnOptions {
+        nullable,
+        default_value,
+        pending_checks,
+    })
+}
+
+/// Converts row-constraint metadata errors into SQLSTATE user errors.
+fn row_constraint_error(err: crate::metadata::RowConstraintError) -> PgWireError {
+    to_user_error(err.sqlstate(), err.message())
+}
+
+/// Builds a deterministic generated CHECK constraint name seed.
+fn generated_check_name_seed(table_name: &str, column_name: Option<&str>) -> String {
+    let table = sanitize_identifier_fragment(table_name);
+    match column_name {
+        Some(column) => format!("{}_{}_check", table, sanitize_identifier_fragment(column)),
+        None => format!("{}_check", table),
+    }
+}
+
+/// Sanitizes identifier fragments used in generated metadata names.
+fn sanitize_identifier_fragment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "check".to_string()
+    } else {
+        out
+    }
+}
+
+/// Normalizes a simple/compound SQL expression into a column name.
+fn extract_column_name_normalized(expr: &SqlExpr) -> Option<String> {
+    match expr {
+        SqlExpr::Identifier(ident) => Some(normalize_ident(ident)),
+        SqlExpr::CompoundIdentifier(idents) => idents.last().map(normalize_ident),
+        SqlExpr::Nested(inner) => extract_column_name_normalized(inner),
+        SqlExpr::Cast { expr, .. } => extract_column_name_normalized(expr),
+        _ => None,
+    }
+}
+
+/// Assigns final constraint names and checks for duplicate explicit names.
+fn finalize_check_constraints(
+    pending: Vec<PendingCheckConstraint>,
+) -> PgWireResult<Vec<TableCheckConstraintRecord>> {
+    let mut used_names = BTreeSet::<String>::new();
+    let mut generated_counter = 1usize;
+    let mut output = Vec::with_capacity(pending.len());
+
+    for entry in pending {
+        let name = match entry.explicit_name {
+            Some(name) => {
+                let trimmed = name.trim();
+                if trimmed.is_empty() {
+                    return Err(to_user_error(
+                        "42601",
+                        "CHECK constraint name cannot be empty",
+                    ));
+                }
+                let normalized = trimmed.to_ascii_lowercase();
+                if !used_names.insert(normalized.clone()) {
+                    return Err(to_user_error(
+                        "42710",
+                        format!("duplicate CHECK constraint name '{}'", trimmed),
+                    ));
+                }
+                trimmed.to_string()
+            }
+            None => {
+                let base = if entry.generated_name_seed.trim().is_empty() {
+                    "check".to_string()
+                } else {
+                    entry.generated_name_seed
+                };
+                let mut candidate = base.clone();
+                let mut normalized = candidate.to_ascii_lowercase();
+                while used_names.contains(normalized.as_str()) {
+                    candidate = format!("{}_{}", base, generated_counter);
+                    generated_counter = generated_counter.saturating_add(1);
+                    normalized = candidate.to_ascii_lowercase();
+                }
+                used_names.insert(normalized);
+                candidate
+            }
+        };
+        output.push(TableCheckConstraintRecord {
+            name,
+            expr: entry.expr,
+        });
+    }
+
+    Ok(output)
+}
+
+/// Compiles one column DEFAULT expression into persisted metadata form.
+fn compile_default_expression(
+    expr: &SqlExpr,
+    column_name: &str,
+) -> PgWireResult<ColumnDefaultValue> {
+    compile_default_literal(expr).map_err(|err| {
+        to_user_error(
+            "22023",
+            format!(
+                "invalid DEFAULT expression for column '{}': {}",
+                column_name, err
+            ),
+        )
+    })
+}
+
+/// Compiles one literal/default SQL expression.
+fn compile_default_literal(expr: &SqlExpr) -> PgWireResult<ColumnDefaultValue> {
+    match expr {
+        SqlExpr::Nested(inner) => compile_default_literal(inner),
+        SqlExpr::Cast { expr, .. } => compile_default_literal(expr),
+        SqlExpr::Value(value) => default_value_from_sql_value(value),
+        SqlExpr::TypedString { data_type, value } => {
+            if !is_timestamp_data_type(data_type) {
+                return Err(to_user_error(
+                    "0A000",
+                    format!("typed literal '{}' is not supported in DEFAULT", data_type),
+                ));
+            }
+            let Some(raw) = sql_string_literal(value) else {
+                return Err(to_user_error(
+                    "22023",
+                    "timestamp DEFAULT literal must be a quoted string",
+                ));
+            };
+            Ok(ColumnDefaultValue::TimestampNanosecond(
+                parse_timestamp_ns_from_string(raw)?,
+            ))
+        }
+        SqlExpr::UnaryOp { op, expr } => {
+            let base = compile_default_literal(expr)?;
+            apply_unary_to_default(op, base)
+        }
+        SqlExpr::Function(function) if is_current_timestamp_function(function) => {
+            Ok(ColumnDefaultValue::CurrentTimestampNanosecond)
+        }
+        SqlExpr::Identifier(ident) if ident.value.eq_ignore_ascii_case("current_timestamp") => {
+            Ok(ColumnDefaultValue::CurrentTimestampNanosecond)
+        }
+        _ => Err(to_user_error(
+            "0A000",
+            format!("DEFAULT expression '{}' is not supported", expr),
+        )),
+    }
+}
+
+/// Parses one SQL literal into the metadata default literal type.
+fn default_value_from_sql_value(value: &ValueWithSpan) -> PgWireResult<ColumnDefaultValue> {
+    match &value.value {
+        Value::Null => Ok(ColumnDefaultValue::Null),
+        Value::Boolean(v) => Ok(ColumnDefaultValue::Boolean(*v)),
+        Value::Number(raw, _) => {
+            if let Ok(v) = raw.parse::<i64>() {
+                Ok(ColumnDefaultValue::Int64(v))
+            } else if let Ok(v) = raw.parse::<u64>() {
+                Ok(ColumnDefaultValue::UInt64(v))
+            } else if let Ok(v) = raw.parse::<f64>() {
+                Ok(ColumnDefaultValue::Float64(v))
+            } else {
+                Err(to_user_error(
+                    "22023",
+                    format!("invalid numeric literal '{raw}'"),
+                ))
+            }
+        }
+        Value::SingleQuotedString(s)
+        | Value::DoubleQuotedString(s)
+        | Value::TripleSingleQuotedString(s)
+        | Value::TripleDoubleQuotedString(s)
+        | Value::EscapedStringLiteral(s)
+        | Value::UnicodeStringLiteral(s)
+        | Value::NationalStringLiteral(s)
+        | Value::HexStringLiteral(s) => Ok(ColumnDefaultValue::Utf8(s.clone())),
+        _ => Err(to_user_error(
+            "0A000",
+            format!("literal '{}' is not supported in DEFAULT", value),
+        )),
+    }
+}
+
+/// Applies unary +/- operators to a parsed default literal.
+fn apply_unary_to_default(
+    op: &UnaryOperator,
+    value: ColumnDefaultValue,
+) -> PgWireResult<ColumnDefaultValue> {
+    match op {
+        UnaryOperator::Plus => match value {
+            ColumnDefaultValue::Int64(_)
+            | ColumnDefaultValue::UInt64(_)
+            | ColumnDefaultValue::Float64(_) => Ok(value),
+            _ => Err(to_user_error(
+                "0A000",
+                "unary plus is only supported for numeric DEFAULT literals",
+            )),
+        },
+        UnaryOperator::Minus => match value {
+            ColumnDefaultValue::Int64(v) => v
+                .checked_neg()
+                .map(ColumnDefaultValue::Int64)
+                .ok_or_else(|| to_user_error("22003", "numeric DEFAULT literal out of range")),
+            ColumnDefaultValue::UInt64(v) => {
+                let signed = i64::try_from(v)
+                    .map_err(|_| to_user_error("22003", "numeric DEFAULT literal out of range"))?;
+                signed
+                    .checked_neg()
+                    .map(ColumnDefaultValue::Int64)
+                    .ok_or_else(|| to_user_error("22003", "numeric DEFAULT literal out of range"))
+            }
+            ColumnDefaultValue::Float64(v) => Ok(ColumnDefaultValue::Float64(-v)),
+            _ => Err(to_user_error(
+                "0A000",
+                "unary minus is only supported for numeric DEFAULT literals",
+            )),
+        },
+        _ => Err(to_user_error(
+            "0A000",
+            "only unary +/- operators are supported in DEFAULT expressions",
+        )),
+    }
+}
+
+/// Returns `true` when SQL function expression represents CURRENT_TIMESTAMP.
+fn is_current_timestamp_function(function: &datafusion::sql::sqlparser::ast::Function) -> bool {
+    let Some(name) = function
+        .name
+        .0
+        .last()
+        .and_then(|part| part.as_ident())
+        .map(normalize_ident)
+        .map(|name| name.to_ascii_lowercase())
+    else {
+        return false;
+    };
+    if name != "current_timestamp" {
+        return false;
+    }
+
+    fn args_empty(args: &datafusion::sql::sqlparser::ast::FunctionArguments) -> bool {
+        match args {
+            datafusion::sql::sqlparser::ast::FunctionArguments::None => true,
+            datafusion::sql::sqlparser::ast::FunctionArguments::List(list) => {
+                list.args.is_empty()
+                    && list.clauses.is_empty()
+                    && list.duplicate_treatment.is_none()
+            }
+            datafusion::sql::sqlparser::ast::FunctionArguments::Subquery(_) => false,
+        }
+    }
+
+    args_empty(&function.parameters)
+        && args_empty(&function.args)
+        && function.filter.is_none()
+        && function.null_treatment.is_none()
+        && function.over.is_none()
+        && function.within_group.is_empty()
+}
+
+/// Returns the literal string content when value is a quoted SQL string.
+fn sql_string_literal(value: &ValueWithSpan) -> Option<&str> {
+    match &value.value {
+        Value::SingleQuotedString(v)
+        | Value::DoubleQuotedString(v)
+        | Value::TripleSingleQuotedString(v)
+        | Value::TripleDoubleQuotedString(v)
+        | Value::EscapedStringLiteral(v)
+        | Value::UnicodeStringLiteral(v)
+        | Value::NationalStringLiteral(v)
+        | Value::HexStringLiteral(v) => Some(v.as_str()),
+        _ => None,
+    }
+}
+
+/// Compiles SQL CHECK expression AST into the persisted metadata AST.
+fn compile_check_expression(expr: &SqlExpr) -> PgWireResult<CheckExpression> {
+    match expr {
+        SqlExpr::Identifier(ident) => Ok(CheckExpression::Column(normalize_ident(ident))),
+        SqlExpr::CompoundIdentifier(idents) => {
+            let Some(last) = idents.last() else {
+                return Err(to_user_error("42601", "invalid CHECK column reference"));
+            };
+            Ok(CheckExpression::Column(normalize_ident(last)))
+        }
+        SqlExpr::Nested(inner) | SqlExpr::Cast { expr: inner, .. } => {
+            compile_check_expression(inner)
+        }
+        SqlExpr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr: inner,
+        } => Ok(CheckExpression::Not(Box::new(compile_check_expression(
+            inner,
+        )?))),
+        SqlExpr::UnaryOp {
+            op: UnaryOperator::Plus | UnaryOperator::Minus,
+            ..
+        }
+        | SqlExpr::Value(_)
+        | SqlExpr::TypedString { .. }
+        | SqlExpr::Function(_) => {
+            let literal = compile_default_literal(expr)?;
+            if matches!(literal, ColumnDefaultValue::CurrentTimestampNanosecond) {
+                return Err(to_user_error(
+                    "0A000",
+                    "CHECK expressions do not support CURRENT_TIMESTAMP",
+                ));
+            }
+            Ok(CheckExpression::Literal(literal))
+        }
+        SqlExpr::IsNull(inner) => Ok(CheckExpression::IsNull(Box::new(compile_check_expression(
+            inner,
+        )?))),
+        SqlExpr::IsNotNull(inner) => Ok(CheckExpression::IsNotNull(Box::new(
+            compile_check_expression(inner)?,
+        ))),
+        SqlExpr::BinaryOp { left, op, right } => {
+            let op = match op {
+                BinaryOperator::And => CheckBinaryOperator::And,
+                BinaryOperator::Or => CheckBinaryOperator::Or,
+                BinaryOperator::Eq => CheckBinaryOperator::Eq,
+                BinaryOperator::NotEq => CheckBinaryOperator::NotEq,
+                BinaryOperator::Lt => CheckBinaryOperator::Lt,
+                BinaryOperator::LtEq => CheckBinaryOperator::LtEq,
+                BinaryOperator::Gt => CheckBinaryOperator::Gt,
+                BinaryOperator::GtEq => CheckBinaryOperator::GtEq,
+                _ => {
+                    return Err(to_user_error(
+                        "0A000",
+                        format!("CHECK expressions do not support operator '{}'", op),
+                    ))
+                }
+            };
+            Ok(CheckExpression::Binary {
+                op,
+                left: Box::new(compile_check_expression(left)?),
+                right: Box::new(compile_check_expression(right)?),
+            })
+        }
+        _ => Err(to_user_error(
+            "0A000",
+            format!("CHECK expression '{}' is not supported", expr),
+        )),
+    }
 }
 
 /// Maps SQL parser type to persisted metadata column type.
@@ -1353,26 +1941,31 @@ fn is_orders_v1_layout(columns: &[TableColumnRecord], primary_key_column: &str) 
                 name,
                 column_type: TableColumnType::Int64,
                 nullable: false,
+                ..
             },
             TableColumnRecord {
                 name: customer_name,
                 column_type: TableColumnType::Int64,
                 nullable: false,
+                ..
             },
             TableColumnRecord {
                 name: status_name,
                 column_type: TableColumnType::Utf8,
                 nullable: true,
+                ..
             },
             TableColumnRecord {
                 name: total_name,
                 column_type: TableColumnType::Int64,
                 nullable: false,
+                ..
             },
             TableColumnRecord {
                 name: created_name,
                 column_type: TableColumnType::TimestampNanosecond,
                 nullable: false,
+                ..
             },
         ] if name == "order_id"
             && customer_name == "customer_id"
@@ -1689,6 +2282,12 @@ async fn execute_update_row_v1(
     for row in &rows {
         let updated = patch.apply(row.values.as_slice());
         if updated != row.values {
+            validate_row_against_metadata(
+                provider.columns(),
+                provider.check_constraints(),
+                updated.as_slice(),
+            )
+            .map_err(row_constraint_error)?;
             let value = provider
                 .encode_row_payload(updated.as_slice())
                 .map_err(|err| api_error(err.to_string()))?;
@@ -3570,6 +4169,18 @@ fn parse_timestamp_ns_from_string(value: &str) -> PgWireResult<i64> {
         )
     })?;
     scalar_to_timestamp_ns(scalar)
+}
+
+/// Returns current wall-clock nanoseconds since Unix epoch.
+fn now_timestamp_nanos() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration
+            .as_nanos()
+            .min(i64::MAX as u128)
+            .try_into()
+            .unwrap_or(i64::MAX),
+        Err(_) => 0,
+    }
 }
 
 /// Executes `rows to batch` for this component.
