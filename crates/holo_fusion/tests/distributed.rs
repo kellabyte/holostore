@@ -9,6 +9,7 @@ use holo_fusion::provider::{encode_table_primary_key, table_key_end};
 use holo_fusion::{run_with_shutdown, HoloFusionConfig};
 use holo_store::{EmbeddedNodeConfig, HoloStoreClient};
 use serde::Deserialize;
+use serial_test::serial;
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 use tokio_postgres::NoTls;
@@ -23,6 +24,7 @@ const ORDERS_TABLE_DDL: &str = "CREATE TABLE IF NOT EXISTS orders (
 );";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[serial]
 async fn phase3_distributed_insert_and_scan_across_nodes() -> Result<()> {
     let temp_dir = TempDir::new().context("create temp dir")?;
 
@@ -36,6 +38,10 @@ async fn phase3_distributed_insert_and_scan_across_nodes() -> Result<()> {
         health_addr: node1.health_addr,
         enable_ballista_sql: false,
         dml_prewrite_delay: Duration::from_millis(250),
+        dml_statement_timeout: Duration::ZERO,
+        dml_max_inflight_statements: 1024,
+        dml_max_scan_rows: 100_000,
+        dml_max_txn_staged_rows: 100_000,
         holostore: EmbeddedNodeConfig {
             node_id: 1,
             listen_redis: node1.redis_addr,
@@ -56,6 +62,10 @@ async fn phase3_distributed_insert_and_scan_across_nodes() -> Result<()> {
         health_addr: node2.health_addr,
         enable_ballista_sql: false,
         dml_prewrite_delay: Duration::ZERO,
+        dml_statement_timeout: Duration::ZERO,
+        dml_max_inflight_statements: 1024,
+        dml_max_scan_rows: 100_000,
+        dml_max_txn_staged_rows: 100_000,
         holostore: EmbeddedNodeConfig {
             node_id: 2,
             listen_redis: node2.redis_addr,
@@ -420,6 +430,7 @@ async fn phase3_distributed_insert_and_scan_across_nodes() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[serial]
 async fn phase7_replica_record_convergence_and_node_failure_read_continuity() -> Result<()> {
     let temp_dir = TempDir::new().context("create temp dir")?;
 
@@ -437,6 +448,10 @@ async fn phase7_replica_record_convergence_and_node_failure_read_continuity() ->
         health_addr: node1.health_addr,
         enable_ballista_sql: false,
         dml_prewrite_delay: Duration::ZERO,
+        dml_statement_timeout: Duration::ZERO,
+        dml_max_inflight_statements: 1024,
+        dml_max_scan_rows: 100_000,
+        dml_max_txn_staged_rows: 100_000,
         holostore: EmbeddedNodeConfig {
             node_id: 1,
             listen_redis: node1.redis_addr,
@@ -457,6 +472,10 @@ async fn phase7_replica_record_convergence_and_node_failure_read_continuity() ->
         health_addr: node2.health_addr,
         enable_ballista_sql: false,
         dml_prewrite_delay: Duration::ZERO,
+        dml_statement_timeout: Duration::ZERO,
+        dml_max_inflight_statements: 1024,
+        dml_max_scan_rows: 100_000,
+        dml_max_txn_staged_rows: 100_000,
         holostore: EmbeddedNodeConfig {
             node_id: 2,
             listen_redis: node2.redis_addr,
@@ -477,6 +496,10 @@ async fn phase7_replica_record_convergence_and_node_failure_read_continuity() ->
         health_addr: node3.health_addr,
         enable_ballista_sql: false,
         dml_prewrite_delay: Duration::ZERO,
+        dml_statement_timeout: Duration::ZERO,
+        dml_max_inflight_statements: 1024,
+        dml_max_scan_rows: 100_000,
+        dml_max_txn_staged_rows: 100_000,
         holostore: EmbeddedNodeConfig {
             node_id: 3,
             listen_redis: node3.redis_addr,
@@ -619,6 +642,7 @@ async fn phase7_replica_record_convergence_and_node_failure_read_continuity() ->
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[serial]
 async fn phase7_create_table_visibility_and_writes_across_nodes() -> Result<()> {
     let temp_dir = TempDir::new().context("create temp dir")?;
 
@@ -632,6 +656,10 @@ async fn phase7_create_table_visibility_and_writes_across_nodes() -> Result<()> 
         health_addr: node1.health_addr,
         enable_ballista_sql: false,
         dml_prewrite_delay: Duration::ZERO,
+        dml_statement_timeout: Duration::ZERO,
+        dml_max_inflight_statements: 1024,
+        dml_max_scan_rows: 100_000,
+        dml_max_txn_staged_rows: 100_000,
         holostore: EmbeddedNodeConfig {
             node_id: 1,
             listen_redis: node1.redis_addr,
@@ -652,6 +680,10 @@ async fn phase7_create_table_visibility_and_writes_across_nodes() -> Result<()> 
         health_addr: node2.health_addr,
         enable_ballista_sql: false,
         dml_prewrite_delay: Duration::ZERO,
+        dml_statement_timeout: Duration::ZERO,
+        dml_max_inflight_statements: 1024,
+        dml_max_scan_rows: 100_000,
+        dml_max_txn_staged_rows: 100_000,
         holostore: EmbeddedNodeConfig {
             node_id: 2,
             listen_redis: node2.redis_addr,
@@ -757,6 +789,373 @@ async fn phase7_create_table_visibility_and_writes_across_nodes() -> Result<()> 
     )
     .await
     .context("wait for cross-node visibility of inserted rows")?;
+
+    runtime1.shutdown().await?;
+    runtime2.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[serial]
+async fn phase7_partial_shard_availability_and_retry_behavior() -> Result<()> {
+    let temp_dir = TempDir::new().context("create temp dir")?;
+
+    let node1 = NodePorts::new()?;
+    let node2 = NodePorts::new()?;
+    let node3 = NodePorts::new()?;
+
+    let initial_members = format!(
+        "1@{},2@{},3@{}",
+        node1.grpc_addr, node2.grpc_addr, node3.grpc_addr
+    );
+    let node1_cfg = HoloFusionConfig {
+        pg_host: "127.0.0.1".to_string(),
+        pg_port: node1.pg_port,
+        health_addr: node1.health_addr,
+        enable_ballista_sql: false,
+        dml_prewrite_delay: Duration::ZERO,
+        dml_statement_timeout: Duration::ZERO,
+        dml_max_inflight_statements: 1024,
+        dml_max_scan_rows: 100_000,
+        dml_max_txn_staged_rows: 100_000,
+        holostore: EmbeddedNodeConfig {
+            node_id: 1,
+            listen_redis: node1.redis_addr,
+            listen_grpc: node1.grpc_addr,
+            bootstrap: true,
+            join: None,
+            initial_members: initial_members.clone(),
+            data_dir: temp_dir.path().join("phase7-partial-node-1"),
+            ready_timeout: Duration::from_secs(30),
+            max_shards: 2,
+            initial_ranges: 1,
+            routing_mode: Some("range".to_string()),
+        },
+    };
+    let node2_cfg = HoloFusionConfig {
+        pg_host: "127.0.0.1".to_string(),
+        pg_port: node2.pg_port,
+        health_addr: node2.health_addr,
+        enable_ballista_sql: false,
+        dml_prewrite_delay: Duration::ZERO,
+        dml_statement_timeout: Duration::ZERO,
+        dml_max_inflight_statements: 1024,
+        dml_max_scan_rows: 100_000,
+        dml_max_txn_staged_rows: 100_000,
+        holostore: EmbeddedNodeConfig {
+            node_id: 2,
+            listen_redis: node2.redis_addr,
+            listen_grpc: node2.grpc_addr,
+            bootstrap: false,
+            join: Some(node1.grpc_addr),
+            initial_members: initial_members.clone(),
+            data_dir: temp_dir.path().join("phase7-partial-node-2"),
+            ready_timeout: Duration::from_secs(30),
+            max_shards: 2,
+            initial_ranges: 1,
+            routing_mode: Some("range".to_string()),
+        },
+    };
+    let node3_cfg = HoloFusionConfig {
+        pg_host: "127.0.0.1".to_string(),
+        pg_port: node3.pg_port,
+        health_addr: node3.health_addr,
+        enable_ballista_sql: false,
+        dml_prewrite_delay: Duration::ZERO,
+        dml_statement_timeout: Duration::ZERO,
+        dml_max_inflight_statements: 1024,
+        dml_max_scan_rows: 100_000,
+        dml_max_txn_staged_rows: 100_000,
+        holostore: EmbeddedNodeConfig {
+            node_id: 3,
+            listen_redis: node3.redis_addr,
+            listen_grpc: node3.grpc_addr,
+            bootstrap: false,
+            join: Some(node1.grpc_addr),
+            initial_members,
+            data_dir: temp_dir.path().join("phase7-partial-node-3"),
+            ready_timeout: Duration::from_secs(30),
+            max_shards: 2,
+            initial_ranges: 1,
+            routing_mode: Some("range".to_string()),
+        },
+    };
+
+    let mut runtime1 = RunningNode::start(node1_cfg, node1).await?;
+    let mut runtime2 = RunningNode::start(node2_cfg, node2).await?;
+    let mut runtime3 = RunningNode::start(node3_cfg, node3).await?;
+
+    let admin_client = HoloStoreClient::new(runtime1.grpc_addr);
+    wait_for(
+        Duration::from_secs(30),
+        Duration::from_millis(200),
+        || async {
+            let state = cluster_state(&admin_client).await?;
+            Ok(state.members.len() >= 3 && !state.shards.is_empty())
+        },
+    )
+    .await
+    .context("wait for 3-node cluster state")?;
+    ensure_orders_table("127.0.0.1", runtime1.pg_port).await?;
+    ensure_orders_table("127.0.0.1", runtime2.pg_port).await?;
+    ensure_orders_table("127.0.0.1", runtime3.pg_port).await?;
+
+    let orders_table = find_table_metadata_by_name(&admin_client, "orders")
+        .await?
+        .context("orders metadata missing")?;
+    let split_key = encode_table_primary_key(orders_table.table_id, 5_000);
+    admin_client.range_split(&split_key).await?;
+
+    wait_for(
+        Duration::from_secs(30),
+        Duration::from_millis(200),
+        || async {
+            let state = cluster_state(&admin_client).await?;
+            Ok(state.shards.iter().any(|s| s.start_key == split_key))
+        },
+    )
+    .await
+    .context("wait for split visibility")?;
+
+    let state = cluster_state(&admin_client).await?;
+    let right = state
+        .shards
+        .iter()
+        .find(|s| s.start_key == split_key)
+        .ok_or_else(|| anyhow::anyhow!("right split shard not found"))?;
+    admin_client
+        .range_rebalance(right.shard_id, &[1, 2, 3], Some(3))
+        .await
+        .context("move right shard leaseholder to node3")?;
+
+    let (pg_client, _pg_guard) = connect_pg("127.0.0.1", runtime1.pg_port).await?;
+    pg_client
+        .batch_execute(
+            "INSERT INTO orders (order_id, customer_id, status, total_cents, created_at) VALUES
+             (7701, 70, 'left', 100, TIMESTAMP '2026-02-12 01:00:00'),
+             (9701, 71, 'right', 200, TIMESTAMP '2026-02-12 01:00:01');",
+        )
+        .await
+        .context("seed rows across split shards")?;
+
+    runtime3.shutdown().await?;
+
+    let _ = wait_for(
+        Duration::from_secs(30),
+        Duration::from_millis(250),
+        || async {
+            let state = cluster_state(&admin_client).await?;
+            Ok(state
+                .shards
+                .iter()
+                .find(|s| s.shard_id == right.shard_id)
+                .map(|s| s.leaseholder == 1 || s.leaseholder == 2)
+                .unwrap_or(false))
+        },
+    )
+    .await;
+
+    let mut attempts = 0usize;
+    loop {
+        attempts = attempts.saturating_add(1);
+        match pg_client
+            .execute(
+                "UPDATE orders SET status = 'recovered' WHERE order_id >= 7701 AND order_id <= 9701",
+                &[],
+            )
+            .await
+        {
+            Ok(rows) => {
+                assert_eq!(rows, 2);
+                break;
+            }
+            Err(err) => {
+                if attempts >= 120 {
+                    return Err(err).context("distributed retry budget exhausted");
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
+
+    let rows = pg_client
+        .query(
+            "SELECT order_id, status FROM orders WHERE order_id IN (7701, 9701) ORDER BY order_id",
+            &[],
+        )
+        .await
+        .context("verify distributed retry update results")?;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].try_get::<_, String>(1)?, "recovered");
+    assert_eq!(rows[1].try_get::<_, String>(1)?, "recovered");
+
+    runtime1.shutdown().await?;
+    runtime2.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[serial]
+async fn phase7_restart_rejoin_visibility_and_rollback_correctness() -> Result<()> {
+    let temp_dir = TempDir::new().context("create temp dir")?;
+
+    let node1 = NodePorts::new()?;
+    let node2 = NodePorts::new()?;
+
+    let initial_members = format!("1@{},2@{}", node1.grpc_addr, node2.grpc_addr);
+    let node1_cfg = HoloFusionConfig {
+        pg_host: "127.0.0.1".to_string(),
+        pg_port: node1.pg_port,
+        health_addr: node1.health_addr,
+        enable_ballista_sql: false,
+        dml_prewrite_delay: Duration::ZERO,
+        dml_statement_timeout: Duration::ZERO,
+        dml_max_inflight_statements: 1024,
+        dml_max_scan_rows: 100_000,
+        dml_max_txn_staged_rows: 100_000,
+        holostore: EmbeddedNodeConfig {
+            node_id: 1,
+            listen_redis: node1.redis_addr,
+            listen_grpc: node1.grpc_addr,
+            bootstrap: true,
+            join: None,
+            initial_members: initial_members.clone(),
+            data_dir: temp_dir.path().join("phase7-restart-node-1"),
+            ready_timeout: Duration::from_secs(30),
+            max_shards: 1,
+            initial_ranges: 1,
+            routing_mode: Some("range".to_string()),
+        },
+    };
+    let node2_cfg = HoloFusionConfig {
+        pg_host: "127.0.0.1".to_string(),
+        pg_port: node2.pg_port,
+        health_addr: node2.health_addr,
+        enable_ballista_sql: false,
+        dml_prewrite_delay: Duration::ZERO,
+        dml_statement_timeout: Duration::ZERO,
+        dml_max_inflight_statements: 1024,
+        dml_max_scan_rows: 100_000,
+        dml_max_txn_staged_rows: 100_000,
+        holostore: EmbeddedNodeConfig {
+            node_id: 2,
+            listen_redis: node2.redis_addr,
+            listen_grpc: node2.grpc_addr,
+            bootstrap: false,
+            join: Some(node1.grpc_addr),
+            initial_members,
+            data_dir: temp_dir.path().join("phase7-restart-node-2"),
+            ready_timeout: Duration::from_secs(30),
+            max_shards: 1,
+            initial_ranges: 1,
+            routing_mode: Some("range".to_string()),
+        },
+    };
+
+    let mut runtime1 = RunningNode::start(node1_cfg.clone(), node1).await?;
+    let mut runtime2 = RunningNode::start(node2_cfg.clone(), node2).await?;
+
+    let admin_client = HoloStoreClient::new(runtime1.grpc_addr);
+    wait_for(
+        Duration::from_secs(30),
+        Duration::from_millis(200),
+        || async {
+            let state = cluster_state(&admin_client).await?;
+            Ok(state.members.len() >= 2 && !state.shards.is_empty())
+        },
+    )
+    .await
+    .context("wait for 2-node cluster state")?;
+    ensure_orders_table("127.0.0.1", runtime1.pg_port).await?;
+    ensure_orders_table("127.0.0.1", runtime2.pg_port).await?;
+
+    admin_client
+        .range_rebalance(
+            cluster_state(&admin_client)
+                .await?
+                .shards
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("missing shard"))?
+                .shard_id,
+            &[1, 2],
+            Some(1),
+        )
+        .await
+        .context("rebalance shard replicas before restart test")?;
+
+    let (pg_node1, _guard_node1) = connect_pg("127.0.0.1", runtime1.pg_port).await?;
+    pg_node1
+        .execute(
+            "INSERT INTO orders (order_id, customer_id, status, total_cents, created_at)
+             VALUES (7801, 1, 'stable', 100, TIMESTAMP '2026-02-12 02:00:00')",
+            &[],
+        )
+        .await
+        .context("seed row before restart")?;
+
+    runtime2.shutdown().await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    runtime2 = RunningNode::start(node2_cfg, node2).await?;
+    ensure_orders_table("127.0.0.1", runtime2.pg_port).await?;
+
+    let (pg_node2, _guard_node2) = connect_pg("127.0.0.1", runtime2.pg_port).await?;
+    wait_for(
+        Duration::from_secs(20),
+        Duration::from_millis(200),
+        || async {
+            let row = pg_node2
+                .query_one(
+                    "SELECT COUNT(*)::BIGINT FROM orders WHERE order_id = 7801",
+                    &[],
+                )
+                .await?;
+            let count: i64 = row.try_get(0)?;
+            Ok(count == 1)
+        },
+    )
+    .await
+    .context("wait for rejoined node visibility of existing data")?;
+
+    pg_node2
+        .execute("BEGIN", &[])
+        .await
+        .context("begin transaction on rejoined node")?;
+    pg_node2
+        .execute(
+            "UPDATE orders SET status = 'tx_temp' WHERE order_id = 7801",
+            &[],
+        )
+        .await
+        .context("stage update on rejoined node")?;
+    pg_node2
+        .execute(
+            "INSERT INTO orders (order_id, customer_id, status, total_cents, created_at)
+             VALUES (7802, 2, 'tx_temp', 200, TIMESTAMP '2026-02-12 02:00:01')",
+            &[],
+        )
+        .await
+        .context("stage insert on rejoined node")?;
+    pg_node2
+        .execute("ROLLBACK", &[])
+        .await
+        .context("rollback transaction on rejoined node")?;
+
+    let status = pg_node1
+        .query_one("SELECT status FROM orders WHERE order_id = 7801", &[])
+        .await
+        .context("verify base row after rollback on rejoined node")?
+        .try_get::<_, String>(0)?;
+    assert_eq!(status, "stable");
+
+    let rolled_back_insert = pg_node1
+        .query_one(
+            "SELECT COUNT(*)::BIGINT FROM orders WHERE order_id = 7802",
+            &[],
+        )
+        .await
+        .context("verify inserted row absent after rollback on rejoined node")?
+        .try_get::<_, i64>(0)?;
+    assert_eq!(rolled_back_insert, 0);
 
     runtime1.shutdown().await?;
     runtime2.shutdown().await?;

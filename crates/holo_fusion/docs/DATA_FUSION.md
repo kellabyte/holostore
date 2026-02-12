@@ -208,7 +208,8 @@ Current status snapshot (updated 2026-02-11):
 - Phase 3: Complete.
 - Phase 4: Complete.
 - Phase 5: Complete (conflict-safe `UPDATE`/`DELETE`, SQLSTATE `40001`, rollback-on-conflict tests).
-- Phase 6: In progress (session-level `BEGIN`/`COMMIT`/`ROLLBACK` semantics and isolation contract still pending).
+- Phase 6: Complete (session-managed `BEGIN` / `COMMIT` / `ROLLBACK` semantics landed across protocol paths).
+- Phase 7: In progress (operability hardening and runbook/capacity guidance still pending).
 
 ## Phase 0: Foundation and Compatibility
 

@@ -12,6 +12,7 @@ anyhow = "1"
 async-trait = "0.1"
 ballista = { git = "https://github.com/apache/datafusion-ballista", package = "ballista", rev = "8c2543c243effa05eb2915c11c9a7830871b5a7a", default-features = false, features = ["standalone"] }
 ballista-core = { git = "https://github.com/apache/datafusion-ballista", package = "ballista-core", rev = "8c2543c243effa05eb2915c11c9a7830871b5a7a" }
+chrono = "0.4"
 datafusion = { version = "=50.3.0", default-features = false }
 datafusion-proto = { version = "=50.3.0" }
 datafusion-pg-catalog = { git = "https://github.com/datafusion-contrib/datafusion-postgres", package = "datafusion-pg-catalog", rev = "f5c039cfaea5a931ef7def48811e2974824f4ec5" }
@@ -25,5 +26,6 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 
 [dev-dependencies]
+serial_test = "3"
 tempfile = "3"
 tokio-postgres = "0.7"

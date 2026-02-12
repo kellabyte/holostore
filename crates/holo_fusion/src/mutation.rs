@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{ArrayRef, Int64Builder, StringBuilder, TimestampNanosecondBuilder};
@@ -32,6 +32,8 @@ use datafusion_postgres::pgwire::api::ClientInfo;
 use datafusion_postgres::pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use datafusion_postgres::pgwire::types::format::FormatOptions;
 use holo_store::{HoloStoreClient, RpcVersion};
+use tokio::sync::Semaphore;
+use tracing::{info_span, Instrument};
 
 use crate::catalog::register_table_from_metadata;
 use crate::metadata::create_table_metadata;
@@ -45,6 +47,10 @@ use crate::provider::{
 /// Represents the `DmlRuntimeConfig` component used by the holo_fusion runtime.
 pub struct DmlRuntimeConfig {
     pub prewrite_delay: Duration,
+    pub statement_timeout: Duration,
+    pub max_inflight_statements: usize,
+    pub max_scan_rows: usize,
+    pub max_txn_staged_rows: usize,
 }
 
 impl Default for DmlRuntimeConfig {
@@ -52,6 +58,10 @@ impl Default for DmlRuntimeConfig {
     fn default() -> Self {
         Self {
             prewrite_delay: Duration::ZERO,
+            statement_timeout: Duration::ZERO,
+            max_inflight_statements: 1024,
+            max_scan_rows: 100_000,
+            max_txn_staged_rows: 100_000,
         }
     }
 }
@@ -63,6 +73,7 @@ pub struct DmlHook {
     tx_manager: Arc<TxnSessionManager>,
     holostore_client: HoloStoreClient,
     pushdown_metrics: Arc<PushdownMetrics>,
+    admission: Arc<Semaphore>,
 }
 
 impl DmlHook {
@@ -77,6 +88,14 @@ impl DmlHook {
             tx_manager: Arc::new(TxnSessionManager::default()),
             holostore_client,
             pushdown_metrics,
+            admission: Arc::new(Semaphore::new(config.max_inflight_statements.max(1))),
+        }
+    }
+
+    /// Returns a read-only transaction state view for `pg_catalog` compatibility tables.
+    pub fn txn_introspection(&self) -> TxnIntrospection {
+        TxnIntrospection {
+            tx_manager: self.tx_manager.clone(),
         }
     }
 
@@ -100,6 +119,61 @@ impl DmlHook {
         session_id
     }
 
+    /// Executes `session has transaction` for this component.
+    async fn session_has_transaction(&self, session_id: &str) -> bool {
+        let sessions = self.tx_manager.sessions.lock().await;
+        sessions.contains_key(session_id)
+    }
+
+    /// Executes `run statement with controls` for this component.
+    async fn run_statement_with_controls(
+        &self,
+        statement: &Statement,
+        session_id: &str,
+        protocol: QueryProtocol,
+        future: impl std::future::Future<Output = PgWireResult<Response>>,
+    ) -> PgWireResult<Response> {
+        let permit = match self.admission.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.pushdown_metrics.record_admission_reject();
+                return Err(to_user_error(
+                    "53300",
+                    "server is overloaded: too many in-flight SQL mutations",
+                ));
+            }
+        };
+
+        let span = info_span!(
+            "holo_fusion.statement",
+            statement = statement_kind(statement),
+            protocol = protocol.as_str(),
+            session_id = session_id
+        );
+
+        let execute = async move {
+            let _permit = permit;
+            future.await
+        };
+
+        if self.config.statement_timeout > Duration::ZERO {
+            match tokio::time::timeout(self.config.statement_timeout, execute.instrument(span))
+                .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    self.pushdown_metrics.record_statement_timeout();
+                    Err(to_user_error(
+                        "57014",
+                        "statement timeout exceeded before completion",
+                    ))
+                }
+            }
+        } else {
+            execute.instrument(span).await
+        }
+    }
+
     /// Executes `route statement` for this component.
     async fn route_statement(
         &self,
@@ -110,49 +184,75 @@ impl DmlHook {
         protocol: QueryProtocol,
     ) -> Option<PgWireResult<Response>> {
         let session_id = self.session_id_for_client(client);
+        let has_active_txn = self.session_has_transaction(&session_id).await;
 
-        // Decision: evaluate `is_txn_control_statement(statement)` to choose the correct SQL/storage control path.
         if is_txn_control_statement(statement) {
             return Some(
-                self.handle_txn_control(statement, session_context, session_id)
-                    .await,
-            );
-        }
-
-        // Decision: evaluate `let Some(result) = self` to choose the correct SQL/storage control path.
-        if let Some(result) = self
-            .route_transactional_statement(
-                statement,
-                params,
-                &session_id,
-                session_context,
-                client,
-                protocol,
-            )
-            .await
-        {
-            return Some(result);
-        }
-
-        // Decision: evaluate `let Statement::CreateTable(create) = statement` to choose the correct SQL/storage control path.
-        if let Statement::CreateTable(create) = statement {
-            return Some(
-                execute_create_table(
-                    create,
-                    session_context,
-                    self.holostore_client.clone(),
-                    self.pushdown_metrics.clone(),
+                self.run_statement_with_controls(
+                    statement,
+                    session_id.as_str(),
+                    protocol,
+                    self.handle_txn_control(statement, session_context, session_id.clone()),
                 )
                 .await,
             );
         }
 
-        // Decision: evaluate `!matches!(statement, Statement::Update { .. } | Statement::Delete(_))` to choose the correct SQL/storage control path.
+        if has_active_txn {
+            return Some(
+                self.run_statement_with_controls(statement, session_id.as_str(), protocol, async {
+                    self.route_transactional_statement(
+                        statement,
+                        params,
+                        &session_id,
+                        session_context,
+                        client,
+                        protocol,
+                    )
+                    .await
+                    .unwrap_or_else(|| {
+                        Err(to_user_error(
+                            "0A000",
+                            "statement is not supported inside explicit transactions",
+                        ))
+                    })
+                })
+                .await,
+            );
+        }
+
+        if let Statement::CreateTable(create) = statement {
+            return Some(
+                self.run_statement_with_controls(statement, session_id.as_str(), protocol, async {
+                    execute_create_table(
+                        create,
+                        session_context,
+                        self.holostore_client.clone(),
+                        self.pushdown_metrics.clone(),
+                    )
+                    .await
+                })
+                .await,
+            );
+        }
+
         if !matches!(statement, Statement::Update { .. } | Statement::Delete(_)) {
             return None;
         }
 
-        Some(execute_dml(statement, params, session_context, self.config).await)
+        Some(
+            self.run_statement_with_controls(statement, session_id.as_str(), protocol, async {
+                execute_dml(
+                    statement,
+                    params,
+                    session_context,
+                    self.config,
+                    self.pushdown_metrics.as_ref(),
+                )
+                .await
+            })
+            .await,
+        )
     }
 
     /// Executes `route transactional statement` for this component.
@@ -174,8 +274,8 @@ impl DmlHook {
             return None;
         };
 
-        // Decision: evaluate `matches!(state, SessionTxnState::Aborted)` to choose the correct SQL/storage control path.
-        if matches!(state, SessionTxnState::Aborted) {
+        // Decision: evaluate `matches!(state, SessionTxnState::Aborted { .. })` to choose the correct SQL/storage control path.
+        if matches!(state, SessionTxnState::Aborted { .. }) {
             return Some(Err(aborted_tx_error()));
         }
 
@@ -200,6 +300,8 @@ impl DmlHook {
                     session_context,
                     &self.tx_manager,
                     session_id,
+                    self.config,
+                    self.pushdown_metrics.as_ref(),
                 )
                 .await
             }
@@ -210,6 +312,8 @@ impl DmlHook {
                     session_context,
                     &self.tx_manager,
                     session_id,
+                    self.config,
+                    self.pushdown_metrics.as_ref(),
                 )
                 .await
             }
@@ -220,6 +324,8 @@ impl DmlHook {
                     session_context,
                     &self.tx_manager,
                     session_id,
+                    self.config,
+                    self.pushdown_metrics.as_ref(),
                 )
                 .await
             }
@@ -267,21 +373,29 @@ impl DmlHook {
                 }
 
                 {
-                    let sessions = self.tx_manager.sessions.lock().await;
-                    // Decision: evaluate `sessions.contains_key(&session_id)` to choose the correct SQL/storage control path.
-                    if sessions.contains_key(&session_id) {
-                        return Err(to_user_error("25001", "transaction already in progress"));
-                    }
-                }
-
-                {
                     let mut sessions = self.tx_manager.sessions.lock().await;
                     // Decision: evaluate `sessions.contains_key(&session_id)` to choose the correct SQL/storage control path.
                     if sessions.contains_key(&session_id) {
-                        return Err(to_user_error("25001", "transaction already in progress"));
+                        return Ok(Response::TransactionStart(Tag::new("BEGIN")));
                     }
-                    sessions.insert(session_id, SessionTxnState::Active(TxnContext::default()));
+                    let meta = TxnSessionMeta {
+                        backend_pid: parse_backend_pid(&session_id),
+                        session_seq: parse_session_seq(&session_id),
+                        txid: self
+                            .tx_manager
+                            .next_tx_id
+                            .fetch_add(1, Ordering::SeqCst)
+                            .saturating_add(1),
+                    };
+                    sessions.insert(
+                        session_id,
+                        SessionTxnState::Active {
+                            meta,
+                            txn: TxnContext::default(),
+                        },
+                    );
                 }
+                self.pushdown_metrics.record_tx_begin();
                 Ok(Response::TransactionStart(Tag::new("BEGIN")))
             }
             Statement::Commit { chain, .. } => {
@@ -296,19 +410,17 @@ impl DmlHook {
                 };
 
                 let Some(state) = state else {
-                    return Err(to_user_error(
-                        "25P01",
-                        "COMMIT called without an active transaction",
-                    ));
+                    return Ok(Response::TransactionEnd(Tag::new("COMMIT")));
                 };
 
-                let SessionTxnState::Active(txn) = state else {
+                let SessionTxnState::Active { meta, txn } = state else {
                     return Ok(Response::TransactionEnd(Tag::new("ROLLBACK")));
                 };
 
                 let writes = txn.as_conditional_writes();
                 // Decision: evaluate `writes.is_empty()` to choose the correct SQL/storage control path.
                 if writes.is_empty() {
+                    self.pushdown_metrics.record_tx_commit(Duration::ZERO);
                     return Ok(Response::TransactionEnd(Tag::new("COMMIT")));
                 }
                 let table_name = txn.table_name.ok_or_else(|| {
@@ -317,6 +429,7 @@ impl DmlHook {
 
                 let provider = get_provider_for_table(session_context, table_name.as_str()).await?;
                 maybe_prewrite_delay(self.config).await;
+                let commit_start = Instant::now();
                 // Decision: evaluate `provider` to choose the correct SQL/storage control path.
                 match provider
                     .apply_orders_writes_conditional(&writes, "txn_commit")
@@ -324,11 +437,14 @@ impl DmlHook {
                     .map_err(|err| api_error(err.to_string()))?
                 {
                     ConditionalWriteOutcome::Applied(_) => {
+                        self.pushdown_metrics
+                            .record_tx_commit(commit_start.elapsed());
                         Ok(Response::TransactionEnd(Tag::new("COMMIT")))
                     }
                     ConditionalWriteOutcome::Conflict => {
+                        self.pushdown_metrics.record_tx_conflict();
                         let mut sessions = self.tx_manager.sessions.lock().await;
-                        sessions.insert(session_id, SessionTxnState::Aborted);
+                        sessions.insert(session_id, SessionTxnState::Aborted { meta });
                         Err(to_user_error(
                             "40001",
                             "transaction commit conflict; ROLLBACK required before retry",
@@ -359,12 +475,10 @@ impl DmlHook {
 
                 // Decision: evaluate `removed.is_none()` to choose the correct SQL/storage control path.
                 if removed.is_none() {
-                    return Err(to_user_error(
-                        "25P01",
-                        "ROLLBACK called without an active transaction",
-                    ));
+                    return Ok(Response::TransactionEnd(Tag::new("ROLLBACK")));
                 }
 
+                self.pushdown_metrics.record_tx_rollback();
                 Ok(Response::TransactionEnd(Tag::new("ROLLBACK")))
             }
             _ => Err(api_error("unexpected transaction control statement")),
@@ -379,20 +493,114 @@ enum QueryProtocol {
     Extended,
 }
 
+impl QueryProtocol {
+    /// Executes `as str` for this component.
+    fn as_str(self) -> &'static str {
+        match self {
+            QueryProtocol::Simple => "simple",
+            QueryProtocol::Extended => "extended",
+        }
+    }
+}
+
 const SESSION_TXN_ID_KEY: &str = "holo_fusion.txn.session_id";
+
+/// Extracts backend PID from our generated session id.
+fn parse_backend_pid(session_id: &str) -> i32 {
+    session_id
+        .split(':')
+        .next()
+        .and_then(|raw| raw.parse::<i32>().ok())
+        .unwrap_or(0)
+}
+
+/// Extracts per-session sequence number from our generated session id.
+fn parse_session_seq(session_id: &str) -> u64 {
+    session_id
+        .rsplit(':')
+        .next()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Enumerates states/variants for `TxnLifecycleState`.
+pub enum TxnLifecycleState {
+    Active,
+    Aborted,
+}
+
+#[derive(Debug, Clone)]
+/// Represents one live SQL transaction entry for compatibility introspection.
+pub struct ActiveTxnSnapshot {
+    pub backend_pid: i32,
+    pub session_seq: u64,
+    pub txid: u64,
+    pub state: TxnLifecycleState,
+}
+
+#[derive(Debug, Clone)]
+/// Provides read-only snapshots of SQL transaction state for catalog providers.
+pub struct TxnIntrospection {
+    tx_manager: Arc<TxnSessionManager>,
+}
+
+impl TxnIntrospection {
+    /// Returns a monotonic current transaction-id hint for xid age calculations.
+    pub fn current_txid_hint(&self) -> u64 {
+        self.tx_manager.next_tx_id.load(Ordering::SeqCst).max(1)
+    }
+
+    /// Captures active/aborted explicit transaction sessions for introspection.
+    pub async fn snapshot_active_transactions(&self) -> Vec<ActiveTxnSnapshot> {
+        let sessions = self.tx_manager.sessions.lock().await;
+        let mut snapshot = Vec::with_capacity(sessions.len());
+        for state in sessions.values() {
+            match state {
+                SessionTxnState::Active { meta, .. } => snapshot.push(ActiveTxnSnapshot {
+                    backend_pid: meta.backend_pid,
+                    session_seq: meta.session_seq,
+                    txid: meta.txid,
+                    state: TxnLifecycleState::Active,
+                }),
+                SessionTxnState::Aborted { meta } => snapshot.push(ActiveTxnSnapshot {
+                    backend_pid: meta.backend_pid,
+                    session_seq: meta.session_seq,
+                    txid: meta.txid,
+                    state: TxnLifecycleState::Aborted,
+                }),
+            }
+        }
+        snapshot
+    }
+}
 
 #[derive(Debug, Default)]
 /// Represents the `TxnSessionManager` component used by the holo_fusion runtime.
 struct TxnSessionManager {
     next_session_id: AtomicU64,
+    next_tx_id: AtomicU64,
     sessions: tokio::sync::Mutex<HashMap<String, SessionTxnState>>,
+}
+
+#[derive(Debug, Clone)]
+/// Stable transaction/session identity metadata used by lock introspection.
+struct TxnSessionMeta {
+    backend_pid: i32,
+    session_seq: u64,
+    txid: u64,
 }
 
 #[derive(Debug, Clone)]
 /// Enumerates states/variants for `SessionTxnState`.
 enum SessionTxnState {
-    Active(TxnContext),
-    Aborted,
+    Active {
+        meta: TxnSessionMeta,
+        txn: TxnContext,
+    },
+    Aborted {
+        meta: TxnSessionMeta,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -507,7 +715,23 @@ impl TxnContext {
     }
 
     /// Executes `stage row for order` for this component.
-    fn stage_row_for_order(&mut self, order_id: i64, row: Option<OrdersSeedRow>) {
+    fn stage_row_for_order(
+        &mut self,
+        order_id: i64,
+        row: Option<OrdersSeedRow>,
+        max_txn_staged_rows: usize,
+    ) -> PgWireResult<()> {
+        let creating_new_entry = !self.pending_writes.contains_key(&order_id);
+        if creating_new_entry && self.pending_writes.len() >= max_txn_staged_rows.max(1) {
+            return Err(to_user_error(
+                "54000",
+                format!(
+                    "transaction staged row limit exceeded (max_txn_staged_rows={})",
+                    max_txn_staged_rows.max(1)
+                ),
+            ));
+        }
+
         let (expected_version, rollback_value) =
             // Decision: evaluate `let Some(existing) = self.pending_writes.get(&order_id)` to choose the correct SQL/storage control path.
             if let Some(existing) = self.pending_writes.get(&order_id) {
@@ -534,6 +758,7 @@ impl TxnContext {
                 rollback_value,
             },
         );
+        Ok(())
     }
 
     /// Executes `as conditional writes` for this component.
@@ -580,7 +805,12 @@ impl QueryHook for DmlHook {
         // Decision: evaluate `matches!(` to choose the correct SQL/storage control path.
         if matches!(
             statement,
-            Statement::Update { .. } | Statement::Delete(_) | Statement::CreateTable(_)
+            Statement::Update { .. }
+                | Statement::Delete(_)
+                | Statement::CreateTable(_)
+                | Statement::StartTransaction { .. }
+                | Statement::Commit { .. }
+                | Statement::Rollback { .. }
         ) {
             Some(dml_placeholder_plan(statement))
         } else {
@@ -616,12 +846,28 @@ fn is_txn_control_statement(statement: &Statement) -> bool {
     )
 }
 
+/// Executes `statement kind` for this component.
+fn statement_kind(statement: &Statement) -> &'static str {
+    match statement {
+        Statement::StartTransaction { .. } => "BEGIN",
+        Statement::Commit { .. } => "COMMIT",
+        Statement::Rollback { .. } => "ROLLBACK",
+        Statement::CreateTable(_) => "CREATE_TABLE",
+        Statement::Update { .. } => "UPDATE",
+        Statement::Delete(_) => "DELETE",
+        Statement::Insert(_) => "INSERT",
+        Statement::Query(_) => "QUERY",
+        _ => "OTHER",
+    }
+}
+
 /// Executes `execute dml` for this component.
 async fn execute_dml(
     statement: &Statement,
     params: &ParamValues,
     session_context: &SessionContext,
     config: DmlRuntimeConfig,
+    pushdown_metrics: &PushdownMetrics,
 ) -> PgWireResult<Response> {
     // Decision: evaluate `statement` to choose the correct SQL/storage control path.
     match statement {
@@ -643,10 +889,13 @@ async fn execute_dml(
                 params,
                 session_context,
                 config,
+                pushdown_metrics,
             )
             .await
         }
-        Statement::Delete(delete) => execute_delete(delete, params, session_context, config).await,
+        Statement::Delete(delete) => {
+            execute_delete(delete, params, session_context, config, pushdown_metrics).await
+        }
         _ => Err(PgWireError::ApiError(Box::new(std::io::Error::other(
             "unsupported dml statement in hook",
         )))),
@@ -1131,6 +1380,7 @@ async fn execute_update(
     params: &ParamValues,
     session_context: &SessionContext,
     config: DmlRuntimeConfig,
+    pushdown_metrics: &PushdownMetrics,
 ) -> PgWireResult<Response> {
     // Decision: evaluate `has_or` to choose the correct SQL/storage control path.
     if has_or {
@@ -1172,11 +1422,22 @@ async fn execute_update(
 
     let patch = parse_update_patch(assignments, params)?;
     let provider = get_provider_for_table(session_context, table_name.as_str()).await?;
+    let scan_limit = config.max_scan_rows.max(1);
 
     let rows = provider
-        .scan_orders_with_versions_by_order_id_bounds(bounds.lower, bounds.upper, None)
+        .scan_orders_with_versions_by_order_id_bounds(
+            bounds.lower,
+            bounds.upper,
+            Some(scan_limit.saturating_add(1)),
+        )
         .await
         .map_err(|err| api_error(err.to_string()))?;
+    enforce_scan_row_limit(
+        rows.len(),
+        scan_limit,
+        pushdown_metrics,
+        "UPDATE matching row count",
+    )?;
     // Decision: evaluate `rows.is_empty()` to choose the correct SQL/storage control path.
     if rows.is_empty() {
         return Ok(Response::Execution(Tag::new("UPDATE").with_rows(0)));
@@ -1226,6 +1487,7 @@ async fn execute_delete(
     params: &ParamValues,
     session_context: &SessionContext,
     config: DmlRuntimeConfig,
+    pushdown_metrics: &PushdownMetrics,
 ) -> PgWireResult<Response> {
     // Decision: evaluate `!delete.tables.is_empty()` to choose the correct SQL/storage control path.
     if !delete.tables.is_empty() {
@@ -1275,10 +1537,21 @@ async fn execute_delete(
     }
 
     let provider = get_provider_for_table(session_context, table_name.as_str()).await?;
+    let scan_limit = config.max_scan_rows.max(1);
     let rows = provider
-        .scan_orders_with_versions_by_order_id_bounds(bounds.lower, bounds.upper, None)
+        .scan_orders_with_versions_by_order_id_bounds(
+            bounds.lower,
+            bounds.upper,
+            Some(scan_limit.saturating_add(1)),
+        )
         .await
         .map_err(|err| api_error(err.to_string()))?;
+    enforce_scan_row_limit(
+        rows.len(),
+        scan_limit,
+        pushdown_metrics,
+        "DELETE matching row count",
+    )?;
     // Decision: evaluate `rows.is_empty()` to choose the correct SQL/storage control path.
     if rows.is_empty() {
         return Ok(Response::Execution(Tag::new("DELETE").with_rows(0)));
@@ -1328,6 +1601,8 @@ async fn execute_update_in_transaction(
     session_context: &SessionContext,
     tx_manager: &TxnSessionManager,
     session_id: &str,
+    config: DmlRuntimeConfig,
+    pushdown_metrics: &PushdownMetrics,
 ) -> PgWireResult<Response> {
     // Decision: evaluate `has_or` to choose the correct SQL/storage control path.
     if has_or {
@@ -1352,8 +1627,15 @@ async fn execute_update_in_transaction(
     }
 
     let table_name = extract_mutation_target_table_name(table, "UPDATE")?;
-    ensure_txn_snapshot_for_table(tx_manager, session_id, session_context, table_name.as_str())
-        .await?;
+    ensure_txn_snapshot_for_table(
+        tx_manager,
+        session_id,
+        session_context,
+        table_name.as_str(),
+        config,
+        pushdown_metrics,
+    )
+    .await?;
     let selection = selection.ok_or_else(|| {
         to_user_error(
             "0A000",
@@ -1382,7 +1664,14 @@ async fn execute_update_in_transaction(
             let updated = patch.apply(row);
             // Decision: evaluate `updated != *row` to choose the correct SQL/storage control path.
             if updated != *row {
-                txn.stage_row_for_order(updated.order_id, Some(updated));
+                if let Err(err) = txn.stage_row_for_order(
+                    updated.order_id,
+                    Some(updated),
+                    config.max_txn_staged_rows.max(1),
+                ) {
+                    pushdown_metrics.record_txn_stage_limit_reject();
+                    return Err(err);
+                }
             }
         }
 
@@ -1400,6 +1689,8 @@ async fn execute_delete_in_transaction(
     session_context: &SessionContext,
     tx_manager: &TxnSessionManager,
     session_id: &str,
+    config: DmlRuntimeConfig,
+    pushdown_metrics: &PushdownMetrics,
 ) -> PgWireResult<Response> {
     // Decision: evaluate `!delete.tables.is_empty()` to choose the correct SQL/storage control path.
     if !delete.tables.is_empty() {
@@ -1432,8 +1723,15 @@ async fn execute_delete_in_transaction(
 
     let table = extract_single_delete_table(&delete.from)?;
     let table_name = extract_mutation_target_table_name(table, "DELETE")?;
-    ensure_txn_snapshot_for_table(tx_manager, session_id, session_context, table_name.as_str())
-        .await?;
+    ensure_txn_snapshot_for_table(
+        tx_manager,
+        session_id,
+        session_context,
+        table_name.as_str(),
+        config,
+        pushdown_metrics,
+    )
+    .await?;
 
     let selection = delete.selection.as_ref().ok_or_else(|| {
         to_user_error(
@@ -1459,7 +1757,12 @@ async fn execute_delete_in_transaction(
         }
 
         for row in &rows {
-            txn.stage_row_for_order(row.order_id, None);
+            if let Err(err) =
+                txn.stage_row_for_order(row.order_id, None, config.max_txn_staged_rows.max(1))
+            {
+                pushdown_metrics.record_txn_stage_limit_reject();
+                return Err(err);
+            }
         }
         Ok(Response::Execution(
             Tag::new("DELETE").with_rows(rows.len()),
@@ -1475,6 +1778,8 @@ async fn execute_insert_in_transaction(
     session_context: &SessionContext,
     tx_manager: &TxnSessionManager,
     session_id: &str,
+    config: DmlRuntimeConfig,
+    pushdown_metrics: &PushdownMetrics,
 ) -> PgWireResult<Response> {
     // Decision: evaluate `insert.returning.is_some()` to choose the correct SQL/storage control path.
     if insert.returning.is_some() {
@@ -1499,8 +1804,15 @@ async fn execute_insert_in_transaction(
     }
 
     let table_name = insert_table_name(&insert.table)?;
-    ensure_txn_snapshot_for_table(tx_manager, session_id, session_context, table_name.as_str())
-        .await?;
+    ensure_txn_snapshot_for_table(
+        tx_manager,
+        session_id,
+        session_context,
+        table_name.as_str(),
+        config,
+        pushdown_metrics,
+    )
+    .await?;
 
     let source = insert.source.as_ref().ok_or_else(|| {
         to_user_error(
@@ -1556,7 +1868,14 @@ async fn execute_insert_in_transaction(
                     ),
                 ));
             }
-            txn.stage_row_for_order(row.order_id, Some(row.clone()));
+            if let Err(err) = txn.stage_row_for_order(
+                row.order_id,
+                Some(row.clone()),
+                config.max_txn_staged_rows.max(1),
+            ) {
+                pushdown_metrics.record_txn_stage_limit_reject();
+                return Err(err);
+            }
         }
 
         Ok(Response::Execution(
@@ -1627,8 +1946,8 @@ async fn with_active_txn_mut<T>(
     };
     // Decision: evaluate `state` to choose the correct SQL/storage control path.
     match state {
-        SessionTxnState::Active(txn) => f(txn),
-        SessionTxnState::Aborted => Err(aborted_tx_error()),
+        SessionTxnState::Active { txn, .. } => f(txn),
+        SessionTxnState::Aborted { .. } => Err(aborted_tx_error()),
     }
 }
 
@@ -1644,8 +1963,8 @@ async fn with_active_txn<T>(
     };
     // Decision: evaluate `state` to choose the correct SQL/storage control path.
     match state {
-        SessionTxnState::Active(txn) => Ok(f(txn)),
-        SessionTxnState::Aborted => Err(aborted_tx_error()),
+        SessionTxnState::Active { txn, .. } => Ok(f(txn)),
+        SessionTxnState::Aborted { .. } => Err(aborted_tx_error()),
     }
 }
 
@@ -1655,6 +1974,8 @@ async fn ensure_txn_snapshot_for_table(
     session_id: &str,
     session_context: &SessionContext,
     table_name: &str,
+    config: DmlRuntimeConfig,
+    pushdown_metrics: &PushdownMetrics,
 ) -> PgWireResult<()> {
     let needs_snapshot = {
         let sessions = tx_manager.sessions.lock().await;
@@ -1663,11 +1984,11 @@ async fn ensure_txn_snapshot_for_table(
         };
         // Decision: evaluate `state` to choose the correct SQL/storage control path.
         match state {
-            SessionTxnState::Active(txn) => {
+            SessionTxnState::Active { txn, .. } => {
                 txn.ensure_same_table(table_name)?;
                 txn.bound_table_name().is_none()
             }
-            SessionTxnState::Aborted => return Err(aborted_tx_error()),
+            SessionTxnState::Aborted { .. } => return Err(aborted_tx_error()),
         }
     };
     // Decision: evaluate `!needs_snapshot` to choose the correct SQL/storage control path.
@@ -1676,10 +1997,22 @@ async fn ensure_txn_snapshot_for_table(
     }
 
     let provider = get_provider_for_table(session_context, table_name).await?;
+    let snapshot_limit = config.max_txn_staged_rows.max(1);
     let rows = provider
-        .scan_orders_with_versions_by_order_id_bounds(None, None, None)
+        .scan_orders_with_versions_by_order_id_bounds(None, None, Some(snapshot_limit + 1))
         .await
         .map_err(|err| api_error(err.to_string()))?;
+    if rows.len() > snapshot_limit {
+        pushdown_metrics.record_txn_stage_limit_reject();
+        return Err(to_user_error(
+            "54000",
+            format!(
+                "transaction snapshot exceeded max_txn_staged_rows={} (snapshot_rows={})",
+                snapshot_limit,
+                rows.len()
+            ),
+        ));
+    }
 
     with_active_txn_mut(tx_manager, session_id, |txn| {
         txn.ensure_same_table(table_name)?;
@@ -1711,6 +2044,26 @@ async fn get_provider_for_table(
                 format!("table '{table_name}' is not available for mutations"),
             )
         })
+}
+
+/// Executes `enforce scan row limit` for this component.
+fn enforce_scan_row_limit(
+    rows_len: usize,
+    max_rows: usize,
+    pushdown_metrics: &PushdownMetrics,
+    context: &'static str,
+) -> PgWireResult<()> {
+    if rows_len > max_rows.max(1) {
+        pushdown_metrics.record_scan_row_limit_reject();
+        return Err(to_user_error(
+            "54000",
+            format!(
+                "{context} exceeded max_scan_rows={} (observed_rows={rows_len})",
+                max_rows.max(1)
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Executes `maybe prewrite delay` for this component.

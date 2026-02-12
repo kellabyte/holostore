@@ -34,6 +34,7 @@ mod catalog;
 pub mod metadata;
 pub mod metrics;
 mod mutation;
+mod pg_catalog_ext;
 mod pg_compat;
 pub mod provider;
 pub mod topology;
@@ -42,6 +43,7 @@ use ballista_codec::HoloFusionLogicalExtensionCodec;
 use catalog::{bootstrap_catalog, sync_catalog_from_metadata};
 use metrics::PushdownMetrics;
 use mutation::{DmlHook, DmlRuntimeConfig};
+use pg_catalog_ext::install_pg_locks_table;
 use pg_compat::{current_unix_timestamp_ns, register_pg_compat_udfs};
 
 /// Interval used by the background metadata-to-catalog synchronization loop.
@@ -123,6 +125,14 @@ pub struct HoloFusionConfig {
     pub enable_ballista_sql: bool,
     /// Optional artificial prewrite delay used by DML path tests.
     pub dml_prewrite_delay: Duration,
+    /// Timeout for SQL statements handled by DML/transaction hook (`0` disables timeout).
+    pub dml_statement_timeout: Duration,
+    /// Maximum number of concurrent hook-managed statements admitted at once.
+    pub dml_max_inflight_statements: usize,
+    /// Maximum number of rows a single mutation/snapshot scan can materialize.
+    pub dml_max_scan_rows: usize,
+    /// Maximum number of staged rows allowed in one explicit transaction.
+    pub dml_max_txn_staged_rows: usize,
     /// Embedded HoloStore node configuration.
     pub holostore: EmbeddedNodeConfig,
 }
@@ -143,6 +153,22 @@ impl HoloFusionConfig {
             .unwrap_or(true);
         let dml_prewrite_delay_ms =
             parse_u64(std::env::var("HOLO_FUSION_DML_PREWRITE_DELAY_MS").ok(), 0)?;
+        let dml_statement_timeout_ms = parse_u64(
+            std::env::var("HOLO_FUSION_DML_STATEMENT_TIMEOUT_MS").ok(),
+            0,
+        )?;
+        let dml_max_inflight_statements = parse_usize(
+            std::env::var("HOLO_FUSION_DML_MAX_INFLIGHT_STATEMENTS").ok(),
+            1024,
+        )?
+        .max(1);
+        let dml_max_scan_rows =
+            parse_usize(std::env::var("HOLO_FUSION_DML_MAX_SCAN_ROWS").ok(), 100_000)?.max(1);
+        let dml_max_txn_staged_rows = parse_usize(
+            std::env::var("HOLO_FUSION_DML_MAX_TXN_STAGED_ROWS").ok(),
+            100_000,
+        )?
+        .max(1);
 
         let node_id = std::env::var("HOLO_FUSION_NODE_ID")
             .ok()
@@ -190,6 +216,10 @@ impl HoloFusionConfig {
             health_addr,
             enable_ballista_sql,
             dml_prewrite_delay: Duration::from_millis(dml_prewrite_delay_ms),
+            dml_statement_timeout: Duration::from_millis(dml_statement_timeout_ms),
+            dml_max_inflight_statements,
+            dml_max_scan_rows,
+            dml_max_txn_staged_rows,
             holostore: EmbeddedNodeConfig {
                 node_id,
                 listen_redis: redis_addr,
@@ -278,7 +308,23 @@ where
     let auth_manager = Arc::new(AuthManager::new());
     setup_pg_catalog(&session_context, "datafusion", auth_manager.clone())
         .context("setup pg_catalog")?;
-    register_pg_compat_udfs(&session_context, postmaster_start_time_ns);
+    let dml_config = DmlRuntimeConfig {
+        prewrite_delay: config.dml_prewrite_delay,
+        statement_timeout: config.dml_statement_timeout,
+        max_inflight_statements: config.dml_max_inflight_statements,
+        max_scan_rows: config.dml_max_scan_rows,
+        max_txn_staged_rows: config.dml_max_txn_staged_rows,
+    };
+    let dml_hook = Arc::new(DmlHook::new(
+        dml_config,
+        holostore_client.clone(),
+        pushdown_metrics.clone(),
+    ));
+    register_pg_compat_udfs(
+        &session_context,
+        postmaster_start_time_ns,
+        dml_hook.txn_introspection(),
+    );
     let bootstrap = bootstrap_catalog(
         session_context.as_ref(),
         holostore_client.clone(),
@@ -296,17 +342,13 @@ where
         .with_host(config.pg_host.clone())
         .with_port(config.pg_port);
 
-    let dml_config = DmlRuntimeConfig {
-        prewrite_delay: config.dml_prewrite_delay,
-    };
-    let query_hooks: Vec<Arc<dyn QueryHook>> = vec![
-        Arc::new(SetShowHook),
-        Arc::new(DmlHook::new(
-            dml_config,
-            holostore_client.clone(),
-            pushdown_metrics.clone(),
-        )),
-    ];
+    install_pg_locks_table(
+        session_context.as_ref(),
+        "datafusion",
+        dml_hook.txn_introspection(),
+    )
+    .context("install pg_catalog.pg_locks compatibility table")?;
+    let query_hooks: Vec<Arc<dyn QueryHook>> = vec![Arc::new(SetShowHook), dml_hook];
     let sql_task = tokio::spawn(async move {
         serve_with_hooks(session_context, &server_opts, auth_manager, query_hooks)
             .await
