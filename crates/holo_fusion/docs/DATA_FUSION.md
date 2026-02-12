@@ -201,7 +201,7 @@ Enforcement requirements:
 
 ## Implementation Phases
 
-Current status snapshot (updated 2026-02-11):
+Current status snapshot (updated 2026-02-12):
 - Phase 0: Complete.
 - Phase 1: Complete.
 - Phase 2: Complete.
@@ -209,7 +209,7 @@ Current status snapshot (updated 2026-02-11):
 - Phase 4: Complete.
 - Phase 5: Complete (conflict-safe `UPDATE`/`DELETE`, SQLSTATE `40001`, rollback-on-conflict tests).
 - Phase 6: Complete (session-managed `BEGIN` / `COMMIT` / `ROLLBACK` semantics landed across protocol paths).
-- Phase 7: In progress (operability hardening and runbook/capacity guidance still pending).
+- Phase 7: Complete (operability hardening, benchmark/SLO package, resiliency tests, runbook/rollout guidance).
 
 ## Phase 0: Foundation and Compatibility
 
@@ -379,8 +379,8 @@ Implemented checkpoints:
 - Transactional `INSERT` / `UPDATE` / `DELETE` are staged in-memory and committed through
   storage-level conditional writes.
 - SQLSTATE mapping:
-  - `25001` for `BEGIN` while transaction is already active,
-  - `25P01` for `COMMIT`/`ROLLBACK` without active transaction,
+  - `BEGIN` while already active returns a no-op `BEGIN` completion,
+  - `COMMIT`/`ROLLBACK` without active transaction return no-op command completion,
   - `25P02` for statements while transaction is aborted (until `ROLLBACK`),
   - `40001` for commit-time write conflicts.
 - Cross-shard commit conflict handling reuses compensating rollback behavior so failed commits
@@ -402,11 +402,14 @@ Acceptance criteria:
 - Clear, stable error behavior for conflict/timeout/retry conditions.
 
 Protocol note:
-- Current explicit transaction semantics are validated on the extended query protocol path
-  (for example `tokio-postgres` `execute/query` APIs). Simple-query transaction control
-  passthrough in upstream `datafusion-postgres` remains a known follow-up hardening item.
+- Explicit transaction semantics are validated on both simple-query and
+  extended-query paths, including no-op behavior parity for transaction-control
+  statements outside active transaction scope.
 
 ## Phase 7: Hardening and Operability
+
+Status:
+- Complete.
 
 Tasks:
 - Performance profiling and tuning.
@@ -414,8 +417,10 @@ Tasks:
 - Backpressure, limits, and guardrails (max rows, memory, timeout).
 
 Deliverables:
-- Benchmark suite (read-heavy, mixed, write-heavy).
-- Runbook for production operations.
+- Benchmark suite (read-heavy, mixed, write-heavy):
+  - `crates/holo_fusion/docs/PHASE7_BENCHMARK_SLO.md`
+- Runbook and rollout guidance:
+  - `crates/holo_fusion/docs/HOLO_FUSION_RUNBOOK.md`
 
 Acceptance criteria:
 - SLO targets met for defined benchmark workloads.

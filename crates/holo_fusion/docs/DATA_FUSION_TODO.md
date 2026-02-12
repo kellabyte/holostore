@@ -33,7 +33,7 @@
 - [x] Define isolation target and statement-to-transaction mapping.
 - [x] Add multi-statement transaction integration tests.
 
-8. [ ] Complete Phase 7 hardening and operability.
+8. [x] Complete Phase 7 hardening and operability.
 - [x] Close transaction-control protocol gap:
   - Ensure explicit transaction semantics are consistent for simple-query and extended-query paths.
   - Add integration tests covering both protocol paths for `BEGIN` / `COMMIT` / `ROLLBACK`.
@@ -53,7 +53,7 @@
   - Node loss during transactional commit.
   - Partial shard availability and retry behavior.
   - Restart/rejoin semantics with correctness checks for visibility and rollback.
-- [ ] Publish runbook and rollout guidance:
+- [x] Publish runbook and rollout guidance:
   - Operational runbook for incident triage (conflict spikes, degraded mode, shard imbalance).
   - Capacity planning notes and tuning knobs.
   - Release checklist for safe upgrades and rollback steps.
