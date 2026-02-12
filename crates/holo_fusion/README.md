@@ -76,6 +76,10 @@ Optional: Ballista standalone mode can be enabled for distributed planning.
 - `src/pg_compat.rs`
   - PostgreSQL compatibility helpers/UDFs used by SQL clients
 
+- `src/pg_catalog_ext.rs`
+  - dynamic `pg_catalog` extensions layered over `datafusion-pg-catalog`
+  - live `pg_catalog.pg_locks` backed by SQL transaction state
+
 - `src/ballista_codec.rs`
   - logical extension codec used when Ballista SQL is enabled
 
@@ -134,6 +138,11 @@ cargo run -p holo_fusion --bin holo-fusion
 - `HOLO_FUSION_HEALTH_ADDR`
 - `HOLO_FUSION_ENABLE_BALLISTA_SQL`
 - `HOLO_FUSION_DML_PREWRITE_DELAY_MS`
+- `HOLO_FUSION_DML_STATEMENT_TIMEOUT_MS`
+- `HOLO_FUSION_DML_MAX_INFLIGHT_STATEMENTS`
+- `HOLO_FUSION_DML_MAX_SCAN_ROWS`
+- `HOLO_FUSION_DML_MAX_TXN_STAGED_ROWS`
+- `HOLO_FUSION_SCAN_MAX_ROWS`
 - `HOLO_FUSION_NODE_ID`
 - `HOLO_FUSION_HOLOSTORE_REDIS_ADDR`
 - `HOLO_FUSION_HOLOSTORE_GRPC_ADDR`
@@ -157,6 +166,7 @@ Key test files:
 
 - `crates/holo_fusion/tests/smoke.rs`
 - `crates/holo_fusion/tests/distributed.rs`
+- `crates/holo_fusion/tests/bench_slo.rs` (ignored; run explicitly)
 
 ## Detailed Docs
 
@@ -164,3 +174,4 @@ Key test files:
 - `crates/holo_fusion/docs/HOLO_FUSION_STORAGE_MODEL.md`
 - `crates/holo_fusion/docs/HOLO_FUSION_SQL_SCOPE.md`
 - `crates/holo_fusion/docs/DATA_FUSION_TODO.md`
+- `crates/holo_fusion/docs/PHASE7_BENCHMARK_SLO.md`

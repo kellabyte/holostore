@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -30,7 +31,7 @@ use holo_store::{
     HoloStoreClient, LatestEntry, ReplicatedConditionalWriteEntry, ReplicatedWriteEntry, RpcVersion,
 };
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, info_span, warn, Instrument};
 
 use crate::metadata::TableMetadataRecord;
 use crate::metrics::PushdownMetrics;
@@ -46,6 +47,21 @@ const TUPLE_TAG_INT64: u8 = 0x02;
 const ROW_FORMAT_VERSION_V1: u8 = 1;
 const ROW_FLAG_TOMBSTONE: u8 = 0x01;
 const SIGN_FLIP_MASK: u64 = 1u64 << 63;
+const DEFAULT_MAX_SCAN_ROWS: usize = 100_000;
+
+/// Executes `default max scan rows` for this component.
+fn default_max_scan_rows() -> usize {
+    DEFAULT_MAX_SCAN_ROWS
+}
+
+/// Executes `configured max scan rows` for this component.
+fn configured_max_scan_rows() -> usize {
+    std::env::var("HOLO_FUSION_SCAN_MAX_ROWS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_SCAN_ROWS)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Represents the `OrdersSeedRow` component used by the holo_fusion runtime.
@@ -107,6 +123,8 @@ pub struct HoloProviderCodecSpec {
     pub table_model: String,
     pub preferred_shards: Vec<usize>,
     pub page_size: usize,
+    #[serde(default = "default_max_scan_rows")]
+    pub max_scan_rows: usize,
     pub local_grpc_addr: String,
 }
 
@@ -218,6 +236,7 @@ pub struct HoloStoreTableProvider {
     table_model: String,
     preferred_shards: Vec<usize>,
     page_size: usize,
+    max_scan_rows: usize,
     local_grpc_addr: SocketAddr,
     client: HoloStoreClient,
     metrics: Arc<PushdownMetrics>,
@@ -234,6 +253,7 @@ impl HoloStoreTableProvider {
             table_model: ORDERS_TABLE_MODEL.to_string(),
             preferred_shards: vec![ORDERS_SHARD_INDEX],
             page_size: 2048,
+            max_scan_rows: configured_max_scan_rows(),
             local_grpc_addr,
             client,
             metrics,
@@ -264,6 +284,7 @@ impl HoloStoreTableProvider {
             table_model: table.table_model.clone(),
             preferred_shards: table.preferred_shards.clone(),
             page_size: table.page_size.max(1),
+            max_scan_rows: configured_max_scan_rows(),
             local_grpc_addr,
             client,
             metrics,
@@ -278,6 +299,7 @@ impl HoloStoreTableProvider {
             table_model: self.table_model.clone(),
             preferred_shards: self.preferred_shards.clone(),
             page_size: self.page_size,
+            max_scan_rows: self.max_scan_rows,
             local_grpc_addr: self.local_grpc_addr.to_string(),
         }
     }
@@ -312,6 +334,7 @@ impl HoloStoreTableProvider {
             table_model: spec.table_model,
             preferred_shards: spec.preferred_shards,
             page_size: spec.page_size.max(1),
+            max_scan_rows: spec.max_scan_rows.max(1),
             local_grpc_addr,
             client,
             metrics,
@@ -455,6 +478,14 @@ impl HoloStoreTableProvider {
                 .collect::<Vec<_>>();
 
             let write_client = self.client_for(target.grpc_addr);
+            let apply_span = info_span!(
+                "holo_fusion.distributed_write_apply",
+                table = %self.table_name,
+                op = op,
+                shard_index = target.shard_index,
+                target = %target.grpc_addr
+            );
+            let apply_started = Instant::now();
             let result = write_client
                 .range_write_latest_conditional(
                     target.shard_index,
@@ -462,6 +493,7 @@ impl HoloStoreTableProvider {
                     target.end_key.as_slice(),
                     request_entries,
                 )
+                .instrument(apply_span)
                 .await
                 .with_context(|| {
                     format!(
@@ -469,9 +501,15 @@ impl HoloStoreTableProvider {
                         self.table_name, target.shard_index, target.grpc_addr
                     )
                 })?;
+            self.metrics.record_distributed_apply(
+                target.shard_index,
+                expected,
+                apply_started.elapsed(),
+            );
 
             // Decision: evaluate `result.conflicts > 0` to choose the correct SQL/storage control path.
             if result.conflicts > 0 {
+                self.metrics.record_distributed_conflict(target.shard_index);
                 self.rollback_conditional_targets(applied_targets.as_slice(), op)
                     .await?;
                 return Ok(ConditionalWriteOutcome::Conflict);
@@ -654,6 +692,15 @@ impl HoloStoreTableProvider {
                         // Decision: evaluate `bounds.matches(row.row.order_id)` to choose the correct SQL/storage control path.
                         if bounds.matches(row.row.order_id) {
                             rows.push(row);
+                            if rows.len() > self.max_scan_rows {
+                                self.metrics.record_scan_row_limit_reject();
+                                return Err(anyhow!(
+                                    "scan row limit exceeded for table '{}': max_scan_rows={}, rows_returned_so_far={}",
+                                    self.table_name,
+                                    self.max_scan_rows,
+                                    rows.len()
+                                ));
+                            }
                             // Decision: evaluate `let Some(limit) = limit` to choose the correct SQL/storage control path.
                             if let Some(limit) = limit {
                                 // Decision: evaluate `rows.len() >= limit` to choose the correct SQL/storage control path.
@@ -722,6 +769,14 @@ impl HoloStoreTableProvider {
                 .collect::<Vec<_>>();
 
             let client = self.client_for(target.grpc_addr);
+            let rollback_span = info_span!(
+                "holo_fusion.distributed_write_rollback",
+                table = %self.table_name,
+                op = op,
+                shard_index = target.shard_index,
+                target = %target.grpc_addr
+            );
+            let rollback_started = Instant::now();
             // Decision: evaluate `client` to choose the correct SQL/storage control path.
             match client
                 .range_write_latest_conditional(
@@ -730,11 +785,18 @@ impl HoloStoreTableProvider {
                     target.end_key.as_slice(),
                     rollback_entries,
                 )
+                .instrument(rollback_span)
                 .await
             {
                 Ok(result) => {
+                    self.metrics.record_distributed_rollback(
+                        target.shard_index,
+                        expected,
+                        rollback_started.elapsed(),
+                    );
                     // Decision: evaluate `result.conflicts > 0` to choose the correct SQL/storage control path.
                     if result.conflicts > 0 {
+                        self.metrics.record_distributed_conflict(target.shard_index);
                         let err = anyhow!(
                             "rollback for {op} conflicted on shard {} (conflicts={})",
                             target.shard_index,
@@ -761,6 +823,11 @@ impl HoloStoreTableProvider {
                     }
                 }
                 Err(err) => {
+                    self.metrics.record_distributed_rollback(
+                        target.shard_index,
+                        expected,
+                        rollback_started.elapsed(),
+                    );
                     let err = anyhow!(
                         "rollback for {op} failed on shard {} target={} with error: {err}",
                         target.shard_index,
@@ -847,6 +914,14 @@ impl HoloStoreTableProvider {
         for (target, entries) in writes {
             let expected = entries.len() as u64;
             let write_client = self.client_for(target.grpc_addr);
+            let apply_span = info_span!(
+                "holo_fusion.distributed_write_apply",
+                table = %self.table_name,
+                op = op,
+                shard_index = target.shard_index,
+                target = %target.grpc_addr
+            );
+            let apply_started = Instant::now();
             let applied = write_client
                 .range_write_latest(
                     target.shard_index,
@@ -854,6 +929,7 @@ impl HoloStoreTableProvider {
                     target.end_key.as_slice(),
                     entries,
                 )
+                .instrument(apply_span)
                 .await
                 .with_context(|| {
                     format!(
@@ -861,6 +937,11 @@ impl HoloStoreTableProvider {
                         self.table_name, target.shard_index, target.grpc_addr
                     )
                 })?;
+            self.metrics.record_distributed_apply(
+                target.shard_index,
+                expected,
+                apply_started.elapsed(),
+            );
 
             // Decision: evaluate `applied != expected` to choose the correct SQL/storage control path.
             if applied != expected {

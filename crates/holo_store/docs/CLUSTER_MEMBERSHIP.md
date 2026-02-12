@@ -157,16 +157,32 @@ membership and Cockroach-style control-plane metadata.
 
 ## Admin Demo
 
-Run a cluster (for example with `scripts/start_cluster.sh`), then exercise the
-admin RPCs with:
+Run a cluster (for example with `scripts/start_cluster.sh`), then exercise
+admin RPCs manually:
 
 ```bash
-./scripts/cluster_admin_demo.sh
-```
+TARGET=127.0.0.1:15051
+bin=(cargo run -q -p holo_store --bin holoctl -- --target "$TARGET")
 
-This script prints the cluster state, splits the first range at key `m`, shows
-the updated state, merges the range back, applies a replica/leaseholder update,
-and prints the final state.
+"${bin[@]}" state
+
+# Split first range at key "m".
+"${bin[@]}" freeze --frozen true
+split_out=$("${bin[@]}" split --split-key m)
+echo "$split_out"
+left_shard_id=$(echo "$split_out" | sed -n 's/.*left_shard_id=\([0-9][0-9]*\).*/\1/p' | head -n1)
+"${bin[@]}" freeze --frozen false
+
+"${bin[@]}" state
+
+# Merge back and rebalance replicas.
+"${bin[@]}" freeze --frozen true
+"${bin[@]}" merge --left-shard-id "$left_shard_id"
+"${bin[@]}" freeze --frozen false
+"${bin[@]}" rebalance --shard-id 1 --replica 1 --replica 2 --replica 3 --leaseholder 1
+
+"${bin[@]}" state
+```
 
 For staged replica moves, `ClusterState` now exposes:
 - `shard_rebalances`: in-flight move metadata (`from_node`, `to_node`, phase)
@@ -220,14 +236,31 @@ single full-keyspace range, all traffic will hit that one range until you split.
 To pre-split into ~4 ranges before running the benchmark:
 
 ```bash
-./scripts/presplit_redis_benchmark.sh
+TARGET=127.0.0.1:15051
+bin=(cargo run -q -p holo_store --bin holoctl -- --target "$TARGET")
+
+REDIS_BENCH_KEYS=100000
+q1=$(( REDIS_BENCH_KEYS / 4 ))
+q2=$(( REDIS_BENCH_KEYS / 2 ))
+q3=$(( (REDIS_BENCH_KEYS * 3) / 4 ))
+
+split1=$(printf "key:%012d" "$q1")
+split2=$(printf "key:%012d" "$q2")
+split3=$(printf "key:%012d" "$q3")
+
+"${bin[@]}" freeze --frozen true
+"${bin[@]}" split --split-key "$split1"
+"${bin[@]}" split --split-key "$split2"
+"${bin[@]}" split --split-key "$split3"
+"${bin[@]}" freeze --frozen false
 ```
 
-By default this script assumes padded keys (`key:000000012345`), which matches
-`redis-benchmark -r` behavior. If your workload uses plain keys, run:
+For plain keys instead of padded keys, change the split-key format:
 
 ```bash
-REDIS_BENCH_KEY_STYLE=plain ./scripts/presplit_redis_benchmark.sh
+split1=$(printf "key:%d" "$q1")
+split2=$(printf "key:%d" "$q2")
+split3=$(printf "key:%d" "$q3")
 ```
 
 For stable benchmark numbers (without split churn during the run), disable

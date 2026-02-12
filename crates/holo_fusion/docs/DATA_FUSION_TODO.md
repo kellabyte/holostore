@@ -34,22 +34,22 @@
 - [x] Add multi-statement transaction integration tests.
 
 8. [ ] Complete Phase 7 hardening and operability.
-- [ ] Close transaction-control protocol gap:
+- [x] Close transaction-control protocol gap:
   - Ensure explicit transaction semantics are consistent for simple-query and extended-query paths.
   - Add integration tests covering both protocol paths for `BEGIN` / `COMMIT` / `ROLLBACK`.
-- [ ] Add production observability:
+- [x] Add production observability:
   - Emit transaction metrics (begin/commit/rollback counts, conflict counts, commit latency).
   - Emit distributed write metrics (per-shard apply latency, rollback count, conflict hotspots).
   - Add tracing spans across SQL statement routing, transaction staging, commit, and rollback.
-- [ ] Add guardrails and backpressure:
+- [x] Add guardrails and backpressure:
   - Statement timeout enforcement and SQLSTATE mapping for timeout/cancel.
   - Memory/row limits for scans and transactional staging to prevent unbounded growth.
   - Admission control behavior under overload with deterministic error semantics.
-- [ ] Build benchmark and SLO package:
+- [x] Build benchmark and SLO package:
   - Read-heavy, mixed, and write-heavy benchmark scenarios.
   - Baseline and target SLOs for p50/p95/p99 latency and throughput.
   - Regression gate criteria for CI/perf test runs.
-- [ ] Add fault-injection and resiliency tests:
+- [x] Add fault-injection and resiliency tests:
   - Node loss during transactional commit.
   - Partial shard availability and retry behavior.
   - Restart/rejoin semantics with correctness checks for visibility and rollback.

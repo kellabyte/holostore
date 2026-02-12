@@ -56,6 +56,204 @@ async fn phase1_pg_postmaster_start_time_available() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase1_pg_is_in_recovery_available_and_false() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    let schema_qualified = client
+        .query_one("SELECT pg_catalog.pg_is_in_recovery()", &[])
+        .await
+        .context("query pg_catalog.pg_is_in_recovery compatibility function")?;
+    let is_in_recovery_schema_qualified: bool = schema_qualified.try_get(0)?;
+    assert!(
+        !is_in_recovery_schema_qualified,
+        "pg_catalog.pg_is_in_recovery should be false"
+    );
+
+    let unqualified = client
+        .query_one("SELECT pg_is_in_recovery()", &[])
+        .await
+        .context("query pg_is_in_recovery compatibility function")?;
+    let is_in_recovery_unqualified: bool = unqualified.try_get(0)?;
+    assert!(
+        !is_in_recovery_unqualified,
+        "pg_is_in_recovery should be false"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase1_txid_current_available_and_nonzero() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    let schema_qualified = client
+        .query_one("SELECT pg_catalog.txid_current()", &[])
+        .await
+        .context("query pg_catalog.txid_current compatibility function")?;
+    let txid_schema_qualified: i64 = schema_qualified.try_get(0)?;
+    assert!(
+        txid_schema_qualified > 0,
+        "pg_catalog.txid_current should return a positive xid"
+    );
+
+    let unqualified = client
+        .query_one("SELECT txid_current()", &[])
+        .await
+        .context("query txid_current compatibility function")?;
+    let txid_unqualified: i64 = unqualified.try_get(0)?;
+    assert!(
+        txid_unqualified > 0,
+        "txid_current should return a positive xid"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase1_pg_age_available_for_temporal_and_xid_forms() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    let temporal = client
+        .query_one(
+            "SELECT pg_catalog.age(
+                TIMESTAMP '2026-02-12 00:00:00',
+                TIMESTAMP '2026-01-12 00:00:00'
+            ) IS NOT NULL",
+            &[],
+        )
+        .await
+        .context("query temporal pg_catalog.age overload")?;
+    assert!(temporal.try_get::<_, bool>(0)?);
+
+    let xid_binary = client
+        .query_one("SELECT pg_catalog.age(10::BIGINT, 3::BIGINT)", &[])
+        .await
+        .context("query xid binary pg_catalog.age overload")?;
+    assert_eq!(xid_binary.try_get::<_, i64>(0)?, 7);
+
+    let xid_unary = client
+        .query_one("SELECT pg_catalog.age(10::BIGINT) IS NOT NULL", &[])
+        .await
+        .context("query xid unary pg_catalog.age overload")?;
+    assert!(xid_unary.try_get::<_, bool>(0)?);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase1_pg_locks_available_and_tracks_explicit_transactions() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client_a, _guard_a) = harness.connect_pg().await?;
+    let (client_b, _guard_b) = harness.connect_pg().await?;
+
+    let before = client_b
+        .query_one("SELECT COUNT(*)::BIGINT FROM pg_catalog.pg_locks", &[])
+        .await
+        .context("query pg_locks before BEGIN")?;
+    let before_count: i64 = before.try_get(0)?;
+    assert_eq!(before_count, 0);
+
+    client_a
+        .execute("BEGIN", &[])
+        .await
+        .context("start explicit transaction for pg_locks test")?;
+
+    let during = client_b
+        .query(
+            "SELECT locktype, mode, granted
+             FROM pg_catalog.pg_locks
+             ORDER BY locktype",
+            &[],
+        )
+        .await
+        .context("query pg_locks during active transaction")?;
+    assert_eq!(during.len(), 2);
+    let locktypes = during
+        .iter()
+        .map(|row| row.try_get::<_, String>(0))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("decode locktype values")?;
+    assert!(locktypes.contains(&"transactionid".to_string()));
+    assert!(locktypes.contains(&"virtualxid".to_string()));
+    for row in during {
+        assert_eq!(row.try_get::<_, String>(1)?, "ExclusiveLock");
+        assert!(row.try_get::<_, bool>(2)?);
+    }
+
+    client_a
+        .execute("ROLLBACK", &[])
+        .await
+        .context("rollback explicit transaction for pg_locks test")?;
+
+    let after = client_b
+        .query_one("SELECT COUNT(*)::BIGINT FROM pg_catalog.pg_locks", &[])
+        .await
+        .context("query pg_locks after ROLLBACK")?;
+    let after_count: i64 = after.try_get(0)?;
+    assert_eq!(after_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase1_datagrip_create_table_probe_path_is_supported() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    client
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS datagrip_probe_orders (
+                order_id BIGINT NOT NULL,
+                customer_id BIGINT NOT NULL,
+                status TEXT,
+                total_cents BIGINT NOT NULL,
+                created_at TIMESTAMP NOT NULL,
+                PRIMARY KEY (order_id)
+            );",
+        )
+        .await
+        .context("create table through postgres wire for datagrip probe path")?;
+
+    let postmaster = client
+        .query_one(
+            "SELECT pg_catalog.pg_postmaster_start_time() IS NOT NULL",
+            &[],
+        )
+        .await
+        .context("run datagrip probe: pg_postmaster_start_time")?;
+    assert!(postmaster.try_get::<_, bool>(0)?);
+
+    let age_probe = client
+        .query_one("SELECT pg_catalog.age(1::INT4) IS NOT NULL", &[])
+        .await
+        .context("run datagrip probe: age(int4)")?;
+    assert!(age_probe.try_get::<_, bool>(0)?);
+
+    let recovery_probe = client
+        .query_one("SELECT pg_is_in_recovery() = false", &[])
+        .await
+        .context("run datagrip probe: pg_is_in_recovery")?;
+    assert!(recovery_probe.try_get::<_, bool>(0)?);
+
+    let txid_probe = client
+        .query_one("SELECT txid_current() > 0", &[])
+        .await
+        .context("run datagrip probe: txid_current")?;
+    assert!(txid_probe.try_get::<_, bool>(0)?);
+
+    let pg_locks_probe = client
+        .query_one("SELECT COUNT(*)::BIGINT FROM pg_catalog.pg_locks", &[])
+        .await
+        .context("run datagrip probe: pg_locks")?;
+    let _locks_count: i64 = pg_locks_probe.try_get(0)?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn phase2_seeded_orders_scan_and_filter() -> Result<()> {
     let harness = TestHarness::start().await?;
     let holostore_client = harness.holostore_client();
@@ -457,14 +655,14 @@ async fn phase6_begin_commit_snapshot_and_read_your_writes() -> Result<()> {
     let commit_without_tx = client_a
         .execute("COMMIT", &[])
         .await
-        .expect_err("COMMIT without BEGIN should fail");
-    assert_sqlstate(&commit_without_tx, "25P01");
+        .context("COMMIT without BEGIN should be a no-op")?;
+    assert_eq!(commit_without_tx, 0);
 
     let rollback_without_tx = client_a
         .execute("ROLLBACK", &[])
         .await
-        .expect_err("ROLLBACK without BEGIN should fail");
-    assert_sqlstate(&rollback_without_tx, "25P01");
+        .context("ROLLBACK without BEGIN should be a no-op")?;
+    assert_eq!(rollback_without_tx, 0);
 
     client_a
         .execute("BEGIN", &[])
@@ -679,6 +877,249 @@ async fn phase6_commit_conflict_aborts_transaction_until_rollback() -> Result<()
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase7_transaction_control_protocol_parity_simple_vs_extended() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    let commit_extended = client
+        .execute("COMMIT", &[])
+        .await
+        .context("extended COMMIT without BEGIN should be a no-op")?;
+    assert_eq!(commit_extended, 0);
+
+    let commit_simple = client
+        .simple_query("COMMIT")
+        .await
+        .context("simple COMMIT without BEGIN should be a no-op")?;
+    assert!(
+        matches!(
+            commit_simple.as_slice(),
+            [tokio_postgres::SimpleQueryMessage::CommandComplete(0)]
+        ),
+        "unexpected simple-query COMMIT response: {commit_simple:?}"
+    );
+
+    client
+        .simple_query("BEGIN")
+        .await
+        .context("simple protocol BEGIN should succeed")?;
+
+    let begin_again_simple = client
+        .simple_query("BEGIN")
+        .await
+        .context("simple protocol BEGIN while tx active should be a no-op")?;
+    assert!(
+        matches!(
+            begin_again_simple.as_slice(),
+            [tokio_postgres::SimpleQueryMessage::CommandComplete(0)]
+        ),
+        "unexpected simple-query BEGIN response: {begin_again_simple:?}"
+    );
+
+    client
+        .simple_query("ROLLBACK")
+        .await
+        .context("simple protocol ROLLBACK should succeed")?;
+
+    client
+        .execute("BEGIN", &[])
+        .await
+        .context("extended BEGIN should succeed")?;
+    let begin_again_extended = client
+        .execute("BEGIN", &[])
+        .await
+        .context("extended BEGIN while tx active should be a no-op")?;
+    assert_eq!(begin_again_extended, 0);
+    client
+        .execute("ROLLBACK", &[])
+        .await
+        .context("extended ROLLBACK should succeed")?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase7_statement_timeout_maps_to_57014() -> Result<()> {
+    let harness = TestHarness::start_with_dml_config(DmlHarnessConfig {
+        prewrite_delay: Duration::from_millis(250),
+        statement_timeout: Duration::from_millis(50),
+        ..DmlHarnessConfig::default()
+    })
+    .await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    client
+        .execute(
+            "INSERT INTO orders (order_id, customer_id, status, total_cents, created_at)
+             VALUES (7301, 33, 'base', 100, TIMESTAMP '2026-02-12 00:00:00')",
+            &[],
+        )
+        .await
+        .context("seed timeout row")?;
+
+    let timeout_err = client
+        .execute(
+            "UPDATE orders SET status = 'late' WHERE order_id = 7301",
+            &[],
+        )
+        .await
+        .expect_err("update should time out with configured statement timeout");
+    assert_sqlstate(&timeout_err, "57014");
+
+    let row = client
+        .query_one("SELECT status FROM orders WHERE order_id = 7301", &[])
+        .await
+        .context("read row after timeout")?;
+    assert_eq!(row.try_get::<_, String>(0)?, "base");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase7_admission_control_rejects_overload_with_53300() -> Result<()> {
+    let harness = TestHarness::start_with_dml_config(DmlHarnessConfig {
+        prewrite_delay: Duration::from_millis(250),
+        max_inflight_statements: 1,
+        ..DmlHarnessConfig::default()
+    })
+    .await?;
+    let (seed, _seed_guard) = harness.connect_pg().await?;
+
+    seed.batch_execute(
+        "INSERT INTO orders (order_id, customer_id, status, total_cents, created_at) VALUES
+         (7401, 10, 'base', 100, TIMESTAMP '2026-02-12 00:00:00'),
+         (7402, 11, 'base', 200, TIMESTAMP '2026-02-12 00:00:01');",
+    )
+    .await
+    .context("seed admission rows")?;
+
+    let (client_a, _guard_a) = harness.connect_pg().await?;
+    let (client_b, _guard_b) = harness.connect_pg().await?;
+
+    let update_a = tokio::spawn(async move {
+        client_a
+            .execute("UPDATE orders SET status = 'a' WHERE order_id = 7401", &[])
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    let update_b = client_b
+        .execute("UPDATE orders SET status = 'b' WHERE order_id = 7402", &[])
+        .await;
+
+    let result_a = update_a.await.context("join first overload update task")?;
+
+    let mut overload_errors = 0usize;
+    for result in [result_a, update_b] {
+        match result {
+            Ok(_) => {}
+            Err(err) => {
+                assert_sqlstate(&err, "53300");
+                overload_errors += 1;
+            }
+        }
+    }
+    assert_eq!(
+        overload_errors, 1,
+        "expected exactly one overload rejection"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase7_scan_and_txn_staging_limits_map_to_54000() -> Result<()> {
+    let harness = TestHarness::start_with_dml_config(DmlHarnessConfig {
+        max_scan_rows: 1,
+        max_txn_staged_rows: 2,
+        ..DmlHarnessConfig::default()
+    })
+    .await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    client
+        .batch_execute(
+            "INSERT INTO orders (order_id, customer_id, status, total_cents, created_at) VALUES
+             (7501, 1, 'base', 100, TIMESTAMP '2026-02-12 00:00:00'),
+             (7502, 2, 'base', 200, TIMESTAMP '2026-02-12 00:00:01');",
+        )
+        .await
+        .context("seed rows for scan limit test")?;
+
+    let scan_limit_err = client
+        .execute(
+            "UPDATE orders SET status = 'limited' WHERE order_id >= 7501 AND order_id <= 7502",
+            &[],
+        )
+        .await
+        .expect_err("scan row limit should reject multi-row UPDATE");
+    assert_sqlstate(&scan_limit_err, "54000");
+
+    client
+        .execute("BEGIN", &[])
+        .await
+        .context("begin transaction for staged row limit test")?;
+
+    client
+        .execute(
+            "INSERT INTO orders (order_id, customer_id, status, total_cents, created_at)
+             VALUES (7601, 11, 'tx', 100, TIMESTAMP '2026-02-12 00:00:10')",
+            &[],
+        )
+        .await
+        .context("stage first tx row")?;
+    client
+        .execute(
+            "INSERT INTO orders (order_id, customer_id, status, total_cents, created_at)
+             VALUES (7602, 12, 'tx', 100, TIMESTAMP '2026-02-12 00:00:11')",
+            &[],
+        )
+        .await
+        .context("stage second tx row")?;
+
+    let stage_limit_err = client
+        .execute(
+            "INSERT INTO orders (order_id, customer_id, status, total_cents, created_at)
+             VALUES (7603, 13, 'tx', 100, TIMESTAMP '2026-02-12 00:00:12')",
+            &[],
+        )
+        .await
+        .expect_err("third staged row should exceed transaction staging limit");
+    assert_sqlstate(&stage_limit_err, "54000");
+
+    client
+        .execute("ROLLBACK", &[])
+        .await
+        .context("rollback after staged row limit failure")?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase7_metrics_expose_txn_distributed_and_guardrail_counters() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let metrics = harness.metrics_body().context("fetch metrics body")?;
+    for key in [
+        "tx_begin_count=",
+        "tx_commit_count=",
+        "tx_rollback_count=",
+        "tx_conflict_count=",
+        "distributed_write_apply_ops=",
+        "distributed_write_rollback_ops=",
+        "distributed_write_conflicts=",
+        "statement_timeout_count=",
+        "admission_reject_count=",
+        "scan_row_limit_reject_count=",
+        "txn_stage_limit_reject_count=",
+    ] {
+        assert!(
+            metrics.contains(key),
+            "missing metric key '{key}' in body: {metrics}"
+        );
+    }
+    Ok(())
+}
+
 fn free_port() -> Result<u16> {
     let listener = TcpListener::bind("127.0.0.1:0").context("bind ephemeral port")?;
     Ok(listener.local_addr()?.port())
@@ -792,12 +1233,41 @@ struct TestHarness {
     _temp_dir: TempDir,
 }
 
+#[derive(Clone, Copy)]
+struct DmlHarnessConfig {
+    prewrite_delay: Duration,
+    statement_timeout: Duration,
+    max_inflight_statements: usize,
+    max_scan_rows: usize,
+    max_txn_staged_rows: usize,
+}
+
+impl Default for DmlHarnessConfig {
+    fn default() -> Self {
+        Self {
+            prewrite_delay: Duration::ZERO,
+            statement_timeout: Duration::ZERO,
+            max_inflight_statements: 1024,
+            max_scan_rows: 100_000,
+            max_txn_staged_rows: 100_000,
+        }
+    }
+}
+
 impl TestHarness {
     async fn start() -> Result<Self> {
-        Self::start_with_dml_prewrite_delay(Duration::ZERO).await
+        Self::start_with_dml_config(DmlHarnessConfig::default()).await
     }
 
     async fn start_with_dml_prewrite_delay(dml_prewrite_delay: Duration) -> Result<Self> {
+        Self::start_with_dml_config(DmlHarnessConfig {
+            prewrite_delay: dml_prewrite_delay,
+            ..DmlHarnessConfig::default()
+        })
+        .await
+    }
+
+    async fn start_with_dml_config(dml: DmlHarnessConfig) -> Result<Self> {
         let temp_dir = TempDir::new().context("create temp dir")?;
 
         let pg_port = free_port()?;
@@ -815,7 +1285,11 @@ impl TestHarness {
             pg_port,
             health_addr,
             enable_ballista_sql: false,
-            dml_prewrite_delay,
+            dml_prewrite_delay: dml.prewrite_delay,
+            dml_statement_timeout: dml.statement_timeout,
+            dml_max_inflight_statements: dml.max_inflight_statements,
+            dml_max_scan_rows: dml.max_scan_rows,
+            dml_max_txn_staged_rows: dml.max_txn_staged_rows,
             holostore: EmbeddedNodeConfig {
                 node_id: 1,
                 listen_redis: redis_addr,

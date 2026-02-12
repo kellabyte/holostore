@@ -1,0 +1,69 @@
+services:
+  cockroach1:
+    image: cockroachdb/cockroach:latest
+    container_name: cockroach1
+    hostname: cockroach1
+    command:
+      - start
+      - --insecure
+      - --store=/cockroach/cockroach-data
+      - --listen-addr=0.0.0.0:26257
+      - --http-addr=0.0.0.0:8080
+      - --advertise-addr=cockroach1:26257
+      - --join=cockroach1:26257,cockroach2:26257,cockroach3:26257
+      - --cache=.25
+      - --max-sql-memory=.25
+    ports:
+      - "26257:26257"
+      - "8080:8080"
+    volumes:
+      - ${COCKROACH_DATA_DIR:-../../../../.cluster/holo_fusion/cockroach}/node1:/cockroach/cockroach-data
+    networks:
+      - cockroach-net
+
+  cockroach2:
+    image: cockroachdb/cockroach:latest
+    container_name: cockroach2
+    hostname: cockroach2
+    command:
+      - start
+      - --insecure
+      - --store=/cockroach/cockroach-data
+      - --listen-addr=0.0.0.0:26257
+      - --http-addr=0.0.0.0:8080
+      - --advertise-addr=cockroach2:26257
+      - --join=cockroach1:26257,cockroach2:26257,cockroach3:26257
+      - --cache=.25
+      - --max-sql-memory=.25
+    ports:
+      - "26258:26257"
+      - "8081:8080"
+    volumes:
+      - ${COCKROACH_DATA_DIR:-../../../../.cluster/holo_fusion/cockroach}/node2:/cockroach/cockroach-data
+    networks:
+      - cockroach-net
+
+  cockroach3:
+    image: cockroachdb/cockroach:latest
+    container_name: cockroach3
+    hostname: cockroach3
+    command:
+      - start
+      - --insecure
+      - --store=/cockroach/cockroach-data
+      - --listen-addr=0.0.0.0:26257
+      - --http-addr=0.0.0.0:8080
+      - --advertise-addr=cockroach3:26257
+      - --join=cockroach1:26257,cockroach2:26257,cockroach3:26257
+      - --cache=.25
+      - --max-sql-memory=.25
+    ports:
+      - "26259:26257"
+      - "8082:8080"
+    volumes:
+      - ${COCKROACH_DATA_DIR:-../../../../.cluster/holo_fusion/cockroach}/node3:/cockroach/cockroach-data
+    networks:
+      - cockroach-net
+
+networks:
+  cockroach-net:
