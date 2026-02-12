@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
+use datafusion::common::ScalarValue;
 use holo_store::{HoloStoreClient, ReplicatedConditionalWriteEntry, RpcVersion};
 use serde::{Deserialize, Serialize};
 
@@ -44,7 +45,7 @@ const METADATA_SCHEMA_VERSION_BASELINE: u32 = 1;
 const METADATA_SCHEMA_VERSION_CURRENT: u32 = 2;
 
 /// Result of attempting to create table metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CreateTableMetadataOutcome {
     /// Metadata record that exists after the operation.
     pub record: TableMetadataRecord,
@@ -121,7 +122,95 @@ impl TableColumnType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+/// Supported persisted column default expressions.
+pub enum ColumnDefaultValue {
+    Null,
+    Boolean(bool),
+    Int64(i64),
+    UInt64(u64),
+    Float64(f64),
+    Utf8(String),
+    TimestampNanosecond(i64),
+    CurrentTimestampNanosecond,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+/// Supported binary operations in persisted CHECK expressions.
+pub enum CheckBinaryOperator {
+    And,
+    Or,
+    Eq,
+    NotEq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+/// Persisted table-level CHECK expression AST.
+pub enum CheckExpression {
+    Column(String),
+    Literal(ColumnDefaultValue),
+    Not(Box<CheckExpression>),
+    IsNull(Box<CheckExpression>),
+    IsNotNull(Box<CheckExpression>),
+    Binary {
+        op: CheckBinaryOperator,
+        left: Box<CheckExpression>,
+        right: Box<CheckExpression>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Persisted CHECK constraint metadata.
+pub struct TableCheckConstraintRecord {
+    /// Constraint name (generated when omitted in DDL).
+    pub name: String,
+    /// Canonical expression tree for this constraint.
+    pub expr: CheckExpression,
+}
+
+#[derive(Debug, Clone)]
+/// Typed row validation/default-evaluation failure with SQLSTATE mapping.
+pub struct RowConstraintError {
+    sqlstate: &'static str,
+    message: String,
+}
+
+impl RowConstraintError {
+    /// Builds a new row-constraint error carrying SQLSTATE and message.
+    pub fn new(sqlstate: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            sqlstate,
+            message: message.into(),
+        }
+    }
+
+    /// Returns SQLSTATE code for this validation error.
+    pub fn sqlstate(&self) -> &'static str {
+        self.sqlstate
+    }
+
+    /// Returns human-readable validation error.
+    pub fn message(&self) -> &str {
+        self.message.as_str()
+    }
+}
+
+impl std::fmt::Display for RowConstraintError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for RowConstraintError {}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 /// One logical SQL column persisted in table metadata.
 pub struct TableColumnRecord {
     /// SQL-visible column name.
@@ -131,15 +220,20 @@ pub struct TableColumnRecord {
     /// Whether this column allows SQL `NULL`.
     #[serde(default)]
     pub nullable: bool,
+    /// Optional persisted default expression evaluated on INSERT when omitted.
+    #[serde(default)]
+    pub default_value: Option<ColumnDefaultValue>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 /// Input contract for creating one metadata table row.
 pub struct CreateTableMetadataSpec {
     /// Storage model to assign to the newly created table.
     pub table_model: String,
     /// Persisted logical columns.
     pub columns: Vec<TableColumnRecord>,
+    /// Persisted CHECK constraints for this table.
+    pub check_constraints: Vec<TableCheckConstraintRecord>,
     /// Name of single-column primary key used for row-key encoding.
     pub primary_key_column: String,
     /// Optional shard affinity for scans and writes.
@@ -157,6 +251,21 @@ impl CreateTableMetadataSpec {
         if self.columns.is_empty() {
             return Err(anyhow!("table metadata spec has no columns"));
         }
+        let mut check_names = BTreeSet::new();
+        for constraint in &self.check_constraints {
+            if constraint.name.trim().is_empty() {
+                return Err(anyhow!(
+                    "table metadata spec has empty check constraint name"
+                ));
+            }
+            let normalized = constraint.name.to_ascii_lowercase();
+            if !check_names.insert(normalized.clone()) {
+                return Err(anyhow!(
+                    "table metadata spec has duplicate check constraint '{}'",
+                    normalized
+                ));
+            }
+        }
         if self.primary_key_column.trim().is_empty() {
             return Err(anyhow!("table metadata spec has empty primary_key_column"));
         }
@@ -168,7 +277,7 @@ impl CreateTableMetadataSpec {
 }
 
 /// Persisted metadata row describing one logical SQL table.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TableMetadataRecord {
     /// Logical database id.
     pub db_id: u64,
@@ -183,6 +292,9 @@ pub struct TableMetadataRecord {
     /// Persisted logical column list used to construct provider schema.
     #[serde(default)]
     pub columns: Vec<TableColumnRecord>,
+    /// Persisted CHECK constraints used for row-level validation.
+    #[serde(default)]
+    pub check_constraints: Vec<TableCheckConstraintRecord>,
     /// Name of single-column primary key used for row-key encoding.
     #[serde(default)]
     pub primary_key_column: Option<String>,
@@ -255,6 +367,47 @@ impl TableMetadataRecord {
                     self.table_name
                 ));
             }
+            if let Some(default_value) = &column.default_value {
+                validate_column_default(column, default_value).map_err(|err| {
+                    anyhow!(
+                        "table metadata default expression invalid for column '{}' in table {}: {}",
+                        column.name,
+                        self.table_name,
+                        err
+                    )
+                })?;
+            }
+        }
+
+        let by_name = self
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), column))
+            .collect::<BTreeMap<_, _>>();
+        let mut check_names = BTreeSet::<String>::new();
+        for check in &self.check_constraints {
+            if check.name.trim().is_empty() {
+                return Err(anyhow!(
+                    "table metadata has empty check constraint name for table {}",
+                    self.table_name
+                ));
+            }
+            let normalized = check.name.to_ascii_lowercase();
+            if !check_names.insert(normalized.clone()) {
+                return Err(anyhow!(
+                    "table metadata has duplicate check constraint '{}' for table {}",
+                    normalized,
+                    self.table_name
+                ));
+            }
+            validate_check_expression(&check.expr, &by_name).map_err(|err| {
+                anyhow!(
+                    "table metadata has invalid check constraint '{}' for table {}: {}",
+                    check.name,
+                    self.table_name,
+                    err
+                )
+            })?;
         }
 
         let primary_key_column = self
@@ -297,6 +450,854 @@ impl TableMetadataRecord {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckExpressionType {
+    Unknown,
+    Boolean,
+    Scalar(TableColumnType),
+}
+
+/// Validates default and CHECK metadata semantics for one table definition.
+pub fn validate_table_constraints(
+    columns: &[TableColumnRecord],
+    checks: &[TableCheckConstraintRecord],
+) -> std::result::Result<(), RowConstraintError> {
+    let mut by_name = BTreeMap::<&str, &TableColumnRecord>::new();
+    for column in columns {
+        if let Some(default_value) = &column.default_value {
+            validate_column_default(column, default_value)?;
+        }
+        by_name.insert(column.name.as_str(), column);
+    }
+    for check in checks {
+        validate_check_expression(&check.expr, &by_name)?;
+    }
+    Ok(())
+}
+
+/// Applies defaults for columns omitted from INSERT input.
+pub fn apply_column_defaults_for_missing(
+    columns: &[TableColumnRecord],
+    values: &mut [ScalarValue],
+    missing_mask: &[bool],
+    now_timestamp_ns: i64,
+) -> std::result::Result<(), RowConstraintError> {
+    if columns.len() != values.len() || values.len() != missing_mask.len() {
+        return Err(RowConstraintError::new(
+            "42804",
+            format!(
+                "row shape mismatch during default evaluation: columns={}, values={}, missing_mask={}",
+                columns.len(),
+                values.len(),
+                missing_mask.len()
+            ),
+        ));
+    }
+
+    for idx in 0..columns.len() {
+        if !missing_mask[idx] {
+            continue;
+        }
+        if let Some(default_value) = &columns[idx].default_value {
+            values[idx] =
+                materialize_default_value(default_value, &columns[idx], now_timestamp_ns)?;
+        }
+    }
+    Ok(())
+}
+
+/// Validates one row against column nullability/types and table CHECK constraints.
+pub fn validate_row_against_metadata(
+    columns: &[TableColumnRecord],
+    checks: &[TableCheckConstraintRecord],
+    values: &[ScalarValue],
+) -> std::result::Result<(), RowConstraintError> {
+    if columns.len() != values.len() {
+        return Err(RowConstraintError::new(
+            "42804",
+            format!(
+                "row column count mismatch: columns={}, values={}",
+                columns.len(),
+                values.len()
+            ),
+        ));
+    }
+
+    let mut by_name = BTreeMap::<String, ScalarValue>::new();
+    for (column, value) in columns.iter().zip(values.iter()) {
+        if matches!(value, ScalarValue::Null) {
+            if !column.nullable {
+                return Err(RowConstraintError::new(
+                    "23502",
+                    format!(
+                        "null value in column '{}' violates not-null constraint",
+                        column.name
+                    ),
+                ));
+            }
+            by_name.insert(column.name.to_ascii_lowercase(), ScalarValue::Null);
+            continue;
+        }
+        if !is_scalar_compatible_with_column(value, column.column_type) {
+            return Err(RowConstraintError::new(
+                "42804",
+                format!(
+                    "value for column '{}' is incompatible with {}",
+                    column.name,
+                    column_type_name(column.column_type)
+                ),
+            ));
+        }
+        by_name.insert(column.name.to_ascii_lowercase(), value.clone());
+    }
+
+    for check in checks {
+        let evaluated = evaluate_check_expression(check.expr.clone(), &by_name)?;
+        if matches!(evaluated, Some(false)) {
+            return Err(RowConstraintError::new(
+                "23514",
+                format!("check constraint '{}' is violated", check.name),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_column_default(
+    column: &TableColumnRecord,
+    default_value: &ColumnDefaultValue,
+) -> std::result::Result<(), RowConstraintError> {
+    if matches!(default_value, ColumnDefaultValue::Null) && !column.nullable {
+        return Err(RowConstraintError::new(
+            "23502",
+            format!(
+                "default NULL is invalid for non-nullable column '{}'",
+                column.name
+            ),
+        ));
+    }
+    let _ = materialize_default_value(default_value, column, 0)?;
+    Ok(())
+}
+
+fn validate_check_expression(
+    expr: &CheckExpression,
+    columns: &BTreeMap<&str, &TableColumnRecord>,
+) -> std::result::Result<(), RowConstraintError> {
+    let expression_type = infer_check_expression_type(expr, columns)?;
+    if !matches!(
+        expression_type,
+        CheckExpressionType::Boolean | CheckExpressionType::Unknown
+    ) {
+        return Err(RowConstraintError::new(
+            "42804",
+            "CHECK expression must evaluate to boolean",
+        ));
+    }
+    Ok(())
+}
+
+fn infer_check_expression_type(
+    expr: &CheckExpression,
+    columns: &BTreeMap<&str, &TableColumnRecord>,
+) -> std::result::Result<CheckExpressionType, RowConstraintError> {
+    match expr {
+        CheckExpression::Column(name) => {
+            let normalized = name.to_ascii_lowercase();
+            let column = columns.get(normalized.as_str()).ok_or_else(|| {
+                RowConstraintError::new(
+                    "42703",
+                    format!("unknown column '{}' in CHECK expression", name),
+                )
+            })?;
+            Ok(CheckExpressionType::Scalar(column.column_type))
+        }
+        CheckExpression::Literal(default_value) => Ok(default_value_type(default_value)),
+        CheckExpression::Not(inner) => {
+            let inner = infer_check_expression_type(inner, columns)?;
+            if is_booleanish(inner) {
+                Ok(CheckExpressionType::Boolean)
+            } else {
+                Err(RowConstraintError::new(
+                    "42804",
+                    "NOT operand in CHECK expression must be boolean",
+                ))
+            }
+        }
+        CheckExpression::IsNull(inner) | CheckExpression::IsNotNull(inner) => {
+            let _ = infer_check_expression_type(inner, columns)?;
+            Ok(CheckExpressionType::Boolean)
+        }
+        CheckExpression::Binary { op, left, right } => {
+            let left_type = infer_check_expression_type(left, columns)?;
+            let right_type = infer_check_expression_type(right, columns)?;
+            match op {
+                CheckBinaryOperator::And | CheckBinaryOperator::Or => {
+                    if !is_booleanish(left_type) || !is_booleanish(right_type) {
+                        return Err(RowConstraintError::new(
+                            "42804",
+                            "logical CHECK operands must be boolean",
+                        ));
+                    }
+                    Ok(CheckExpressionType::Boolean)
+                }
+                CheckBinaryOperator::Eq | CheckBinaryOperator::NotEq => {
+                    if are_comparable_check_types(left_type, right_type) {
+                        Ok(CheckExpressionType::Boolean)
+                    } else {
+                        Err(RowConstraintError::new(
+                            "42804",
+                            "comparison CHECK operands are not comparable",
+                        ))
+                    }
+                }
+                CheckBinaryOperator::Lt
+                | CheckBinaryOperator::LtEq
+                | CheckBinaryOperator::Gt
+                | CheckBinaryOperator::GtEq => {
+                    if are_orderable_check_types(left_type, right_type) {
+                        Ok(CheckExpressionType::Boolean)
+                    } else {
+                        Err(RowConstraintError::new(
+                            "42804",
+                            "ordered CHECK comparison operands are not compatible",
+                        ))
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn is_booleanish(value: CheckExpressionType) -> bool {
+    matches!(
+        value,
+        CheckExpressionType::Boolean | CheckExpressionType::Unknown
+    )
+}
+
+fn default_value_type(value: &ColumnDefaultValue) -> CheckExpressionType {
+    match value {
+        ColumnDefaultValue::Null => CheckExpressionType::Unknown,
+        ColumnDefaultValue::Boolean(_) => CheckExpressionType::Scalar(TableColumnType::Boolean),
+        ColumnDefaultValue::Int64(_) => CheckExpressionType::Scalar(TableColumnType::Int64),
+        ColumnDefaultValue::UInt64(_) => CheckExpressionType::Scalar(TableColumnType::UInt64),
+        ColumnDefaultValue::Float64(_) => CheckExpressionType::Scalar(TableColumnType::Float64),
+        ColumnDefaultValue::Utf8(_) => CheckExpressionType::Scalar(TableColumnType::Utf8),
+        ColumnDefaultValue::TimestampNanosecond(_)
+        | ColumnDefaultValue::CurrentTimestampNanosecond => {
+            CheckExpressionType::Scalar(TableColumnType::TimestampNanosecond)
+        }
+    }
+}
+
+fn are_comparable_check_types(left: CheckExpressionType, right: CheckExpressionType) -> bool {
+    if matches!(left, CheckExpressionType::Unknown) || matches!(right, CheckExpressionType::Unknown)
+    {
+        return true;
+    }
+    match (left, right) {
+        (CheckExpressionType::Scalar(l), CheckExpressionType::Scalar(r)) => {
+            if is_numeric_column_type(l) && is_numeric_column_type(r) {
+                true
+            } else {
+                l == r
+            }
+        }
+        (CheckExpressionType::Boolean, CheckExpressionType::Boolean) => true,
+        _ => false,
+    }
+}
+
+fn are_orderable_check_types(left: CheckExpressionType, right: CheckExpressionType) -> bool {
+    if matches!(left, CheckExpressionType::Unknown) || matches!(right, CheckExpressionType::Unknown)
+    {
+        return true;
+    }
+    match (left, right) {
+        (CheckExpressionType::Scalar(l), CheckExpressionType::Scalar(r)) => {
+            (is_numeric_column_type(l) && is_numeric_column_type(r))
+                || (l == TableColumnType::Utf8 && r == TableColumnType::Utf8)
+                || (l == TableColumnType::TimestampNanosecond
+                    && r == TableColumnType::TimestampNanosecond)
+        }
+        _ => false,
+    }
+}
+
+fn is_numeric_column_type(column_type: TableColumnType) -> bool {
+    matches!(
+        column_type,
+        TableColumnType::Int8
+            | TableColumnType::Int16
+            | TableColumnType::Int32
+            | TableColumnType::Int64
+            | TableColumnType::UInt8
+            | TableColumnType::UInt16
+            | TableColumnType::UInt32
+            | TableColumnType::UInt64
+            | TableColumnType::Float64
+    )
+}
+
+fn materialize_default_value(
+    default_value: &ColumnDefaultValue,
+    column: &TableColumnRecord,
+    now_timestamp_ns: i64,
+) -> std::result::Result<ScalarValue, RowConstraintError> {
+    match default_value {
+        ColumnDefaultValue::Null => {
+            if !column.nullable {
+                return Err(RowConstraintError::new(
+                    "23502",
+                    format!(
+                        "null default is invalid for non-nullable column '{}'",
+                        column.name
+                    ),
+                ));
+            }
+            Ok(ScalarValue::Null)
+        }
+        ColumnDefaultValue::CurrentTimestampNanosecond => {
+            if column.column_type != TableColumnType::TimestampNanosecond {
+                return Err(RowConstraintError::new(
+                    "42804",
+                    format!(
+                        "CURRENT_TIMESTAMP default is only valid for timestamp column '{}'",
+                        column.name
+                    ),
+                ));
+            }
+            Ok(ScalarValue::TimestampNanosecond(
+                Some(now_timestamp_ns),
+                None,
+            ))
+        }
+        other => coerce_default_literal_to_scalar(other, column),
+    }
+}
+
+fn coerce_default_literal_to_scalar(
+    value: &ColumnDefaultValue,
+    column: &TableColumnRecord,
+) -> std::result::Result<ScalarValue, RowConstraintError> {
+    match column.column_type {
+        TableColumnType::Int8 => {
+            let value = default_numeric_to_i64(value, column)?;
+            let narrowed = i8::try_from(value).map_err(|_| {
+                RowConstraintError::new(
+                    "22003",
+                    format!("default value out of range for column '{}'", column.name),
+                )
+            })?;
+            Ok(ScalarValue::Int8(Some(narrowed)))
+        }
+        TableColumnType::Int16 => {
+            let value = default_numeric_to_i64(value, column)?;
+            let narrowed = i16::try_from(value).map_err(|_| {
+                RowConstraintError::new(
+                    "22003",
+                    format!("default value out of range for column '{}'", column.name),
+                )
+            })?;
+            Ok(ScalarValue::Int16(Some(narrowed)))
+        }
+        TableColumnType::Int32 => {
+            let value = default_numeric_to_i64(value, column)?;
+            let narrowed = i32::try_from(value).map_err(|_| {
+                RowConstraintError::new(
+                    "22003",
+                    format!("default value out of range for column '{}'", column.name),
+                )
+            })?;
+            Ok(ScalarValue::Int32(Some(narrowed)))
+        }
+        TableColumnType::Int64 => {
+            let value = default_numeric_to_i64(value, column)?;
+            Ok(ScalarValue::Int64(Some(value)))
+        }
+        TableColumnType::UInt8 => {
+            let value = default_numeric_to_u64(value, column)?;
+            let narrowed = u8::try_from(value).map_err(|_| {
+                RowConstraintError::new(
+                    "22003",
+                    format!("default value out of range for column '{}'", column.name),
+                )
+            })?;
+            Ok(ScalarValue::UInt8(Some(narrowed)))
+        }
+        TableColumnType::UInt16 => {
+            let value = default_numeric_to_u64(value, column)?;
+            let narrowed = u16::try_from(value).map_err(|_| {
+                RowConstraintError::new(
+                    "22003",
+                    format!("default value out of range for column '{}'", column.name),
+                )
+            })?;
+            Ok(ScalarValue::UInt16(Some(narrowed)))
+        }
+        TableColumnType::UInt32 => {
+            let value = default_numeric_to_u64(value, column)?;
+            let narrowed = u32::try_from(value).map_err(|_| {
+                RowConstraintError::new(
+                    "22003",
+                    format!("default value out of range for column '{}'", column.name),
+                )
+            })?;
+            Ok(ScalarValue::UInt32(Some(narrowed)))
+        }
+        TableColumnType::UInt64 => {
+            let value = default_numeric_to_u64(value, column)?;
+            Ok(ScalarValue::UInt64(Some(value)))
+        }
+        TableColumnType::Float64 => {
+            let value = default_numeric_to_f64(value, column)?;
+            Ok(ScalarValue::Float64(Some(value)))
+        }
+        TableColumnType::Boolean => match value {
+            ColumnDefaultValue::Boolean(v) => Ok(ScalarValue::Boolean(Some(*v))),
+            _ => Err(RowConstraintError::new(
+                "42804",
+                format!(
+                    "default expression is incompatible with boolean column '{}'",
+                    column.name
+                ),
+            )),
+        },
+        TableColumnType::Utf8 => match value {
+            ColumnDefaultValue::Utf8(v) => Ok(ScalarValue::Utf8(Some(v.clone()))),
+            _ => Err(RowConstraintError::new(
+                "42804",
+                format!(
+                    "default expression is incompatible with text column '{}'",
+                    column.name
+                ),
+            )),
+        },
+        TableColumnType::TimestampNanosecond => match value {
+            ColumnDefaultValue::TimestampNanosecond(v) => {
+                Ok(ScalarValue::TimestampNanosecond(Some(*v), None))
+            }
+            _ => Err(RowConstraintError::new(
+                "42804",
+                format!(
+                    "default expression is incompatible with timestamp column '{}'",
+                    column.name
+                ),
+            )),
+        },
+    }
+}
+
+fn default_numeric_to_i64(
+    value: &ColumnDefaultValue,
+    column: &TableColumnRecord,
+) -> std::result::Result<i64, RowConstraintError> {
+    match value {
+        ColumnDefaultValue::Int64(v) => Ok(*v),
+        ColumnDefaultValue::UInt64(v) => i64::try_from(*v).map_err(|_| {
+            RowConstraintError::new(
+                "22003",
+                format!("default value out of range for column '{}'", column.name),
+            )
+        }),
+        _ => Err(RowConstraintError::new(
+            "42804",
+            format!(
+                "default expression is incompatible with integer column '{}'",
+                column.name
+            ),
+        )),
+    }
+}
+
+fn default_numeric_to_u64(
+    value: &ColumnDefaultValue,
+    column: &TableColumnRecord,
+) -> std::result::Result<u64, RowConstraintError> {
+    match value {
+        ColumnDefaultValue::UInt64(v) => Ok(*v),
+        ColumnDefaultValue::Int64(v) => u64::try_from(*v).map_err(|_| {
+            RowConstraintError::new(
+                "22003",
+                format!("default value out of range for column '{}'", column.name),
+            )
+        }),
+        _ => Err(RowConstraintError::new(
+            "42804",
+            format!(
+                "default expression is incompatible with unsigned integer column '{}'",
+                column.name
+            ),
+        )),
+    }
+}
+
+fn default_numeric_to_f64(
+    value: &ColumnDefaultValue,
+    column: &TableColumnRecord,
+) -> std::result::Result<f64, RowConstraintError> {
+    match value {
+        ColumnDefaultValue::Float64(v) => Ok(*v),
+        ColumnDefaultValue::Int64(v) => Ok(*v as f64),
+        ColumnDefaultValue::UInt64(v) => Ok(*v as f64),
+        _ => Err(RowConstraintError::new(
+            "42804",
+            format!(
+                "default expression is incompatible with numeric column '{}'",
+                column.name
+            ),
+        )),
+    }
+}
+
+fn is_scalar_compatible_with_column(value: &ScalarValue, column_type: TableColumnType) -> bool {
+    match column_type {
+        TableColumnType::Int8 => matches!(
+            value,
+            ScalarValue::Int8(_)
+                | ScalarValue::Int16(_)
+                | ScalarValue::Int32(_)
+                | ScalarValue::Int64(_)
+                | ScalarValue::UInt8(_)
+                | ScalarValue::UInt16(_)
+                | ScalarValue::UInt32(_)
+                | ScalarValue::UInt64(_)
+        ),
+        TableColumnType::Int16 => matches!(
+            value,
+            ScalarValue::Int8(_)
+                | ScalarValue::Int16(_)
+                | ScalarValue::Int32(_)
+                | ScalarValue::Int64(_)
+                | ScalarValue::UInt8(_)
+                | ScalarValue::UInt16(_)
+                | ScalarValue::UInt32(_)
+                | ScalarValue::UInt64(_)
+        ),
+        TableColumnType::Int32 => matches!(
+            value,
+            ScalarValue::Int8(_)
+                | ScalarValue::Int16(_)
+                | ScalarValue::Int32(_)
+                | ScalarValue::Int64(_)
+                | ScalarValue::UInt8(_)
+                | ScalarValue::UInt16(_)
+                | ScalarValue::UInt32(_)
+                | ScalarValue::UInt64(_)
+        ),
+        TableColumnType::Int64 => matches!(
+            value,
+            ScalarValue::Int8(_)
+                | ScalarValue::Int16(_)
+                | ScalarValue::Int32(_)
+                | ScalarValue::Int64(_)
+                | ScalarValue::UInt8(_)
+                | ScalarValue::UInt16(_)
+                | ScalarValue::UInt32(_)
+                | ScalarValue::UInt64(_)
+        ),
+        TableColumnType::UInt8 => matches!(
+            value,
+            ScalarValue::UInt8(_)
+                | ScalarValue::UInt16(_)
+                | ScalarValue::UInt32(_)
+                | ScalarValue::UInt64(_)
+                | ScalarValue::Int8(_)
+                | ScalarValue::Int16(_)
+                | ScalarValue::Int32(_)
+                | ScalarValue::Int64(_)
+        ),
+        TableColumnType::UInt16 => matches!(
+            value,
+            ScalarValue::UInt8(_)
+                | ScalarValue::UInt16(_)
+                | ScalarValue::UInt32(_)
+                | ScalarValue::UInt64(_)
+                | ScalarValue::Int8(_)
+                | ScalarValue::Int16(_)
+                | ScalarValue::Int32(_)
+                | ScalarValue::Int64(_)
+        ),
+        TableColumnType::UInt32 => matches!(
+            value,
+            ScalarValue::UInt8(_)
+                | ScalarValue::UInt16(_)
+                | ScalarValue::UInt32(_)
+                | ScalarValue::UInt64(_)
+                | ScalarValue::Int8(_)
+                | ScalarValue::Int16(_)
+                | ScalarValue::Int32(_)
+                | ScalarValue::Int64(_)
+        ),
+        TableColumnType::UInt64 => matches!(
+            value,
+            ScalarValue::UInt8(_)
+                | ScalarValue::UInt16(_)
+                | ScalarValue::UInt32(_)
+                | ScalarValue::UInt64(_)
+                | ScalarValue::Int8(_)
+                | ScalarValue::Int16(_)
+                | ScalarValue::Int32(_)
+                | ScalarValue::Int64(_)
+        ),
+        TableColumnType::Float64 => matches!(
+            value,
+            ScalarValue::Float32(_)
+                | ScalarValue::Float64(_)
+                | ScalarValue::Int8(_)
+                | ScalarValue::Int16(_)
+                | ScalarValue::Int32(_)
+                | ScalarValue::Int64(_)
+                | ScalarValue::UInt8(_)
+                | ScalarValue::UInt16(_)
+                | ScalarValue::UInt32(_)
+                | ScalarValue::UInt64(_)
+        ),
+        TableColumnType::Boolean => matches!(value, ScalarValue::Boolean(_)),
+        TableColumnType::Utf8 => matches!(value, ScalarValue::Utf8(_) | ScalarValue::LargeUtf8(_)),
+        TableColumnType::TimestampNanosecond => matches!(
+            value,
+            ScalarValue::TimestampNanosecond(_, _)
+                | ScalarValue::TimestampMicrosecond(_, _)
+                | ScalarValue::TimestampMillisecond(_, _)
+                | ScalarValue::TimestampSecond(_, _)
+        ),
+    }
+}
+
+fn column_type_name(column_type: TableColumnType) -> &'static str {
+    match column_type {
+        TableColumnType::Int8 => "int8",
+        TableColumnType::Int16 => "int16",
+        TableColumnType::Int32 => "int32",
+        TableColumnType::Int64 => "int64",
+        TableColumnType::UInt8 => "uint8",
+        TableColumnType::UInt16 => "uint16",
+        TableColumnType::UInt32 => "uint32",
+        TableColumnType::UInt64 => "uint64",
+        TableColumnType::Float64 => "float64",
+        TableColumnType::Boolean => "boolean",
+        TableColumnType::Utf8 => "utf8",
+        TableColumnType::TimestampNanosecond => "timestamp_ns",
+    }
+}
+
+fn evaluate_check_expression(
+    expr: CheckExpression,
+    values: &BTreeMap<String, ScalarValue>,
+) -> std::result::Result<Option<bool>, RowConstraintError> {
+    match expr {
+        CheckExpression::Column(name) => {
+            let value = values
+                .get(name.to_ascii_lowercase().as_str())
+                .ok_or_else(|| {
+                    RowConstraintError::new(
+                        "42703",
+                        format!("unknown column '{}' in CHECK evaluation", name),
+                    )
+                })?;
+            scalar_to_optional_bool(value)
+        }
+        CheckExpression::Literal(value) => default_literal_to_optional_bool(value),
+        CheckExpression::Not(inner) => Ok(evaluate_check_expression(*inner, values)?.map(|v| !v)),
+        CheckExpression::IsNull(inner) => Ok(Some(
+            evaluate_check_scalar(*inner, values)
+                .map(|scalar| matches!(scalar, ScalarValue::Null))
+                .unwrap_or(true),
+        )),
+        CheckExpression::IsNotNull(inner) => Ok(Some(
+            evaluate_check_scalar(*inner, values)
+                .map(|scalar| !matches!(scalar, ScalarValue::Null))
+                .unwrap_or(false),
+        )),
+        CheckExpression::Binary { op, left, right } => match op {
+            CheckBinaryOperator::And => {
+                let left = evaluate_check_expression(*left, values)?;
+                let right = evaluate_check_expression(*right, values)?;
+                Ok(tri_and(left, right))
+            }
+            CheckBinaryOperator::Or => {
+                let left = evaluate_check_expression(*left, values)?;
+                let right = evaluate_check_expression(*right, values)?;
+                Ok(tri_or(left, right))
+            }
+            CheckBinaryOperator::Eq
+            | CheckBinaryOperator::NotEq
+            | CheckBinaryOperator::Lt
+            | CheckBinaryOperator::LtEq
+            | CheckBinaryOperator::Gt
+            | CheckBinaryOperator::GtEq => {
+                let left = evaluate_check_scalar(*left, values);
+                let right = evaluate_check_scalar(*right, values);
+                if let (Some(left), Some(right)) = (left, right) {
+                    compare_scalars(op, left, right)
+                } else {
+                    Ok(None)
+                }
+            }
+        },
+    }
+}
+
+fn evaluate_check_scalar(
+    expr: CheckExpression,
+    values: &BTreeMap<String, ScalarValue>,
+) -> Option<ScalarValue> {
+    match expr {
+        CheckExpression::Column(name) => values.get(name.to_ascii_lowercase().as_str()).cloned(),
+        CheckExpression::Literal(value) => default_literal_to_scalar(value),
+        CheckExpression::Not(_)
+        | CheckExpression::IsNull(_)
+        | CheckExpression::IsNotNull(_)
+        | CheckExpression::Binary {
+            op: CheckBinaryOperator::And | CheckBinaryOperator::Or,
+            ..
+        } => evaluate_check_expression(expr, values)
+            .ok()
+            .flatten()
+            .map(|v| ScalarValue::Boolean(Some(v))),
+        CheckExpression::Binary { .. } => evaluate_check_expression(expr, values)
+            .ok()
+            .flatten()
+            .map(|v| ScalarValue::Boolean(Some(v))),
+    }
+}
+
+fn scalar_to_optional_bool(
+    value: &ScalarValue,
+) -> std::result::Result<Option<bool>, RowConstraintError> {
+    match value {
+        ScalarValue::Boolean(Some(v)) => Ok(Some(*v)),
+        ScalarValue::Boolean(None) | ScalarValue::Null => Ok(None),
+        _ => Err(RowConstraintError::new(
+            "42804",
+            "CHECK expression expected boolean value",
+        )),
+    }
+}
+
+fn default_literal_to_optional_bool(
+    value: ColumnDefaultValue,
+) -> std::result::Result<Option<bool>, RowConstraintError> {
+    match value {
+        ColumnDefaultValue::Boolean(v) => Ok(Some(v)),
+        ColumnDefaultValue::Null => Ok(None),
+        _ => Err(RowConstraintError::new(
+            "42804",
+            "CHECK expression expected boolean literal",
+        )),
+    }
+}
+
+fn default_literal_to_scalar(value: ColumnDefaultValue) -> Option<ScalarValue> {
+    match value {
+        ColumnDefaultValue::Null => None,
+        ColumnDefaultValue::Boolean(v) => Some(ScalarValue::Boolean(Some(v))),
+        ColumnDefaultValue::Int64(v) => Some(ScalarValue::Int64(Some(v))),
+        ColumnDefaultValue::UInt64(v) => Some(ScalarValue::UInt64(Some(v))),
+        ColumnDefaultValue::Float64(v) => Some(ScalarValue::Float64(Some(v))),
+        ColumnDefaultValue::Utf8(v) => Some(ScalarValue::Utf8(Some(v))),
+        ColumnDefaultValue::TimestampNanosecond(v) => {
+            Some(ScalarValue::TimestampNanosecond(Some(v), None))
+        }
+        ColumnDefaultValue::CurrentTimestampNanosecond => None,
+    }
+}
+
+fn tri_and(left: Option<bool>, right: Option<bool>) -> Option<bool> {
+    match (left, right) {
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        (Some(true), Some(true)) => Some(true),
+        _ => None,
+    }
+}
+
+fn tri_or(left: Option<bool>, right: Option<bool>) -> Option<bool> {
+    match (left, right) {
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (Some(false), Some(false)) => Some(false),
+        _ => None,
+    }
+}
+
+fn compare_scalars(
+    op: CheckBinaryOperator,
+    left: ScalarValue,
+    right: ScalarValue,
+) -> std::result::Result<Option<bool>, RowConstraintError> {
+    let ordering = compare_scalar_values(left, right)?;
+    let outcome = match op {
+        CheckBinaryOperator::Eq => ordering.map(|v| v == std::cmp::Ordering::Equal),
+        CheckBinaryOperator::NotEq => ordering.map(|v| v != std::cmp::Ordering::Equal),
+        CheckBinaryOperator::Lt => ordering.map(|v| v == std::cmp::Ordering::Less),
+        CheckBinaryOperator::LtEq => {
+            ordering.map(|v| matches!(v, std::cmp::Ordering::Less | std::cmp::Ordering::Equal))
+        }
+        CheckBinaryOperator::Gt => ordering.map(|v| v == std::cmp::Ordering::Greater),
+        CheckBinaryOperator::GtEq => {
+            ordering.map(|v| matches!(v, std::cmp::Ordering::Greater | std::cmp::Ordering::Equal))
+        }
+        CheckBinaryOperator::And | CheckBinaryOperator::Or => {
+            return Err(RowConstraintError::new(
+                "42804",
+                "invalid binary operator for scalar comparison",
+            ))
+        }
+    };
+    Ok(outcome)
+}
+
+fn compare_scalar_values(
+    left: ScalarValue,
+    right: ScalarValue,
+) -> std::result::Result<Option<std::cmp::Ordering>, RowConstraintError> {
+    if matches!(left, ScalarValue::Null) || matches!(right, ScalarValue::Null) {
+        return Ok(None);
+    }
+
+    if let (Some(left), Some(right)) = (scalar_to_f64_lossy(&left), scalar_to_f64_lossy(&right)) {
+        return Ok(left.partial_cmp(&right));
+    }
+
+    match (&left, &right) {
+        (ScalarValue::Utf8(Some(left)), ScalarValue::Utf8(Some(right)))
+        | (ScalarValue::Utf8(Some(left)), ScalarValue::LargeUtf8(Some(right)))
+        | (ScalarValue::LargeUtf8(Some(left)), ScalarValue::Utf8(Some(right)))
+        | (ScalarValue::LargeUtf8(Some(left)), ScalarValue::LargeUtf8(Some(right))) => {
+            Ok(Some(left.cmp(right)))
+        }
+        (ScalarValue::Boolean(Some(left)), ScalarValue::Boolean(Some(right))) => {
+            Ok(Some(left.cmp(right)))
+        }
+        (
+            ScalarValue::TimestampNanosecond(Some(left), _),
+            ScalarValue::TimestampNanosecond(Some(right), _),
+        ) => Ok(Some(left.cmp(right))),
+        _ => Err(RowConstraintError::new(
+            "42804",
+            "CHECK comparison operands are not comparable",
+        )),
+    }
+}
+
+fn scalar_to_f64_lossy(value: &ScalarValue) -> Option<f64> {
+    match value {
+        ScalarValue::Float64(Some(v)) => Some(*v),
+        ScalarValue::Float32(Some(v)) => Some(f64::from(*v)),
+        ScalarValue::Int64(Some(v)) => Some(*v as f64),
+        ScalarValue::Int32(Some(v)) => Some(*v as f64),
+        ScalarValue::Int16(Some(v)) => Some(*v as f64),
+        ScalarValue::Int8(Some(v)) => Some(*v as f64),
+        ScalarValue::UInt64(Some(v)) => Some(*v as f64),
+        ScalarValue::UInt32(Some(v)) => Some(*v as f64),
+        ScalarValue::UInt16(Some(v)) => Some(*v as f64),
+        ScalarValue::UInt8(Some(v)) => Some(*v as f64),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 /// Legacy table metadata shape used before schema-driven column metadata.
 struct LegacyTableMetadataRecordV0 {
@@ -324,6 +1325,7 @@ impl LegacyTableMetadataRecordV0 {
                 .table_model
                 .unwrap_or_else(|| TABLE_MODEL_ORDERS_V1.to_string()),
             columns: Vec::new(),
+            check_constraints: Vec::new(),
             primary_key_column: None,
             preferred_shards: self.preferred_shards,
             page_size: self.page_size.unwrap_or_else(default_page_size).max(1),
@@ -563,26 +1565,31 @@ fn canonical_orders_columns() -> Vec<TableColumnRecord> {
             name: "order_id".to_string(),
             column_type: TableColumnType::Int64,
             nullable: false,
+            default_value: None,
         },
         TableColumnRecord {
             name: "customer_id".to_string(),
             column_type: TableColumnType::Int64,
             nullable: false,
+            default_value: None,
         },
         TableColumnRecord {
             name: "status".to_string(),
             column_type: TableColumnType::Utf8,
             nullable: true,
+            default_value: None,
         },
         TableColumnRecord {
             name: "total_cents".to_string(),
             column_type: TableColumnType::Int64,
             nullable: false,
+            default_value: None,
         },
         TableColumnRecord {
             name: "created_at".to_string(),
             column_type: TableColumnType::TimestampNanosecond,
             nullable: false,
+            default_value: None,
         },
     ]
 }
@@ -865,6 +1872,7 @@ pub async fn create_table_metadata(
             table_name: table_name.to_string(),
             table_model: spec.table_model.clone(),
             columns: spec.columns.clone(),
+            check_constraints: spec.check_constraints.clone(),
             primary_key_column: Some(spec.primary_key_column.clone()),
             preferred_shards: spec.preferred_shards.clone(),
             page_size: spec.page_size.max(1),
@@ -1190,6 +2198,7 @@ mod tests {
             table_name: "orders".to_string(),
             table_model: table_model_orders_v1().to_string(),
             columns: Vec::new(),
+            check_constraints: Vec::new(),
             primary_key_column: None,
             preferred_shards: Vec::new(),
             page_size: 0,
@@ -1237,6 +2246,7 @@ mod tests {
             &CreateTableMetadataSpec {
                 table_model: table_model_orders_v1().to_string(),
                 columns: canonical_orders_columns(),
+                check_constraints: Vec::new(),
                 primary_key_column: "order_id".to_string(),
                 preferred_shards: Vec::new(),
                 page_size: default_page_size(),
@@ -1313,6 +2323,117 @@ mod tests {
         node.shutdown()
             .await
             .context("shutdown migration test node")?;
+        Ok(())
+    }
+
+    #[test]
+    fn row_defaults_and_checks_apply_and_validate() -> Result<()> {
+        let columns = vec![
+            TableColumnRecord {
+                name: "id".to_string(),
+                column_type: TableColumnType::Int64,
+                nullable: false,
+                default_value: None,
+            },
+            TableColumnRecord {
+                name: "status".to_string(),
+                column_type: TableColumnType::Utf8,
+                nullable: false,
+                default_value: Some(ColumnDefaultValue::Utf8("new".to_string())),
+            },
+            TableColumnRecord {
+                name: "qty".to_string(),
+                column_type: TableColumnType::Int64,
+                nullable: false,
+                default_value: Some(ColumnDefaultValue::Int64(0)),
+            },
+            TableColumnRecord {
+                name: "created_at".to_string(),
+                column_type: TableColumnType::TimestampNanosecond,
+                nullable: false,
+                default_value: Some(ColumnDefaultValue::CurrentTimestampNanosecond),
+            },
+        ];
+        let checks = vec![
+            TableCheckConstraintRecord {
+                name: "qty_non_negative".to_string(),
+                expr: CheckExpression::Binary {
+                    op: CheckBinaryOperator::GtEq,
+                    left: Box::new(CheckExpression::Column("qty".to_string())),
+                    right: Box::new(CheckExpression::Literal(ColumnDefaultValue::Int64(0))),
+                },
+            },
+            TableCheckConstraintRecord {
+                name: "status_not_empty".to_string(),
+                expr: CheckExpression::Binary {
+                    op: CheckBinaryOperator::NotEq,
+                    left: Box::new(CheckExpression::Column("status".to_string())),
+                    right: Box::new(CheckExpression::Literal(ColumnDefaultValue::Utf8(
+                        "".to_string(),
+                    ))),
+                },
+            },
+        ];
+
+        validate_table_constraints(columns.as_slice(), checks.as_slice())?;
+
+        let mut row = vec![
+            ScalarValue::Int64(Some(1)),
+            ScalarValue::Null,
+            ScalarValue::Null,
+            ScalarValue::Null,
+        ];
+        let missing = vec![false, true, true, true];
+        apply_column_defaults_for_missing(
+            columns.as_slice(),
+            row.as_mut_slice(),
+            missing.as_slice(),
+            1_700_000_000_000_000_000,
+        )?;
+        validate_row_against_metadata(columns.as_slice(), checks.as_slice(), row.as_slice())?;
+
+        assert_eq!(row[1], ScalarValue::Utf8(Some("new".to_string())));
+        assert_eq!(row[2], ScalarValue::Int64(Some(0)));
+        assert!(matches!(
+            row[3],
+            ScalarValue::TimestampNanosecond(Some(_), _)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn row_check_violation_reports_23514() -> Result<()> {
+        let columns = vec![
+            TableColumnRecord {
+                name: "id".to_string(),
+                column_type: TableColumnType::Int64,
+                nullable: false,
+                default_value: None,
+            },
+            TableColumnRecord {
+                name: "qty".to_string(),
+                column_type: TableColumnType::Int64,
+                nullable: false,
+                default_value: None,
+            },
+        ];
+        let checks = vec![TableCheckConstraintRecord {
+            name: "qty_non_negative".to_string(),
+            expr: CheckExpression::Binary {
+                op: CheckBinaryOperator::GtEq,
+                left: Box::new(CheckExpression::Column("qty".to_string())),
+                right: Box::new(CheckExpression::Literal(ColumnDefaultValue::Int64(0))),
+            },
+        }];
+
+        validate_table_constraints(columns.as_slice(), checks.as_slice())?;
+        let err = validate_row_against_metadata(
+            columns.as_slice(),
+            checks.as_slice(),
+            &[ScalarValue::Int64(Some(1)), ScalarValue::Int64(Some(-5))],
+        )
+        .expect_err("negative qty should violate CHECK");
+        assert_eq!(err.sqlstate(), "23514");
         Ok(())
     }
 

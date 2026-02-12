@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -38,7 +38,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, info_span, warn, Instrument};
 
 use crate::metadata::{
-    table_model_row_v1, TableColumnRecord, TableColumnType, TableMetadataRecord,
+    apply_column_defaults_for_missing, table_model_row_v1, validate_row_against_metadata,
+    TableCheckConstraintRecord, TableColumnRecord, TableColumnType, TableMetadataRecord,
 };
 use crate::metrics::PushdownMetrics;
 use crate::topology::{fetch_topology, require_non_empty_topology, route_key, scan_targets};
@@ -55,6 +56,8 @@ const ROW_FORMAT_VERSION_V2: u8 = 2;
 const ROW_FLAG_TOMBSTONE: u8 = 0x01;
 const SIGN_FLIP_MASK: u64 = 1u64 << 63;
 const DEFAULT_MAX_SCAN_ROWS: usize = 100_000;
+const DISTRIBUTED_WRITE_RETRY_LIMIT: usize = 5;
+const DISTRIBUTED_WRITE_RETRY_DELAY_MS: u64 = 100;
 
 /// Executes `default max scan rows` for this component.
 fn default_max_scan_rows() -> usize {
@@ -139,7 +142,7 @@ pub enum ConditionalWriteOutcome {
     Conflict,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 /// Represents the `HoloProviderCodecSpec` component used by the holo_fusion runtime.
 pub struct HoloProviderCodecSpec {
     pub table_name: String,
@@ -147,6 +150,8 @@ pub struct HoloProviderCodecSpec {
     pub table_model: String,
     #[serde(default)]
     pub columns: Vec<TableColumnRecord>,
+    #[serde(default)]
+    pub check_constraints: Vec<TableCheckConstraintRecord>,
     #[serde(default)]
     pub primary_key_column: Option<String>,
     pub preferred_shards: Vec<usize>,
@@ -178,26 +183,31 @@ fn orders_columns() -> Vec<TableColumnRecord> {
             name: "order_id".to_string(),
             column_type: TableColumnType::Int64,
             nullable: false,
+            default_value: None,
         },
         TableColumnRecord {
             name: "customer_id".to_string(),
             column_type: TableColumnType::Int64,
             nullable: false,
+            default_value: None,
         },
         TableColumnRecord {
             name: "status".to_string(),
             column_type: TableColumnType::Utf8,
             nullable: true,
+            default_value: None,
         },
         TableColumnRecord {
             name: "total_cents".to_string(),
             column_type: TableColumnType::Int64,
             nullable: false,
+            default_value: None,
         },
         TableColumnRecord {
             name: "created_at".to_string(),
             column_type: TableColumnType::TimestampNanosecond,
             nullable: false,
+            default_value: None,
         },
     ]
 }
@@ -296,6 +306,7 @@ fn encode_generic_tombstone_value() -> Vec<u8> {
 pub struct HoloStoreTableProvider {
     schema: SchemaRef,
     columns: Vec<TableColumnRecord>,
+    check_constraints: Vec<TableCheckConstraintRecord>,
     table_name: String,
     table_id: u64,
     table_model: String,
@@ -476,6 +487,7 @@ impl HoloStoreTableProvider {
         Self {
             schema: orders_schema(),
             columns,
+            check_constraints: Vec::new(),
             table_name: ORDERS_TABLE_NAME.to_string(),
             table_id: ORDERS_TABLE_ID,
             table_model: ORDERS_TABLE_MODEL.to_string(),
@@ -505,6 +517,7 @@ impl HoloStoreTableProvider {
         Ok(Self {
             schema,
             columns,
+            check_constraints: table.check_constraints.clone(),
             table_name: table.table_name.clone(),
             table_id: table.table_id,
             table_model: table.table_model.clone(),
@@ -527,6 +540,7 @@ impl HoloStoreTableProvider {
             table_id: self.table_id,
             table_model: self.table_model.clone(),
             columns: self.columns.clone(),
+            check_constraints: self.check_constraints.clone(),
             primary_key_column: Some(self.primary_key_column.clone()),
             preferred_shards: self.preferred_shards.clone(),
             page_size: self.page_size,
@@ -556,6 +570,7 @@ impl HoloStoreTableProvider {
         Ok(Self {
             schema,
             columns,
+            check_constraints: spec.check_constraints,
             table_name: spec.table_name,
             table_id: spec.table_id,
             table_model: spec.table_model,
@@ -589,6 +604,11 @@ impl HoloStoreTableProvider {
     /// Executes `column definitions` for this component.
     pub fn columns(&self) -> &[TableColumnRecord] {
         self.columns.as_slice()
+    }
+
+    /// Returns persisted CHECK constraints for this table metadata.
+    pub fn check_constraints(&self) -> &[TableCheckConstraintRecord] {
+        self.check_constraints.as_slice()
     }
 
     /// Executes `is orders v1 table` for this component.
@@ -708,6 +728,43 @@ impl HoloStoreTableProvider {
             .iter()
             .map(|row| (row.order_id, encode_orders_row_value(row)))
             .collect::<Vec<_>>();
+        self.write_primary_entries(entries, "upsert").await
+    }
+
+    /// Upserts generic row_v1 rows encoded from typed ScalarValue vectors.
+    pub async fn upsert_generic_rows(&self, rows: &[Vec<ScalarValue>]) -> Result<u64> {
+        if self.row_codec_mode != RowCodecMode::RowV1 {
+            return Err(anyhow!(
+                "generic upsert helpers are only available for row_v1 table model"
+            ));
+        }
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let mut entries = Vec::with_capacity(rows.len());
+        for row in rows {
+            if row.len() != self.columns.len() {
+                return Err(anyhow!(
+                    "row_v1 upsert expects {} columns, got {}",
+                    self.columns.len(),
+                    row.len()
+                ));
+            }
+            validate_row_against_metadata(
+                self.columns.as_slice(),
+                self.check_constraints.as_slice(),
+                row.as_slice(),
+            )
+            .map_err(row_constraint_to_anyhow)?;
+            let primary_key = scalar_to_primary_key_i64(
+                row[self.primary_key_index].clone(),
+                &self.columns[self.primary_key_index],
+            )?;
+            let payload = self.encode_row_payload(row.as_slice())?;
+            entries.push((primary_key, payload));
+        }
+
         self.write_primary_entries(entries, "upsert").await
     }
 
@@ -1424,6 +1481,7 @@ impl HoloStoreTableProvider {
                 entries.extend(decode_generic_rows(
                     batch,
                     self.columns.as_slice(),
+                    self.check_constraints.as_slice(),
                     self.primary_key_index,
                 )?);
             }
@@ -1447,98 +1505,121 @@ impl HoloStoreTableProvider {
         if rows.is_empty() {
             return Ok(0);
         }
-
-        let topology = fetch_topology(&self.client)
-            .await
-            .with_context(|| format!("fetch topology for {op}"))?;
-        require_non_empty_topology(&topology)?;
-
-        let mut writes = BTreeMap::<WriteTarget, Vec<ReplicatedWriteEntry>>::new();
         let row_count = rows.len() as u64;
+        let mut last_error: Option<anyhow::Error> = None;
 
-        for (primary_key, value) in rows {
-            let key = encode_primary_key(self.table_id, primary_key);
-            let route = route_key(
-                &topology,
-                self.local_grpc_addr,
-                key.as_slice(),
-                &self.preferred_shards,
-            )
-            .ok_or_else(|| {
-                anyhow!(
-                    "no shard route found for key table={} primary_key={}",
-                    self.table_name,
-                    primary_key
-                )
-            })?;
-
-            let target = WriteTarget {
-                shard_index: route.shard_index,
-                grpc_addr: route.grpc_addr,
-                start_key: route.start_key,
-                end_key: route.end_key,
-            };
-            writes
-                .entry(target)
-                .or_default()
-                .push(ReplicatedWriteEntry { key, value });
-        }
-
-        let mut written = 0u64;
-        for (target, entries) in writes {
-            let expected = entries.len() as u64;
-            let write_client = self.client_for(target.grpc_addr);
-            let apply_span = info_span!(
-                "holo_fusion.distributed_write_apply",
-                table = %self.table_name,
-                op = op,
-                shard_index = target.shard_index,
-                target = %target.grpc_addr
-            );
-            let apply_started = Instant::now();
-            let applied = write_client
-                .range_write_latest(
-                    target.shard_index,
-                    target.start_key.as_slice(),
-                    target.end_key.as_slice(),
-                    entries,
-                )
-                .instrument(apply_span)
+        for attempt in 0..DISTRIBUTED_WRITE_RETRY_LIMIT.max(1) {
+            let topology = fetch_topology(&self.client)
                 .await
-                .with_context(|| {
-                    format!(
-                        "apply {op} batch table={} shard={} target={}",
-                        self.table_name, target.shard_index, target.grpc_addr
+                .with_context(|| format!("fetch topology for {op}"))?;
+            require_non_empty_topology(&topology)?;
+
+            let mut writes = BTreeMap::<WriteTarget, Vec<ReplicatedWriteEntry>>::new();
+            for (primary_key, value) in &rows {
+                let key = encode_primary_key(self.table_id, *primary_key);
+                let route = route_key(
+                    &topology,
+                    self.local_grpc_addr,
+                    key.as_slice(),
+                    &self.preferred_shards,
+                )
+                .ok_or_else(|| {
+                    anyhow!(
+                        "no shard route found for key table={} primary_key={}",
+                        self.table_name,
+                        primary_key
                     )
                 })?;
-            self.metrics.record_distributed_apply(
-                target.shard_index,
-                expected,
-                apply_started.elapsed(),
-            );
 
-            // Decision: evaluate `applied != expected` to choose the correct SQL/storage control path.
-            if applied != expected {
-                return Err(anyhow!(
-                    "partial {op} apply on shard {}: expected {}, applied {}",
-                    target.shard_index,
-                    expected,
-                    applied
-                ));
+                let target = WriteTarget {
+                    shard_index: route.shard_index,
+                    grpc_addr: route.grpc_addr,
+                    start_key: route.start_key,
+                    end_key: route.end_key,
+                };
+                writes
+                    .entry(target)
+                    .or_default()
+                    .push(ReplicatedWriteEntry {
+                        key,
+                        value: value.clone(),
+                    });
             }
-            written = written.saturating_add(applied);
+
+            let mut written = 0u64;
+            let mut attempt_error: Option<anyhow::Error> = None;
+            for (target, entries) in writes {
+                let expected = entries.len() as u64;
+                let write_client = self.client_for(target.grpc_addr);
+                let apply_span = info_span!(
+                    "holo_fusion.distributed_write_apply",
+                    table = %self.table_name,
+                    op = op,
+                    shard_index = target.shard_index,
+                    target = %target.grpc_addr
+                );
+                let apply_started = Instant::now();
+                match write_client
+                    .range_write_latest(
+                        target.shard_index,
+                        target.start_key.as_slice(),
+                        target.end_key.as_slice(),
+                        entries,
+                    )
+                    .instrument(apply_span)
+                    .await
+                {
+                    Ok(applied) => {
+                        self.metrics.record_distributed_apply(
+                            target.shard_index,
+                            expected,
+                            apply_started.elapsed(),
+                        );
+                        if applied != expected {
+                            attempt_error = Some(anyhow!(
+                                "partial {op} apply on shard {}: expected {}, applied {}",
+                                target.shard_index,
+                                expected,
+                                applied
+                            ));
+                            break;
+                        }
+                        written = written.saturating_add(applied);
+                    }
+                    Err(err) => {
+                        attempt_error = Some(anyhow!(
+                            "apply {op} batch table={} shard={} target={} failed: {err}",
+                            self.table_name,
+                            target.shard_index,
+                            target.grpc_addr
+                        ));
+                        break;
+                    }
+                }
+            }
+
+            if let Some(err) = attempt_error {
+                last_error = Some(err);
+                if attempt + 1 < DISTRIBUTED_WRITE_RETRY_LIMIT {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        DISTRIBUTED_WRITE_RETRY_DELAY_MS,
+                    ))
+                    .await;
+                    continue;
+                }
+            } else {
+                if written != row_count {
+                    return Err(anyhow!(
+                        "{op} row count mismatch: expected {}, written {}",
+                        row_count,
+                        written
+                    ));
+                }
+                return Ok(written);
+            }
         }
 
-        // Decision: evaluate `written != row_count` to choose the correct SQL/storage control path.
-        if written != row_count {
-            return Err(anyhow!(
-                "{op} row count mismatch: expected {}, written {}",
-                row_count,
-                written
-            ));
-        }
-
-        Ok(written)
+        Err(last_error.unwrap_or_else(|| anyhow!("distributed {op} write retries exhausted")))
     }
 
     /// Executes `client for` for this component.
@@ -2056,15 +2137,9 @@ fn decode_orders_rows(batch: &RecordBatch) -> Result<Vec<OrdersSeedRow>> {
 fn decode_generic_rows(
     batch: &RecordBatch,
     columns: &[TableColumnRecord],
+    checks: &[TableCheckConstraintRecord],
     primary_key_index: usize,
 ) -> Result<Vec<(i64, Vec<u8>)>> {
-    if batch.num_columns() != columns.len() {
-        return Err(anyhow!(
-            "row_v1 insert expects {} columns, got {}",
-            columns.len(),
-            batch.num_columns()
-        ));
-    }
     if primary_key_index >= columns.len() {
         return Err(anyhow!(
             "primary key index {} is out of bounds for {} columns",
@@ -2073,23 +2148,87 @@ fn decode_generic_rows(
         ));
     }
 
+    let mut metadata_index_by_name = BTreeMap::<String, usize>::new();
+    for (idx, column) in columns.iter().enumerate() {
+        metadata_index_by_name.insert(column.name.to_ascii_lowercase(), idx);
+    }
+
+    let mut input_index_by_metadata = vec![None; columns.len()];
+    for (input_idx, field) in batch.schema().fields().iter().enumerate() {
+        let normalized = field.name().to_ascii_lowercase();
+        let Some(metadata_idx) = metadata_index_by_name.get(normalized.as_str()).copied() else {
+            return Err(anyhow!(
+                "row_v1 insert references unknown column '{}' for table schema",
+                field.name()
+            ));
+        };
+        if input_index_by_metadata[metadata_idx].is_some() {
+            return Err(anyhow!(
+                "row_v1 insert contains duplicate column '{}' in input schema",
+                field.name()
+            ));
+        }
+        input_index_by_metadata[metadata_idx] = Some(input_idx);
+    }
+
     let mut rows = Vec::with_capacity(batch.num_rows());
+    let now_timestamp_ns = now_timestamp_nanos();
     for row_idx in 0..batch.num_rows() {
-        let mut encoded = Vec::with_capacity(columns.len());
+        let mut values = vec![ScalarValue::Null; columns.len()];
+        let mut missing_mask = vec![true; columns.len()];
         let mut primary_key: Option<i64> = None;
         for (col_idx, column) in columns.iter().enumerate() {
-            let scalar = ScalarValue::try_from_array(batch.column(col_idx).as_ref(), row_idx)?;
-            let payload = encode_scalar_payload(scalar.clone(), column)?;
-            if col_idx == primary_key_index {
-                let key = scalar_to_primary_key_i64(scalar, column)?;
+            if let Some(input_idx) = input_index_by_metadata[col_idx] {
+                values[col_idx] =
+                    ScalarValue::try_from_array(batch.column(input_idx).as_ref(), row_idx)?;
+                missing_mask[col_idx] = false;
+            }
+            if col_idx == primary_key_index && !matches!(values[col_idx], ScalarValue::Null) {
+                let key = scalar_to_primary_key_i64(values[col_idx].clone(), column)?;
                 primary_key = Some(key);
             }
+        }
+
+        apply_column_defaults_for_missing(
+            columns,
+            values.as_mut_slice(),
+            missing_mask.as_slice(),
+            now_timestamp_ns,
+        )
+        .map_err(row_constraint_to_anyhow)?;
+        validate_row_against_metadata(columns, checks, values.as_slice())
+            .map_err(row_constraint_to_anyhow)?;
+
+        if primary_key.is_none() {
+            let column = &columns[primary_key_index];
+            let key = scalar_to_primary_key_i64(values[primary_key_index].clone(), column)?;
+            primary_key = Some(key);
+        }
+
+        let mut encoded = Vec::with_capacity(columns.len());
+        for (column, value) in columns.iter().zip(values.iter()) {
+            let payload = encode_scalar_payload(value.clone(), column)?;
             encoded.push(payload);
         }
         let primary_key = primary_key.ok_or_else(|| anyhow!("missing primary key value"))?;
         rows.push((primary_key, encode_generic_row_value(encoded)));
     }
     Ok(rows)
+}
+
+fn now_timestamp_nanos() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration
+            .as_nanos()
+            .min(i64::MAX as u128)
+            .try_into()
+            .unwrap_or(i64::MAX),
+        Err(_) => 0,
+    }
+}
+
+fn row_constraint_to_anyhow(err: crate::metadata::RowConstraintError) -> anyhow::Error {
+    anyhow!("[{}] {}", err.sqlstate(), err.message())
 }
 
 /// Executes `scalar to required i64` for this component.

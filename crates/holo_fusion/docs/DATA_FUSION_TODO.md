@@ -75,3 +75,12 @@
   - Add idempotent conflict-safe conditional writes for concurrent migrators across nodes.
   - Add migration tests covering legacy decode, canonical backfill, and idempotent reruns.
 - [ ] #4 Extended type coverage and SQL defaults/check constraints roadmap.
+
+10. [ ] Complete Phase 9 distributed SQL execution evolution.
+- [x] Publish design baseline in `DISTRIBUTED_SQL_EXECUTION_DESIGN.md`.
+- [ ] Phase A: instrumentation and plan placement introspection.
+- [ ] Phase B: leaseholder filter/projection pushdown via typed scan contract.
+- [ ] Phase C: distributed partial aggregation/top-k.
+- [ ] Phase D: distributed joins with bounded-memory exchanges.
+- [ ] Phase E: failure semantics, resume, and topology-churn safety.
+- [ ] Phase F: production SLO gates and regression automation.

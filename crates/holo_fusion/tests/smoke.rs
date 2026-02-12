@@ -624,6 +624,78 @@ async fn phase8_generic_row_model_create_insert_select() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase8_row_v1_defaults_and_check_constraints() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    client
+        .batch_execute(
+            "CREATE TABLE metric_defaults (
+                metric_id BIGINT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'new',
+                sample_count BIGINT NOT NULL DEFAULT 0,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (metric_id),
+                CHECK (sample_count >= 0),
+                CONSTRAINT status_non_empty CHECK (status <> '')
+            );",
+        )
+        .await
+        .context("create row_v1 table with defaults and checks")?;
+
+    let inserted = client
+        .execute(
+            "INSERT INTO metric_defaults (metric_id) VALUES (1), (2)",
+            &[],
+        )
+        .await
+        .context("insert rows that rely on DEFAULT values")?;
+    assert_eq!(inserted, 2);
+
+    let row = client
+        .query_one(
+            "SELECT status, sample_count, created_at IS NOT NULL
+             FROM metric_defaults
+             WHERE metric_id = 1",
+            &[],
+        )
+        .await
+        .context("read back defaulted row values")?;
+    assert_eq!(row.try_get::<_, String>(0)?, "new");
+    assert_eq!(row.try_get::<_, i64>(1)?, 0);
+    assert!(row.try_get::<_, bool>(2)?);
+
+    let check_insert_err = client
+        .execute(
+            "INSERT INTO metric_defaults (metric_id, sample_count) VALUES (3, -1)",
+            &[],
+        )
+        .await
+        .expect_err("negative sample_count must violate CHECK");
+    assert_error_contains(&check_insert_err, "check constraint");
+
+    let null_insert_err = client
+        .execute(
+            "INSERT INTO metric_defaults (metric_id, status) VALUES (4, NULL)",
+            &[],
+        )
+        .await
+        .expect_err("explicit NULL status must violate not-null");
+    assert_error_contains(&null_insert_err, "violates not-null constraint");
+
+    let check_update_err = client
+        .execute(
+            "UPDATE metric_defaults SET sample_count = -5 WHERE metric_id = 1",
+            &[],
+        )
+        .await
+        .expect_err("UPDATE must enforce CHECK constraints");
+    assert_sqlstate(&check_update_err, "23514");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn phase5_update_delete_strict_semantics_and_prepared_retry() -> Result<()> {
     let harness = TestHarness::start().await?;
     let (client, _guard) = harness.connect_pg().await?;
@@ -1305,6 +1377,21 @@ fn assert_sqlstate(err: &tokio_postgres::Error, expected: &str) {
         actual,
         Some(expected),
         "unexpected SQLSTATE for error: {err}"
+    );
+}
+
+fn assert_error_contains(err: &tokio_postgres::Error, needle: &str) {
+    let message = if let Some(db) = err.as_db_error() {
+        let detail = db.detail().unwrap_or_default();
+        let hint = db.hint().unwrap_or_default();
+        format!("{} {} {}", db.message(), detail, hint)
+    } else {
+        err.to_string()
+    }
+    .to_ascii_lowercase();
+    assert!(
+        message.contains(&needle.to_ascii_lowercase()),
+        "expected error message to contain '{needle}', got: {err}"
     );
 }
 
