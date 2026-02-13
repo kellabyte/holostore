@@ -44,9 +44,9 @@ use crate::metadata::{
 };
 use crate::metrics::PushdownMetrics;
 use crate::provider::{
-    encode_orders_row_value, encode_orders_tombstone_value, orders_schema, ConditionalOrderWrite,
-    ConditionalPrimaryWrite, ConditionalWriteOutcome, HoloStoreTableProvider, OrdersSeedRow,
-    VersionedOrdersRow,
+    encode_orders_row_value, encode_orders_tombstone_value, is_duplicate_key_violation_message,
+    orders_schema, ConditionalOrderWrite, ConditionalPrimaryWrite, ConditionalWriteOutcome,
+    DuplicateKeyViolation, HoloStoreTableProvider, OrdersSeedRow, VersionedOrdersRow,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -136,6 +136,7 @@ impl DmlHook {
         &self,
         statement: &Statement,
         session_id: &str,
+        query_execution_id: &str,
         protocol: QueryProtocol,
         future: impl std::future::Future<Output = PgWireResult<Response>>,
     ) -> PgWireResult<Response> {
@@ -152,6 +153,7 @@ impl DmlHook {
 
         let span = info_span!(
             "holo_fusion.statement",
+            query_execution_id = query_execution_id,
             statement = statement_kind(statement),
             protocol = protocol.as_str(),
             session_id = session_id
@@ -185,20 +187,28 @@ impl DmlHook {
         &self,
         statement: &Statement,
         params: &ParamValues,
+        session_id: &str,
         session_context: &SessionContext,
         client: &mut (dyn ClientInfo + Send + Sync),
         protocol: QueryProtocol,
     ) -> Option<PgWireResult<Response>> {
-        let session_id = self.session_id_for_client(client);
-        let has_active_txn = self.session_has_transaction(&session_id).await;
+        let query_execution_id = self
+            .pushdown_metrics
+            .active_query_execution_id(session_id)
+            .unwrap_or_else(|| {
+                self.pushdown_metrics
+                    .ensure_query_execution_for_session(session_id, statement_kind(statement))
+            });
+        let has_active_txn = self.session_has_transaction(session_id).await;
 
         if is_txn_control_statement(statement) {
             return Some(
                 self.run_statement_with_controls(
                     statement,
-                    session_id.as_str(),
+                    session_id,
+                    query_execution_id.as_str(),
                     protocol,
-                    self.handle_txn_control(statement, session_context, session_id.clone()),
+                    self.handle_txn_control(statement, session_context, session_id.to_string()),
                 )
                 .await,
             );
@@ -206,56 +216,85 @@ impl DmlHook {
 
         if has_active_txn {
             return Some(
-                self.run_statement_with_controls(statement, session_id.as_str(), protocol, async {
-                    self.route_transactional_statement(
-                        statement,
-                        params,
-                        &session_id,
-                        session_context,
-                        client,
-                        protocol,
-                    )
-                    .await
-                    .unwrap_or_else(|| {
-                        Err(to_user_error(
-                            "0A000",
-                            "statement is not supported inside explicit transactions",
-                        ))
-                    })
-                })
+                self.run_statement_with_controls(
+                    statement,
+                    session_id,
+                    query_execution_id.as_str(),
+                    protocol,
+                    async {
+                        self.route_transactional_statement(
+                            statement,
+                            params,
+                            session_id,
+                            session_context,
+                            client,
+                            protocol,
+                        )
+                        .await
+                        .unwrap_or_else(|| {
+                            Err(to_user_error(
+                                "0A000",
+                                "statement is not supported inside explicit transactions",
+                            ))
+                        })
+                    },
+                )
+                .await,
+            );
+        }
+
+        if matches!(statement, Statement::Explain { .. }) {
+            return Some(
+                self.run_statement_with_controls(
+                    statement,
+                    session_id,
+                    query_execution_id.as_str(),
+                    protocol,
+                    async {
+                        execute_explain_dist(
+                            statement,
+                            session_context,
+                            client,
+                            protocol,
+                            query_execution_id.as_str(),
+                        )
+                        .await
+                    },
+                )
                 .await,
             );
         }
 
         if let Statement::CreateTable(create) = statement {
             return Some(
-                self.run_statement_with_controls(statement, session_id.as_str(), protocol, async {
-                    execute_create_table(
-                        create,
-                        session_context,
-                        self.holostore_client.clone(),
-                        self.pushdown_metrics.clone(),
-                    )
-                    .await
-                })
+                self.run_statement_with_controls(
+                    statement,
+                    session_id,
+                    query_execution_id.as_str(),
+                    protocol,
+                    async {
+                        execute_create_table(
+                            create,
+                            session_context,
+                            self.holostore_client.clone(),
+                            self.pushdown_metrics.clone(),
+                        )
+                        .await
+                    },
+                )
                 .await,
             );
         }
 
         if let Statement::Insert(insert) = statement {
-            let values_insert = insert
-                .source
-                .as_ref()
-                .map(|source| matches!(source.body.as_ref(), SetExpr::Values(_)))
-                .unwrap_or(false);
-            if !values_insert {
-                return None;
-            }
-
             return Some(
-                self.run_statement_with_controls(statement, session_id.as_str(), protocol, async {
-                    execute_insert(insert, params, session_context).await
-                })
+                self.run_statement_with_controls(
+                    statement,
+                    session_id,
+                    query_execution_id.as_str(),
+                    protocol,
+                    async { execute_insert(insert, params, session_context).await },
+                )
                 .await,
             );
         }
@@ -265,16 +304,22 @@ impl DmlHook {
         }
 
         Some(
-            self.run_statement_with_controls(statement, session_id.as_str(), protocol, async {
-                execute_dml(
-                    statement,
-                    params,
-                    session_context,
-                    self.config,
-                    self.pushdown_metrics.as_ref(),
-                )
-                .await
-            })
+            self.run_statement_with_controls(
+                statement,
+                session_id,
+                query_execution_id.as_str(),
+                protocol,
+                async {
+                    execute_dml(
+                        statement,
+                        params,
+                        session_context,
+                        self.config,
+                        self.pushdown_metrics.as_ref(),
+                    )
+                    .await
+                },
+            )
             .await,
         )
     }
@@ -528,6 +573,7 @@ impl QueryProtocol {
 }
 
 const SESSION_TXN_ID_KEY: &str = "holo_fusion.txn.session_id";
+const SESSION_QUERY_EXEC_ID_KEY: &str = "holo_fusion.query.execution_id";
 
 /// Extracts backend PID from our generated session id.
 fn parse_backend_pid(session_id: &str) -> i32 {
@@ -808,15 +854,35 @@ impl QueryHook for DmlHook {
         session_context: &SessionContext,
         client: &mut (dyn ClientInfo + Send + Sync),
     ) -> Option<PgWireResult<Response>> {
+        let session_id = self.session_id_for_client(client);
+        let query_execution_id = self.pushdown_metrics.begin_query_execution(
+            session_id.as_str(),
+            statement_kind(statement),
+            QueryProtocol::Simple.as_str(),
+        );
+        client.metadata_mut().insert(
+            SESSION_QUERY_EXEC_ID_KEY.to_string(),
+            query_execution_id.clone(),
+        );
         let params = ParamValues::List(Vec::new());
-        self.route_statement(
-            statement,
-            &params,
-            session_context,
-            client,
-            QueryProtocol::Simple,
-        )
-        .await
+        let routed = self
+            .route_statement(
+                statement,
+                &params,
+                session_id.as_str(),
+                session_context,
+                client,
+                QueryProtocol::Simple,
+            )
+            .await;
+        if let Some(result) = &routed {
+            self.pushdown_metrics.finish_query_execution(
+                session_id.as_str(),
+                query_execution_id.as_str(),
+                result.is_ok(),
+            );
+        }
+        routed
     }
 
     /// Executes `handle extended parse query` for this component.
@@ -826,15 +892,6 @@ impl QueryHook for DmlHook {
         _session_context: &SessionContext,
         _client: &(dyn ClientInfo + Send + Sync),
     ) -> Option<PgWireResult<LogicalPlan>> {
-        let insert_values = match statement {
-            Statement::Insert(insert) => insert
-                .source
-                .as_ref()
-                .map(|source| matches!(source.body.as_ref(), SetExpr::Values(_)))
-                .unwrap_or(false),
-            _ => false,
-        };
-
         // Decision: evaluate `matches!(` to choose the correct SQL/storage control path.
         if matches!(
             statement,
@@ -844,8 +901,8 @@ impl QueryHook for DmlHook {
                 | Statement::StartTransaction { .. }
                 | Statement::Commit { .. }
                 | Statement::Rollback { .. }
-        ) || insert_values
-        {
+                | Statement::Insert(_)
+        ) {
             Some(dml_placeholder_plan(statement))
         } else {
             None
@@ -861,14 +918,34 @@ impl QueryHook for DmlHook {
         session_context: &SessionContext,
         client: &mut (dyn ClientInfo + Send + Sync),
     ) -> Option<PgWireResult<Response>> {
-        self.route_statement(
-            statement,
-            params,
-            session_context,
-            client,
-            QueryProtocol::Extended,
-        )
-        .await
+        let session_id = self.session_id_for_client(client);
+        let query_execution_id = self.pushdown_metrics.begin_query_execution(
+            session_id.as_str(),
+            statement_kind(statement),
+            QueryProtocol::Extended.as_str(),
+        );
+        client.metadata_mut().insert(
+            SESSION_QUERY_EXEC_ID_KEY.to_string(),
+            query_execution_id.clone(),
+        );
+        let routed = self
+            .route_statement(
+                statement,
+                params,
+                session_id.as_str(),
+                session_context,
+                client,
+                QueryProtocol::Extended,
+            )
+            .await;
+        if let Some(result) = &routed {
+            self.pushdown_metrics.finish_query_execution(
+                session_id.as_str(),
+                query_execution_id.as_str(),
+                result.is_ok(),
+            );
+        }
+        routed
     }
 }
 
@@ -890,6 +967,7 @@ fn statement_kind(statement: &Statement) -> &'static str {
         Statement::Update { .. } => "UPDATE",
         Statement::Delete(_) => "DELETE",
         Statement::Insert(_) => "INSERT",
+        Statement::Explain { .. } => "EXPLAIN",
         Statement::Query(_) => "QUERY",
         _ => "OTHER",
     }
@@ -961,17 +1039,12 @@ async fn execute_insert(
         ));
     }
 
-    let source = insert.source.as_ref().ok_or_else(|| {
-        to_user_error(
-            "0A000",
-            "INSERT source is required; only VALUES inserts are supported",
-        )
-    })?;
+    let source = insert
+        .source
+        .as_ref()
+        .ok_or_else(|| to_user_error("0A000", "INSERT source is required"))?;
     let SetExpr::Values(values) = source.body.as_ref() else {
-        return Err(to_user_error(
-            "0A000",
-            "INSERT INTO ... SELECT is routed through DataFusion execution",
-        ));
+        return execute_insert_via_datafusion(insert, session_context).await;
     };
     if values.rows.is_empty() {
         return Ok(Response::Execution(
@@ -1004,9 +1077,9 @@ async fn execute_insert(
             .map(|exprs| decode_insert_orders_row(exprs, &columns, params))
             .collect::<PgWireResult<Vec<_>>>()?;
         let written = provider
-            .upsert_orders_rows(rows.as_slice())
+            .insert_orders_rows(rows.as_slice())
             .await
-            .map_err(|err| api_error(err.to_string()))?;
+            .map_err(map_insert_provider_error)?;
         return Ok(Response::Execution(
             Tag::new("INSERT").with_oid(0).with_rows(written as usize),
         ));
@@ -1080,12 +1153,77 @@ async fn execute_insert(
     }
 
     let written = provider
-        .upsert_generic_rows(generic_rows.as_slice())
+        .insert_generic_rows(generic_rows.as_slice())
         .await
-        .map_err(|err| api_error(err.to_string()))?;
+        .map_err(map_insert_provider_error)?;
     Ok(Response::Execution(
         Tag::new("INSERT").with_oid(0).with_rows(written as usize),
     ))
+}
+
+/// Executes `execute insert via datafusion` for non-VALUES INSERT forms.
+async fn execute_insert_via_datafusion(
+    insert: &Insert,
+    session_context: &SessionContext,
+) -> PgWireResult<Response> {
+    let statement = Statement::Insert(insert.clone());
+    let df_statement = datafusion::sql::parser::Statement::Statement(Box::new(statement));
+    let logical_plan = session_context
+        .state()
+        .statement_to_plan(df_statement)
+        .await
+        .map_err(map_insert_datafusion_error)?;
+    let optimized = session_context
+        .state()
+        .optimize(&logical_plan)
+        .map_err(map_insert_datafusion_error)?;
+    let dataframe = session_context
+        .execute_logical_plan(optimized)
+        .await
+        .map_err(map_insert_datafusion_error)?;
+    let result = dataframe
+        .collect()
+        .await
+        .map_err(map_insert_datafusion_error)?;
+
+    let rows_affected = result
+        .first()
+        .and_then(|batch| batch.column_by_name("count"))
+        .and_then(|col| {
+            col.as_any()
+                .downcast_ref::<datafusion::arrow::array::UInt64Array>()
+        })
+        .map_or(0usize, |array| array.value(0) as usize);
+    Ok(Response::Execution(
+        Tag::new("INSERT").with_oid(0).with_rows(rows_affected),
+    ))
+}
+
+/// Maps provider INSERT errors to PostgreSQL-compatible SQLSTATEs.
+fn map_insert_provider_error(err: anyhow::Error) -> PgWireError {
+    if let Some(duplicate) = err.downcast_ref::<DuplicateKeyViolation>() {
+        return to_user_error("23505", duplicate.to_string());
+    }
+    api_error(err.to_string())
+}
+
+/// Maps DataFusion INSERT execution errors to PostgreSQL-compatible SQLSTATEs.
+fn map_insert_datafusion_error(err: impl std::fmt::Display) -> PgWireError {
+    let message = err.to_string();
+    if is_duplicate_key_violation_message(message.as_str()) {
+        return to_user_error("23505", extract_duplicate_key_message(message.as_str()));
+    }
+    api_error(message)
+}
+
+/// Extracts a concise duplicate-key violation message from nested execution errors.
+fn extract_duplicate_key_message(message: &str) -> String {
+    for line in message.lines() {
+        if is_duplicate_key_violation_message(line) {
+            return line.trim().to_string();
+        }
+    }
+    message.trim().to_string()
 }
 
 /// Executes `execute create table` for this component.
@@ -2760,6 +2898,199 @@ async fn execute_query_in_transaction(
     Ok(Response::Query(query))
 }
 
+/// Executes `EXPLAIN DIST`-style plan classification with placement annotations.
+async fn execute_explain_dist(
+    statement: &Statement,
+    session_context: &SessionContext,
+    client: &(dyn ClientInfo + Send + Sync),
+    protocol: QueryProtocol,
+    query_execution_id: &str,
+) -> PgWireResult<Response> {
+    let Statement::Explain {
+        statement: explained,
+        analyze,
+        verbose,
+        ..
+    } = statement
+    else {
+        return Err(api_error("expected EXPLAIN statement"));
+    };
+
+    let explain_sql = if *analyze {
+        format!("EXPLAIN ANALYZE VERBOSE {}", explained)
+    } else if *verbose {
+        format!("EXPLAIN VERBOSE {}", explained)
+    } else {
+        format!("EXPLAIN {}", explained)
+    };
+
+    let explain_df = session_context
+        .sql(explain_sql.as_str())
+        .await
+        .map_err(|err| api_error(err.to_string()))?;
+    let batches = explain_df
+        .collect()
+        .await
+        .map_err(|err| api_error(err.to_string()))?;
+
+    let mut plan_lines = Vec::new();
+    for batch in &batches {
+        for row_idx in 0..batch.num_rows() {
+            for col_idx in 0..batch.num_columns() {
+                let scalar = ScalarValue::try_from_array(batch.column(col_idx).as_ref(), row_idx)
+                    .map_err(|err| api_error(err.to_string()))?;
+                match scalar {
+                    ScalarValue::Utf8(Some(text)) | ScalarValue::LargeUtf8(Some(text)) => {
+                        if !text.trim().is_empty() {
+                            plan_lines.push(text);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let rows = classify_explain_placement(plan_lines.as_slice(), query_execution_id);
+    let batch = explain_dist_rows_to_batch(rows.as_slice())?;
+    let schema = batch.schema();
+    let mem =
+        MemTable::try_new(schema, vec![vec![batch]]).map_err(|err| api_error(err.to_string()))?;
+
+    let query_ctx = SessionContext::new();
+    query_ctx
+        .register_table("holo_explain_dist", Arc::new(mem))
+        .map_err(|err| api_error(err.to_string()))?;
+    let dataframe = query_ctx
+        .sql("SELECT stage, placement, detail FROM holo_explain_dist")
+        .await
+        .map_err(|err| api_error(err.to_string()))?;
+
+    let format_options = Arc::new(FormatOptions::from_client_metadata(client.metadata()));
+    let wire_format = match protocol {
+        QueryProtocol::Simple => Format::UnifiedText,
+        QueryProtocol::Extended => Format::UnifiedBinary,
+    };
+    let query = df::encode_dataframe(dataframe, &wire_format, Some(format_options))
+        .await
+        .map_err(|err| api_error(err.to_string()))?;
+    Ok(Response::Query(query))
+}
+
+/// Converts explain placement rows into a record batch.
+fn explain_dist_rows_to_batch(rows: &[(String, String, String)]) -> PgWireResult<RecordBatch> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("stage", ArrowDataType::Utf8, false),
+        Field::new("placement", ArrowDataType::Utf8, false),
+        Field::new("detail", ArrowDataType::Utf8, false),
+    ]));
+
+    let mut stage_builder = StringBuilder::new();
+    let mut placement_builder = StringBuilder::new();
+    let mut detail_builder = StringBuilder::new();
+    for row in rows {
+        stage_builder.append_value(row.0.as_str());
+        placement_builder.append_value(row.1.as_str());
+        detail_builder.append_value(row.2.as_str());
+    }
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(stage_builder.finish()) as ArrayRef,
+            Arc::new(placement_builder.finish()) as ArrayRef,
+            Arc::new(detail_builder.finish()) as ArrayRef,
+        ],
+    )
+    .map_err(|err| api_error(err.to_string()))
+}
+
+/// Classifies physical plan lines into placement-oriented stage rows.
+fn classify_explain_placement(
+    plan_lines: &[String],
+    query_execution_id: &str,
+) -> Vec<(String, String, String)> {
+    let mut rows = vec![(
+        "query".to_string(),
+        "gateway".to_string(),
+        format!("query_execution_id={query_execution_id}"),
+    )];
+
+    for line in plan_lines {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("holostoretableprovider") || lower.contains("tablescan") {
+            rows.push((
+                "scan".to_string(),
+                "executor+leaseholder".to_string(),
+                line.clone(),
+            ));
+            continue;
+        }
+        if lower.contains("filterexec") || lower.contains("projectionexec") {
+            rows.push((
+                "filter_projection".to_string(),
+                "executor-local".to_string(),
+                line.clone(),
+            ));
+            continue;
+        }
+        if lower.contains("aggregateexec") && lower.contains("mode=partial") {
+            rows.push((
+                "aggregate_partial".to_string(),
+                "executor-local".to_string(),
+                line.clone(),
+            ));
+            continue;
+        }
+        if lower.contains("aggregateexec") && lower.contains("mode=final") {
+            rows.push((
+                "aggregate_final".to_string(),
+                "merge/gateway".to_string(),
+                line.clone(),
+            ));
+            continue;
+        }
+        if (lower.contains("sortexec") && lower.contains("fetch="))
+            || lower.contains("sortpreservingmergeexec")
+        {
+            rows.push((
+                "topk".to_string(),
+                "executor+merge".to_string(),
+                line.clone(),
+            ));
+            continue;
+        }
+        if lower.contains("hashjoinexec") || lower.contains("sortmergejoinexec") {
+            rows.push((
+                "join".to_string(),
+                "distributed-executor".to_string(),
+                line.clone(),
+            ));
+            continue;
+        }
+        if lower.contains("repartitionexec")
+            || lower.contains("coalescepartitionsexec")
+            || lower.contains("coalescebatchesexec")
+        {
+            rows.push((
+                "exchange".to_string(),
+                "networked-executor".to_string(),
+                line.clone(),
+            ));
+        }
+    }
+
+    rows.dedup();
+    if rows.len() == 1 {
+        rows.push((
+            "plan".to_string(),
+            "gateway".to_string(),
+            "no distributed physical operators detected".to_string(),
+        ));
+    }
+    rows
+}
+
 /// Executes `with active txn mut` for this component.
 async fn with_active_txn_mut<T>(
     tx_manager: &TxnSessionManager,
@@ -4278,4 +4609,31 @@ fn aborted_tx_error() -> PgWireError {
         "25P02",
         "current transaction is aborted, commands ignored until end of transaction block",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_explain_placement_detects_key_stages() {
+        let lines = vec![
+            "TableScan: orders".to_string(),
+            "ProjectionExec: expr=[order_id@0]".to_string(),
+            "AggregateExec: mode=Partial".to_string(),
+            "AggregateExec: mode=Final".to_string(),
+            "HashJoinExec: mode=Partitioned".to_string(),
+            "RepartitionExec: partitioning=Hash([order_id@0], 8)".to_string(),
+            "SortExec: fetch=10".to_string(),
+        ];
+
+        let rows = classify_explain_placement(lines.as_slice(), "q0000000000000001");
+        assert!(rows.iter().any(|row| row.0 == "query"));
+        assert!(rows.iter().any(|row| row.0 == "scan"));
+        assert!(rows.iter().any(|row| row.0 == "aggregate_partial"));
+        assert!(rows.iter().any(|row| row.0 == "aggregate_final"));
+        assert!(rows.iter().any(|row| row.0 == "join"));
+        assert!(rows.iter().any(|row| row.0 == "exchange"));
+        assert!(rows.iter().any(|row| row.0 == "topk"));
+    }
 }

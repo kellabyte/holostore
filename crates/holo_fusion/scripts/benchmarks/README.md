@@ -15,6 +15,7 @@ This directory contains quick SQL benchmark tooling for:
 - `select.sql`: pgbench point-select workload
 - `update.sql`: pgbench point-update workload
 - `run_pgbench_suite.sh`: runs insert/select/update workloads sequentially
+- `run_phase9_sales_facts_canary.sh`: Phase 9 ingest canary with split-churn + SLO gating + metrics/topology snapshots
 
 CockroachDB data is stored in:
 
@@ -42,6 +43,12 @@ Run suite against HoloFusion:
 
 ```bash
 TARGET=holofusion ./crates/holo_fusion/scripts/benchmarks/run_pgbench_suite.sh
+```
+
+Run Phase 9 canary (3-node HoloFusion dev cluster + `sales_facts` 20k/50k ingest gate):
+
+```bash
+./crates/holo_fusion/scripts/benchmarks/run_phase9_sales_facts_canary.sh
 ```
 
 Stop CockroachDB cluster:

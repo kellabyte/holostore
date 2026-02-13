@@ -355,67 +355,138 @@ async fn phase4_insert_select_generate_series_round_trip() -> Result<()> {
     let (client, _guard) = harness.connect_pg().await?;
 
     let before = client
-        .query_one("SELECT COUNT(*)::BIGINT FROM orders", &[])
+        .query_one("SELECT COUNT(order_id)::BIGINT FROM orders", &[])
         .await
         .context("count rows before insert-select")?
         .try_get::<_, i64>(0)?;
     assert_eq!(before, 0);
 
+    let insert_stmt = "INSERT INTO orders (order_id, customer_id, status, total_cents, created_at)
+         SELECT
+           (SELECT COALESCE(MAX(order_id), 0) FROM orders) + i,
+           2000 + (i % 500),
+           CASE
+             WHEN i % 4 = 0 THEN 'paid'
+             WHEN i % 4 = 1 THEN 'pending'
+             WHEN i % 4 = 2 THEN 'shipped'
+             ELSE 'cancelled'
+           END,
+           500 + ((i * 37) % 50000),
+           TIMESTAMP '2026-02-11 00:00:00' + (i || ' seconds')::interval
+         FROM generate_series(1, 10000) AS g(i)";
+
+    for run in 1..=3 {
+        let inserted = client
+            .execute(insert_stmt, &[])
+            .await
+            .with_context(|| format!("run insert-select generate_series iteration {run}"))?;
+        assert_eq!(inserted, 10_000);
+
+        let after = client
+            .query_one("SELECT COUNT(order_id)::BIGINT FROM orders", &[])
+            .await
+            .with_context(|| format!("count rows after insert-select iteration {run}"))?
+            .try_get::<_, i64>(0)?;
+        assert_eq!(after, (run as i64) * 10_000);
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase4_insert_values_duplicate_primary_key_returns_23505() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    client
+        .execute(
+            "INSERT INTO orders (order_id, customer_id, status, total_cents, created_at)
+             VALUES (9101, 77, 'paid', 1299, TIMESTAMP '2026-02-11 00:00:00')",
+            &[],
+        )
+        .await
+        .context("insert baseline row into orders")?;
+
+    let duplicate_err = client
+        .execute(
+            "INSERT INTO orders (order_id, customer_id, status, total_cents, created_at)
+             VALUES (9101, 88, 'pending', 2399, TIMESTAMP '2026-02-11 00:00:01')",
+            &[],
+        )
+        .await
+        .expect_err("duplicate INSERT should fail with unique-violation");
+    assert_sqlstate(&duplicate_err, "23505");
+
+    let count = client
+        .query_one(
+            "SELECT COUNT(order_id)::BIGINT FROM orders WHERE order_id = 9101",
+            &[],
+        )
+        .await
+        .context("count surviving duplicate-key row")?
+        .try_get::<_, i64>(0)?;
+    assert_eq!(count, 1);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase4_insert_select_duplicate_primary_key_returns_23505() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    client
+        .batch_execute(
+            "CREATE TABLE sales_facts (
+                order_id BIGINT NOT NULL,
+                customer_id BIGINT NOT NULL,
+                merchant_id BIGINT NOT NULL,
+                region_id BIGINT NOT NULL,
+                event_day BIGINT NOT NULL,
+                status VARCHAR NOT NULL,
+                amount_cents BIGINT NOT NULL,
+                PRIMARY KEY (order_id)
+            );",
+        )
+        .await
+        .context("create sales_facts")?;
+
+    let insert_stmt = "INSERT INTO sales_facts (
+            order_id, customer_id, merchant_id, region_id, event_day, status, amount_cents
+        )
+        SELECT
+          i AS order_id,
+          100000 + (i % 500000) AS customer_id,
+          1 + (i % 20000) AS merchant_id,
+          1 + (i % 20) AS region_id,
+          1 + ((i - 1) / 86400) AS event_day,
+          CASE
+            WHEN i % 10 < 6 THEN 'paid'
+            WHEN i % 10 < 8 THEN 'shipped'
+            WHEN i % 10 = 8 THEN 'pending'
+            ELSE 'cancelled'
+          END AS status,
+          100 + ((i * 37) % 20000) AS amount_cents
+        FROM generate_series(1, 2000) AS g(i)";
+
     let inserted = client
-        .execute(
-            "INSERT INTO orders (order_id, customer_id, status, total_cents, created_at)
-             SELECT
-               1000000 + i,
-               2000 + (i % 500),
-               CASE
-                 WHEN i % 4 = 0 THEN 'paid'
-                 WHEN i % 4 = 1 THEN 'pending'
-                 WHEN i % 4 = 2 THEN 'shipped'
-                 ELSE 'cancelled'
-               END,
-               500 + ((i * 37) % 50000),
-               TIMESTAMP '2026-02-11 00:00:00' + (i || ' seconds')::interval
-             FROM generate_series(1, 10000) AS g(i)",
-            &[],
-        )
+        .execute(insert_stmt, &[])
         .await
-        .context("run insert-select generate_series")?;
-    assert_eq!(inserted, 10_000);
+        .context("run initial insert-select into sales_facts")?;
+    assert_eq!(inserted, 2_000);
 
-    let after_first = client
-        .query_one("SELECT COUNT(*)::BIGINT FROM orders", &[])
+    let duplicate_err = client
+        .execute(insert_stmt, &[])
         .await
-        .context("count rows after first insert-select")?
+        .expect_err("duplicate insert-select should fail with unique-violation");
+    assert_sqlstate(&duplicate_err, "23505");
+
+    let count = client
+        .query_one("SELECT COUNT(order_id)::BIGINT FROM sales_facts", &[])
+        .await
+        .context("count rows after duplicate insert-select failure")?
         .try_get::<_, i64>(0)?;
-    assert_eq!(after_first, 10_000);
-
-    let inserted_again = client
-        .execute(
-            "INSERT INTO orders (order_id, customer_id, status, total_cents, created_at)
-             SELECT
-               1000000 + i,
-               2000 + (i % 500),
-               CASE
-                 WHEN i % 4 = 0 THEN 'paid'
-                 WHEN i % 4 = 1 THEN 'pending'
-                 WHEN i % 4 = 2 THEN 'shipped'
-                 ELSE 'cancelled'
-               END,
-               500 + ((i * 37) % 50000),
-               TIMESTAMP '2026-02-11 00:00:00' + (i || ' seconds')::interval
-             FROM generate_series(1, 10000) AS g(i)",
-            &[],
-        )
-        .await
-        .context("run second insert-select generate_series")?;
-    assert_eq!(inserted_again, 10_000);
-
-    let after_second = client
-        .query_one("SELECT COUNT(*)::BIGINT FROM orders", &[])
-        .await
-        .context("count rows after second insert-select")?
-        .try_get::<_, i64>(0)?;
-    assert_eq!(after_second, 10_000);
+    assert_eq!(count, 2_000);
 
     Ok(())
 }
@@ -1362,12 +1433,60 @@ async fn phase7_metrics_expose_txn_distributed_and_guardrail_counters() -> Resul
         "admission_reject_count=",
         "scan_row_limit_reject_count=",
         "txn_stage_limit_reject_count=",
+        "query_execution_started=",
+        "query_execution_completed=",
+        "query_execution_failed=",
+        "stage_events=",
+        "scan_retry_count=",
+        "scan_reroute_count=",
+        "scan_chunk_count=",
+        "scan_duplicate_rows_skipped=",
+        "active_query_sessions=",
     ] {
         assert!(
             metrics.contains(key),
             "missing metric key '{key}' in body: {metrics}"
         );
     }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase9_explain_dist_reports_stage_placement() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    let rows = client
+        .query(
+            "EXPLAIN SELECT order_id FROM orders WHERE order_id >= 1 ORDER BY order_id LIMIT 5",
+            &[],
+        )
+        .await
+        .context("run explain dist query")?;
+    assert!(
+        !rows.is_empty(),
+        "expected explain output rows for stage placement"
+    );
+
+    let mut has_query_stage = false;
+    let mut has_scan_stage = false;
+    for row in &rows {
+        let stage: String = row
+            .try_get(0)
+            .context("read stage column from explain output")?;
+        if stage == "query" {
+            has_query_stage = true;
+        }
+        if stage == "scan" {
+            has_scan_stage = true;
+        }
+    }
+
+    assert!(
+        has_query_stage,
+        "expected query stage row in explain output"
+    );
+    assert!(has_scan_stage, "expected scan stage row in explain output");
     Ok(())
 }
 
@@ -1506,6 +1625,8 @@ struct DmlHarnessConfig {
     max_inflight_statements: usize,
     max_scan_rows: usize,
     max_txn_staged_rows: usize,
+    max_shards: usize,
+    initial_ranges: usize,
 }
 
 impl Default for DmlHarnessConfig {
@@ -1516,6 +1637,8 @@ impl Default for DmlHarnessConfig {
             max_inflight_statements: 1024,
             max_scan_rows: 100_000,
             max_txn_staged_rows: 100_000,
+            max_shards: 1,
+            initial_ranges: 1,
         }
     }
 }
@@ -1565,8 +1688,8 @@ impl TestHarness {
                 initial_members: format!("1@{grpc_addr}"),
                 data_dir: temp_dir.path().join("node-1"),
                 ready_timeout: Duration::from_secs(30),
-                max_shards: 1,
-                initial_ranges: 1,
+                max_shards: dml.max_shards.max(1),
+                initial_ranges: dml.initial_ranges.max(1).min(dml.max_shards.max(1)),
                 routing_mode: None,
             },
         };
