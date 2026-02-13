@@ -3554,7 +3554,7 @@ fn parse_update_scalar_for_column(
             Ok(ScalarValue::Int64(Some(value)))
         }
         TableColumnType::UInt8 => {
-            let value = match extract_i64_expr(expr, params)? {
+            let value = match extract_u64_expr(expr, params)? {
                 Some(value) => value,
                 None => {
                     return null_assignment_or_type_error(
@@ -3574,7 +3574,7 @@ fn parse_update_scalar_for_column(
             Ok(ScalarValue::UInt8(Some(narrowed)))
         }
         TableColumnType::UInt16 => {
-            let value = match extract_i64_expr(expr, params)? {
+            let value = match extract_u64_expr(expr, params)? {
                 Some(value) => value,
                 None => {
                     return null_assignment_or_type_error(
@@ -3594,7 +3594,7 @@ fn parse_update_scalar_for_column(
             Ok(ScalarValue::UInt16(Some(narrowed)))
         }
         TableColumnType::UInt32 => {
-            let value = match extract_i64_expr(expr, params)? {
+            let value = match extract_u64_expr(expr, params)? {
                 Some(value) => value,
                 None => {
                     return null_assignment_or_type_error(
@@ -3614,7 +3614,7 @@ fn parse_update_scalar_for_column(
             Ok(ScalarValue::UInt32(Some(narrowed)))
         }
         TableColumnType::UInt64 => {
-            let value = match extract_i64_expr(expr, params)? {
+            let value = match extract_u64_expr(expr, params)? {
                 Some(value) => value,
                 None => {
                     return null_assignment_or_type_error(
@@ -3625,13 +3625,7 @@ fn parse_update_scalar_for_column(
                     )
                 }
             };
-            let narrowed = u64::try_from(value).map_err(|_| {
-                to_user_error(
-                    "22003",
-                    format!("value out of range for column '{}'", column.name),
-                )
-            })?;
-            Ok(ScalarValue::UInt64(Some(narrowed)))
+            Ok(ScalarValue::UInt64(Some(value)))
         }
         TableColumnType::Float64 => {
             let value = match extract_f64_expr(expr, params)? {
@@ -3884,6 +3878,28 @@ fn extract_i64_expr(expr: &SqlExpr, params: &ParamValues) -> PgWireResult<Option
     }
 }
 
+/// Executes `extract u64 expr` for this component.
+fn extract_u64_expr(expr: &SqlExpr, params: &ParamValues) -> PgWireResult<Option<u64>> {
+    match expr {
+        SqlExpr::Value(value) => scalar_to_u64(resolve_sql_value(value, params)?)
+            .ok_or_else(|| to_user_error("22023", "invalid uint64 literal"))
+            .map(Some),
+        SqlExpr::UnaryOp { op, expr } => {
+            let Some(value) = extract_u64_expr(expr, params)? else {
+                return Ok(None);
+            };
+            match op {
+                UnaryOperator::Plus => Ok(Some(value)),
+                UnaryOperator::Minus if value == 0 => Ok(Some(0)),
+                _ => Ok(None),
+            }
+        }
+        SqlExpr::Nested(inner) => extract_u64_expr(inner, params),
+        SqlExpr::Cast { expr, .. } => extract_u64_expr(expr, params),
+        _ => Ok(None),
+    }
+}
+
 /// Executes `extract f64 expr` for this component.
 fn extract_f64_expr(expr: &SqlExpr, params: &ParamValues) -> PgWireResult<Option<f64>> {
     match expr {
@@ -4082,6 +4098,22 @@ fn scalar_to_i64(value: ScalarValue) -> Option<i64> {
         ScalarValue::UInt16(v) => v.map(i64::from),
         ScalarValue::UInt8(v) => v.map(i64::from),
         ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) => v.parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+/// Executes `scalar to u64` for this component.
+fn scalar_to_u64(value: ScalarValue) -> Option<u64> {
+    match value {
+        ScalarValue::UInt64(v) => v,
+        ScalarValue::UInt32(v) => v.map(u64::from),
+        ScalarValue::UInt16(v) => v.map(u64::from),
+        ScalarValue::UInt8(v) => v.map(u64::from),
+        ScalarValue::Int64(v) => v.and_then(|v| u64::try_from(v).ok()),
+        ScalarValue::Int32(v) => v.and_then(|v| u64::try_from(v).ok()),
+        ScalarValue::Int16(v) => v.and_then(|v| u64::try_from(v).ok()),
+        ScalarValue::Int8(v) => v.and_then(|v| u64::try_from(v).ok()),
+        ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) => v.parse::<u64>().ok(),
         _ => None,
     }
 }
