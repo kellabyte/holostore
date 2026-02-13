@@ -84,6 +84,10 @@ High-signal counters from `/metrics`:
 - `scan_row_limit_reject_count`: scan guardrail trips (`SQLSTATE 54000`).
 - `txn_stage_limit_reject_count`: transactional staging limit trips (`SQLSTATE 54000`).
 - `distributed_write_shard_<n>_conflicts`: per-shard conflict hotspot signal.
+- `query_execution_started` / `query_execution_completed` / `query_execution_failed`: end-to-end SQL execution lifecycle counters.
+- `stage_events`: total query/stage timeline events emitted across planning/scan execution.
+- `scan_retry_count` / `scan_reroute_count`: scan-path resiliency activity under failures/topology churn.
+- `scan_chunk_count` / `scan_duplicate_rows_skipped`: storage scan chunk flow and idempotent merge behavior.
 
 Use deltas/rates, not absolute values, during incident windows.
 
@@ -163,6 +167,7 @@ Actions:
 - Admission: raise `HOLO_FUSION_DML_MAX_INFLIGHT_STATEMENTS` cautiously.
 - Scan pressure: tune `HOLO_FUSION_DML_MAX_SCAN_ROWS`.
 - Transaction staging pressure: tune `HOLO_FUSION_DML_MAX_TXN_STAGED_ROWS`.
+- Write RPC sizing: tune `HOLO_FUSION_DML_WRITE_MAX_BATCH_ENTRIES` and `HOLO_FUSION_DML_WRITE_MAX_BATCH_BYTES`.
 3. Prefer load-shedding and workload shaping over unlimited knob increases.
 
 ### 4) Shard Imbalance / Replica Convergence Issues
@@ -193,6 +198,8 @@ Primary runtime knobs:
 | `HOLO_FUSION_DML_MAX_INFLIGHT_STATEMENTS` | `1024` | Admission-control concurrency limit. |
 | `HOLO_FUSION_DML_MAX_SCAN_ROWS` | `100000` | Caps per-mutation/snapshot scan fan-out. |
 | `HOLO_FUSION_DML_MAX_TXN_STAGED_ROWS` | `100000` | Caps staged writes in explicit tx. |
+| `HOLO_FUSION_DML_WRITE_MAX_BATCH_ENTRIES` | `1024` | Max rows per distributed write RPC chunk. |
+| `HOLO_FUSION_DML_WRITE_MAX_BATCH_BYTES` | `1048576` | Approximate payload budget per write RPC chunk. |
 | `HOLO_FUSION_HOLOSTORE_MAX_SHARDS` | `1` | Total shards available for spread. |
 | `HOLO_FUSION_HOLOSTORE_INITIAL_RANGES` | `1` | Starting split count before growth. |
 | `HOLO_FUSION_HOLOSTORE_ROUTING_MODE` | `range` | Key routing mode (`range`/`hash`). |
@@ -207,6 +214,7 @@ Tuning method:
 For benchmark SLO targets and regression gates, use:
 
 - `crates/holo_fusion/docs/PHASE7_BENCHMARK_SLO.md`
+- `crates/holo_fusion/docs/PHASE9_SALES_FACTS_CANARY_SLO.md`
 
 ## Release Checklist (Safe Upgrade)
 
@@ -219,7 +227,13 @@ Pre-release gates:
 HOLO_FUSION_ENFORCE_SLO=1 cargo test -p holo_fusion phase7_benchmark_and_slo_package -- --ignored --nocapture
 ```
 
-3. Validate SQL client compatibility probes:
+3. Run Phase 9 ingest canary gate:
+
+```bash
+./crates/holo_fusion/scripts/benchmarks/run_phase9_sales_facts_canary.sh
+```
+
+4. Validate SQL client compatibility probes:
 - `pg_postmaster_start_time()`
 - `pg_is_in_recovery()`
 - `txid_current()`
