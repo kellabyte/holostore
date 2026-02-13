@@ -696,6 +696,64 @@ async fn phase8_row_v1_defaults_and_check_constraints() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase8_uint64_type_coverage_and_range_enforcement() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    client
+        .batch_execute(
+            "CREATE TABLE metrics_uint64 (
+                id BIGINT NOT NULL,
+                counter BIGINT UNSIGNED NOT NULL DEFAULT 18446744073709551614,
+                PRIMARY KEY (id),
+                CHECK (counter > 9007199254740992)
+            );",
+        )
+        .await
+        .context("create uint64 coverage table")?;
+
+    client
+        .execute("INSERT INTO metrics_uint64 (id) VALUES (1)", &[])
+        .await
+        .context("insert row relying on uint64 default")?;
+
+    let count = client
+        .query_one(
+            "SELECT COUNT(*)::BIGINT FROM metrics_uint64 WHERE counter > 9007199254740992",
+            &[],
+        )
+        .await
+        .context("read back row using large-uint64 predicate")?
+        .try_get::<_, i64>(0)?;
+    assert_eq!(count, 1);
+
+    client
+        .execute(
+            "UPDATE metrics_uint64 SET counter = 18446744073709551615 WHERE id = 1",
+            &[],
+        )
+        .await
+        .context("update uint64 to max range value")?;
+
+    let negative_err = client
+        .execute("UPDATE metrics_uint64 SET counter = -1 WHERE id = 1", &[])
+        .await
+        .expect_err("negative update should fail for uint64");
+    assert_sqlstate(&negative_err, "22023");
+
+    let overflow_err = client
+        .execute(
+            "UPDATE metrics_uint64 SET counter = 18446744073709551616 WHERE id = 1",
+            &[],
+        )
+        .await
+        .expect_err("overflowing update should fail for uint64");
+    assert_sqlstate(&overflow_err, "22023");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn phase5_update_delete_strict_semantics_and_prepared_retry() -> Result<()> {
     let harness = TestHarness::start().await?;
     let (client, _guard) = harness.connect_pg().await?;

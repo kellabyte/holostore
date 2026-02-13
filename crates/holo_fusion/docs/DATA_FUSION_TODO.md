@@ -58,7 +58,7 @@
   - Capacity planning notes and tuning knobs.
   - Release checklist for safe upgrades and rollback steps.
 
-9. [ ] Complete Phase 8 generic storage model expansion.
+9. [x] Complete Phase 8 generic storage model expansion.
 - [x] #1 Generic CREATE TABLE + schema-driven provider:
   - Persist table columns and primary-key metadata in HoloStore (`row_v1`).
   - Remove CREATE TABLE hard requirement on the fixed `orders_v1` column set.
@@ -74,7 +74,12 @@
   - Add startup migration runner that upgrades legacy `orders_v1` metadata rows in-place.
   - Add idempotent conflict-safe conditional writes for concurrent migrators across nodes.
   - Add migration tests covering legacy decode, canonical backfill, and idempotent reruns.
-- [ ] #4 Extended type coverage and SQL defaults/check constraints roadmap.
+- [x] #4 Extended type coverage and SQL defaults/check constraints roadmap.
+  - Add schema-persisted column defaults and CHECK constraints with metadata validation at DDL time.
+  - Enforce defaults/checks/not-null/type coercion on row_v1 INSERT/UPDATE execution paths.
+  - Strengthen numeric CHECK correctness for large integer domains (including uint64 precision-sensitive comparisons).
+  - Expand assignment/type coercion coverage for unsigned integer columns (`UInt8/16/32/64`), including proper range enforcement.
+  - Document supported DEFAULT/CHECK SQL scope and deterministic deferred forms in `HOLO_FUSION_SQL_SCOPE.md`.
 
 10. [ ] Complete Phase 9 distributed SQL execution evolution.
 - [x] Publish design baseline in `DISTRIBUTED_SQL_EXECUTION_DESIGN.md`.

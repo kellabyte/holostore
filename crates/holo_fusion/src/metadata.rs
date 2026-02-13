@@ -1257,8 +1257,11 @@ fn compare_scalar_values(
         return Ok(None);
     }
 
-    if let (Some(left), Some(right)) = (scalar_to_f64_lossy(&left), scalar_to_f64_lossy(&right)) {
-        return Ok(left.partial_cmp(&right));
+    if let (Some(left), Some(right)) = (
+        scalar_to_numeric_comparable(&left),
+        scalar_to_numeric_comparable(&right),
+    ) {
+        return compare_numeric_values(left, right);
     }
 
     match (&left, &right) {
@@ -1282,19 +1285,45 @@ fn compare_scalar_values(
     }
 }
 
-fn scalar_to_f64_lossy(value: &ScalarValue) -> Option<f64> {
+#[derive(Debug, Clone, Copy)]
+enum NumericComparable {
+    Integer(i128),
+    Float(f64),
+}
+
+fn scalar_to_numeric_comparable(value: &ScalarValue) -> Option<NumericComparable> {
     match value {
-        ScalarValue::Float64(Some(v)) => Some(*v),
-        ScalarValue::Float32(Some(v)) => Some(f64::from(*v)),
-        ScalarValue::Int64(Some(v)) => Some(*v as f64),
-        ScalarValue::Int32(Some(v)) => Some(*v as f64),
-        ScalarValue::Int16(Some(v)) => Some(*v as f64),
-        ScalarValue::Int8(Some(v)) => Some(*v as f64),
-        ScalarValue::UInt64(Some(v)) => Some(*v as f64),
-        ScalarValue::UInt32(Some(v)) => Some(*v as f64),
-        ScalarValue::UInt16(Some(v)) => Some(*v as f64),
-        ScalarValue::UInt8(Some(v)) => Some(*v as f64),
+        ScalarValue::Float64(Some(v)) => Some(NumericComparable::Float(*v)),
+        ScalarValue::Float32(Some(v)) => Some(NumericComparable::Float(f64::from(*v))),
+        ScalarValue::Int64(Some(v)) => Some(NumericComparable::Integer(i128::from(*v))),
+        ScalarValue::Int32(Some(v)) => Some(NumericComparable::Integer(i128::from(*v))),
+        ScalarValue::Int16(Some(v)) => Some(NumericComparable::Integer(i128::from(*v))),
+        ScalarValue::Int8(Some(v)) => Some(NumericComparable::Integer(i128::from(*v))),
+        ScalarValue::UInt64(Some(v)) => Some(NumericComparable::Integer(i128::from(*v))),
+        ScalarValue::UInt32(Some(v)) => Some(NumericComparable::Integer(i128::from(*v))),
+        ScalarValue::UInt16(Some(v)) => Some(NumericComparable::Integer(i128::from(*v))),
+        ScalarValue::UInt8(Some(v)) => Some(NumericComparable::Integer(i128::from(*v))),
         _ => None,
+    }
+}
+
+fn compare_numeric_values(
+    left: NumericComparable,
+    right: NumericComparable,
+) -> std::result::Result<Option<std::cmp::Ordering>, RowConstraintError> {
+    match (left, right) {
+        (NumericComparable::Integer(left), NumericComparable::Integer(right)) => {
+            Ok(Some(left.cmp(&right)))
+        }
+        (NumericComparable::Float(left), NumericComparable::Float(right)) => {
+            Ok(left.partial_cmp(&right))
+        }
+        (NumericComparable::Integer(left), NumericComparable::Float(right)) => {
+            Ok((left as f64).partial_cmp(&right))
+        }
+        (NumericComparable::Float(left), NumericComparable::Integer(right)) => {
+            Ok(left.partial_cmp(&(right as f64)))
+        }
     }
 }
 
@@ -2433,6 +2462,43 @@ mod tests {
             &[ScalarValue::Int64(Some(1)), ScalarValue::Int64(Some(-5))],
         )
         .expect_err("negative qty should violate CHECK");
+        assert_eq!(err.sqlstate(), "23514");
+        Ok(())
+    }
+
+    #[test]
+    fn row_check_large_uint64_precision_is_exact() -> Result<()> {
+        let columns = vec![TableColumnRecord {
+            name: "u".to_string(),
+            column_type: TableColumnType::UInt64,
+            nullable: false,
+            default_value: None,
+        }];
+        let checks = vec![TableCheckConstraintRecord {
+            name: "u_gt_threshold".to_string(),
+            expr: CheckExpression::Binary {
+                op: CheckBinaryOperator::Gt,
+                left: Box::new(CheckExpression::Column("u".to_string())),
+                right: Box::new(CheckExpression::Literal(ColumnDefaultValue::UInt64(
+                    9_007_199_254_740_992,
+                ))),
+            },
+        }];
+
+        validate_table_constraints(columns.as_slice(), checks.as_slice())?;
+
+        validate_row_against_metadata(
+            columns.as_slice(),
+            checks.as_slice(),
+            &[ScalarValue::UInt64(Some(9_007_199_254_740_993))],
+        )?;
+
+        let err = validate_row_against_metadata(
+            columns.as_slice(),
+            checks.as_slice(),
+            &[ScalarValue::UInt64(Some(9_007_199_254_740_992))],
+        )
+        .expect_err("row should violate strict greater-than check");
         assert_eq!(err.sqlstate(), "23514");
         Ok(())
     }

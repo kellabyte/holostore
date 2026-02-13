@@ -30,14 +30,14 @@ Unless stated otherwise, unsupported statements must return:
 | Query | `SELECT ... ORDER BY ... LIMIT ...` | Supported | Phase 2 | Full sort may spill depending on engine settings. |
 | Query | `SELECT ... JOIN ...` | Supported | Phase 3 | Distributed path may be used via Ballista policy. |
 | Query | `SELECT` with aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) | Supported | Phase 3 | Subject to DataFusion function support. |
-| DML | `INSERT INTO t VALUES (...)` | Supported | Phase 4 | Must route writes via embedded HoloStore APIs. |
+| DML | `INSERT INTO t VALUES (...)` | Supported | Phase 8 | Supports schema-driven row materialization with type coercion, column defaults, and CHECK/not-null enforcement. |
 | DML | `INSERT INTO t SELECT ...` | Supported | Phase 4 | Same idempotency/retry guarantees as other inserts. |
 | DML | `UPDATE ... WHERE ...` | Supported (controlled) | Phase 8 | Supports PK-bounded `UPDATE` for `orders_v1` and schema-driven `row_v1` tables in autocommit mode; `row_v1` `UPDATE` inside explicit transactions is deferred and returns `0A000`. |
 | DML | `DELETE FROM ... WHERE ...` | Supported (controlled) | Phase 8 | Supports PK-bounded `DELETE` for `orders_v1` and schema-driven `row_v1` tables in autocommit mode; `row_v1` `DELETE` inside explicit transactions is deferred and returns `0A000`. |
 | Txn | `BEGIN` / `START TRANSACTION` | Supported (session-managed) | Phase 6 | Backed by HoloStore transaction/session layer. |
 | Txn | `COMMIT` | Supported (session-managed) | Phase 6 | Commits HoloStore transaction context. |
 | Txn | `ROLLBACK` | Supported (session-managed) | Phase 6 | Aborts HoloStore transaction context. |
-| DDL | `CREATE TABLE` | Supported (controlled) | Phase 8 | Persists table metadata in HoloStore; supports schema-driven `row_v1` tables with single-column signed-integer `PRIMARY KEY`, while preserving legacy `orders_v1` compatibility. |
+| DDL | `CREATE TABLE` | Supported (controlled) | Phase 8 | Persists table metadata in HoloStore; supports schema-driven `row_v1` tables with single-column signed-integer `PRIMARY KEY`, column `DEFAULT` literals (`CURRENT_TIMESTAMP` on timestamp), and table/column `CHECK` constraints; preserves legacy `orders_v1` compatibility. |
 
 ## Explicitly rejected or deferred statements
 
@@ -52,6 +52,8 @@ Unless stated otherwise, unsupported statements must return:
 | DML | `INSERT OVERWRITE` / `INSERT REPLACE` | Rejected (initially) | `0A000` | Not in MVP scope. |
 | DML | `TRUNCATE` | Rejected (initially) | `0A000` | Not in MVP scope. |
 | DML | `UPDATE` / `DELETE` on `row_v1` tables inside explicit transactions | Deferred | `0A000` | Generic transactional DML staging for `row_v1` is not enabled yet. |
+| DDL | `DEFAULT` expressions using non-literal SQL (subqueries/functions other than `CURRENT_TIMESTAMP`) | Deferred | `0A000` | DEFAULT is restricted to literals and `CURRENT_TIMESTAMP` for deterministic metadata execution. |
+| DDL | `CHECK` expressions using subqueries/window/functions/regex operators | Deferred | `0A000` | CHECK is restricted to deterministic boolean expressions over row-local columns/literals. |
 | Query | `SELECT ... FOR UPDATE` | Rejected (initially) | `0A000` | Row-locking syntax not supported in MVP. |
 | Txn | `SAVEPOINT`, `RELEASE SAVEPOINT`, `ROLLBACK TO SAVEPOINT` | Rejected (initially) | `0A000` | Nested transaction control not supported in MVP. |
 | Session | `SET TRANSACTION ...` | Deferred | `0A000` | Isolation-level tuning deferred to post-MVP. |
