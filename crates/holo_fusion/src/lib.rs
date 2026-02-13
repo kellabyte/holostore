@@ -248,6 +248,23 @@ pub async fn run_with_shutdown<F>(config: HoloFusionConfig, shutdown: F) -> Resu
 where
     F: std::future::Future<Output = Result<(), std::io::Error>> + Send,
 {
+    let default_target_partitions = std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(4)
+        .max(1);
+    let sql_target_partitions = parse_usize(
+        std::env::var("HOLO_FUSION_SQL_TARGET_PARTITIONS").ok(),
+        default_target_partitions,
+    )?
+    .max(1);
+    let sql_sort_spill_reservation_bytes = parse_usize(
+        std::env::var("HOLO_FUSION_SQL_SORT_SPILL_RESERVATION_BYTES").ok(),
+        16 * 1024 * 1024,
+    )?
+    .max(1);
+    let sql_spill_compression =
+        normalize_spill_compression(std::env::var("HOLO_FUSION_SQL_SPILL_COMPRESSION").ok());
+
     let postmaster_start_time_ns =
         current_unix_timestamp_ns().context("capture pg postmaster start time")?;
     let health = RuntimeHealth::new();
@@ -282,9 +299,14 @@ where
         let codec = Arc::new(HoloFusionLogicalExtensionCodec::new(
             pushdown_metrics.clone(),
         ));
-        let session_config = SessionConfig::new_with_ballista()
-            .with_information_schema(true)
-            .with_ballista_logical_extension_codec(codec);
+        let session_config = configured_session_config(
+            SessionConfig::new_with_ballista(),
+            sql_target_partitions,
+            sql_sort_spill_reservation_bytes,
+            sql_spill_compression.as_str(),
+        )
+        .with_information_schema(true)
+        .with_ballista_logical_extension_codec(codec);
         let session_state = SessionStateBuilder::new()
             .with_default_features()
             .with_config(session_config)
@@ -299,11 +321,27 @@ where
                         format!("ballista unavailable, falling back to local datafusion: {err}"),
                     )
                     .await;
-                (Arc::new(SessionContext::new()), BallistaMode::LocalFallback)
+                (
+                    Arc::new(SessionContext::new_with_config(configured_session_config(
+                        SessionConfig::new(),
+                        sql_target_partitions,
+                        sql_sort_spill_reservation_bytes,
+                        sql_spill_compression.as_str(),
+                    ))),
+                    BallistaMode::LocalFallback,
+                )
             }
         }
     } else {
-        (Arc::new(SessionContext::new()), BallistaMode::Disabled)
+        (
+            Arc::new(SessionContext::new_with_config(configured_session_config(
+                SessionConfig::new(),
+                sql_target_partitions,
+                sql_sort_spill_reservation_bytes,
+                sql_spill_compression.as_str(),
+            ))),
+            BallistaMode::Disabled,
+        )
     };
 
     let auth_manager = Arc::new(AuthManager::new());
@@ -452,6 +490,46 @@ where
     }
 
     Ok(())
+}
+
+/// Applies distributed SQL execution defaults for production query planning.
+fn configured_session_config(
+    config: SessionConfig,
+    target_partitions: usize,
+    sort_spill_reservation_bytes: usize,
+    spill_compression: &str,
+) -> SessionConfig {
+    config
+        .with_target_partitions(target_partitions.max(1))
+        .with_repartition_aggregations(true)
+        .with_repartition_joins(true)
+        .with_repartition_sorts(true)
+        .with_repartition_windows(true)
+        .set_str(
+            "datafusion.execution.sort_spill_reservation_bytes",
+            sort_spill_reservation_bytes.to_string().as_str(),
+        )
+        .set_str("datafusion.execution.spill_compression", spill_compression)
+}
+
+/// Normalizes spill compression configuration to valid DataFusion values.
+fn normalize_spill_compression(value: Option<String>) -> String {
+    match value
+        .as_deref()
+        .map(|raw| raw.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("zstd") => "zstd".to_string(),
+        Some("uncompressed") => "uncompressed".to_string(),
+        Some("lz4_frame") | None => "lz4_frame".to_string(),
+        Some(other) => {
+            warn!(
+                value = other,
+                "invalid HOLO_FUSION_SQL_SPILL_COMPRESSION; using lz4_frame"
+            );
+            "lz4_frame".to_string()
+        }
+    }
 }
 
 /// Runtime mode selected for DataFusion/Ballista integration.

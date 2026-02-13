@@ -99,6 +99,11 @@ What is implemented today:
 - HoloStore-backed reads and writes via provider + hooks
 - Cluster scripts for local multi-node testing
 - Health endpoint and degraded mode behavior
+- Phase 9 distributed SQL baseline:
+  - query/stage execution IDs and stage timeline metrics
+  - typed storage scan contract with retry/reroute resume behavior
+  - distributed explain placement classification (`EXPLAIN`)
+  - distributed planner defaults for agg/top-k/join repartitioning
 
 What is intentionally not full-featured yet:
 
@@ -142,7 +147,12 @@ cargo run -p holo_fusion --bin holo-fusion
 - `HOLO_FUSION_DML_MAX_INFLIGHT_STATEMENTS`
 - `HOLO_FUSION_DML_MAX_SCAN_ROWS`
 - `HOLO_FUSION_DML_MAX_TXN_STAGED_ROWS`
+- `HOLO_FUSION_DML_WRITE_MAX_BATCH_ENTRIES`
+- `HOLO_FUSION_DML_WRITE_MAX_BATCH_BYTES`
 - `HOLO_FUSION_SCAN_MAX_ROWS`
+- `HOLO_FUSION_SQL_TARGET_PARTITIONS`
+- `HOLO_FUSION_SQL_SORT_SPILL_RESERVATION_BYTES`
+- `HOLO_FUSION_SQL_SPILL_COMPRESSION` (`lz4_frame`, `zstd`, `uncompressed`)
 - `HOLO_FUSION_NODE_ID`
 - `HOLO_FUSION_HOLOSTORE_REDIS_ADDR`
 - `HOLO_FUSION_HOLOSTORE_GRPC_ADDR`

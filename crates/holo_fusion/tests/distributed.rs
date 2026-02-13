@@ -431,6 +431,175 @@ async fn phase3_distributed_insert_and_scan_across_nodes() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[serial]
+async fn phase9_insert_select_survives_split_route_churn_without_partial_apply() -> Result<()> {
+    let temp_dir = TempDir::new().context("create temp dir")?;
+
+    let node1 = NodePorts::new()?;
+    let node2 = NodePorts::new()?;
+
+    let initial_members = format!("1@{},2@{}", node1.grpc_addr, node2.grpc_addr);
+    let node1_cfg = HoloFusionConfig {
+        pg_host: "127.0.0.1".to_string(),
+        pg_port: node1.pg_port,
+        health_addr: node1.health_addr,
+        enable_ballista_sql: false,
+        dml_prewrite_delay: Duration::ZERO,
+        dml_statement_timeout: Duration::ZERO,
+        dml_max_inflight_statements: 1024,
+        dml_max_scan_rows: 100_000,
+        dml_max_txn_staged_rows: 100_000,
+        holostore: EmbeddedNodeConfig {
+            node_id: 1,
+            listen_redis: node1.redis_addr,
+            listen_grpc: node1.grpc_addr,
+            bootstrap: true,
+            join: None,
+            initial_members: initial_members.clone(),
+            data_dir: temp_dir.path().join("phase9-split-churn-node-1"),
+            ready_timeout: Duration::from_secs(30),
+            max_shards: 2,
+            initial_ranges: 1,
+            routing_mode: Some("range".to_string()),
+        },
+    };
+    let node2_cfg = HoloFusionConfig {
+        pg_host: "127.0.0.1".to_string(),
+        pg_port: node2.pg_port,
+        health_addr: node2.health_addr,
+        enable_ballista_sql: false,
+        dml_prewrite_delay: Duration::ZERO,
+        dml_statement_timeout: Duration::ZERO,
+        dml_max_inflight_statements: 1024,
+        dml_max_scan_rows: 100_000,
+        dml_max_txn_staged_rows: 100_000,
+        holostore: EmbeddedNodeConfig {
+            node_id: 2,
+            listen_redis: node2.redis_addr,
+            listen_grpc: node2.grpc_addr,
+            bootstrap: false,
+            join: Some(node1.grpc_addr),
+            initial_members,
+            data_dir: temp_dir.path().join("phase9-split-churn-node-2"),
+            ready_timeout: Duration::from_secs(30),
+            max_shards: 2,
+            initial_ranges: 1,
+            routing_mode: Some("range".to_string()),
+        },
+    };
+
+    let mut runtime1 = RunningNode::start(node1_cfg, node1).await?;
+    let mut runtime2 = RunningNode::start(node2_cfg, node2).await?;
+
+    let admin_client = HoloStoreClient::new(runtime1.grpc_addr);
+    wait_for(
+        Duration::from_secs(30),
+        Duration::from_millis(200),
+        || async {
+            let state = cluster_state(&admin_client).await?;
+            Ok(state.members.len() >= 2 && !state.shards.is_empty())
+        },
+    )
+    .await
+    .context("wait for 2-node cluster state")?;
+
+    let (pg_client, _pg_guard) = connect_pg("127.0.0.1", runtime1.pg_port).await?;
+    pg_client
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS sales_facts (
+                order_id BIGINT NOT NULL,
+                customer_id BIGINT NOT NULL,
+                merchant_id BIGINT NOT NULL,
+                region_id BIGINT NOT NULL,
+                event_day BIGINT NOT NULL,
+                status VARCHAR NOT NULL,
+                amount_cents BIGINT NOT NULL,
+                PRIMARY KEY (order_id)
+            );",
+        )
+        .await
+        .context("create sales_facts")?;
+
+    let insert_stmt = "INSERT INTO sales_facts (
+        order_id, customer_id, merchant_id, region_id, event_day, status, amount_cents
+    )
+    WITH base AS (
+      SELECT COALESCE(MAX(order_id), 0) AS max_id
+      FROM sales_facts
+    )
+    SELECT
+      base.max_id + i AS order_id,
+      100000 + (i % 500000) AS customer_id,
+      1 + (i % 20000) AS merchant_id,
+      1 + (i % 20) AS region_id,
+      1 + ((i - 1) / 86400) AS event_day,
+      CASE
+        WHEN i % 10 < 6 THEN 'paid'
+        WHEN i % 10 < 8 THEN 'shipped'
+        WHEN i % 10 = 8 THEN 'pending'
+        ELSE 'cancelled'
+      END AS status,
+      100 + ((i * 37) % 20000) AS amount_cents
+    FROM base
+    CROSS JOIN generate_series(1, 5000) AS g(i);";
+
+    let written = pg_client
+        .execute(insert_stmt, &[])
+        .await
+        .context("insert batch 1")?;
+    assert_eq!(written, 5000);
+    let written = pg_client
+        .execute(insert_stmt, &[])
+        .await
+        .context("insert batch 2")?;
+    assert_eq!(written, 5000);
+
+    let sales_facts_table = find_table_metadata_by_name(&admin_client, "sales_facts")
+        .await
+        .context("read metadata for sales_facts table")?
+        .context("sales_facts table metadata should exist")?;
+    let split_key = encode_table_primary_key(sales_facts_table.table_id, 12_500);
+    admin_client
+        .range_split(&split_key)
+        .await
+        .context("split sales_facts range during ingest")?;
+
+    let written = pg_client
+        .execute(insert_stmt, &[])
+        .await
+        .context("insert batch 3 after split request")?;
+    assert_eq!(written, 5000);
+
+    wait_for(
+        Duration::from_secs(30),
+        Duration::from_millis(200),
+        || async {
+            let state = cluster_state(&admin_client).await?;
+            Ok(state.shards.iter().any(|s| s.start_key == split_key))
+        },
+    )
+    .await
+    .context("wait for split visibility after ingest")?;
+
+    let written = pg_client
+        .execute(insert_stmt, &[])
+        .await
+        .context("insert batch 4 after split propagation")?;
+    assert_eq!(written, 5000);
+
+    let row = pg_client
+        .query_one("SELECT COUNT(order_id)::BIGINT FROM sales_facts", &[])
+        .await
+        .context("count sales_facts rows")?;
+    let count: i64 = row.try_get(0)?;
+    assert_eq!(count, 20_000);
+
+    runtime1.shutdown().await?;
+    runtime2.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[serial]
 async fn phase7_replica_record_convergence_and_node_failure_read_continuity() -> Result<()> {
     let temp_dir = TempDir::new().context("create temp dir")?;
 

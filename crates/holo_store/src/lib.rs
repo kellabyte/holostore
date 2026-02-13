@@ -269,11 +269,15 @@ impl HoloStoreClient {
     }
 
     pub fn new(target: EmbedSocketAddr) -> Self {
-        Self::with_timeout(target, EmbedDuration::from_secs(3))
+        Self::with_timeout(target, EmbedDuration::from_secs(10))
     }
 
     pub fn target(&self) -> EmbedSocketAddr {
         self.target
+    }
+
+    pub fn timeout(&self) -> EmbedDuration {
+        self.timeout
     }
 
     pub async fn cluster_state_json(&self) -> anyhow::Result<String> {

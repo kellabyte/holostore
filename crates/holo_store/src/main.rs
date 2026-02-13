@@ -538,7 +538,7 @@ struct NodeState {
     controller_lease_renew_margin: Duration,
     meta_move_stuck_warn: Duration,
     split_lock: Arc<std::sync::RwLock<()>>,
-    sql_write_lock: Arc<tokio::sync::Mutex<()>>,
+    sql_write_locks: Arc<Vec<tokio::sync::Mutex<()>>>,
     shard_load: ShardLoadTracker,
     range_stats: Arc<LocalRangeStats>,
     recovery_checkpoints: Arc<RecoveryCheckpointStats>,
@@ -798,7 +798,12 @@ impl LocalRangeStats {
                 }
                 continue;
             };
-            let (cur_version, _) = kv::decode_latest_value(&cur_bytes)?;
+            let (cur_version, cur_value) = kv::decode_latest_value(&cur_bytes)?;
+            if entry.expected_version == kv::Version::zero()
+                && latest_value_is_sql_tombstone(cur_value.as_slice())
+            {
+                continue;
+            }
             if cur_version != entry.expected_version {
                 conflicts = conflicts.saturating_add(1);
             }
@@ -2072,6 +2077,13 @@ impl NodeState {
         Ok(())
     }
 
+    /// Returns the per-shard SQL write lock used to serialize writes within one shard only.
+    fn sql_write_lock_for_shard(&self, shard_index: usize) -> &tokio::sync::Mutex<()> {
+        self.sql_write_locks
+            .get(shard_index)
+            .unwrap_or_else(|| &self.sql_write_locks[0])
+    }
+
     async fn write_range_latest_replicated(
         &self,
         shard_index: usize,
@@ -2093,7 +2105,7 @@ impl NodeState {
             return Ok(0);
         }
 
-        let _write_guard = self.sql_write_lock.lock().await;
+        let _write_guard = self.sql_write_lock_for_shard(shard_index).lock().await;
 
         let keys = in_range
             .iter()
@@ -2135,7 +2147,7 @@ impl NodeState {
             return Ok(RangeConditionalWriteResult::default());
         }
 
-        let _write_guard = self.sql_write_lock.lock().await;
+        let _write_guard = self.sql_write_lock_for_shard(shard_index).lock().await;
 
         let keys = in_range
             .iter()
@@ -2146,7 +2158,12 @@ impl NodeState {
         let mut conflicts = 0u64;
         for entry in &in_range {
             match self.kv_latest(entry.key.as_slice()) {
-                Some((_, version)) => {
+                Some((value, version)) => {
+                    if entry.expected_version == kv::Version::zero()
+                        && latest_value_is_sql_tombstone(value.as_slice())
+                    {
+                        continue;
+                    }
                     if version != entry.expected_version {
                         conflicts = conflicts.saturating_add(1);
                     }
@@ -3202,6 +3219,18 @@ fn spawn_get_batcher(
             });
         }
     });
+}
+
+/// Returns whether a latest value is a SQL row-model tombstone payload.
+fn latest_value_is_sql_tombstone(value: &[u8]) -> bool {
+    const ROW_FORMAT_V1: u8 = 1;
+    const ROW_FORMAT_V2: u8 = 2;
+    const ROW_FLAG_TOMBSTONE: u8 = 0x01;
+
+    if value.len() < 2 {
+        return false;
+    }
+    matches!(value[0], ROW_FORMAT_V1 | ROW_FORMAT_V2) && (value[1] & ROW_FLAG_TOMBSTONE != 0)
 }
 
 /// Pick the highest-version value from a list of optional versions.
@@ -4656,7 +4685,11 @@ where
         ),
         meta_move_stuck_warn: Duration::from_millis(args.meta_move_stuck_warn_ms.max(1)),
         split_lock: split_lock.clone(),
-        sql_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        sql_write_locks: Arc::new(
+            (0..data_shards.max(1))
+                .map(|_| tokio::sync::Mutex::new(()))
+                .collect(),
+        ),
         shard_load: ShardLoadTracker::new(data_shards),
         range_stats,
         recovery_checkpoints: recovery_checkpoint_stats.clone(),

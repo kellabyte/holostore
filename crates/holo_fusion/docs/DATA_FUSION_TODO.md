@@ -83,9 +83,70 @@
 
 10. [ ] Complete Phase 9 distributed SQL execution evolution.
 - [x] Publish design baseline in `DISTRIBUTED_SQL_EXECUTION_DESIGN.md`.
-- [ ] Phase A: instrumentation and plan placement introspection.
-- [ ] Phase B: leaseholder filter/projection pushdown via typed scan contract.
-- [ ] Phase C: distributed partial aggregation/top-k.
-- [ ] Phase D: distributed joins with bounded-memory exchanges.
-- [ ] Phase E: failure semantics, resume, and topology-churn safety.
-- [ ] Phase F: production SLO gates and regression automation.
+- [x] Phase A: instrumentation and plan placement introspection.
+  - query execution IDs + stage IDs emitted across SQL hook and storage scan stages.
+  - `/metrics` includes query/stage lifecycle counters and active-query snapshots.
+  - `EXPLAIN` now returns distributed stage placement classification (`scan`, `aggregate_partial`, `aggregate_final`, `join`, `exchange`, `topk`).
+- [x] Phase B: leaseholder filter/projection pushdown via typed scan contract.
+  - typed `ScanSpec` / `ScanChunk` / `ScanStats` contract added for storage-facing scan execution.
+  - explicit pushdown fallback stage events emitted when predicates are not storage-pushdown-safe.
+  - projection is applied at provider scan output to reduce downstream batch width.
+- [x] Phase C: distributed partial aggregation/top-k.
+  - distributed optimizer defaults force repartitioned aggregates/sorts/windows with multi-partition execution.
+  - explain placement surfaces partial/final aggregate and top-k stage placement.
+- [x] Phase D: distributed joins with bounded-memory exchanges.
+  - repartitioned distributed join planning enabled by default.
+  - exchange/join placement surfaced in explain output for operability.
+- [x] Phase E: failure semantics, resume, and topology-churn safety.
+  - scan retry with bounded backoff + topology reroute on transient/leaseholder movement errors.
+  - idempotent scan merge skips duplicate keys after retry/reroute chunk replays.
+- [x] Phase F: production SLO gates and regression automation.
+  - runtime spill controls and sort spill reservation wired through environment controls.
+  - smoke coverage extended for phase-9 metrics and explain-placement behavior.
+  - reproducible `sales_facts` ingest canary (`20k` / `50k` batches + split-churn) with hard pass/fail gates.
+  - canary snapshots capture `/metrics` and `holoctl topology` before/after each batch for regression triage.
+
+11. [ ] Complete Phase 10 workload management and transaction throughput control.
+- [ ] Phase A: adaptive admission control and overload semantics.
+  - shard-aware admission budgets for read/write/transaction classes with deterministic fairness.
+  - explicit queue-time limits and deterministic SQLSTATE mapping for overload rejection paths.
+  - add shard/replica token-based pacing and deterministic overload semantics (`53300`).
+  - separate regular traffic vs elastic/background traffic with independent budgets.
+  - separate guardrails for foreground SQL workload vs background maintenance tasks.
+- [ ] Phase B: distributed flow control, in-flight replication budgets, and hotspot distribution controls.
+  - hotspot fix first (highest ROI): add hash distribution for sequential keys (table-level hash-sharded PK/routing).
+  - add `PRIMARY KEY (...) USING HASH` DDL support (with optional shard/bucket count).
+  - persist metadata for hash-sharded key layout and placement configuration.
+  - add hash-based write routing and scan planning behavior.
+  - pre-split and rebalance ranges before large ingest jobs; treat this as required for sustained linear scale.
+  - per-shard and per-target in-flight limits (rows, bytes, and RPC count) on write and rollback paths.
+  - leaseholder/replica backpressure signaling surfaced to SQL execution before RPC timeout boundaries.
+  - dynamic write-batch sizing policy driven by observed apply latency and timeout/error feedback.
+- [ ] Phase C: retry governance and circuit breakers.
+  - bounded retry budgets per statement and per transaction with jittered exponential backoff.
+  - explicit retryable/non-retryable error classification across HoloStore RPC and SQL hook layers.
+  - per-target circuit breakers with half-open probing to prevent thundering-herd retries.
+- [ ] Phase D: transaction pipelining, commit-path optimization, and bulk ingest execution.
+  - add dedicated bulk path for `INSERT ... SELECT` / `COPY` (separate from normal OLTP path).
+  - stream batches directly through the sink path (no end-to-end buffering before writes start).
+  - add per-shard writer workers for bulk ingest.
+  - enforce bounded in-flight windows for bulk ingest (rows/bytes/RPC).
+  - use adaptive chunk sizing from observed latency/error feedback.
+  - add idempotent chunk IDs for safe retry/resume semantics.
+  - replace global `sql_write_lock` with per-shard concurrency control.
+  - avoid per-chunk polling loops; return commit/apply acknowledgments from storage and barrier once per statement phase.
+  - pipeline conditional writes safely within one transaction while preserving conflict semantics.
+  - reduce commit critical path via parallel shard commit where correctness constraints permit.
+  - add online migration/backfill path from non-hash PK to hash PK.
+  - durable coordinator recovery semantics for partially-pipelined transactions and rollback intents.
+- [ ] Phase E: observability and SLO-driven control loops.
+  - emit queue-depth, admission wait-time, drop/reject, and circuit-state metrics per shard/target.
+  - add ingest progress metrics (`rows_ingested`, `rows_per_second`, `queue_depth`, `inflight_bytes`, per-shard lag) and job-level status.
+  - publish saturation diagnostics and recommended tuning bands in runbook and metrics output.
+  - add hotspot metrics and correctness coverage for `USING HASH` routing and rebalance behavior.
+  - add CI/perf regression gates for sustained p95/p99 overload behavior regressions.
+- [ ] Phase F: failure-injection validation and rollout safety.
+  - overload chaos suite for burst writes, hot shards, partial partitions, and slow follower scenarios.
+  - canary rollout plan with abort thresholds tied to latency/error/admission metrics.
+  - add rollout/canary gates for hash-distributed PK adoption and bulk ingest controls.
+  - feature-flag kill switches and rollback playbooks for each Phase 10 control-plane capability.
