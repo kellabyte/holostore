@@ -106,27 +106,27 @@
   - reproducible `sales_facts` ingest canary (`20k` / `50k` batches + split-churn) with hard pass/fail gates.
   - canary snapshots capture `/metrics` and `holoctl topology` before/after each batch for regression triage.
 
-11. [ ] Complete Phase 10 workload management and transaction throughput control.
-- [ ] Phase A: adaptive admission control and overload semantics.
+11. [x] Complete Phase 10 workload management and transaction throughput control.
+- [x] Phase A: adaptive admission control and overload semantics.
   - shard-aware admission budgets for read/write/transaction classes with deterministic fairness.
   - explicit queue-time limits and deterministic SQLSTATE mapping for overload rejection paths.
   - add shard/replica token-based pacing and deterministic overload semantics (`53300`).
   - separate regular traffic vs elastic/background traffic with independent budgets.
   - separate guardrails for foreground SQL workload vs background maintenance tasks.
-- [ ] Phase B: distributed flow control, in-flight replication budgets, and hotspot distribution controls.
+- [x] Phase B: distributed flow control, in-flight replication budgets, and hotspot distribution controls.
   - hotspot fix first (highest ROI): add hash distribution for sequential keys (table-level hash-sharded PK/routing).
   - add `PRIMARY KEY (...) USING HASH` DDL support (with optional shard/bucket count).
   - persist metadata for hash-sharded key layout and placement configuration.
   - add hash-based write routing and scan planning behavior.
-  - pre-split and rebalance ranges before large ingest jobs; treat this as required for sustained linear scale.
+  - pre-split and rebalance ranges before large ingest jobs; treat this as required for sustained linear scale (operational runbook step, automation deferred).
   - per-shard and per-target in-flight limits (rows, bytes, and RPC count) on write and rollback paths.
   - leaseholder/replica backpressure signaling surfaced to SQL execution before RPC timeout boundaries.
   - dynamic write-batch sizing policy driven by observed apply latency and timeout/error feedback.
-- [ ] Phase C: retry governance and circuit breakers.
+- [x] Phase C: retry governance and circuit breakers.
   - bounded retry budgets per statement and per transaction with jittered exponential backoff.
   - explicit retryable/non-retryable error classification across HoloStore RPC and SQL hook layers.
   - per-target circuit breakers with half-open probing to prevent thundering-herd retries.
-- [ ] Phase D: transaction pipelining, commit-path optimization, and bulk ingest execution.
+- [x] Phase D: transaction pipelining, commit-path optimization, and bulk ingest execution.
   - add dedicated bulk path for `INSERT ... SELECT` / `COPY` (separate from normal OLTP path).
   - stream batches directly through the sink path (no end-to-end buffering before writes start).
   - add per-shard writer workers for bulk ingest.
@@ -139,14 +139,20 @@
   - reduce commit critical path via parallel shard commit where correctness constraints permit.
   - add online migration/backfill path from non-hash PK to hash PK.
   - durable coordinator recovery semantics for partially-pipelined transactions and rollback intents.
-- [ ] Phase E: observability and SLO-driven control loops.
+- [x] Phase E: observability and SLO-driven control loops.
   - emit queue-depth, admission wait-time, drop/reject, and circuit-state metrics per shard/target.
   - add ingest progress metrics (`rows_ingested`, `rows_per_second`, `queue_depth`, `inflight_bytes`, per-shard lag) and job-level status.
   - publish saturation diagnostics and recommended tuning bands in runbook and metrics output.
   - add hotspot metrics and correctness coverage for `USING HASH` routing and rebalance behavior.
   - add CI/perf regression gates for sustained p95/p99 overload behavior regressions.
-- [ ] Phase F: failure-injection validation and rollout safety.
+- [x] Phase F: failure-injection validation and rollout safety.
   - overload chaos suite for burst writes, hot shards, partial partitions, and slow follower scenarios.
   - canary rollout plan with abort thresholds tied to latency/error/admission metrics.
   - add rollout/canary gates for hash-distributed PK adoption and bulk ingest controls.
   - feature-flag kill switches and rollback playbooks for each Phase 10 control-plane capability.
+
+12. [ ] Complete Phase 10 stabilization gate for production readiness.
+- [ ] Long soak and chaos validation for mixed OLTP + bulk ingest + split/rebalance churn with strict SLO pass/fail gates.
+- [ ] Operational automation for pre-split/rebalance workflows (move from runbook-only to automated execution paths).
+- [ ] Planner/executor hardening for additional aggregate and boundary-scan patterns under topology churn.
+- [ ] Final go-live gate with repeated rollback drills and canary criteria validation in CI/perf environments.

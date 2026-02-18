@@ -799,6 +799,7 @@ async fn backfill_learner_replica(
                 &shard.end_key,
                 &cursor,
                 PAGE_LIMIT,
+                false,
             )
             .await?;
         if !entries.is_empty() {

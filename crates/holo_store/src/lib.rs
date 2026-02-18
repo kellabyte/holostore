@@ -318,6 +318,7 @@ impl HoloStoreClient {
         end_key: &[u8],
         cursor: &[u8],
         limit: usize,
+        reverse: bool,
     ) -> anyhow::Result<(Vec<LatestEntry>, Vec<u8>, bool)> {
         let request = volo_gen::holo_store::rpc::RangeSnapshotLatestRequest {
             shard_index: shard_index as u64,
@@ -325,6 +326,7 @@ impl HoloStoreClient {
             end_key: end_key.to_vec().into(),
             cursor: cursor.to_vec().into(),
             limit: limit.clamp(1, u32::MAX as usize) as u32,
+            reverse,
         };
 
         let response =

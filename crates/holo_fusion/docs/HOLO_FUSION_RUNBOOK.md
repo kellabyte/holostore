@@ -1,6 +1,6 @@
 # HoloFusion Runbook and Rollout Guide
 
-This document closes Phase 7 operational guidance for `holo_fusion`.
+This document covers production operations through Phase 10 for `holo_fusion`.
 
 ## Scope
 
@@ -88,6 +88,12 @@ High-signal counters from `/metrics`:
 - `stage_events`: total query/stage timeline events emitted across planning/scan execution.
 - `scan_retry_count` / `scan_reroute_count`: scan-path resiliency activity under failures/topology churn.
 - `scan_chunk_count` / `scan_duplicate_rows_skipped`: storage scan chunk flow and idempotent merge behavior.
+- `admission_<class>_queue_depth` / `_queue_depth_peak` / `_wait_ns_total`: per-class queue pressure and latency.
+- `distributed_write_target_<target>_circuit_state`: per-target breaker state (`0=closed,1=open,2=half_open`).
+- `distributed_write_target_<target>_circuit_open_count` / `_circuit_reject_count`: breaker trips and shed traffic.
+- `distributed_write_target_<target>_retryable_failures`: retry-governance signal by endpoint.
+- `ingest_rows_ingested_total`, `ingest_jobs_started/completed/failed`: bulk ingest throughput and stability.
+- `ingest_job_<n>_rows_per_second`, `_queue_depth`, `_inflight_bytes`, `_status`: job-level ingest progress.
 
 Use deltas/rates, not absolute values, during incident windows.
 
@@ -165,9 +171,15 @@ Actions:
 2. Apply focused tuning:
 - Timeouts: increase `HOLO_FUSION_DML_STATEMENT_TIMEOUT_MS` only if workload justifies longer statements.
 - Admission: raise `HOLO_FUSION_DML_MAX_INFLIGHT_STATEMENTS` cautiously.
+- Class budgets: tune `HOLO_FUSION_DML_MAX_INFLIGHT_READS`, `...WRITES`, `...TXNS`, `...BACKGROUND`.
+- Queue policy: tune `HOLO_FUSION_DML_ADMISSION_QUEUE_LIMIT` and `...ADMISSION_WAIT_TIMEOUT_MS`.
 - Scan pressure: tune `HOLO_FUSION_DML_MAX_SCAN_ROWS`.
 - Transaction staging pressure: tune `HOLO_FUSION_DML_MAX_TXN_STAGED_ROWS`.
 - Write RPC sizing: tune `HOLO_FUSION_DML_WRITE_MAX_BATCH_ENTRIES` and `HOLO_FUSION_DML_WRITE_MAX_BATCH_BYTES`.
+- Retry governance: tune `HOLO_FUSION_DML_RETRY_MAX_ATTEMPTS`, `...RETRY_BASE_DELAY_MS`, `...RETRY_MAX_DELAY_MS`, `...RETRY_BUDGET_MS`.
+- Circuit breaker: tune `HOLO_FUSION_DML_CIRCUIT_BREAKER_FAILURE_THRESHOLD` and `...CIRCUIT_BREAKER_OPEN_MS`.
+- In-flight write budgets: tune `HOLO_FUSION_DML_WRITE_MAX_INFLIGHT_ROWS`, `...BYTES`, `...RPCS`.
+- Bulk ingest controls: tune `HOLO_FUSION_BULK_CHUNK_ROWS_{INITIAL,MIN,MAX}` and latency thresholds.
 3. Prefer load-shedding and workload shaping over unlimited knob increases.
 
 ### 4) Shard Imbalance / Replica Convergence Issues
@@ -196,13 +208,38 @@ Primary runtime knobs:
 | --- | --- | --- |
 | `HOLO_FUSION_DML_STATEMENT_TIMEOUT_MS` | `0` (disabled) | Upper bound for statement duration. |
 | `HOLO_FUSION_DML_MAX_INFLIGHT_STATEMENTS` | `1024` | Admission-control concurrency limit. |
+| `HOLO_FUSION_DML_MAX_INFLIGHT_READS` | `1024` | Read admission budget. |
+| `HOLO_FUSION_DML_MAX_INFLIGHT_WRITES` | `1024` | Write admission budget. |
+| `HOLO_FUSION_DML_MAX_INFLIGHT_TXNS` | `512` | Explicit transaction admission budget. |
+| `HOLO_FUSION_DML_MAX_INFLIGHT_BACKGROUND` | `256` | Background/elastic admission budget. |
+| `HOLO_FUSION_DML_ADMISSION_QUEUE_LIMIT` | `4096` | Max queue depth before `53300` shed. |
+| `HOLO_FUSION_DML_ADMISSION_WAIT_TIMEOUT_MS` | `0` | Queue wait timeout (`53300` on expiry). |
 | `HOLO_FUSION_DML_MAX_SCAN_ROWS` | `100000` | Caps per-mutation/snapshot scan fan-out. |
 | `HOLO_FUSION_DML_MAX_TXN_STAGED_ROWS` | `100000` | Caps staged writes in explicit tx. |
 | `HOLO_FUSION_DML_WRITE_MAX_BATCH_ENTRIES` | `1024` | Max rows per distributed write RPC chunk. |
 | `HOLO_FUSION_DML_WRITE_MAX_BATCH_BYTES` | `1048576` | Approximate payload budget per write RPC chunk. |
+| `HOLO_FUSION_DML_RETRY_MAX_ATTEMPTS` | `5` | Max attempts for retry-governed distributed writes. |
+| `HOLO_FUSION_DML_RETRY_BASE_DELAY_MS` | `50` | Base backoff for jittered retry policy. |
+| `HOLO_FUSION_DML_RETRY_MAX_DELAY_MS` | `1000` | Ceiling for retry backoff delay. |
+| `HOLO_FUSION_DML_RETRY_BUDGET_MS` | `10000` | Total retry time budget per statement. |
+| `HOLO_FUSION_DML_CIRCUIT_BREAKER_FAILURE_THRESHOLD` | `4` | Consecutive retryable failures before open. |
+| `HOLO_FUSION_DML_CIRCUIT_BREAKER_OPEN_MS` | `2000` | Open-state cooldown before half-open probe. |
+| `HOLO_FUSION_DML_WRITE_MAX_INFLIGHT_ROWS` | `32768` | In-flight row budget guardrail. |
+| `HOLO_FUSION_DML_WRITE_MAX_INFLIGHT_BYTES` | `33554432` | In-flight byte budget guardrail. |
+| `HOLO_FUSION_DML_WRITE_MAX_INFLIGHT_RPCS` | `32` | In-flight RPC budget guardrail. |
+| `HOLO_FUSION_BULK_CHUNK_ROWS_INITIAL` | `1024` | Initial adaptive chunk target for bulk ingest. |
+| `HOLO_FUSION_BULK_CHUNK_ROWS_MIN` | `128` | Lower bound for adaptive bulk chunking. |
+| `HOLO_FUSION_BULK_CHUNK_ROWS_MAX` | `8192` | Upper bound for adaptive bulk chunking. |
+| `HOLO_FUSION_BULK_CHUNK_LOW_LATENCY_MS` | `40` | Grow chunk when latency stays below threshold. |
+| `HOLO_FUSION_BULK_CHUNK_HIGH_LATENCY_MS` | `150` | Shrink chunk when latency exceeds threshold. |
 | `HOLO_FUSION_HOLOSTORE_MAX_SHARDS` | `1` | Total shards available for spread. |
 | `HOLO_FUSION_HOLOSTORE_INITIAL_RANGES` | `1` | Starting split count before growth. |
 | `HOLO_FUSION_HOLOSTORE_ROUTING_MODE` | `range` | Key routing mode (`range`/`hash`). |
+| `HOLO_FUSION_PHASE10_HASH_PK_DDL_ENABLED` | `true` | Kill switch for new `USING HASH` DDL adoption. |
+| `HOLO_FUSION_PHASE10_HASH_PK_MIGRATION_ENABLED` | `true` | Kill switch for hash-PK migration control path. |
+| `HOLO_FUSION_PHASE10_RETRY_GOVERNANCE_ENABLED` | `true` | Kill switch for retry-governance policy. |
+| `HOLO_FUSION_PHASE10_CIRCUIT_BREAKER_ENABLED` | `true` | Kill switch for per-target circuit breakers. |
+| `HOLO_FUSION_PHASE10_BULK_INGEST_ENABLED` | `true` | Kill switch for streaming bulk ingest path. |
 
 Tuning method:
 
@@ -238,6 +275,10 @@ HOLO_FUSION_ENFORCE_SLO=1 cargo test -p holo_fusion phase7_benchmark_and_slo_pac
 - `pg_is_in_recovery()`
 - `txid_current()`
 - `pg_catalog.pg_locks`
+5. Validate Phase 10 stability gate:
+- run `phase10_hash_primary_key_create_insert_and_scan`
+- run `phase10_hash_primary_key_migration_backfills_online`
+- run `phase10_metrics_expose_circuit_and_ingest_status`
 
 Rolling upgrade guidance:
 
@@ -256,12 +297,18 @@ For metadata migration state model and rollout details, see:
 ## Rollback Checklist
 
 1. Stop rollout immediately on regression (availability, correctness, or SLO breach).
-2. Re-deploy previous known-good binary and previous knob set on affected node.
-3. Verify:
+2. Disable Phase 10 controls first when impact is isolated:
+- `HOLO_FUSION_PHASE10_CIRCUIT_BREAKER_ENABLED=false`
+- `HOLO_FUSION_PHASE10_RETRY_GOVERNANCE_ENABLED=false`
+- `HOLO_FUSION_PHASE10_BULK_INGEST_ENABLED=false`
+- `HOLO_FUSION_PHASE10_HASH_PK_DDL_ENABLED=false`
+- `HOLO_FUSION_PHASE10_HASH_PK_MIGRATION_ENABLED=false`
+3. Re-deploy previous known-good binary and previous knob set on affected node.
+4. Verify:
 - `/ready` healthy
 - topology convergence
 - conflict/timeout/admission rates return to baseline
-4. If schema or metadata migration was included, run the documented reverse migration before resuming traffic.
+5. If schema or metadata migration was included, run the documented reverse migration before resuming traffic.
 
 ## Post-Incident Checklist
 
