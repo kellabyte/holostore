@@ -5,7 +5,7 @@
 //! operations against HoloStore-backed tables.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -19,11 +19,14 @@ use datafusion::logical_expr::expr::Placeholder;
 use datafusion::logical_expr::{Expr as DfExpr, LogicalPlan, LogicalPlanBuilder};
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::{
-    Assignment, AssignmentTarget, BinaryOperator, ColumnDef, ColumnOption, CreateTable,
-    CreateTableOptions, DataType, Delete, Expr as SqlExpr, FromTable, IndexColumn, Insert,
-    ObjectName, SetExpr, Statement, TableConstraint, TableFactor, TableObject, TableWithJoins,
-    TimezoneInfo, UnaryOperator, Value, ValueWithSpan,
+    AlterTableOperation, Assignment, AssignmentTarget, BinaryOperator, ColumnDef, ColumnOption,
+    CreateTable, CreateTableOptions, DataType, Delete, Expr as SqlExpr, FromTable, FunctionArg,
+    FunctionArgExpr, FunctionArguments, IndexColumn, IndexOption, IndexType, Insert, ObjectName,
+    Query, SelectItem, SetExpr, SqlOption, Statement, TableConstraint, TableFactor, TableObject,
+    TableWithJoins, TimezoneInfo, UnaryOperator, Value, ValueWithSpan,
 };
+use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
+use datafusion::sql::sqlparser::parser::Parser;
 use datafusion_postgres::arrow_pg::datatypes::df;
 use datafusion_postgres::hooks::QueryHook;
 use datafusion_postgres::pgwire::api::portal::Format;
@@ -32,21 +35,23 @@ use datafusion_postgres::pgwire::api::ClientInfo;
 use datafusion_postgres::pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use datafusion_postgres::pgwire::types::format::FormatOptions;
 use holo_store::{HoloStoreClient, RpcVersion};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{info_span, Instrument};
 
 use crate::catalog::register_table_from_metadata;
 use crate::metadata::{
-    apply_column_defaults_for_missing, create_table_metadata, table_model_orders_v1,
-    table_model_row_v1, validate_row_against_metadata, validate_table_constraints,
-    CheckBinaryOperator, CheckExpression, ColumnDefaultValue, CreateTableMetadataSpec,
+    apply_column_defaults_for_missing, create_table_metadata, find_table_metadata_by_name,
+    table_model_orders_v1, table_model_row_v1, update_table_primary_key_distribution,
+    validate_row_against_metadata, validate_table_constraints, CheckBinaryOperator,
+    CheckExpression, ColumnDefaultValue, CreateTableMetadataSpec, PrimaryKeyDistribution,
     TableCheckConstraintRecord, TableColumnRecord, TableColumnType,
 };
 use crate::metrics::PushdownMetrics;
 use crate::provider::{
     encode_orders_row_value, encode_orders_tombstone_value, is_duplicate_key_violation_message,
-    orders_schema, ConditionalOrderWrite, ConditionalPrimaryWrite, ConditionalWriteOutcome,
-    DuplicateKeyViolation, HoloStoreTableProvider, OrdersSeedRow, VersionedOrdersRow,
+    is_overload_error_message, orders_schema, ConditionalOrderWrite, ConditionalPrimaryWrite,
+    ConditionalWriteOutcome, DuplicateKeyViolation, HoloStoreTableProvider, OrdersSeedRow,
+    PrimaryKeyExtreme, VersionedOrdersRow,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -55,6 +60,12 @@ pub struct DmlRuntimeConfig {
     pub prewrite_delay: Duration,
     pub statement_timeout: Duration,
     pub max_inflight_statements: usize,
+    pub max_inflight_reads: usize,
+    pub max_inflight_writes: usize,
+    pub max_inflight_txns: usize,
+    pub max_inflight_background: usize,
+    pub admission_queue_limit: usize,
+    pub admission_wait_timeout: Duration,
     pub max_scan_rows: usize,
     pub max_txn_staged_rows: usize,
 }
@@ -66,9 +77,189 @@ impl Default for DmlRuntimeConfig {
             prewrite_delay: Duration::ZERO,
             statement_timeout: Duration::ZERO,
             max_inflight_statements: 1024,
+            max_inflight_reads: 1024,
+            max_inflight_writes: 1024,
+            max_inflight_txns: 512,
+            max_inflight_background: 256,
+            admission_queue_limit: 4096,
+            admission_wait_timeout: Duration::ZERO,
             max_scan_rows: 100_000,
             max_txn_staged_rows: 100_000,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdmissionClass {
+    Read,
+    Write,
+    Transaction,
+    Background,
+}
+
+impl AdmissionClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Transaction => "transaction",
+            Self::Background => "background",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdmissionRejection {
+    QueueTimeout,
+    QueueLimit,
+}
+
+#[derive(Debug)]
+struct AdmissionPermit {
+    _global: OwnedSemaphorePermit,
+    _class: OwnedSemaphorePermit,
+}
+
+#[derive(Debug)]
+struct AdmissionController {
+    global: Arc<Semaphore>,
+    reads: Arc<Semaphore>,
+    writes: Arc<Semaphore>,
+    txns: Arc<Semaphore>,
+    background: Arc<Semaphore>,
+    wait_timeout: Duration,
+    queue_limit: usize,
+    read_queue_depth: AtomicUsize,
+    write_queue_depth: AtomicUsize,
+    txn_queue_depth: AtomicUsize,
+    background_queue_depth: AtomicUsize,
+}
+
+impl AdmissionController {
+    fn new(config: DmlRuntimeConfig) -> Self {
+        Self {
+            global: Arc::new(Semaphore::new(config.max_inflight_statements.max(1))),
+            reads: Arc::new(Semaphore::new(config.max_inflight_reads.max(1))),
+            writes: Arc::new(Semaphore::new(config.max_inflight_writes.max(1))),
+            txns: Arc::new(Semaphore::new(config.max_inflight_txns.max(1))),
+            background: Arc::new(Semaphore::new(config.max_inflight_background.max(1))),
+            wait_timeout: config.admission_wait_timeout,
+            queue_limit: config.admission_queue_limit.max(1),
+            read_queue_depth: AtomicUsize::new(0),
+            write_queue_depth: AtomicUsize::new(0),
+            txn_queue_depth: AtomicUsize::new(0),
+            background_queue_depth: AtomicUsize::new(0),
+        }
+    }
+
+    fn queue_counter(&self, class: AdmissionClass) -> &AtomicUsize {
+        match class {
+            AdmissionClass::Read => &self.read_queue_depth,
+            AdmissionClass::Write => &self.write_queue_depth,
+            AdmissionClass::Transaction => &self.txn_queue_depth,
+            AdmissionClass::Background => &self.background_queue_depth,
+        }
+    }
+
+    fn class_semaphore(&self, class: AdmissionClass) -> Arc<Semaphore> {
+        match class {
+            AdmissionClass::Read => self.reads.clone(),
+            AdmissionClass::Write => self.writes.clone(),
+            AdmissionClass::Transaction => self.txns.clone(),
+            AdmissionClass::Background => self.background.clone(),
+        }
+    }
+
+    async fn acquire(
+        &self,
+        class: AdmissionClass,
+        metrics: &PushdownMetrics,
+    ) -> std::result::Result<AdmissionPermit, AdmissionRejection> {
+        let queue_counter = self.queue_counter(class);
+        let queued = queue_counter
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        metrics.record_admission_queue_depth(class.as_str(), queued as u64);
+        if queued > self.queue_limit {
+            let depth = queue_counter
+                .fetch_sub(1, Ordering::Relaxed)
+                .saturating_sub(1);
+            metrics.record_admission_queue_depth(class.as_str(), depth as u64);
+            metrics.record_admission_reject_class(
+                class.as_str(),
+                crate::metrics::AdmissionRejectKind::QueueLimit,
+            );
+            return Err(AdmissionRejection::QueueLimit);
+        }
+
+        let wait_started = Instant::now();
+        let class_sem = self.class_semaphore(class);
+        let global_sem = self.global.clone();
+        let (global_permit, class_permit) = if self.wait_timeout > Duration::ZERO {
+            let class_sem_wait = class_sem.clone();
+            let global_sem_wait = global_sem.clone();
+            let acquire_fut = async move {
+                let class_permit = class_sem_wait.acquire_owned().await;
+                let global_permit = global_sem_wait.acquire_owned().await;
+                (global_permit, class_permit)
+            };
+            match tokio::time::timeout(self.wait_timeout, acquire_fut).await {
+                Ok((Ok(global_permit), Ok(class_permit))) => (global_permit, class_permit),
+                _ => {
+                    let depth = queue_counter
+                        .fetch_sub(1, Ordering::Relaxed)
+                        .saturating_sub(1);
+                    metrics.record_admission_queue_depth(class.as_str(), depth as u64);
+                    metrics.record_admission_reject_class(
+                        class.as_str(),
+                        crate::metrics::AdmissionRejectKind::QueueTimeout,
+                    );
+                    return Err(AdmissionRejection::QueueTimeout);
+                }
+            }
+        } else {
+            let class_permit = match class_sem.try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    let depth = queue_counter
+                        .fetch_sub(1, Ordering::Relaxed)
+                        .saturating_sub(1);
+                    metrics.record_admission_queue_depth(class.as_str(), depth as u64);
+                    metrics.record_admission_reject_class(
+                        class.as_str(),
+                        crate::metrics::AdmissionRejectKind::QueueTimeout,
+                    );
+                    return Err(AdmissionRejection::QueueTimeout);
+                }
+            };
+            let global_permit = match global_sem.try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    drop(class_permit);
+                    let depth = queue_counter
+                        .fetch_sub(1, Ordering::Relaxed)
+                        .saturating_sub(1);
+                    metrics.record_admission_queue_depth(class.as_str(), depth as u64);
+                    metrics.record_admission_reject_class(
+                        class.as_str(),
+                        crate::metrics::AdmissionRejectKind::QueueTimeout,
+                    );
+                    return Err(AdmissionRejection::QueueTimeout);
+                }
+            };
+            (global_permit, class_permit)
+        };
+
+        let depth = queue_counter
+            .fetch_sub(1, Ordering::Relaxed)
+            .saturating_sub(1);
+        metrics.record_admission_queue_depth(class.as_str(), depth as u64);
+
+        metrics.record_admission_grant(class.as_str(), wait_started.elapsed());
+        Ok(AdmissionPermit {
+            _global: global_permit,
+            _class: class_permit,
+        })
     }
 }
 
@@ -79,7 +270,7 @@ pub struct DmlHook {
     tx_manager: Arc<TxnSessionManager>,
     holostore_client: HoloStoreClient,
     pushdown_metrics: Arc<PushdownMetrics>,
-    admission: Arc<Semaphore>,
+    admission: AdmissionController,
 }
 
 impl DmlHook {
@@ -94,7 +285,7 @@ impl DmlHook {
             tx_manager: Arc::new(TxnSessionManager::default()),
             holostore_client,
             pushdown_metrics,
-            admission: Arc::new(Semaphore::new(config.max_inflight_statements.max(1))),
+            admission: AdmissionController::new(config),
         }
     }
 
@@ -138,15 +329,25 @@ impl DmlHook {
         session_id: &str,
         query_execution_id: &str,
         protocol: QueryProtocol,
+        admission_class: AdmissionClass,
         future: impl std::future::Future<Output = PgWireResult<Response>>,
     ) -> PgWireResult<Response> {
-        let permit = match self.admission.clone().try_acquire_owned() {
+        let permit = match self
+            .admission
+            .acquire(admission_class, self.pushdown_metrics.as_ref())
+            .await
+        {
             Ok(permit) => permit,
-            Err(_) => {
-                self.pushdown_metrics.record_admission_reject();
+            Err(AdmissionRejection::QueueTimeout) => {
                 return Err(to_user_error(
                     "53300",
-                    "server is overloaded: too many in-flight SQL mutations",
+                    "server is overloaded: admission queue timeout exceeded",
+                ));
+            }
+            Err(AdmissionRejection::QueueLimit) => {
+                return Err(to_user_error(
+                    "53300",
+                    "server is overloaded: admission queue depth limit exceeded",
                 ));
             }
         };
@@ -156,7 +357,8 @@ impl DmlHook {
             query_execution_id = query_execution_id,
             statement = statement_kind(statement),
             protocol = protocol.as_str(),
-            session_id = session_id
+            session_id = session_id,
+            admission_class = admission_class.as_str()
         );
 
         let execute = async move {
@@ -208,6 +410,7 @@ impl DmlHook {
                     session_id,
                     query_execution_id.as_str(),
                     protocol,
+                    statement_admission_class(statement, false, session_id),
                     self.handle_txn_control(statement, session_context, session_id.to_string()),
                 )
                 .await,
@@ -221,6 +424,7 @@ impl DmlHook {
                     session_id,
                     query_execution_id.as_str(),
                     protocol,
+                    statement_admission_class(statement, true, session_id),
                     async {
                         self.route_transactional_statement(
                             statement,
@@ -250,6 +454,7 @@ impl DmlHook {
                     session_id,
                     query_execution_id.as_str(),
                     protocol,
+                    statement_admission_class(statement, false, session_id),
                     async {
                         execute_explain_dist(
                             statement,
@@ -272,9 +477,36 @@ impl DmlHook {
                     session_id,
                     query_execution_id.as_str(),
                     protocol,
+                    statement_admission_class(statement, false, session_id),
                     async {
                         execute_create_table(
                             create,
+                            session_context,
+                            self.holostore_client.clone(),
+                            self.pushdown_metrics.clone(),
+                        )
+                        .await
+                    },
+                )
+                .await,
+            );
+        }
+
+        if let Statement::AlterTable {
+            name, operations, ..
+        } = statement
+        {
+            return Some(
+                self.run_statement_with_controls(
+                    statement,
+                    session_id,
+                    query_execution_id.as_str(),
+                    protocol,
+                    statement_admission_class(statement, false, session_id),
+                    async {
+                        execute_alter_table(
+                            name,
+                            operations.as_slice(),
                             session_context,
                             self.holostore_client.clone(),
                             self.pushdown_metrics.clone(),
@@ -293,10 +525,39 @@ impl DmlHook {
                     session_id,
                     query_execution_id.as_str(),
                     protocol,
+                    statement_admission_class(statement, false, session_id),
                     async { execute_insert(insert, params, session_context).await },
                 )
                 .await,
             );
+        }
+
+        if let Some(spec) = extract_fast_primary_key_aggregate_statement(statement) {
+            if let Some(provider) =
+                try_get_holo_provider_for_table(session_context, spec.table_name.as_str()).await
+            {
+                if spec
+                    .column_name
+                    .eq_ignore_ascii_case(provider.primary_key_column())
+                {
+                    return Some(
+                        self.run_statement_with_controls(
+                            statement,
+                            session_id,
+                            query_execution_id.as_str(),
+                            protocol,
+                            statement_admission_class(statement, false, session_id),
+                            async move {
+                                execute_fast_primary_key_aggregate_query(
+                                    provider, spec, client, protocol,
+                                )
+                                .await
+                            },
+                        )
+                        .await,
+                    );
+                }
+            }
         }
 
         if !matches!(statement, Statement::Update { .. } | Statement::Delete(_)) {
@@ -309,6 +570,7 @@ impl DmlHook {
                 session_id,
                 query_execution_id.as_str(),
                 protocol,
+                statement_admission_class(statement, false, session_id),
                 async {
                     execute_dml(
                         statement,
@@ -964,12 +1226,238 @@ fn statement_kind(statement: &Statement) -> &'static str {
         Statement::Commit { .. } => "COMMIT",
         Statement::Rollback { .. } => "ROLLBACK",
         Statement::CreateTable(_) => "CREATE_TABLE",
+        Statement::AlterTable { .. } => "ALTER_TABLE",
         Statement::Update { .. } => "UPDATE",
         Statement::Delete(_) => "DELETE",
         Statement::Insert(_) => "INSERT",
         Statement::Explain { .. } => "EXPLAIN",
         Statement::Query(_) => "QUERY",
         _ => "OTHER",
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FastPrimaryKeyAggregateSpec {
+    table_name: String,
+    column_name: String,
+    extreme: PrimaryKeyExtreme,
+    coalesce_fallback: Option<i64>,
+    output_alias: Option<String>,
+}
+
+/// Extracts supported `MIN/MAX(primary_key)` aggregate shape from a statement.
+fn extract_fast_primary_key_aggregate_statement(
+    statement: &Statement,
+) -> Option<FastPrimaryKeyAggregateSpec> {
+    let Statement::Query(query) = statement else {
+        return None;
+    };
+    extract_fast_primary_key_aggregate_query(query.as_ref())
+}
+
+/// Extracts supported `MIN/MAX(primary_key)` aggregate shape from a query.
+fn extract_fast_primary_key_aggregate_query(query: &Query) -> Option<FastPrimaryKeyAggregateSpec> {
+    if query.with.is_some()
+        || query.order_by.is_some()
+        || query.limit_clause.is_some()
+        || query.fetch.is_some()
+        || !query.locks.is_empty()
+        || query.for_clause.is_some()
+        || query.settings.is_some()
+        || query.format_clause.is_some()
+        || !query.pipe_operators.is_empty()
+    {
+        return None;
+    }
+
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    if select.distinct.is_some()
+        || select.top.is_some()
+        || select.exclude.is_some()
+        || select.into.is_some()
+        || !select.lateral_views.is_empty()
+        || select.prewhere.is_some()
+        || select.selection.is_some()
+        || !select.cluster_by.is_empty()
+        || !select.distribute_by.is_empty()
+        || !select.sort_by.is_empty()
+        || select.having.is_some()
+        || !select.named_window.is_empty()
+        || select.qualify.is_some()
+        || select.value_table_mode.is_some()
+        || select.connect_by.is_some()
+    {
+        return None;
+    }
+    match &select.group_by {
+        datafusion::sql::sqlparser::ast::GroupByExpr::Expressions(exprs, _) if exprs.is_empty() => {
+        }
+        _ => return None,
+    }
+
+    if select.projection.len() != 1 || select.from.len() != 1 {
+        return None;
+    }
+
+    let from = select.from.first()?;
+    if !from.joins.is_empty() {
+        return None;
+    }
+    let TableFactor::Table { name, .. } = &from.relation else {
+        return None;
+    };
+    let table_name = object_name_leaf(name).ok()?;
+
+    let (expr, output_alias) = match select.projection.first()? {
+        SelectItem::UnnamedExpr(expr) => (expr, None),
+        SelectItem::ExprWithAlias { expr, alias } => (expr, Some(normalize_ident(alias))),
+        _ => return None,
+    };
+
+    let (column_name, extreme, coalesce_fallback) = extract_primary_key_aggregate_expr(expr)?;
+    Some(FastPrimaryKeyAggregateSpec {
+        table_name,
+        column_name,
+        extreme,
+        coalesce_fallback,
+        output_alias,
+    })
+}
+
+/// Extracts `column`, `extreme`, and optional COALESCE fallback from one projection expression.
+fn extract_primary_key_aggregate_expr(
+    expr: &SqlExpr,
+) -> Option<(String, PrimaryKeyExtreme, Option<i64>)> {
+    match expr {
+        SqlExpr::Function(function) if is_function_named(function, "coalesce") => {
+            let args = function_args_list(function)?;
+            if args.len() != 2 {
+                return None;
+            }
+            let aggregate_expr = function_arg_as_expr(args.first()?)?;
+            let fallback_expr = function_arg_as_expr(args.get(1)?)?;
+            let (column_name, extreme) = extract_min_max_function(aggregate_expr)?;
+            let fallback = parse_i64_literal(fallback_expr)?;
+            Some((column_name, extreme, Some(fallback)))
+        }
+        SqlExpr::Function(_) => {
+            let (column_name, extreme) = extract_min_max_function(expr)?;
+            Some((column_name, extreme, None))
+        }
+        _ => None,
+    }
+}
+
+/// Extracts MIN/MAX aggregate and target column from one SQL expression.
+fn extract_min_max_function(expr: &SqlExpr) -> Option<(String, PrimaryKeyExtreme)> {
+    let SqlExpr::Function(function) = expr else {
+        return None;
+    };
+    let extreme = if is_function_named(function, "max") {
+        PrimaryKeyExtreme::Max
+    } else if is_function_named(function, "min") {
+        PrimaryKeyExtreme::Min
+    } else {
+        return None;
+    };
+
+    if function.parameters != FunctionArguments::None
+        || function.filter.is_some()
+        || function.null_treatment.is_some()
+        || function.over.is_some()
+        || !function.within_group.is_empty()
+    {
+        return None;
+    }
+    let args = function_args_list(function)?;
+    if args.len() != 1 {
+        return None;
+    }
+    let column_name = sql_expr_column_name(function_arg_as_expr(args.first()?)?)?;
+    Some((column_name, extreme))
+}
+
+/// Returns normalized function name equality.
+fn is_function_named(function: &datafusion::sql::sqlparser::ast::Function, expected: &str) -> bool {
+    function
+        .name
+        .0
+        .last()
+        .and_then(|part| part.as_ident())
+        .map(normalize_ident)
+        .map(|name| name.eq_ignore_ascii_case(expected))
+        .unwrap_or(false)
+}
+
+/// Returns simple positional function args (`f(arg1, arg2)`).
+fn function_args_list(
+    function: &datafusion::sql::sqlparser::ast::Function,
+) -> Option<&[FunctionArg]> {
+    match &function.args {
+        FunctionArguments::List(list)
+            if list.duplicate_treatment.is_none() && list.clauses.is_empty() =>
+        {
+            Some(list.args.as_slice())
+        }
+        _ => None,
+    }
+}
+
+/// Extracts one unnamed expression argument.
+fn function_arg_as_expr(arg: &FunctionArg) -> Option<&SqlExpr> {
+    match arg {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => Some(expr),
+        _ => None,
+    }
+}
+
+/// Extracts one normalized column name from a SQL expression.
+fn sql_expr_column_name(expr: &SqlExpr) -> Option<String> {
+    match expr {
+        SqlExpr::Identifier(ident) => Some(normalize_ident(ident)),
+        SqlExpr::CompoundIdentifier(idents) => idents.last().map(normalize_ident),
+        _ => None,
+    }
+}
+
+/// Parses one signed 64-bit integer literal.
+fn parse_i64_literal(expr: &SqlExpr) -> Option<i64> {
+    match expr {
+        SqlExpr::Value(ValueWithSpan {
+            value: Value::Number(raw, _),
+            ..
+        }) => raw.parse::<i64>().ok(),
+        SqlExpr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => parse_i64_literal(expr).map(|value| -value),
+        SqlExpr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr,
+        } => parse_i64_literal(expr),
+        _ => None,
+    }
+}
+
+/// Maps one statement/session context to an admission workload class.
+fn statement_admission_class(
+    statement: &Statement,
+    in_explicit_txn: bool,
+    session_id: &str,
+) -> AdmissionClass {
+    let session_is_background =
+        session_id.starts_with("background:") || session_id.starts_with("internal_background:");
+    if session_is_background {
+        return AdmissionClass::Background;
+    }
+    if in_explicit_txn || is_txn_control_statement(statement) {
+        return AdmissionClass::Transaction;
+    }
+    match statement {
+        Statement::Query(_) | Statement::Explain { .. } => AdmissionClass::Read,
+        _ => AdmissionClass::Write,
     }
 }
 
@@ -1166,7 +1654,11 @@ async fn execute_insert_via_datafusion(
     insert: &Insert,
     session_context: &SessionContext,
 ) -> PgWireResult<Response> {
-    let statement = Statement::Insert(insert.clone());
+    let mut rewritten_insert = insert.clone();
+    rewrite_insert_source_fast_primary_key_aggregates(&mut rewritten_insert, session_context)
+        .await?;
+
+    let statement = Statement::Insert(rewritten_insert);
     let df_statement = datafusion::sql::parser::Statement::Statement(Box::new(statement));
     let logical_plan = session_context
         .state()
@@ -1199,12 +1691,113 @@ async fn execute_insert_via_datafusion(
     ))
 }
 
+/// Rewrites fast-path `MIN/MAX(primary_key)` aggregate subqueries inside INSERT source query.
+async fn rewrite_insert_source_fast_primary_key_aggregates(
+    insert: &mut Insert,
+    session_context: &SessionContext,
+) -> PgWireResult<()> {
+    let Some(source) = insert.source.as_mut() else {
+        return Ok(());
+    };
+
+    if let Some(replacement) =
+        rewrite_query_if_fast_primary_key_aggregate(source.as_ref(), session_context).await?
+    {
+        *source = Box::new(replacement);
+        return Ok(());
+    }
+
+    if let Some(with) = source.with.as_mut() {
+        for cte in &mut with.cte_tables {
+            if let Some(replacement) =
+                rewrite_query_if_fast_primary_key_aggregate(cte.query.as_ref(), session_context)
+                    .await?
+            {
+                cte.query = Box::new(replacement);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Returns a rewritten literal query when the input matches fast PK aggregate shape.
+async fn rewrite_query_if_fast_primary_key_aggregate(
+    query: &Query,
+    session_context: &SessionContext,
+) -> PgWireResult<Option<Query>> {
+    let Some(spec) = extract_fast_primary_key_aggregate_query(query) else {
+        return Ok(None);
+    };
+    let Some(provider) =
+        try_get_holo_provider_for_table(session_context, spec.table_name.as_str()).await
+    else {
+        return Ok(None);
+    };
+    if !spec
+        .column_name
+        .eq_ignore_ascii_case(provider.primary_key_column())
+    {
+        return Ok(None);
+    }
+
+    let value = evaluate_fast_primary_key_aggregate(provider, &spec).await?;
+    let replacement = parse_literal_select_query(value, spec.output_alias.as_deref())?;
+    Ok(Some(replacement))
+}
+
+/// Evaluates one fast PK aggregate on a table provider.
+async fn evaluate_fast_primary_key_aggregate(
+    provider: HoloStoreTableProvider,
+    spec: &FastPrimaryKeyAggregateSpec,
+) -> PgWireResult<Option<i64>> {
+    let value = provider
+        .scan_primary_key_extreme(spec.extreme)
+        .await
+        .map_err(|err| api_error(err.to_string()))?;
+    Ok(match value {
+        Some(value) => Some(value),
+        None => spec.coalesce_fallback,
+    })
+}
+
+/// Parses `SELECT <literal> [AS <alias>]` into a query AST.
+fn parse_literal_select_query(value: Option<i64>, alias: Option<&str>) -> PgWireResult<Query> {
+    let value_sql = value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "NULL".to_string());
+    let alias_sql = alias
+        .map(|name| format!(" AS {}", quote_ident_sql(name)))
+        .unwrap_or_default();
+    let sql = format!("SELECT {value_sql}{alias_sql}");
+
+    let dialect = PostgreSqlDialect {};
+    let mut statements =
+        Parser::parse_sql(&dialect, sql.as_str()).map_err(|err| api_error(err.to_string()))?;
+    if statements.len() != 1 {
+        return Err(api_error(format!(
+            "fast aggregate rewrite produced {} statements",
+            statements.len()
+        )));
+    }
+    match statements.remove(0) {
+        Statement::Query(query) => Ok(*query),
+        other => Err(api_error(format!(
+            "fast aggregate rewrite expected query statement, got {other:?}"
+        ))),
+    }
+}
+
+/// Quotes one SQL identifier for parser-safe literal query generation.
+fn quote_ident_sql(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 /// Maps provider INSERT errors to PostgreSQL-compatible SQLSTATEs.
 fn map_insert_provider_error(err: anyhow::Error) -> PgWireError {
     if let Some(duplicate) = err.downcast_ref::<DuplicateKeyViolation>() {
         return to_user_error("23505", duplicate.to_string());
     }
-    api_error(err.to_string())
+    map_runtime_error(err)
 }
 
 /// Maps DataFusion INSERT execution errors to PostgreSQL-compatible SQLSTATEs.
@@ -1212,6 +1805,18 @@ fn map_insert_datafusion_error(err: impl std::fmt::Display) -> PgWireError {
     let message = err.to_string();
     if is_duplicate_key_violation_message(message.as_str()) {
         return to_user_error("23505", extract_duplicate_key_message(message.as_str()));
+    }
+    map_runtime_error(message)
+}
+
+/// Maps runtime/provider errors to user SQLSTATEs when possible.
+fn map_runtime_error(err: impl std::fmt::Display) -> PgWireError {
+    let message = err.to_string();
+    if is_duplicate_key_violation_message(message.as_str()) {
+        return to_user_error("23505", extract_duplicate_key_message(message.as_str()));
+    }
+    if is_overload_error_message(message.as_str()) {
+        return to_user_error("53300", message);
     }
     api_error(message)
 }
@@ -1258,6 +1863,273 @@ async fn execute_create_table(
     Ok(Response::Execution(Tag::new("CREATE TABLE")))
 }
 
+fn configured_hash_pk_migration_enabled() -> bool {
+    std::env::var("HOLO_FUSION_PHASE10_HASH_PK_MIGRATION_ENABLED")
+        .ok()
+        .and_then(|raw| raw.parse::<bool>().ok())
+        .unwrap_or(true)
+}
+
+/// Parses ALTER TABLE properties for hash-primary-key migration.
+fn parse_hash_pk_migration_from_alter(
+    operations: &[AlterTableOperation],
+) -> PgWireResult<Option<usize>> {
+    if operations.len() != 1 {
+        return Err(to_user_error(
+            "0A000",
+            "ALTER TABLE supports exactly one operation in current HoloFusion scope",
+        ));
+    }
+    let AlterTableOperation::SetTblProperties { table_properties } = &operations[0] else {
+        return Err(to_user_error(
+            "0A000",
+            "ALTER TABLE only supports SET TBLPROPERTIES for primary key migration",
+        ));
+    };
+    if table_properties.is_empty() {
+        return Err(to_user_error(
+            "0A000",
+            "ALTER TABLE SET TBLPROPERTIES requires at least one property",
+        ));
+    }
+
+    let mut bucket_count = None::<usize>;
+    let mut distribution = None::<PrimaryKeyDistribution>;
+    for option in table_properties {
+        let SqlOption::KeyValue { key, value } = option else {
+            return Err(to_user_error(
+                "0A000",
+                format!("ALTER TABLE property '{}' is not supported", option),
+            ));
+        };
+        let option_key = normalize_ident(key).to_ascii_lowercase();
+        match option_key.as_str() {
+            "hash_shards" | "hash_buckets" | "bucket_count" | "buckets" => {
+                if bucket_count.is_some() {
+                    return Err(to_user_error(
+                        "42601",
+                        format!(
+                            "ALTER TABLE property '{}' specified more than once",
+                            option_key
+                        ),
+                    ));
+                }
+                bucket_count = Some(parse_positive_usize_sql_expr(value)?);
+            }
+            "primary_key_distribution" | "pk_distribution" => {
+                if distribution.is_some() {
+                    return Err(to_user_error(
+                        "42601",
+                        format!(
+                            "ALTER TABLE property '{}' specified more than once",
+                            option_key
+                        ),
+                    ));
+                }
+                let parsed = match value {
+                    SqlExpr::Value(value) => match &value.value {
+                        Value::SingleQuotedString(raw) | Value::DoubleQuotedString(raw) => {
+                            raw.to_ascii_lowercase()
+                        }
+                        other => {
+                            return Err(to_user_error(
+                                "22023",
+                                format!(
+                                    "invalid value '{}' for ALTER TABLE property '{}'",
+                                    other, option_key
+                                ),
+                            ))
+                        }
+                    },
+                    SqlExpr::Identifier(ident) => normalize_ident(ident).to_ascii_lowercase(),
+                    _ => {
+                        return Err(to_user_error(
+                            "22023",
+                            format!(
+                                "invalid value '{}' for ALTER TABLE property '{}'",
+                                value, option_key
+                            ),
+                        ))
+                    }
+                };
+                distribution = Some(match parsed.as_str() {
+                    "hash" => PrimaryKeyDistribution::Hash,
+                    "range" => PrimaryKeyDistribution::Range,
+                    other => {
+                        return Err(to_user_error(
+                            "22023",
+                            format!(
+                                "unsupported primary_key_distribution '{}' (expected 'hash' or 'range')",
+                                other
+                            ),
+                        ))
+                    }
+                });
+            }
+            _ => {
+                return Err(to_user_error(
+                    "0A000",
+                    format!("ALTER TABLE property '{}' is not supported", option_key),
+                ));
+            }
+        }
+    }
+
+    if matches!(distribution, Some(PrimaryKeyDistribution::Range)) {
+        return Err(to_user_error(
+            "0A000",
+            "ALTER TABLE migration to range primary key is not supported",
+        ));
+    }
+    if distribution != Some(PrimaryKeyDistribution::Hash) && bucket_count.is_none() {
+        return Err(to_user_error(
+            "0A000",
+            "ALTER TABLE must specify hash primary key migration properties",
+        ));
+    }
+    Ok(bucket_count.or(Some(DEFAULT_HASH_PK_BUCKETS)))
+}
+
+/// Executes ALTER TABLE hash-primary-key migration with online backfill.
+async fn execute_alter_table(
+    name: &ObjectName,
+    operations: &[AlterTableOperation],
+    session_context: &SessionContext,
+    holostore_client: HoloStoreClient,
+    pushdown_metrics: Arc<PushdownMetrics>,
+) -> PgWireResult<Response> {
+    if !configured_hash_pk_migration_enabled() {
+        return Err(to_user_error(
+            "0A000",
+            "ALTER TABLE hash primary key migration is disabled by rollout policy",
+        ));
+    }
+    let table_name = parse_create_table_name(name)?;
+    let target_buckets =
+        parse_hash_pk_migration_from_alter(operations)?.unwrap_or(DEFAULT_HASH_PK_BUCKETS);
+    if target_buckets == 0 || target_buckets > MAX_HASH_PK_BUCKETS {
+        return Err(to_user_error(
+            "22023",
+            format!(
+                "hash bucket count must be in range [1, {}], got {}",
+                MAX_HASH_PK_BUCKETS, target_buckets
+            ),
+        ));
+    }
+
+    let table = find_table_metadata_by_name(&holostore_client, table_name.as_str())
+        .await
+        .map_err(map_runtime_error)?
+        .ok_or_else(|| {
+            to_user_error("42P01", format!("relation '{}' does not exist", table_name))
+        })?;
+
+    if table.primary_key_distribution == PrimaryKeyDistribution::Hash
+        && table.primary_key_hash_buckets == Some(target_buckets)
+    {
+        return Ok(Response::Execution(Tag::new("ALTER TABLE").with_rows(0)));
+    }
+
+    let source_provider = HoloStoreTableProvider::from_table_metadata(
+        &table,
+        holostore_client.clone(),
+        pushdown_metrics.clone(),
+    )
+    .map_err(map_runtime_error)?;
+    let mut target_metadata = table.clone();
+    target_metadata.primary_key_distribution = PrimaryKeyDistribution::Hash;
+    target_metadata.primary_key_hash_buckets = Some(target_buckets);
+    target_metadata.validate().map_err(map_runtime_error)?;
+    let target_provider = HoloStoreTableProvider::from_table_metadata(
+        &target_metadata,
+        holostore_client.clone(),
+        pushdown_metrics.clone(),
+    )
+    .map_err(map_runtime_error)?;
+
+    let migrated_rows = if source_provider.is_row_v1_table() {
+        let rows = source_provider
+            .scan_generic_rows_with_versions_by_primary_key_bounds(None, None, None)
+            .await
+            .map_err(map_runtime_error)?;
+        let values = rows
+            .iter()
+            .map(|row| row.values.clone())
+            .collect::<Vec<_>>();
+        let cleanup_keys = rows.iter().map(|row| row.primary_key).collect::<Vec<_>>();
+        target_provider
+            .upsert_generic_rows(values.as_slice())
+            .await
+            .map_err(map_runtime_error)?;
+        update_table_primary_key_distribution(
+            &holostore_client,
+            table_name.as_str(),
+            PrimaryKeyDistribution::Hash,
+            Some(target_buckets),
+        )
+        .await
+        .map_err(map_runtime_error)?;
+        if !cleanup_keys.is_empty() {
+            // Best-effort cleanup: stale range keys are unreachable once metadata switches to hash.
+            let _ = source_provider
+                .tombstone_generic_rows_by_primary_key(cleanup_keys.as_slice())
+                .await;
+        }
+        values.len()
+    } else {
+        let rows = source_provider
+            .scan_orders_with_versions_by_order_id_bounds(None, None, None)
+            .await
+            .map_err(map_runtime_error)?;
+        let values = rows.iter().map(|row| row.row.clone()).collect::<Vec<_>>();
+        let cleanup_keys = values.iter().map(|row| row.order_id).collect::<Vec<_>>();
+        target_provider
+            .upsert_orders_rows(values.as_slice())
+            .await
+            .map_err(map_runtime_error)?;
+        update_table_primary_key_distribution(
+            &holostore_client,
+            table_name.as_str(),
+            PrimaryKeyDistribution::Hash,
+            Some(target_buckets),
+        )
+        .await
+        .map_err(map_runtime_error)?;
+        if !cleanup_keys.is_empty() {
+            // Best-effort cleanup: stale range keys are unreachable once metadata switches to hash.
+            let _ = source_provider
+                .tombstone_orders_by_order_id(cleanup_keys.as_slice())
+                .await;
+        }
+        values.len()
+    };
+
+    let updated = find_table_metadata_by_name(&holostore_client, table_name.as_str())
+        .await
+        .map_err(map_runtime_error)?
+        .ok_or_else(|| {
+            to_user_error(
+                "XX000",
+                format!(
+                    "metadata for relation '{}' is not visible after hash primary key migration",
+                    table_name
+                ),
+            )
+        })?;
+    register_table_from_metadata(
+        session_context,
+        holostore_client,
+        pushdown_metrics,
+        &updated,
+    )
+    .await
+    .map_err(map_runtime_error)?;
+
+    Ok(Response::Execution(
+        Tag::new("ALTER TABLE").with_rows(migrated_rows),
+    ))
+}
+
 /// Executes `validate supported create table` for this component.
 fn validate_supported_create_table(create: &CreateTable) -> PgWireResult<()> {
     // Decision: evaluate `create.or_replace` to choose the correct SQL/storage control path.
@@ -1300,22 +2172,7 @@ fn validate_supported_create_table(create: &CreateTable) -> PgWireResult<()> {
             "CREATE TABLE LIKE/CLONE is not supported in current HoloFusion scope",
         ));
     }
-    // Decision: evaluate `&create.table_options` to choose the correct SQL/storage control path.
-    match &create.table_options {
-        CreateTableOptions::None => {}
-        CreateTableOptions::With(options)
-        | CreateTableOptions::Options(options)
-        | CreateTableOptions::Plain(options)
-        | CreateTableOptions::TableProperties(options)
-            // Decision: evaluate `options.is_empty() => {}` to choose the correct SQL/storage control path.
-            if options.is_empty() => {}
-        _ => {
-            return Err(to_user_error(
-                "0A000",
-                "CREATE TABLE options are not supported in current HoloFusion scope",
-            ));
-        }
-    }
+    validate_supported_create_table_options(&create.table_options)?;
     // Decision: evaluate `create.comment.is_some()` to choose the correct SQL/storage control path.
     if create.comment.is_some()
         || create.on_commit.is_some()
@@ -1356,6 +2213,122 @@ fn validate_supported_create_table(create: &CreateTable) -> PgWireResult<()> {
     }
 
     Ok(())
+}
+
+/// Default hash bucket count for `PRIMARY KEY ... USING HASH` when unspecified.
+const DEFAULT_HASH_PK_BUCKETS: usize = 32;
+/// Maximum supported hash bucket count for `USING HASH` layouts.
+const MAX_HASH_PK_BUCKETS: usize = u16::MAX as usize;
+
+/// Returns whether new hash-PK DDL adoption is enabled.
+fn configured_hash_pk_ddl_enabled() -> bool {
+    std::env::var("HOLO_FUSION_PHASE10_HASH_PK_DDL_ENABLED")
+        .ok()
+        .and_then(|raw| raw.parse::<bool>().ok())
+        .unwrap_or(true)
+}
+
+/// Validates CREATE TABLE options and allows only hash-PK bucket controls.
+fn validate_supported_create_table_options(table_options: &CreateTableOptions) -> PgWireResult<()> {
+    let _ = parse_hash_bucket_count_from_create_table_options(table_options)?;
+    Ok(())
+}
+
+/// Parses optional hash bucket count from supported CREATE TABLE options.
+fn parse_hash_bucket_count_from_create_table_options(
+    table_options: &CreateTableOptions,
+) -> PgWireResult<Option<usize>> {
+    let options = match table_options {
+        CreateTableOptions::None => return Ok(None),
+        CreateTableOptions::With(options)
+        | CreateTableOptions::Options(options)
+        | CreateTableOptions::Plain(options)
+        | CreateTableOptions::TableProperties(options) => options,
+    };
+    if options.is_empty() {
+        return Ok(None);
+    }
+
+    let mut bucket_count = None::<usize>;
+    for option in options {
+        let SqlOption::KeyValue { key, value } = option else {
+            return Err(to_user_error(
+                "0A000",
+                format!("CREATE TABLE option '{}' is not supported", option),
+            ));
+        };
+        let option_key = normalize_ident(key).to_ascii_lowercase();
+        if !matches!(
+            option_key.as_str(),
+            "hash_shards" | "hash_buckets" | "bucket_count" | "buckets"
+        ) {
+            return Err(to_user_error(
+                "0A000",
+                format!("CREATE TABLE option '{}' is not supported", option_key),
+            ));
+        }
+        if bucket_count.is_some() {
+            return Err(to_user_error(
+                "42601",
+                format!(
+                    "CREATE TABLE option '{}' specified more than once",
+                    option_key
+                ),
+            ));
+        }
+        let parsed = parse_positive_usize_sql_expr(value)?;
+        if parsed > MAX_HASH_PK_BUCKETS {
+            return Err(to_user_error(
+                "22023",
+                format!(
+                    "hash bucket count {} exceeds supported max {}",
+                    parsed, MAX_HASH_PK_BUCKETS
+                ),
+            ));
+        }
+        bucket_count = Some(parsed);
+    }
+
+    Ok(bucket_count)
+}
+
+/// Parses a strictly positive integer value from CREATE TABLE option expression.
+fn parse_positive_usize_sql_expr(expr: &SqlExpr) -> PgWireResult<usize> {
+    let raw = match expr {
+        SqlExpr::Value(value) => match &value.value {
+            Value::Number(raw, _) => raw.as_str(),
+            _ => {
+                return Err(to_user_error(
+                    "22023",
+                    format!("expected positive integer option value, got '{}'", expr),
+                ))
+            }
+        },
+        SqlExpr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr,
+        } => return parse_positive_usize_sql_expr(expr),
+        _ => {
+            return Err(to_user_error(
+                "22023",
+                format!("expected positive integer option value, got '{}'", expr),
+            ))
+        }
+    };
+
+    let parsed = raw.parse::<usize>().map_err(|_| {
+        to_user_error(
+            "22023",
+            format!("invalid positive integer option value '{}'", raw),
+        )
+    })?;
+    if parsed == 0 {
+        return Err(to_user_error(
+            "22023",
+            "hash bucket count must be greater than zero",
+        ));
+    }
+    Ok(parsed)
 }
 
 /// Executes `parse create table name` for this component.
@@ -1442,6 +2415,10 @@ fn compile_create_table_metadata_spec(
     table_name: &str,
 ) -> PgWireResult<CreateTableMetadataSpec> {
     let mut pk_columns = BTreeSet::<String>::new();
+    let mut primary_key_distribution = PrimaryKeyDistribution::Range;
+    let mut primary_key_distribution_explicit = false;
+    let mut primary_key_hash_buckets =
+        parse_hash_bucket_count_from_create_table_options(&create.table_options)?;
     let mut by_name = BTreeMap::<String, usize>::new();
     let mut columns = Vec::<TableColumnRecord>::with_capacity(create.columns.len());
     let mut pending_checks = Vec::<PendingCheckConstraint>::new();
@@ -1473,7 +2450,60 @@ fn compile_create_table_metadata_spec(
     for constraint in &create.constraints {
         // Decision: evaluate `constraint` to choose the correct SQL/storage control path.
         match constraint {
-            TableConstraint::PrimaryKey { columns, .. } => {
+            TableConstraint::PrimaryKey {
+                columns,
+                index_type,
+                index_options,
+                ..
+            } => {
+                let mut maybe_distribution = index_type
+                    .as_ref()
+                    .map(|index_type| match index_type {
+                        IndexType::Hash => Ok(PrimaryKeyDistribution::Hash),
+                        IndexType::BTree => Ok(PrimaryKeyDistribution::Range),
+                        other => Err(to_user_error(
+                            "0A000",
+                            format!("PRIMARY KEY USING {} is not supported", other),
+                        )),
+                    })
+                    .transpose()?;
+                for option in index_options {
+                    let IndexOption::Using(index_type) = option else {
+                        continue;
+                    };
+                    let option_distribution = match index_type {
+                        IndexType::Hash => PrimaryKeyDistribution::Hash,
+                        IndexType::BTree => PrimaryKeyDistribution::Range,
+                        other => {
+                            return Err(to_user_error(
+                                "0A000",
+                                format!("PRIMARY KEY USING {} is not supported", other),
+                            ))
+                        }
+                    };
+                    if let Some(existing) = maybe_distribution {
+                        if existing != option_distribution {
+                            return Err(to_user_error(
+                                "42601",
+                                "conflicting PRIMARY KEY USING clauses are not supported",
+                            ));
+                        }
+                    }
+                    maybe_distribution = Some(option_distribution);
+                }
+
+                if let Some(next_distribution) = maybe_distribution {
+                    if primary_key_distribution_explicit
+                        && primary_key_distribution != next_distribution
+                    {
+                        return Err(to_user_error(
+                            "42601",
+                            "conflicting PRIMARY KEY USING clauses are not supported",
+                        ));
+                    }
+                    primary_key_distribution = next_distribution;
+                    primary_key_distribution_explicit = true;
+                }
                 for index_column in columns {
                     let column = index_column_name(index_column).ok_or_else(|| {
                         to_user_error("0A000", "PRIMARY KEY must reference plain column names")
@@ -1563,6 +2593,36 @@ fn compile_create_table_metadata_spec(
         ));
     }
 
+    match primary_key_distribution {
+        PrimaryKeyDistribution::Range => {
+            if primary_key_hash_buckets.is_some() {
+                return Err(to_user_error(
+                    "0A000",
+                    "hash bucket options require PRIMARY KEY ... USING HASH",
+                ));
+            }
+        }
+        PrimaryKeyDistribution::Hash => {
+            if !configured_hash_pk_ddl_enabled() {
+                return Err(to_user_error(
+                    "0A000",
+                    "hash primary key DDL is disabled by rollout policy",
+                ));
+            }
+            let buckets = primary_key_hash_buckets.unwrap_or(DEFAULT_HASH_PK_BUCKETS);
+            if buckets == 0 || buckets > MAX_HASH_PK_BUCKETS {
+                return Err(to_user_error(
+                    "22023",
+                    format!(
+                        "hash bucket count must be in range [1, {}], got {}",
+                        MAX_HASH_PK_BUCKETS, buckets
+                    ),
+                ));
+            }
+            primary_key_hash_buckets = Some(buckets);
+        }
+    }
+
     let check_constraints = finalize_check_constraints(pending_checks)?;
     validate_table_constraints(columns.as_slice(), check_constraints.as_slice())
         .map_err(row_constraint_error)?;
@@ -1581,6 +2641,8 @@ fn compile_create_table_metadata_spec(
         columns,
         check_constraints,
         primary_key_column,
+        primary_key_distribution,
+        primary_key_hash_buckets,
         preferred_shards: Vec::new(),
         page_size: 2048,
     })
@@ -2898,6 +3960,61 @@ async fn execute_query_in_transaction(
     Ok(Response::Query(query))
 }
 
+/// Executes one fast `MIN/MAX(primary_key)` query directly on provider scan fast path.
+async fn execute_fast_primary_key_aggregate_query(
+    provider: HoloStoreTableProvider,
+    spec: FastPrimaryKeyAggregateSpec,
+    client: &(dyn ClientInfo + Send + Sync),
+    protocol: QueryProtocol,
+) -> PgWireResult<Response> {
+    let value = evaluate_fast_primary_key_aggregate(provider, &spec).await?;
+    let column_name = spec.output_alias.clone().unwrap_or_else(|| {
+        if spec.coalesce_fallback.is_some() {
+            "coalesce".to_string()
+        } else {
+            match spec.extreme {
+                PrimaryKeyExtreme::Min => "min".to_string(),
+                PrimaryKeyExtreme::Max => "max".to_string(),
+            }
+        }
+    });
+
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        column_name.as_str(),
+        ArrowDataType::Int64,
+        true,
+    )]));
+    let mut values = Int64Builder::new();
+    if let Some(value) = value {
+        values.append_value(value);
+    } else {
+        values.append_null();
+    }
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values.finish()) as ArrayRef])
+        .map_err(|err| api_error(err.to_string()))?;
+    let mem =
+        MemTable::try_new(schema, vec![vec![batch]]).map_err(|err| api_error(err.to_string()))?;
+
+    let query_ctx = SessionContext::new();
+    query_ctx
+        .register_table("holo_fast_pk_aggregate", Arc::new(mem))
+        .map_err(|err| api_error(err.to_string()))?;
+    let dataframe = query_ctx
+        .sql("SELECT * FROM holo_fast_pk_aggregate")
+        .await
+        .map_err(|err| api_error(err.to_string()))?;
+
+    let format_options = Arc::new(FormatOptions::from_client_metadata(client.metadata()));
+    let wire_format = match protocol {
+        QueryProtocol::Simple => Format::UnifiedText,
+        QueryProtocol::Extended => Format::UnifiedBinary,
+    };
+    let query = df::encode_dataframe(dataframe, &wire_format, Some(format_options))
+        .await
+        .map_err(|err| api_error(err.to_string()))?;
+    Ok(Response::Query(query))
+}
+
 /// Executes `EXPLAIN DIST`-style plan classification with placement annotations.
 async fn execute_explain_dist(
     statement: &Statement,
@@ -3201,6 +4318,18 @@ async fn get_provider_for_table(
                 format!("table '{table_name}' is not available for mutations"),
             )
         })
+}
+
+/// Looks up a HoloStore table provider by table name, returning `None` when unavailable.
+async fn try_get_holo_provider_for_table(
+    session_context: &SessionContext,
+    table_name: &str,
+) -> Option<HoloStoreTableProvider> {
+    let provider = session_context.table_provider(table_name).await.ok()?;
+    provider
+        .as_any()
+        .downcast_ref::<HoloStoreTableProvider>()
+        .cloned()
 }
 
 /// Executes `enforce scan row limit` for this component.
@@ -4595,7 +5724,14 @@ fn to_user_error(code: impl Into<String>, message: impl Into<String>) -> PgWireE
 
 /// Executes `api error` for this component.
 fn api_error(message: impl Into<String>) -> PgWireError {
-    PgWireError::ApiError(Box::new(std::io::Error::other(message.into())))
+    let message = message.into();
+    if is_duplicate_key_violation_message(message.as_str()) {
+        return to_user_error("23505", extract_duplicate_key_message(message.as_str()));
+    }
+    if is_overload_error_message(message.as_str()) {
+        return to_user_error("53300", message);
+    }
+    PgWireError::ApiError(Box::new(std::io::Error::other(message)))
 }
 
 /// Executes `no active tx error` for this component.

@@ -875,6 +875,7 @@ impl GrpcTransport {
         end_key: &[u8],
         cursor: &[u8],
         limit: usize,
+        reverse: bool,
     ) -> anyhow::Result<(Vec<RangeLatestEntry>, Vec<u8>, bool)> {
         let peer = self.peer(target)?;
         let req = rpc::RangeSnapshotLatestRequest {
@@ -883,6 +884,7 @@ impl GrpcTransport {
             end_key: end_key.to_vec().into(),
             cursor: cursor.to_vec().into(),
             limit: limit.min(u32::MAX as usize) as u32,
+            reverse,
         };
         let resp = time::timeout(
             self.rpc_timeout,

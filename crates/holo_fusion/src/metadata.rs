@@ -43,6 +43,10 @@ const METADATA_MIGRATION_BATCH_SIZE: usize = 128;
 const METADATA_SCHEMA_VERSION_BASELINE: u32 = 1;
 /// Current metadata schema version expected by this binary.
 const METADATA_SCHEMA_VERSION_CURRENT: u32 = 2;
+/// Default hash bucket count used when table metadata selects hash-PK routing.
+const DEFAULT_PRIMARY_KEY_HASH_BUCKETS: usize = 32;
+/// Maximum supported hash bucket count for hash-PK table routing.
+const MAX_PRIMARY_KEY_HASH_BUCKETS: usize = u16::MAX as usize;
 
 /// Result of attempting to create table metadata.
 #[derive(Debug, Clone, PartialEq)]
@@ -120,6 +124,22 @@ impl TableColumnType {
     pub fn is_signed_integer(&self) -> bool {
         matches!(self, Self::Int8 | Self::Int16 | Self::Int32 | Self::Int64)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+/// Primary-key physical layout used for storage key encoding and routing.
+pub enum PrimaryKeyDistribution {
+    /// Traditional ordered primary-key layout (`table_id + pk`).
+    #[default]
+    Range,
+    /// Hash-bucketed primary-key layout (`table_id + bucket + pk`).
+    Hash,
+}
+
+/// Returns default bucket count for hash-distributed primary keys.
+fn default_primary_key_hash_buckets() -> usize {
+    DEFAULT_PRIMARY_KEY_HASH_BUCKETS
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -236,6 +256,10 @@ pub struct CreateTableMetadataSpec {
     pub check_constraints: Vec<TableCheckConstraintRecord>,
     /// Name of single-column primary key used for row-key encoding.
     pub primary_key_column: String,
+    /// Primary-key physical distribution/routing mode.
+    pub primary_key_distribution: PrimaryKeyDistribution,
+    /// Optional hash bucket count when `primary_key_distribution=hash`.
+    pub primary_key_hash_buckets: Option<usize>,
     /// Optional shard affinity for scans and writes.
     pub preferred_shards: Vec<usize>,
     /// Suggested page size for scan pagination.
@@ -269,6 +293,32 @@ impl CreateTableMetadataSpec {
         if self.primary_key_column.trim().is_empty() {
             return Err(anyhow!("table metadata spec has empty primary_key_column"));
         }
+        match self.primary_key_distribution {
+            PrimaryKeyDistribution::Range => {
+                if self.primary_key_hash_buckets.is_some() {
+                    return Err(anyhow!(
+                        "table metadata spec has hash bucket count for range primary key"
+                    ));
+                }
+            }
+            PrimaryKeyDistribution::Hash => {
+                let buckets = self
+                    .primary_key_hash_buckets
+                    .unwrap_or_else(default_primary_key_hash_buckets);
+                if buckets == 0 {
+                    return Err(anyhow!(
+                        "table metadata spec has invalid primary_key_hash_buckets=0"
+                    ));
+                }
+                if buckets > MAX_PRIMARY_KEY_HASH_BUCKETS {
+                    return Err(anyhow!(
+                        "table metadata spec has primary_key_hash_buckets={} above max {}",
+                        buckets,
+                        MAX_PRIMARY_KEY_HASH_BUCKETS
+                    ));
+                }
+            }
+        }
         if self.page_size == 0 {
             return Err(anyhow!("table metadata spec has invalid page_size=0"));
         }
@@ -298,6 +348,12 @@ pub struct TableMetadataRecord {
     /// Name of single-column primary key used for row-key encoding.
     #[serde(default)]
     pub primary_key_column: Option<String>,
+    /// Primary-key physical distribution/routing mode.
+    #[serde(default)]
+    pub primary_key_distribution: PrimaryKeyDistribution,
+    /// Optional hash bucket count used when `primary_key_distribution=hash`.
+    #[serde(default)]
+    pub primary_key_hash_buckets: Option<usize>,
     /// Optional shard affinity for scans and writes.
     #[serde(default)]
     pub preferred_shards: Vec<usize>,
@@ -445,6 +501,35 @@ impl TableMetadataRecord {
                 primary_key_column,
                 self.table_name
             ));
+        }
+        match self.primary_key_distribution {
+            PrimaryKeyDistribution::Range => {
+                if self.primary_key_hash_buckets.is_some() {
+                    return Err(anyhow!(
+                        "table metadata has hash bucket count for range primary key in table {}",
+                        self.table_name
+                    ));
+                }
+            }
+            PrimaryKeyDistribution::Hash => {
+                let buckets = self
+                    .primary_key_hash_buckets
+                    .unwrap_or_else(default_primary_key_hash_buckets);
+                if buckets == 0 {
+                    return Err(anyhow!(
+                        "table metadata has invalid primary_key_hash_buckets=0 in table {}",
+                        self.table_name
+                    ));
+                }
+                if buckets > MAX_PRIMARY_KEY_HASH_BUCKETS {
+                    return Err(anyhow!(
+                        "table metadata has primary_key_hash_buckets={} above max {} in table {}",
+                        buckets,
+                        MAX_PRIMARY_KEY_HASH_BUCKETS,
+                        self.table_name
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -1356,6 +1441,8 @@ impl LegacyTableMetadataRecordV0 {
             columns: Vec::new(),
             check_constraints: Vec::new(),
             primary_key_column: None,
+            primary_key_distribution: PrimaryKeyDistribution::Range,
+            primary_key_hash_buckets: None,
             preferred_shards: self.preferred_shards,
             page_size: self.page_size.unwrap_or_else(default_page_size).max(1),
         }
@@ -1755,6 +1842,7 @@ async fn list_table_metadata_entries(client: &HoloStoreClient) -> Result<Vec<Tab
                     target.end_key.as_slice(),
                     cursor.as_slice(),
                     DEFAULT_SCAN_PAGE_SIZE,
+                    false,
                 )
                 .await
                 .with_context(|| {
@@ -1903,6 +1991,8 @@ pub async fn create_table_metadata(
             columns: spec.columns.clone(),
             check_constraints: spec.check_constraints.clone(),
             primary_key_column: Some(spec.primary_key_column.clone()),
+            primary_key_distribution: spec.primary_key_distribution,
+            primary_key_hash_buckets: spec.primary_key_hash_buckets,
             preferred_shards: spec.preferred_shards.clone(),
             page_size: spec.page_size.max(1),
         };
@@ -1978,6 +2068,108 @@ pub async fn create_table_metadata(
             tokio::time::sleep(METADATA_CREATE_RETRY_INTERVAL).await;
             continue;
         }
+    }
+}
+
+/// Updates primary-key distribution metadata for an existing table.
+pub async fn update_table_primary_key_distribution(
+    client: &HoloStoreClient,
+    table_name: &str,
+    distribution: PrimaryKeyDistribution,
+    hash_buckets: Option<usize>,
+) -> Result<TableMetadataRecord> {
+    let table_name = table_name.trim();
+    if table_name.is_empty() {
+        return Err(anyhow!(
+            "table metadata update has empty table_name for primary key distribution update"
+        ));
+    }
+
+    let deadline = tokio::time::Instant::now() + METADATA_CREATE_TIMEOUT;
+    loop {
+        let existing = find_table_metadata_by_name(client, table_name)
+            .await?
+            .ok_or_else(|| anyhow!("table '{}' does not exist", table_name))?;
+        let entry = find_table_metadata_entry_by_id(
+            client,
+            existing.db_id,
+            existing.schema_id,
+            existing.table_id,
+        )
+        .await?
+        .ok_or_else(|| anyhow!("table '{}' metadata entry is missing", table_name))?;
+
+        let mut updated = entry.record.clone();
+        updated.primary_key_distribution = distribution;
+        updated.primary_key_hash_buckets = hash_buckets;
+        updated.validate()?;
+        if updated == entry.record {
+            return Ok(updated);
+        }
+
+        let topology = fetch_topology(client).await?;
+        require_non_empty_topology(&topology)?;
+        let route =
+            route_key(&topology, client.target(), entry.key.as_slice(), &[]).ok_or_else(|| {
+                anyhow!(
+                    "failed to route metadata key for table '{}'",
+                    updated.table_name
+                )
+            })?;
+        let write_client = HoloStoreClient::new(route.grpc_addr);
+        let payload = serde_json::to_vec(&updated).context("encode updated table metadata json")?;
+        let result = write_client
+            .range_write_latest_conditional(
+                route.shard_index,
+                route.start_key.as_slice(),
+                route.end_key.as_slice(),
+                vec![ReplicatedConditionalWriteEntry {
+                    key: entry.key.clone(),
+                    value: payload,
+                    expected_version: entry.version,
+                }],
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "persist primary key distribution metadata for table '{}'",
+                    updated.table_name
+                )
+            })?;
+
+        if result.conflicts > 0 || result.applied != 1 {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "metadata update conflict for table '{}' (applied={}, conflicts={})",
+                    updated.table_name,
+                    result.applied,
+                    result.conflicts
+                ));
+            }
+            tokio::time::sleep(METADATA_CREATE_RETRY_INTERVAL).await;
+            continue;
+        }
+
+        let visible = wait_for_table_metadata_by_name(
+            client,
+            updated.table_name.as_str(),
+            METADATA_VISIBILITY_TIMEOUT,
+        )
+        .await?;
+        if let Some(record) = visible {
+            if record.primary_key_distribution == distribution
+                && record.primary_key_hash_buckets == hash_buckets
+            {
+                return Ok(record);
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(anyhow!(
+                "metadata update applied for table '{}' but new primary key distribution was not visible",
+                updated.table_name
+            ));
+        }
+        tokio::time::sleep(METADATA_CREATE_RETRY_INTERVAL).await;
     }
 }
 
@@ -2118,6 +2310,7 @@ async fn read_exact_latest_entry(
                 target.end_key.as_slice(),
                 &[],
                 DEFAULT_SCAN_PAGE_SIZE,
+                false,
             )
             .await
             .with_context(|| {
@@ -2229,6 +2422,8 @@ mod tests {
             columns: Vec::new(),
             check_constraints: Vec::new(),
             primary_key_column: None,
+            primary_key_distribution: PrimaryKeyDistribution::Range,
+            primary_key_hash_buckets: None,
             preferred_shards: Vec::new(),
             page_size: 0,
         };
@@ -2277,6 +2472,8 @@ mod tests {
                 columns: canonical_orders_columns(),
                 check_constraints: Vec::new(),
                 primary_key_column: "order_id".to_string(),
+                primary_key_distribution: PrimaryKeyDistribution::Range,
+                primary_key_hash_buckets: None,
                 preferred_shards: Vec::new(),
                 page_size: default_page_size(),
             },

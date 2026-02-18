@@ -9,7 +9,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::ops::Range;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -40,9 +40,10 @@ use tracing::{debug, info, info_span, warn, Instrument};
 
 use crate::metadata::{
     apply_column_defaults_for_missing, table_model_row_v1, validate_row_against_metadata,
-    TableCheckConstraintRecord, TableColumnRecord, TableColumnType, TableMetadataRecord,
+    PrimaryKeyDistribution, TableCheckConstraintRecord, TableColumnRecord, TableColumnType,
+    TableMetadataRecord,
 };
-use crate::metrics::PushdownMetrics;
+use crate::metrics::{CircuitState, PushdownMetrics};
 use crate::topology::{
     fetch_topology, min_end_bound, require_non_empty_topology, route_key, scan_targets,
 };
@@ -53,18 +54,32 @@ pub const ORDERS_TABLE_MODEL: &str = "orders_v1";
 pub const ORDERS_SHARD_INDEX: usize = 0;
 
 const DATA_PREFIX_PRIMARY_ROW: u8 = 0x20;
+const HASH_BUCKET_TAG: u8 = 0x68;
 const TUPLE_TAG_INT64: u8 = 0x02;
 const ROW_FORMAT_VERSION_V1: u8 = 1;
 const ROW_FORMAT_VERSION_V2: u8 = 2;
 const ROW_FLAG_TOMBSTONE: u8 = 0x01;
 const SIGN_FLIP_MASK: u64 = 1u64 << 63;
 const DEFAULT_MAX_SCAN_ROWS: usize = 100_000;
+const DEFAULT_HASH_PK_BUCKETS: usize = 32;
 const DEFAULT_DISTRIBUTED_WRITE_MAX_BATCH_ENTRIES: usize = 1_024;
 const DEFAULT_DISTRIBUTED_WRITE_MAX_BATCH_BYTES: usize = 1_048_576;
-const DISTRIBUTED_WRITE_RETRY_LIMIT: usize = 5;
-const DISTRIBUTED_WRITE_RETRY_DELAY_MS: u64 = 100;
-const DISTRIBUTED_SCAN_RETRY_LIMIT: usize = 5;
-const DISTRIBUTED_SCAN_RETRY_DELAY_MS: u64 = 60;
+const DEFAULT_DISTRIBUTED_WRITE_RETRY_LIMIT: usize = 5;
+const DEFAULT_DISTRIBUTED_WRITE_RETRY_BASE_DELAY_MS: u64 = 50;
+const DEFAULT_DISTRIBUTED_WRITE_RETRY_MAX_DELAY_MS: u64 = 1_000;
+const DEFAULT_DISTRIBUTED_WRITE_RETRY_BUDGET_MS: u64 = 10_000;
+const DEFAULT_DISTRIBUTED_SCAN_RETRY_LIMIT: usize = 5;
+const DEFAULT_DISTRIBUTED_SCAN_RETRY_DELAY_MS: u64 = 60;
+const DEFAULT_DISTRIBUTED_CIRCUIT_BREAKER_FAILURE_THRESHOLD: u32 = 4;
+const DEFAULT_DISTRIBUTED_CIRCUIT_BREAKER_OPEN_MS: u64 = 2_000;
+const DEFAULT_DISTRIBUTED_WRITE_MAX_INFLIGHT_ROWS: usize = 32_768;
+const DEFAULT_DISTRIBUTED_WRITE_MAX_INFLIGHT_BYTES: usize = 32 * 1_024 * 1_024;
+const DEFAULT_DISTRIBUTED_WRITE_MAX_INFLIGHT_RPCS: usize = 32;
+const DEFAULT_BULK_CHUNK_ROWS_INITIAL: usize = 1_024;
+const DEFAULT_BULK_CHUNK_ROWS_MIN: usize = 128;
+const DEFAULT_BULK_CHUNK_ROWS_MAX: usize = 8_192;
+const DEFAULT_BULK_CHUNK_LOW_LATENCY_MS: u64 = 40;
+const DEFAULT_BULK_CHUNK_HIGH_LATENCY_MS: u64 = 150;
 
 /// Executes `default max scan rows` for this component.
 fn default_max_scan_rows() -> usize {
@@ -98,20 +113,342 @@ fn configured_write_max_batch_bytes() -> usize {
         .unwrap_or(DEFAULT_DISTRIBUTED_WRITE_MAX_BATCH_BYTES)
 }
 
-/// Backoff policy for distributed conditional-write retries.
-fn retry_backoff(attempt: usize) -> std::time::Duration {
-    let exp = 1u64 << attempt.min(5);
-    std::time::Duration::from_millis(DISTRIBUTED_WRITE_RETRY_DELAY_MS.saturating_mul(exp))
+/// Executes `configured bulk chunk rows initial` for this component.
+fn configured_bulk_chunk_rows_initial() -> usize {
+    std::env::var("HOLO_FUSION_BULK_CHUNK_ROWS_INITIAL")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_BULK_CHUNK_ROWS_INITIAL)
 }
 
-/// Returns whether a conditional write error can be retried after topology refresh.
-fn is_retryable_conditional_write_error(err: &anyhow::Error) -> bool {
-    let message = err.to_string().to_ascii_lowercase();
-    message.contains("key routed to shard")
-        || message.contains("request targeted shard")
-        || message.contains("no shard route found")
-        || message.contains("split key does not map")
-        || message.contains("split key must")
+/// Executes `configured bulk chunk rows min` for this component.
+fn configured_bulk_chunk_rows_min() -> usize {
+    std::env::var("HOLO_FUSION_BULK_CHUNK_ROWS_MIN")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_BULK_CHUNK_ROWS_MIN)
+}
+
+/// Executes `configured bulk chunk rows max` for this component.
+fn configured_bulk_chunk_rows_max() -> usize {
+    std::env::var("HOLO_FUSION_BULK_CHUNK_ROWS_MAX")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_BULK_CHUNK_ROWS_MAX)
+}
+
+/// Executes `configured bulk chunk low latency ms` for this component.
+fn configured_bulk_chunk_low_latency_ms() -> u64 {
+    std::env::var("HOLO_FUSION_BULK_CHUNK_LOW_LATENCY_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_BULK_CHUNK_LOW_LATENCY_MS)
+}
+
+/// Executes `configured bulk chunk high latency ms` for this component.
+fn configured_bulk_chunk_high_latency_ms() -> u64 {
+    std::env::var("HOLO_FUSION_BULK_CHUNK_HIGH_LATENCY_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_BULK_CHUNK_HIGH_LATENCY_MS)
+}
+
+fn configured_write_retry_limit() -> usize {
+    std::env::var("HOLO_FUSION_DML_RETRY_MAX_ATTEMPTS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_DISTRIBUTED_WRITE_RETRY_LIMIT)
+}
+
+fn configured_write_retry_base_delay_ms() -> u64 {
+    std::env::var("HOLO_FUSION_DML_RETRY_BASE_DELAY_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_DISTRIBUTED_WRITE_RETRY_BASE_DELAY_MS)
+}
+
+fn configured_write_retry_max_delay_ms() -> u64 {
+    std::env::var("HOLO_FUSION_DML_RETRY_MAX_DELAY_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_DISTRIBUTED_WRITE_RETRY_MAX_DELAY_MS)
+}
+
+fn configured_write_retry_budget_ms() -> u64 {
+    std::env::var("HOLO_FUSION_DML_RETRY_BUDGET_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_DISTRIBUTED_WRITE_RETRY_BUDGET_MS)
+}
+
+fn configured_scan_retry_limit() -> usize {
+    std::env::var("HOLO_FUSION_SCAN_RETRY_MAX_ATTEMPTS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_DISTRIBUTED_SCAN_RETRY_LIMIT)
+}
+
+fn configured_scan_retry_delay_ms() -> u64 {
+    std::env::var("HOLO_FUSION_SCAN_RETRY_DELAY_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_DISTRIBUTED_SCAN_RETRY_DELAY_MS)
+}
+
+fn configured_write_inflight_max_rows() -> usize {
+    std::env::var("HOLO_FUSION_DML_WRITE_MAX_INFLIGHT_ROWS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_DISTRIBUTED_WRITE_MAX_INFLIGHT_ROWS)
+}
+
+fn configured_write_inflight_max_bytes() -> usize {
+    std::env::var("HOLO_FUSION_DML_WRITE_MAX_INFLIGHT_BYTES")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_DISTRIBUTED_WRITE_MAX_INFLIGHT_BYTES)
+}
+
+fn configured_write_inflight_max_rpcs() -> usize {
+    std::env::var("HOLO_FUSION_DML_WRITE_MAX_INFLIGHT_RPCS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_DISTRIBUTED_WRITE_MAX_INFLIGHT_RPCS)
+}
+
+fn configured_circuit_breaker_failure_threshold() -> u32 {
+    std::env::var("HOLO_FUSION_DML_CIRCUIT_BREAKER_FAILURE_THRESHOLD")
+        .ok()
+        .and_then(|raw| raw.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_DISTRIBUTED_CIRCUIT_BREAKER_FAILURE_THRESHOLD)
+}
+
+fn configured_circuit_breaker_open_ms() -> u64 {
+    std::env::var("HOLO_FUSION_DML_CIRCUIT_BREAKER_OPEN_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_DISTRIBUTED_CIRCUIT_BREAKER_OPEN_MS)
+}
+
+fn configured_retry_governance_enabled() -> bool {
+    std::env::var("HOLO_FUSION_PHASE10_RETRY_GOVERNANCE_ENABLED")
+        .ok()
+        .and_then(|raw| raw.parse::<bool>().ok())
+        .unwrap_or(true)
+}
+
+fn configured_circuit_breaker_enabled() -> bool {
+    std::env::var("HOLO_FUSION_PHASE10_CIRCUIT_BREAKER_ENABLED")
+        .ok()
+        .and_then(|raw| raw.parse::<bool>().ok())
+        .unwrap_or(true)
+}
+
+fn configured_bulk_ingest_enabled() -> bool {
+    std::env::var("HOLO_FUSION_PHASE10_BULK_INGEST_ENABLED")
+        .ok()
+        .and_then(|raw| raw.parse::<bool>().ok())
+        .unwrap_or(true)
+}
+
+/// Classifies distributed write failures for retry governance and SLO metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryableErrorClass {
+    Topology,
+    TransientRpc,
+    Overload,
+    NonRetryable,
+}
+
+impl RetryableErrorClass {
+    fn is_retryable(self) -> bool {
+        !matches!(self, Self::NonRetryable)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RetryPolicy {
+    enabled: bool,
+    max_attempts: usize,
+    max_elapsed: Duration,
+    base_delay: Duration,
+    max_delay: Duration,
+}
+
+impl RetryPolicy {
+    fn from_env() -> Self {
+        let base_delay_ms = configured_write_retry_base_delay_ms();
+        let max_delay_ms = configured_write_retry_max_delay_ms().max(base_delay_ms);
+        Self {
+            enabled: configured_retry_governance_enabled(),
+            max_attempts: configured_write_retry_limit().max(1),
+            max_elapsed: Duration::from_millis(configured_write_retry_budget_ms()),
+            base_delay: Duration::from_millis(base_delay_ms),
+            max_delay: Duration::from_millis(max_delay_ms),
+        }
+    }
+
+    fn max_attempts(self) -> usize {
+        if self.enabled {
+            self.max_attempts.max(1)
+        } else {
+            1
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InflightBudgetConfig {
+    max_rows: usize,
+    max_bytes: usize,
+    max_rpcs: usize,
+}
+
+impl InflightBudgetConfig {
+    fn from_env() -> Self {
+        Self {
+            max_rows: configured_write_inflight_max_rows().max(1),
+            max_bytes: configured_write_inflight_max_bytes().max(1),
+            max_rpcs: configured_write_inflight_max_rpcs().max(1),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CircuitBreakerConfig {
+    enabled: bool,
+    failure_threshold: u32,
+    open_duration: Duration,
+}
+
+impl CircuitBreakerConfig {
+    fn from_env() -> Self {
+        Self {
+            enabled: configured_circuit_breaker_enabled(),
+            failure_threshold: configured_circuit_breaker_failure_threshold().max(1),
+            open_duration: Duration::from_millis(configured_circuit_breaker_open_ms()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CircuitAcquireKind {
+    Closed,
+    HalfOpenProbe,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CircuitAcquireToken {
+    kind: CircuitAcquireKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TargetCircuitState {
+    state: CircuitState,
+    consecutive_failures: u32,
+    open_until: Option<Instant>,
+    half_open_probe_inflight: bool,
+}
+
+impl Default for TargetCircuitState {
+    fn default() -> Self {
+        Self {
+            state: CircuitState::Closed,
+            consecutive_failures: 0,
+            open_until: None,
+            half_open_probe_inflight: false,
+        }
+    }
+}
+
+/// Structured overload rejection used for deterministic SQLSTATE mapping.
+#[derive(Debug, Clone)]
+pub struct OverloadError {
+    message: String,
+}
+
+impl OverloadError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for OverloadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.message.as_str())
+    }
+}
+
+impl std::error::Error for OverloadError {}
+
+/// Returns `true` when `message` encodes overload/flow-control rejection.
+pub fn is_overload_error_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("server is overloaded")
+        || lower.contains("circuit breaker open")
+        || lower.contains("write inflight budget exceeded")
+}
+
+/// Backoff policy for distributed write retries with bounded jitter.
+fn retry_backoff(policy: RetryPolicy, attempt: usize, jitter_seed: u64) -> std::time::Duration {
+    let exp = 1u64 << attempt.min(8);
+    let base_ms = policy.base_delay.as_millis().min(u64::MAX as u128) as u64;
+    let max_ms = policy.max_delay.as_millis().min(u64::MAX as u128) as u64;
+    let without_jitter = base_ms.saturating_mul(exp).min(max_ms);
+    // Decision: deterministic pseudo-jitter avoids synchronization without
+    // requiring additional RNG dependencies.
+    let jitter = jitter_seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add((attempt as u64).saturating_mul(0x9E3779B97F4A7C15));
+    let jitter_ms = jitter % (without_jitter.saturating_div(4).max(1));
+    std::time::Duration::from_millis(without_jitter.saturating_add(jitter_ms))
+}
+
+fn classify_write_error_message(message: &str) -> RetryableErrorClass {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("key routed to shard")
+        || lower.contains("request targeted shard")
+        || lower.contains("no shard route found")
+        || lower.contains("split key does not map")
+        || lower.contains("split key must")
+        || lower.contains("range metadata changed")
+    {
+        return RetryableErrorClass::Topology;
+    }
+    if lower.contains("timed out")
+        || lower.contains("deadline")
+        || lower.contains("temporarily unavailable")
+        || lower.contains("unavailable")
+        || lower.contains("transport")
+        || lower.contains("connection reset")
+        || lower.contains("connection refused")
+        || lower.contains("broken pipe")
+        || lower.contains("network")
+    {
+        return RetryableErrorClass::TransientRpc;
+    }
+    if is_overload_error_message(message) || lower.contains("too many requests") {
+        return RetryableErrorClass::Overload;
+    }
+    RetryableErrorClass::NonRetryable
 }
 
 /// Estimates one replicated write entry payload size for batch sizing.
@@ -273,6 +610,42 @@ pub enum ConditionalWriteOutcome {
     Conflict,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Supported primary-key aggregate extremes for fast-path execution.
+pub enum PrimaryKeyExtreme {
+    Min,
+    Max,
+}
+
+impl PrimaryKeyExtreme {
+    /// Returns `true` when the storage scan should run in reverse key order.
+    fn reverse_scan(self) -> bool {
+        matches!(self, Self::Max)
+    }
+
+    /// Picks the best aggregate candidate under this extreme.
+    fn pick(self, current: i64, candidate: i64) -> i64 {
+        match self {
+            Self::Min => current.min(candidate),
+            Self::Max => current.max(candidate),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+/// Detailed result of one conditional apply operation including rollback metadata.
+struct ConditionalWriteAppliedBatch {
+    applied_rows: u64,
+    applied_targets: Vec<(WriteTarget, Vec<PreparedConditionalEntry>)>,
+}
+
+#[derive(Debug, Clone)]
+/// Detailed conditional apply outcome used by streaming ingest/rollback flows.
+enum ConditionalWriteDetailedOutcome {
+    Applied(ConditionalWriteAppliedBatch),
+    Conflict,
+}
+
 #[derive(Debug, Clone)]
 /// Structured duplicate-key violation used to preserve SQLSTATE mapping.
 pub struct DuplicateKeyViolation {
@@ -317,6 +690,10 @@ pub struct HoloProviderCodecSpec {
     pub check_constraints: Vec<TableCheckConstraintRecord>,
     #[serde(default)]
     pub primary_key_column: Option<String>,
+    #[serde(default)]
+    pub primary_key_distribution: PrimaryKeyDistribution,
+    #[serde(default)]
+    pub primary_key_hash_buckets: Option<usize>,
     pub preferred_shards: Vec<usize>,
     pub page_size: usize,
     #[serde(default = "default_max_scan_rows")]
@@ -476,11 +853,20 @@ pub struct HoloStoreTableProvider {
     row_codec_mode: RowCodecMode,
     primary_key_column: String,
     primary_key_index: usize,
+    primary_key_distribution: PrimaryKeyDistribution,
+    primary_key_hash_buckets: Option<usize>,
     preferred_shards: Vec<usize>,
     page_size: usize,
     max_scan_rows: usize,
     distributed_write_max_batch_entries: usize,
     distributed_write_max_batch_bytes: usize,
+    write_retry_policy: RetryPolicy,
+    scan_retry_limit: usize,
+    scan_retry_delay: Duration,
+    inflight_budget: InflightBudgetConfig,
+    circuit_breaker_config: CircuitBreakerConfig,
+    circuit_by_target: Arc<std::sync::Mutex<BTreeMap<SocketAddr, TargetCircuitState>>>,
+    bulk_ingest_enabled: bool,
     local_grpc_addr: SocketAddr,
     client: HoloStoreClient,
     metrics: Arc<PushdownMetrics>,
@@ -659,11 +1045,20 @@ impl HoloStoreTableProvider {
             row_codec_mode: RowCodecMode::OrdersV1,
             primary_key_column: "order_id".to_string(),
             primary_key_index: 0,
+            primary_key_distribution: PrimaryKeyDistribution::Range,
+            primary_key_hash_buckets: None,
             preferred_shards: vec![ORDERS_SHARD_INDEX],
             page_size: 2048,
             max_scan_rows: configured_max_scan_rows(),
             distributed_write_max_batch_entries: configured_write_max_batch_entries(),
             distributed_write_max_batch_bytes: configured_write_max_batch_bytes(),
+            write_retry_policy: RetryPolicy::from_env(),
+            scan_retry_limit: configured_scan_retry_limit().max(1),
+            scan_retry_delay: Duration::from_millis(configured_scan_retry_delay_ms()),
+            inflight_budget: InflightBudgetConfig::from_env(),
+            circuit_breaker_config: CircuitBreakerConfig::from_env(),
+            circuit_by_target: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            bulk_ingest_enabled: configured_bulk_ingest_enabled(),
             local_grpc_addr,
             client,
             metrics,
@@ -691,11 +1086,20 @@ impl HoloStoreTableProvider {
             row_codec_mode,
             primary_key_column,
             primary_key_index,
+            primary_key_distribution: table.primary_key_distribution,
+            primary_key_hash_buckets: table.primary_key_hash_buckets,
             preferred_shards: table.preferred_shards.clone(),
             page_size: table.page_size.max(1),
             max_scan_rows: configured_max_scan_rows(),
             distributed_write_max_batch_entries: configured_write_max_batch_entries(),
             distributed_write_max_batch_bytes: configured_write_max_batch_bytes(),
+            write_retry_policy: RetryPolicy::from_env(),
+            scan_retry_limit: configured_scan_retry_limit().max(1),
+            scan_retry_delay: Duration::from_millis(configured_scan_retry_delay_ms()),
+            inflight_budget: InflightBudgetConfig::from_env(),
+            circuit_breaker_config: CircuitBreakerConfig::from_env(),
+            circuit_by_target: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            bulk_ingest_enabled: configured_bulk_ingest_enabled(),
             local_grpc_addr,
             client,
             metrics,
@@ -711,6 +1115,8 @@ impl HoloStoreTableProvider {
             columns: self.columns.clone(),
             check_constraints: self.check_constraints.clone(),
             primary_key_column: Some(self.primary_key_column.clone()),
+            primary_key_distribution: self.primary_key_distribution,
+            primary_key_hash_buckets: self.primary_key_hash_buckets,
             preferred_shards: self.preferred_shards.clone(),
             page_size: self.page_size,
             max_scan_rows: self.max_scan_rows,
@@ -746,11 +1152,20 @@ impl HoloStoreTableProvider {
             row_codec_mode,
             primary_key_column,
             primary_key_index,
+            primary_key_distribution: spec.primary_key_distribution,
+            primary_key_hash_buckets: spec.primary_key_hash_buckets,
             preferred_shards: spec.preferred_shards,
             page_size: spec.page_size.max(1),
             max_scan_rows: spec.max_scan_rows.max(1),
             distributed_write_max_batch_entries: configured_write_max_batch_entries(),
             distributed_write_max_batch_bytes: configured_write_max_batch_bytes(),
+            write_retry_policy: RetryPolicy::from_env(),
+            scan_retry_limit: configured_scan_retry_limit().max(1),
+            scan_retry_delay: Duration::from_millis(configured_scan_retry_delay_ms()),
+            inflight_budget: InflightBudgetConfig::from_env(),
+            circuit_breaker_config: CircuitBreakerConfig::from_env(),
+            circuit_by_target: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            bulk_ingest_enabled: configured_bulk_ingest_enabled(),
             local_grpc_addr,
             client,
             metrics,
@@ -760,6 +1175,11 @@ impl HoloStoreTableProvider {
     /// Executes `table name` for this component.
     pub fn table_name(&self) -> &str {
         self.table_name.as_str()
+    }
+
+    /// Returns stable table identifier from metadata.
+    pub fn table_id(&self) -> u64 {
+        self.table_id
     }
 
     /// Executes `table model` for this component.
@@ -782,6 +1202,26 @@ impl HoloStoreTableProvider {
         self.check_constraints.as_slice()
     }
 
+    /// Returns physical primary-key distribution mode.
+    pub fn primary_key_distribution(&self) -> PrimaryKeyDistribution {
+        self.primary_key_distribution
+    }
+
+    /// Returns optional hash bucket count for hash-distributed primary keys.
+    pub fn primary_key_hash_buckets(&self) -> Option<usize> {
+        self.primary_key_hash_buckets
+    }
+
+    /// Returns preferred shard affinity from metadata.
+    pub fn preferred_shards(&self) -> &[usize] {
+        self.preferred_shards.as_slice()
+    }
+
+    /// Returns configured scan page size.
+    pub fn page_size(&self) -> usize {
+        self.page_size
+    }
+
     /// Executes `is orders v1 table` for this component.
     pub fn is_orders_v1_table(&self) -> bool {
         self.row_codec_mode == RowCodecMode::OrdersV1
@@ -790,6 +1230,149 @@ impl HoloStoreTableProvider {
     /// Executes `is row v1 table` for this component.
     pub fn is_row_v1_table(&self) -> bool {
         self.row_codec_mode == RowCodecMode::RowV1
+    }
+
+    /// Returns configured hash bucket count when this table uses hash-PK routing.
+    fn hash_bucket_count(&self) -> Option<usize> {
+        if self.primary_key_distribution != PrimaryKeyDistribution::Hash {
+            return None;
+        }
+        Some(
+            self.primary_key_hash_buckets
+                .unwrap_or(DEFAULT_HASH_PK_BUCKETS)
+                .max(1)
+                .min(u16::MAX as usize),
+        )
+    }
+
+    /// Encodes one table primary key according to persisted PK distribution mode.
+    fn encode_storage_primary_key(&self, primary_key: i64) -> Vec<u8> {
+        encode_primary_key_with_distribution(
+            self.table_id,
+            primary_key,
+            self.primary_key_distribution,
+            self.hash_bucket_count(),
+        )
+    }
+
+    /// Builds one or more scan ranges for PK bounds under current PK distribution mode.
+    fn scan_ranges_for_bounds(
+        &self,
+        bounds: PkBounds,
+        table_id: u64,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if bounds.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.primary_key_distribution != PrimaryKeyDistribution::Hash {
+            return Ok(vec![bounds.as_scan_range(table_id)?]);
+        }
+
+        let bucket_count = self.hash_bucket_count().unwrap_or(DEFAULT_HASH_PK_BUCKETS);
+        let mut ranges = Vec::with_capacity(bucket_count);
+        for bucket in 0..bucket_count {
+            let bucket_u16 = u16::try_from(bucket)
+                .map_err(|_| anyhow!("hash bucket {} out of u16 range", bucket))?;
+            let mut start = table_hash_bucket_prefix(table_id, bucket_u16);
+            let mut end = prefix_end(start.as_slice()).unwrap_or_default();
+
+            if let Some((lower, inclusive)) = bounds.lower {
+                let lower_key = encode_primary_key_hash(table_id, bucket_u16, lower);
+                start = if inclusive {
+                    lower_key
+                } else {
+                    prefix_end(&lower_key).unwrap_or(lower_key)
+                };
+            }
+            if let Some((upper, inclusive)) = bounds.upper {
+                let upper_key = encode_primary_key_hash(table_id, bucket_u16, upper);
+                end = if inclusive {
+                    prefix_end(&upper_key).unwrap_or_default()
+                } else {
+                    upper_key
+                };
+            }
+            if !end.is_empty() && start >= end {
+                continue;
+            }
+            ranges.push((start, end));
+        }
+        Ok(ranges)
+    }
+
+    /// Reads MIN/MAX(primary_key) using one directed page per scan target.
+    pub async fn scan_primary_key_extreme(
+        &self,
+        extreme: PrimaryKeyExtreme,
+    ) -> Result<Option<i64>> {
+        let scan_ranges = self.scan_ranges_for_bounds(PkBounds::default(), self.table_id)?;
+        if scan_ranges.is_empty() {
+            return Ok(None);
+        }
+
+        let mut best: Option<i64> = None;
+        for (range_start, range_end) in scan_ranges {
+            let targets = self
+                .scan_targets_for_range(range_start.as_slice(), range_end.as_slice())
+                .await;
+            for target in targets {
+                let Some(candidate) = self
+                    .scan_target_primary_key_extreme(&target, extreme)
+                    .await?
+                else {
+                    continue;
+                };
+                best = Some(match best {
+                    Some(current) => extreme.pick(current, candidate),
+                    None => candidate,
+                });
+            }
+        }
+
+        Ok(best)
+    }
+
+    /// Reads one target-local MIN/MAX(primary_key) candidate using directed pagination.
+    async fn scan_target_primary_key_extreme(
+        &self,
+        target: &LocalScanTarget,
+        extreme: PrimaryKeyExtreme,
+    ) -> Result<Option<i64>> {
+        let mut cursor = Vec::new();
+        let page_limit = self.page_size.min(64).max(1);
+        let scan_client = self.client_for(target.grpc_addr);
+
+        loop {
+            let (entries, next_cursor, done) = scan_client
+                .range_snapshot_latest(
+                    target.shard_index,
+                    target.start_key.as_slice(),
+                    target.end_key.as_slice(),
+                    cursor.as_slice(),
+                    page_limit,
+                    extreme.reverse_scan(),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "scan primary-key {:?} candidate shard={} target={}",
+                        extreme, target.shard_index, target.grpc_addr
+                    )
+                })?;
+
+            for entry in entries {
+                if row_payload_is_sql_tombstone(entry.value.as_slice()) {
+                    continue;
+                }
+                let primary_key = decode_primary_key(entry.key.as_slice(), self.table_id)?;
+                return Ok(Some(primary_key));
+            }
+
+            if done || next_cursor.is_empty() {
+                return Ok(None);
+            }
+            cursor = next_cursor;
+        }
     }
 
     /// Executes `scan orders by order id bounds` for this component.
@@ -1005,6 +1588,24 @@ impl HoloStoreTableProvider {
         self.write_primary_entries(entries, "delete").await
     }
 
+    /// Tombstones row_v1 rows by primary key.
+    pub async fn tombstone_generic_rows_by_primary_key(&self, primary_keys: &[i64]) -> Result<u64> {
+        if self.row_codec_mode != RowCodecMode::RowV1 {
+            return Err(anyhow!(
+                "generic tombstone helpers are only available for row_v1 table model"
+            ));
+        }
+        if primary_keys.is_empty() {
+            return Ok(0);
+        }
+        let tombstone = encode_generic_tombstone_value();
+        let entries = primary_keys
+            .iter()
+            .map(|primary_key| (*primary_key, tombstone.clone()))
+            .collect::<Vec<_>>();
+        self.write_primary_entries(entries, "delete").await
+    }
+
     /// Executes `apply orders writes conditional` for this component.
     pub async fn apply_orders_writes_conditional(
         &self,
@@ -1084,31 +1685,76 @@ impl HoloStoreTableProvider {
         writes: &[ConditionalPrimaryWrite],
         op: &'static str,
     ) -> Result<ConditionalWriteOutcome> {
-        if writes.is_empty() {
-            return Ok(ConditionalWriteOutcome::Applied(0));
+        match self
+            .apply_primary_writes_conditional_detailed(writes, op)
+            .await?
+        {
+            ConditionalWriteDetailedOutcome::Applied(applied) => {
+                Ok(ConditionalWriteOutcome::Applied(applied.applied_rows))
+            }
+            ConditionalWriteDetailedOutcome::Conflict => Ok(ConditionalWriteOutcome::Conflict),
         }
-        let retry_limit = DISTRIBUTED_WRITE_RETRY_LIMIT.max(1);
+    }
+
+    /// Applies conditional writes and returns detailed rollback metadata on success.
+    async fn apply_primary_writes_conditional_detailed(
+        &self,
+        writes: &[ConditionalPrimaryWrite],
+        op: &'static str,
+    ) -> Result<ConditionalWriteDetailedOutcome> {
+        if writes.is_empty() {
+            return Ok(ConditionalWriteDetailedOutcome::Applied(
+                ConditionalWriteAppliedBatch {
+                    applied_rows: 0,
+                    applied_targets: Vec::new(),
+                },
+            ));
+        }
+        let retry_policy = self.write_retry_policy;
+        let retry_limit = retry_policy.max_attempts();
+        let retry_deadline = if retry_policy.enabled && retry_policy.max_elapsed > Duration::ZERO {
+            Some(Instant::now() + retry_policy.max_elapsed)
+        } else {
+            None
+        };
         let mut last_retryable_error: Option<anyhow::Error> = None;
 
         'attempts: for attempt in 0..retry_limit {
+            if let Some(deadline) = retry_deadline {
+                if Instant::now() >= deadline {
+                    break 'attempts;
+                }
+            }
             let topology = match fetch_topology(&self.client)
                 .await
                 .with_context(|| format!("fetch topology for {op}"))
             {
                 Ok(topology) => topology,
                 Err(err) => {
-                    if attempt + 1 < retry_limit {
+                    let class = classify_write_error_message(err.to_string().as_str());
+                    if class.is_retryable() && attempt + 1 < retry_limit {
                         last_retryable_error = Some(err);
-                        tokio::time::sleep(retry_backoff(attempt)).await;
+                        tokio::time::sleep(retry_backoff(
+                            retry_policy,
+                            attempt,
+                            now_timestamp_nanos().unsigned_abs(),
+                        ))
+                        .await;
                         continue 'attempts;
                     }
                     return Err(err);
                 }
             };
             if let Err(err) = require_non_empty_topology(&topology) {
-                if attempt + 1 < retry_limit {
+                let class = classify_write_error_message(err.to_string().as_str());
+                if class.is_retryable() && attempt + 1 < retry_limit {
                     last_retryable_error = Some(err);
-                    tokio::time::sleep(retry_backoff(attempt)).await;
+                    tokio::time::sleep(retry_backoff(
+                        retry_policy,
+                        attempt,
+                        now_timestamp_nanos().unsigned_abs(),
+                    ))
+                    .await;
                     continue 'attempts;
                 }
                 return Err(err);
@@ -1116,7 +1762,7 @@ impl HoloStoreTableProvider {
 
             let mut by_target = BTreeMap::<WriteTarget, Vec<PreparedConditionalEntry>>::new();
             for write in writes {
-                let key = encode_primary_key(self.table_id, write.primary_key);
+                let key = self.encode_storage_primary_key(write.primary_key);
                 let route = match route_key(
                     &topology,
                     self.local_grpc_addr,
@@ -1130,9 +1776,15 @@ impl HoloStoreTableProvider {
                             self.table_name,
                             write.primary_key
                         );
-                        if attempt + 1 < retry_limit {
+                        let class = classify_write_error_message(err.to_string().as_str());
+                        if class.is_retryable() && attempt + 1 < retry_limit {
                             last_retryable_error = Some(err);
-                            tokio::time::sleep(retry_backoff(attempt)).await;
+                            tokio::time::sleep(retry_backoff(
+                                retry_policy,
+                                attempt,
+                                now_timestamp_nanos().unsigned_abs(),
+                            ))
+                            .await;
                             continue 'attempts;
                         }
                         return Err(err);
@@ -1156,6 +1808,26 @@ impl HoloStoreTableProvider {
                         rollback_value: write.rollback_value.clone(),
                     });
             }
+            let planned_rows = writes.len();
+            let mut planned_bytes = 0usize;
+            let mut planned_rpcs = 0usize;
+            for entries in by_target.values() {
+                planned_bytes = planned_bytes.saturating_add(
+                    entries
+                        .iter()
+                        .map(prepared_conditional_entry_size)
+                        .fold(0usize, |acc, next| acc.saturating_add(next)),
+                );
+                planned_rpcs = planned_rpcs.saturating_add(
+                    conditional_chunk_ranges(
+                        entries.as_slice(),
+                        self.distributed_write_max_batch_entries,
+                        self.distributed_write_max_batch_bytes,
+                    )
+                    .len(),
+                );
+            }
+            self.enforce_inflight_budget(planned_rows, planned_bytes, planned_rpcs, "write_plan")?;
 
             let mut applied_targets = Vec::<(WriteTarget, Vec<PreparedConditionalEntry>)>::new();
             for (target, mut entries) in by_target {
@@ -1173,6 +1845,10 @@ impl HoloStoreTableProvider {
                 for (batch_idx, batch_range) in batch_ranges.into_iter().enumerate() {
                     let start = batch_range.start;
                     let end = batch_range.end;
+                    let batch_bytes = entries[start..end]
+                        .iter()
+                        .map(prepared_conditional_entry_size)
+                        .fold(0usize, |acc, next| acc.saturating_add(next));
                     let request_entries = entries[start..end]
                         .iter()
                         .map(|entry| ReplicatedConditionalWriteEntry {
@@ -1182,6 +1858,67 @@ impl HoloStoreTableProvider {
                         })
                         .collect::<Vec<_>>();
                     let batch_expected = request_entries.len() as u64;
+                    self.enforce_inflight_budget(
+                        batch_expected as usize,
+                        batch_bytes,
+                        1,
+                        "conditional_apply_batch",
+                    )?;
+                    let circuit_token = match self.circuit_acquire(target.grpc_addr) {
+                        Ok(token) => token,
+                        Err(err) => {
+                            let apply_error = anyhow!(
+                                "apply conditional {op} batch table={} shard={} target={} chunk={}/{} failed: {err}",
+                                self.table_name,
+                                target.shard_index,
+                                target.grpc_addr,
+                                batch_idx + 1,
+                                batch_count
+                            );
+                            let classification =
+                                classify_write_error_message(apply_error.to_string().as_str());
+                            self.metrics.record_distributed_apply_failure(
+                                target.grpc_addr.to_string().as_str(),
+                                classification.is_retryable(),
+                            );
+                            if !applied_this_target.is_empty() {
+                                let rollback_scope =
+                                    vec![(target.clone(), applied_this_target.clone())];
+                                self.rollback_conditional_targets(rollback_scope.as_slice(), op)
+                                    .await
+                                    .with_context(|| {
+                                        format!(
+                                            "rollback conditional {op} writes for shard {} after circuit rejection",
+                                            target.shard_index
+                                        )
+                                    })?;
+                            }
+                            self.rollback_conditional_targets(applied_targets.as_slice(), op)
+                                .await
+                                .with_context(|| {
+                                    format!(
+                                        "rollback previously applied conditional {op} writes after circuit rejection"
+                                    )
+                                })?;
+
+                            if classification.is_retryable() && attempt + 1 < retry_limit {
+                                if let Some(deadline) = retry_deadline {
+                                    if Instant::now() >= deadline {
+                                        return Err(apply_error);
+                                    }
+                                }
+                                last_retryable_error = Some(apply_error);
+                                tokio::time::sleep(retry_backoff(
+                                    retry_policy,
+                                    attempt,
+                                    target.grpc_addr.port() as u64,
+                                ))
+                                .await;
+                                continue 'attempts;
+                            }
+                            return Err(apply_error);
+                        }
+                    };
                     let apply_span = info_span!(
                         "holo_fusion.distributed_write_apply",
                         table = %self.table_name,
@@ -1202,8 +1939,12 @@ impl HoloStoreTableProvider {
                         .instrument(apply_span)
                         .await
                     {
-                        Ok(result) => result,
+                        Ok(result) => {
+                            self.circuit_on_success(target.grpc_addr, circuit_token);
+                            result
+                        }
                         Err(err) => {
+                            self.circuit_on_failure(target.grpc_addr, circuit_token);
                             let apply_error = anyhow!(
                                 "apply conditional {op} batch table={} shard={} target={} chunk={}/{} failed: {err}",
                                 self.table_name,
@@ -1211,6 +1952,12 @@ impl HoloStoreTableProvider {
                                 target.grpc_addr,
                                 batch_idx + 1,
                                 batch_count
+                            );
+                            let classification =
+                                classify_write_error_message(apply_error.to_string().as_str());
+                            self.metrics.record_distributed_apply_failure(
+                                target.grpc_addr.to_string().as_str(),
+                                classification.is_retryable(),
                             );
                             if !applied_this_target.is_empty() {
                                 let rollback_scope =
@@ -1232,11 +1979,19 @@ impl HoloStoreTableProvider {
                                     )
                                 })?;
 
-                            if attempt + 1 < retry_limit
-                                && is_retryable_conditional_write_error(&apply_error)
-                            {
+                            if classification.is_retryable() && attempt + 1 < retry_limit {
+                                if let Some(deadline) = retry_deadline {
+                                    if Instant::now() >= deadline {
+                                        return Err(apply_error);
+                                    }
+                                }
                                 last_retryable_error = Some(apply_error);
-                                tokio::time::sleep(retry_backoff(attempt)).await;
+                                tokio::time::sleep(retry_backoff(
+                                    retry_policy,
+                                    attempt,
+                                    target.grpc_addr.port() as u64,
+                                ))
+                                .await;
                                 continue 'attempts;
                             }
                             return Err(apply_error);
@@ -1259,7 +2014,7 @@ impl HoloStoreTableProvider {
                         }
                         self.rollback_conditional_targets(applied_targets.as_slice(), op)
                             .await?;
-                        return Ok(ConditionalWriteOutcome::Conflict);
+                        return Ok(ConditionalWriteDetailedOutcome::Conflict);
                     }
 
                     // Decision: evaluate `result.applied != batch_expected` to choose the correct SQL/storage control path.
@@ -1345,7 +2100,12 @@ impl HoloStoreTableProvider {
                 applied_targets.push((target, entries));
             }
 
-            return Ok(ConditionalWriteOutcome::Applied(writes.len() as u64));
+            return Ok(ConditionalWriteDetailedOutcome::Applied(
+                ConditionalWriteAppliedBatch {
+                    applied_rows: writes.len() as u64,
+                    applied_targets,
+                },
+            ));
         }
 
         Err(last_retryable_error
@@ -1749,14 +2509,18 @@ impl HoloStoreTableProvider {
             return Ok(ScanExecutionResult::default());
         }
 
-        let (start_key, end_key) = spec.bounds.as_scan_range(spec.table_id)?;
-        if !end_key.is_empty() && start_key >= end_key {
+        let scan_ranges = self.scan_ranges_for_bounds(spec.bounds, spec.table_id)?;
+        if scan_ranges.is_empty() {
             return Ok(ScanExecutionResult::default());
         }
 
-        let targets = self
-            .scan_targets_for_range(start_key.as_slice(), end_key.as_slice())
-            .await;
+        let mut all_targets = Vec::<LocalScanTarget>::new();
+        for (start_key, end_key) in &scan_ranges {
+            let mut targets = self
+                .scan_targets_for_range(start_key.as_slice(), end_key.as_slice())
+                .await;
+            all_targets.append(&mut targets);
+        }
         self.metrics.record_stage_event(
             spec.query_execution_id.as_str(),
             spec.stage_id,
@@ -1764,7 +2528,7 @@ impl HoloStoreTableProvider {
             format!(
                 "table={} targets={} projection_columns={} limit={}",
                 spec.table_name,
-                targets.len(),
+                all_targets.len(),
                 spec.projected_columns.len(),
                 spec.limit
                     .map(|value| value.to_string())
@@ -1783,63 +2547,69 @@ impl HoloStoreTableProvider {
         let mut result = ScanExecutionResult::default();
         let mut seen_keys = BTreeSet::<Vec<u8>>::new();
 
-        for base_target in targets {
-            let mut target = base_target;
-            let mut cursor = Vec::new();
-            let mut retries = 0usize;
-            loop {
-                let remaining = spec
-                    .limit
-                    .map(|limit| limit.saturating_sub(result.entries.len()));
-                if matches!(remaining, Some(0)) {
-                    break;
-                }
+        for (range_start_key, range_end_key) in scan_ranges {
+            let targets = self
+                .scan_targets_for_range(range_start_key.as_slice(), range_end_key.as_slice())
+                .await;
+            for base_target in targets {
+                let mut target = base_target;
+                let mut cursor = Vec::new();
+                let mut retries = 0usize;
+                loop {
+                    let remaining = spec
+                        .limit
+                        .map(|limit| limit.saturating_sub(result.entries.len()));
+                    if matches!(remaining, Some(0)) {
+                        break;
+                    }
 
-                let page_limit = remaining
-                    .map(|remaining| remaining.min(self.page_size).max(1))
-                    .unwrap_or(self.page_size);
+                    let page_limit = remaining
+                        .map(|remaining| remaining.min(self.page_size).max(1))
+                        .unwrap_or(self.page_size);
 
-                let scan_client = self.client_for(target.grpc_addr);
-                match scan_client
-                    .range_snapshot_latest(
-                        target.shard_index,
-                        target.start_key.as_slice(),
-                        target.end_key.as_slice(),
-                        cursor.as_slice(),
-                        page_limit,
-                    )
-                    .await
-                {
-                    Ok((entries, next_cursor, done)) => {
-                        retries = 0;
-                        result.stats.rpc_pages = result.stats.rpc_pages.saturating_add(1);
+                    let scan_client = self.client_for(target.grpc_addr);
+                    match scan_client
+                        .range_snapshot_latest(
+                            target.shard_index,
+                            target.start_key.as_slice(),
+                            target.end_key.as_slice(),
+                            cursor.as_slice(),
+                            page_limit,
+                            false,
+                        )
+                        .await
+                    {
+                        Ok((entries, next_cursor, done)) => {
+                            retries = 0;
+                            result.stats.rpc_pages = result.stats.rpc_pages.saturating_add(1);
 
-                        let mut chunk = ScanChunk {
-                            sequence: result.stats.chunks.saturating_add(1),
-                            resume_cursor: next_cursor.clone(),
-                            rows_scanned: 0,
-                            bytes_scanned: 0,
-                        };
+                            let mut chunk = ScanChunk {
+                                sequence: result.stats.chunks.saturating_add(1),
+                                resume_cursor: next_cursor.clone(),
+                                rows_scanned: 0,
+                                bytes_scanned: 0,
+                            };
 
-                        for entry in entries {
-                            let bytes = entry.key.len() as u64 + entry.value.len() as u64;
-                            result.stats.rows_scanned = result.stats.rows_scanned.saturating_add(1);
-                            result.stats.bytes_scanned =
-                                result.stats.bytes_scanned.saturating_add(bytes);
-                            chunk.rows_scanned = chunk.rows_scanned.saturating_add(1);
-                            chunk.bytes_scanned = chunk.bytes_scanned.saturating_add(bytes);
+                            for entry in entries {
+                                let bytes = entry.key.len() as u64 + entry.value.len() as u64;
+                                result.stats.rows_scanned =
+                                    result.stats.rows_scanned.saturating_add(1);
+                                result.stats.bytes_scanned =
+                                    result.stats.bytes_scanned.saturating_add(bytes);
+                                chunk.rows_scanned = chunk.rows_scanned.saturating_add(1);
+                                chunk.bytes_scanned = chunk.bytes_scanned.saturating_add(bytes);
 
-                            if !seen_keys.insert(entry.key.clone()) {
-                                result.stats.duplicate_rows_skipped =
-                                    result.stats.duplicate_rows_skipped.saturating_add(1);
-                                continue;
+                                if !seen_keys.insert(entry.key.clone()) {
+                                    result.stats.duplicate_rows_skipped =
+                                        result.stats.duplicate_rows_skipped.saturating_add(1);
+                                    continue;
+                                }
+                                result.entries.push(entry);
                             }
-                            result.entries.push(entry);
-                        }
 
-                        result.stats.chunks = result.stats.chunks.saturating_add(1);
-                        self.metrics.record_scan_chunk();
-                        self.metrics.record_stage_event(
+                            result.stats.chunks = result.stats.chunks.saturating_add(1);
+                            self.metrics.record_scan_chunk();
+                            self.metrics.record_stage_event(
                             spec.query_execution_id.as_str(),
                             spec.stage_id,
                             "scan_chunk",
@@ -1854,17 +2624,17 @@ impl HoloStoreTableProvider {
                             ),
                         );
 
-                        if done
-                            || next_cursor.is_empty()
-                            || matches!(spec.limit, Some(limit) if result.entries.len() >= limit)
-                        {
-                            break;
+                            if done
+                                || next_cursor.is_empty()
+                                || matches!(spec.limit, Some(limit) if result.entries.len() >= limit)
+                            {
+                                break;
+                            }
+                            cursor = next_cursor;
                         }
-                        cursor = next_cursor;
-                    }
-                    Err(err) => {
-                        if retries + 1 >= DISTRIBUTED_SCAN_RETRY_LIMIT.max(1) {
-                            return Err(anyhow!(
+                        Err(err) => {
+                            if retries + 1 >= self.scan_retry_limit.max(1) {
+                                return Err(anyhow!(
                                 "snapshot table={} shard={} target={} start={} end={} cursor={} limit={} failed after {} retries: {}",
                                 self.table_name,
                                 target.shard_index,
@@ -1876,54 +2646,55 @@ impl HoloStoreTableProvider {
                                 retries,
                                 err
                             ));
-                        }
-                        retries = retries.saturating_add(1);
-                        result.stats.retries = result.stats.retries.saturating_add(1);
-                        self.metrics.record_scan_retry();
-                        self.metrics.record_stage_event(
-                            spec.query_execution_id.as_str(),
-                            spec.stage_id,
-                            "scan_retry",
-                            format!(
-                                "attempt={} shard={} target={} error={}",
-                                retries, target.shard_index, target.grpc_addr, err
-                            ),
-                        );
-
-                        let resume_key = if cursor.is_empty() {
-                            target.start_key.clone()
-                        } else {
-                            cursor.clone()
-                        };
-                        if let Some(rerouted) = self
-                            .reroute_scan_target(resume_key.as_slice(), end_key.as_slice())
-                            .await
-                        {
-                            if rerouted.grpc_addr != target.grpc_addr
-                                || rerouted.shard_index != target.shard_index
-                            {
-                                result.stats.reroutes = result.stats.reroutes.saturating_add(1);
-                                self.metrics.record_scan_reroute();
-                                self.metrics.record_stage_event(
-                                    spec.query_execution_id.as_str(),
-                                    spec.stage_id,
-                                    "scan_reroute",
-                                    format!(
-                                        "from_shard={} from_target={} to_shard={} to_target={}",
-                                        target.shard_index,
-                                        target.grpc_addr,
-                                        rerouted.shard_index,
-                                        rerouted.grpc_addr
-                                    ),
-                                );
                             }
-                            target = rerouted;
-                        }
+                            retries = retries.saturating_add(1);
+                            result.stats.retries = result.stats.retries.saturating_add(1);
+                            self.metrics.record_scan_retry();
+                            self.metrics.record_stage_event(
+                                spec.query_execution_id.as_str(),
+                                spec.stage_id,
+                                "scan_retry",
+                                format!(
+                                    "attempt={} shard={} target={} error={}",
+                                    retries, target.shard_index, target.grpc_addr, err
+                                ),
+                            );
 
-                        tokio::time::sleep(std::time::Duration::from_millis(
-                            DISTRIBUTED_SCAN_RETRY_DELAY_MS,
-                        ))
-                        .await;
+                            let resume_key = if cursor.is_empty() {
+                                target.start_key.clone()
+                            } else {
+                                cursor.clone()
+                            };
+                            if let Some(rerouted) = self
+                                .reroute_scan_target(
+                                    resume_key.as_slice(),
+                                    range_end_key.as_slice(),
+                                )
+                                .await
+                            {
+                                if rerouted.grpc_addr != target.grpc_addr
+                                    || rerouted.shard_index != target.shard_index
+                                {
+                                    result.stats.reroutes = result.stats.reroutes.saturating_add(1);
+                                    self.metrics.record_scan_reroute();
+                                    self.metrics.record_stage_event(
+                                        spec.query_execution_id.as_str(),
+                                        spec.stage_id,
+                                        "scan_reroute",
+                                        format!(
+                                            "from_shard={} from_target={} to_shard={} to_target={}",
+                                            target.shard_index,
+                                            target.grpc_addr,
+                                            rerouted.shard_index,
+                                            rerouted.grpc_addr
+                                        ),
+                                    );
+                                }
+                                target = rerouted;
+                            }
+
+                            tokio::time::sleep(self.scan_retry_delay).await;
+                        }
                     }
                 }
             }
@@ -2024,6 +2795,32 @@ impl HoloStoreTableProvider {
                     })
                     .collect::<Vec<_>>();
                 let expected = rollback_entries.len() as u64;
+                let rollback_bytes = entries[start..end]
+                    .iter()
+                    .map(prepared_conditional_entry_size)
+                    .fold(0usize, |acc, next| acc.saturating_add(next));
+                if let Err(err) = self.enforce_inflight_budget(
+                    expected as usize,
+                    rollback_bytes,
+                    1,
+                    "rollback_batch",
+                ) {
+                    warn!(error = %err, "rollback budget rejection");
+                    if first_err.is_none() {
+                        first_err = Some(err);
+                    }
+                    continue;
+                }
+                let circuit_token = match self.circuit_acquire(target.grpc_addr) {
+                    Ok(token) => token,
+                    Err(err) => {
+                        warn!(error = %err, "rollback circuit rejection");
+                        if first_err.is_none() {
+                            first_err = Some(err);
+                        }
+                        continue;
+                    }
+                };
                 let rollback_span = info_span!(
                     "holo_fusion.distributed_write_rollback",
                     table = %self.table_name,
@@ -2046,6 +2843,7 @@ impl HoloStoreTableProvider {
                     .await
                 {
                     Ok(result) => {
+                        self.circuit_on_success(target.grpc_addr, circuit_token);
                         self.metrics.record_distributed_rollback(
                             target.shard_index,
                             expected,
@@ -2084,6 +2882,11 @@ impl HoloStoreTableProvider {
                         }
                     }
                     Err(err) => {
+                        self.circuit_on_failure(target.grpc_addr, circuit_token);
+                        self.metrics.record_distributed_apply_failure(
+                            target.grpc_addr.to_string().as_str(),
+                            classify_write_error_message(err.to_string().as_str()).is_retryable(),
+                        );
                         self.metrics.record_distributed_rollback(
                             target.shard_index,
                             expected,
@@ -2140,6 +2943,235 @@ impl HoloStoreTableProvider {
         self.insert_orders_rows(&rows).await
     }
 
+    /// Decodes one insert input batch into primary-key/value entries.
+    fn decode_batch_to_primary_entries(&self, batch: &RecordBatch) -> Result<Vec<(i64, Vec<u8>)>> {
+        if self.row_codec_mode == RowCodecMode::RowV1 {
+            return decode_generic_rows(
+                batch,
+                self.columns.as_slice(),
+                self.check_constraints.as_slice(),
+                self.primary_key_index,
+            );
+        }
+
+        let rows = decode_orders_rows(batch)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.order_id, encode_orders_row_value(&row)))
+            .collect())
+    }
+
+    /// Applies one streaming insert chunk and records detailed rollback metadata.
+    async fn apply_streaming_insert_chunk(
+        &self,
+        pending: &mut Vec<(i64, Vec<u8>)>,
+        rollback_value: &[u8],
+        applied_targets: &mut Vec<(WriteTarget, Vec<PreparedConditionalEntry>)>,
+        chunk_id: &str,
+    ) -> Result<(u64, Duration, Vec<(usize, u64)>)> {
+        if pending.is_empty() {
+            return Ok((0, Duration::ZERO, Vec::new()));
+        }
+        let writes = pending
+            .drain(..)
+            .map(|(primary_key, value)| ConditionalPrimaryWrite {
+                primary_key,
+                expected_version: RpcVersion::zero(),
+                value,
+                rollback_value: rollback_value.to_vec(),
+            })
+            .collect::<Vec<_>>();
+        let started = Instant::now();
+        match self
+            .apply_primary_writes_conditional_detailed(writes.as_slice(), "bulk_insert")
+            .await
+        {
+            Ok(ConditionalWriteDetailedOutcome::Applied(applied)) => {
+                let mut applied_rows_by_shard = BTreeMap::<usize, u64>::new();
+                for (target, rows) in &applied.applied_targets {
+                    let entry = applied_rows_by_shard.entry(target.shard_index).or_default();
+                    *entry = entry.saturating_add(rows.len() as u64);
+                }
+                info!(
+                    table = %self.table_name,
+                    chunk_id = chunk_id,
+                    rows = applied.applied_rows,
+                    latency_ms = started.elapsed().as_millis() as u64,
+                    "bulk insert chunk applied"
+                );
+                applied_targets.extend(applied.applied_targets);
+                Ok((
+                    applied.applied_rows,
+                    started.elapsed(),
+                    applied_rows_by_shard.into_iter().collect(),
+                ))
+            }
+            Ok(ConditionalWriteDetailedOutcome::Conflict) => {
+                self.rollback_conditional_targets(applied_targets.as_slice(), "bulk_insert")
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "rollback previously applied bulk insert chunks after conflict in {}",
+                            chunk_id
+                        )
+                    })?;
+                Err(DuplicateKeyViolation::for_table(self.table_name.as_str()).into())
+            }
+            Err(err) => {
+                self.rollback_conditional_targets(applied_targets.as_slice(), "bulk_insert")
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "rollback previously applied bulk insert chunks after failure in {}",
+                            chunk_id
+                        )
+                    })?;
+                Err(err)
+            }
+        }
+    }
+
+    /// Streaming bulk insert path used by `INSERT ... SELECT` / sink execution.
+    async fn write_streaming_insert(&self, data: &mut SendableRecordBatchStream) -> Result<u64> {
+        if !self.bulk_ingest_enabled {
+            let mut buffered = Vec::new();
+            while let Some(batch) = data.next().await.transpose()? {
+                self.schema
+                    .logically_equivalent_names_and_types(&batch.schema())?;
+                buffered.push(batch);
+            }
+            return self.write_batches(buffered.as_slice()).await;
+        }
+
+        let rollback_value = self.encode_tombstone_payload();
+        let statement_id = format!("bulk_{}", now_timestamp_nanos().unsigned_abs());
+        self.metrics
+            .begin_ingest_job(statement_id.as_str(), self.table_name.as_str());
+        let result = async {
+            let mut seen_keys = HashSet::<i64>::new();
+            let mut pending = Vec::<(i64, Vec<u8>)>::new();
+            let mut pending_bytes = 0usize;
+            let mut applied_targets = Vec::<(WriteTarget, Vec<PreparedConditionalEntry>)>::new();
+            let mut written_rows = 0u64;
+
+            let chunk_min = configured_bulk_chunk_rows_min().max(1);
+            let chunk_max = configured_bulk_chunk_rows_max().max(chunk_min);
+            let mut chunk_target = configured_bulk_chunk_rows_initial()
+                .max(chunk_min)
+                .min(chunk_max);
+            let low_latency = Duration::from_millis(configured_bulk_chunk_low_latency_ms());
+            let high_latency = Duration::from_millis(configured_bulk_chunk_high_latency_ms());
+            let mut chunk_seq = 0u64;
+
+            while let Some(batch) = data.next().await.transpose()? {
+                self.schema
+                    .logically_equivalent_names_and_types(&batch.schema())?;
+                let entries = self.decode_batch_to_primary_entries(&batch)?;
+                for (primary_key, value) in entries {
+                    if !seen_keys.insert(primary_key) {
+                        self.rollback_conditional_targets(applied_targets.as_slice(), "bulk_insert")
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "rollback previously applied bulk insert chunks after duplicate key primary_key={}",
+                                    primary_key
+                                )
+                            })?;
+                        return Err(DuplicateKeyViolation::for_table(self.table_name.as_str()).into());
+                    }
+                    pending_bytes = pending_bytes
+                        .saturating_add(value.len())
+                        .saturating_add(std::mem::size_of::<i64>());
+                    pending.push((primary_key, value));
+
+                    if pending.len() >= chunk_target
+                        || pending_bytes >= self.distributed_write_max_batch_bytes
+                    {
+                        chunk_seq = chunk_seq.saturating_add(1);
+                        let chunk_id = format!("{statement_id}:{chunk_seq}");
+                        let (applied, latency, by_shard) = self
+                            .apply_streaming_insert_chunk(
+                                &mut pending,
+                                rollback_value.as_slice(),
+                                &mut applied_targets,
+                                chunk_id.as_str(),
+                            )
+                            .await?;
+                        written_rows = written_rows.saturating_add(applied);
+                        pending_bytes = 0;
+                        let shard_lag = by_shard
+                            .iter()
+                            .map(|(shard, _)| (*shard, 0u64))
+                            .collect::<Vec<_>>();
+                        self.metrics.record_ingest_progress(
+                            statement_id.as_str(),
+                            applied,
+                            pending.len() as u64,
+                            0,
+                            0,
+                            0,
+                            shard_lag.as_slice(),
+                        );
+                        if latency > high_latency {
+                            chunk_target = (chunk_target / 2).max(chunk_min);
+                        } else if latency <= low_latency {
+                            chunk_target = chunk_target
+                                .saturating_add(chunk_target / 4)
+                                .min(chunk_max);
+                        }
+                    }
+                }
+            }
+
+            if !pending.is_empty() {
+                chunk_seq = chunk_seq.saturating_add(1);
+                let chunk_id = format!("{statement_id}:{chunk_seq}");
+                let (applied, _latency, by_shard) = self
+                    .apply_streaming_insert_chunk(
+                        &mut pending,
+                        rollback_value.as_slice(),
+                        &mut applied_targets,
+                        chunk_id.as_str(),
+                    )
+                    .await?;
+                written_rows = written_rows.saturating_add(applied);
+                let shard_lag = by_shard
+                    .iter()
+                    .map(|(shard, _)| (*shard, 0u64))
+                    .collect::<Vec<_>>();
+                self.metrics.record_ingest_progress(
+                    statement_id.as_str(),
+                    applied,
+                    pending.len() as u64,
+                    0,
+                    0,
+                    0,
+                    shard_lag.as_slice(),
+                );
+            }
+
+            Ok::<u64, anyhow::Error>(written_rows)
+        }
+        .await;
+
+        match result {
+            Ok(written_rows) => {
+                self.metrics
+                    .finish_ingest_job(statement_id.as_str(), true, None);
+                Ok(written_rows)
+            }
+            Err(err) => {
+                let message = err.to_string();
+                self.metrics.finish_ingest_job(
+                    statement_id.as_str(),
+                    false,
+                    Some(message.as_str()),
+                );
+                Err(err)
+            }
+        }
+    }
+
     /// Executes strict insert semantics (fail on duplicate PK) for encoded entries.
     async fn insert_primary_entries(&self, rows: Vec<(i64, Vec<u8>)>) -> Result<u64> {
         if rows.is_empty() {
@@ -2184,30 +3216,86 @@ impl HoloStoreTableProvider {
             return Ok(0);
         }
         let row_count = rows.len() as u64;
+        let retry_policy = self.write_retry_policy;
+        let retry_limit = retry_policy.max_attempts();
+        let retry_deadline = if retry_policy.enabled && retry_policy.max_elapsed > Duration::ZERO {
+            Some(Instant::now() + retry_policy.max_elapsed)
+        } else {
+            None
+        };
         let mut last_error: Option<anyhow::Error> = None;
 
-        for attempt in 0..DISTRIBUTED_WRITE_RETRY_LIMIT.max(1) {
-            let topology = fetch_topology(&self.client)
+        'attempts: for attempt in 0..retry_limit {
+            if let Some(deadline) = retry_deadline {
+                if Instant::now() >= deadline {
+                    break 'attempts;
+                }
+            }
+            let topology = match fetch_topology(&self.client)
                 .await
-                .with_context(|| format!("fetch topology for {op}"))?;
-            require_non_empty_topology(&topology)?;
+                .with_context(|| format!("fetch topology for {op}"))
+            {
+                Ok(topology) => topology,
+                Err(err) => {
+                    let class = classify_write_error_message(err.to_string().as_str());
+                    if class.is_retryable() && attempt + 1 < retry_limit {
+                        last_error = Some(err);
+                        tokio::time::sleep(retry_backoff(
+                            retry_policy,
+                            attempt,
+                            now_timestamp_nanos().unsigned_abs(),
+                        ))
+                        .await;
+                        continue 'attempts;
+                    }
+                    return Err(err);
+                }
+            };
+            if let Err(err) = require_non_empty_topology(&topology) {
+                let class = classify_write_error_message(err.to_string().as_str());
+                if class.is_retryable() && attempt + 1 < retry_limit {
+                    last_error = Some(err);
+                    tokio::time::sleep(retry_backoff(
+                        retry_policy,
+                        attempt,
+                        now_timestamp_nanos().unsigned_abs(),
+                    ))
+                    .await;
+                    continue 'attempts;
+                }
+                return Err(err);
+            }
 
             let mut writes = BTreeMap::<WriteTarget, Vec<ReplicatedWriteEntry>>::new();
             for (primary_key, value) in &rows {
-                let key = encode_primary_key(self.table_id, *primary_key);
-                let route = route_key(
+                let key = self.encode_storage_primary_key(*primary_key);
+                let route = match route_key(
                     &topology,
                     self.local_grpc_addr,
                     key.as_slice(),
                     &self.preferred_shards,
-                )
-                .ok_or_else(|| {
-                    anyhow!(
-                        "no shard route found for key table={} primary_key={}",
-                        self.table_name,
-                        primary_key
-                    )
-                })?;
+                ) {
+                    Some(route) => route,
+                    None => {
+                        let err = anyhow!(
+                            "no shard route found for key table={} primary_key={}",
+                            self.table_name,
+                            primary_key
+                        );
+                        let class = classify_write_error_message(err.to_string().as_str());
+                        if class.is_retryable() && attempt + 1 < retry_limit {
+                            last_error = Some(err);
+                            tokio::time::sleep(retry_backoff(
+                                retry_policy,
+                                attempt,
+                                now_timestamp_nanos().unsigned_abs(),
+                            ))
+                            .await;
+                            continue 'attempts;
+                        }
+                        return Err(err);
+                    }
+                };
 
                 let target = WriteTarget {
                     shard_index: route.shard_index,
@@ -2223,6 +3311,25 @@ impl HoloStoreTableProvider {
                         value: value.clone(),
                     });
             }
+            let mut planned_bytes = 0usize;
+            let mut planned_rpcs = 0usize;
+            for entries in writes.values() {
+                planned_bytes = planned_bytes.saturating_add(
+                    entries
+                        .iter()
+                        .map(replicated_write_entry_size)
+                        .fold(0usize, |acc, next| acc.saturating_add(next)),
+                );
+                planned_rpcs = planned_rpcs.saturating_add(
+                    chunk_replicated_writes(
+                        entries.clone(),
+                        self.distributed_write_max_batch_entries,
+                        self.distributed_write_max_batch_bytes,
+                    )
+                    .len(),
+                );
+            }
+            self.enforce_inflight_budget(rows.len(), planned_bytes, planned_rpcs, "write_plan")?;
 
             let mut written = 0u64;
             let mut attempt_error: Option<anyhow::Error> = None;
@@ -2238,6 +3345,26 @@ impl HoloStoreTableProvider {
                 let mut target_written = 0u64;
                 for (batch_idx, batch_entries) in chunks.into_iter().enumerate() {
                     let batch_expected = batch_entries.len() as u64;
+                    let batch_bytes = batch_entries
+                        .iter()
+                        .map(replicated_write_entry_size)
+                        .fold(0usize, |acc, next| acc.saturating_add(next));
+                    if let Err(err) = self.enforce_inflight_budget(
+                        batch_expected as usize,
+                        batch_bytes,
+                        1,
+                        "write_batch",
+                    ) {
+                        attempt_error = Some(err);
+                        break;
+                    }
+                    let circuit_token = match self.circuit_acquire(target.grpc_addr) {
+                        Ok(token) => token,
+                        Err(err) => {
+                            attempt_error = Some(err);
+                            break;
+                        }
+                    };
                     let apply_span = info_span!(
                         "holo_fusion.distributed_write_apply",
                         table = %self.table_name,
@@ -2259,6 +3386,7 @@ impl HoloStoreTableProvider {
                         .await
                     {
                         Ok(applied) => {
+                            self.circuit_on_success(target.grpc_addr, circuit_token);
                             self.metrics.record_distributed_apply(
                                 target.shard_index,
                                 batch_expected,
@@ -2279,14 +3407,22 @@ impl HoloStoreTableProvider {
                             written = written.saturating_add(applied);
                         }
                         Err(err) => {
-                            attempt_error = Some(anyhow!(
+                            self.circuit_on_failure(target.grpc_addr, circuit_token);
+                            let wrapped = anyhow!(
                                 "apply {op} batch table={} shard={} target={} chunk {}/{} failed: {err}",
                                 self.table_name,
                                 target.shard_index,
                                 target.grpc_addr,
                                 batch_idx + 1,
                                 batch_count
-                            ));
+                            );
+                            let classification =
+                                classify_write_error_message(wrapped.to_string().as_str());
+                            self.metrics.record_distributed_apply_failure(
+                                target.grpc_addr.to_string().as_str(),
+                                classification.is_retryable(),
+                            );
+                            attempt_error = Some(anyhow!("{}", wrapped));
                             break;
                         }
                     }
@@ -2306,14 +3442,23 @@ impl HoloStoreTableProvider {
             }
 
             if let Some(err) = attempt_error {
+                let class = classify_write_error_message(err.to_string().as_str());
                 last_error = Some(err);
-                if attempt + 1 < DISTRIBUTED_WRITE_RETRY_LIMIT {
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        DISTRIBUTED_WRITE_RETRY_DELAY_MS,
+                if class.is_retryable() && attempt + 1 < retry_limit {
+                    if let Some(deadline) = retry_deadline {
+                        if Instant::now() >= deadline {
+                            break 'attempts;
+                        }
+                    }
+                    tokio::time::sleep(retry_backoff(
+                        retry_policy,
+                        attempt,
+                        now_timestamp_nanos().unsigned_abs(),
                     ))
                     .await;
                     continue;
                 }
+                break 'attempts;
             } else {
                 if written != row_count {
                     return Err(anyhow!(
@@ -2336,6 +3481,142 @@ impl HoloStoreTableProvider {
             self.client.clone()
         } else {
             HoloStoreClient::with_timeout(target, self.client.timeout())
+        }
+    }
+
+    fn enforce_inflight_budget(
+        &self,
+        rows: usize,
+        bytes: usize,
+        rpcs: usize,
+        context: &'static str,
+    ) -> Result<()> {
+        if rows > self.inflight_budget.max_rows
+            || bytes > self.inflight_budget.max_bytes
+            || rpcs > self.inflight_budget.max_rpcs
+        {
+            return Err(
+                OverloadError::new(format!(
+                    "server is overloaded: write inflight budget exceeded in {} (rows={} max_rows={} bytes={} max_bytes={} rpcs={} max_rpcs={})",
+                    context,
+                    rows,
+                    self.inflight_budget.max_rows,
+                    bytes,
+                    self.inflight_budget.max_bytes,
+                    rpcs,
+                    self.inflight_budget.max_rpcs
+                ))
+                .into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn circuit_acquire(&self, target: SocketAddr) -> Result<CircuitAcquireToken> {
+        if !self.circuit_breaker_config.enabled {
+            return Ok(CircuitAcquireToken {
+                kind: CircuitAcquireKind::Closed,
+            });
+        }
+        let target_key = target.to_string();
+        let mut by_target = self
+            .circuit_by_target
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = by_target.entry(target).or_default();
+        let now = Instant::now();
+
+        if state.state == CircuitState::Open {
+            if let Some(open_until) = state.open_until {
+                if now < open_until {
+                    self.metrics.record_circuit_reject(target_key.as_str());
+                    self.metrics
+                        .record_circuit_state(target_key.as_str(), CircuitState::Open);
+                    return Err(OverloadError::new(format!(
+                        "server is overloaded: circuit breaker open for {}",
+                        target
+                    ))
+                    .into());
+                }
+            }
+            state.state = CircuitState::HalfOpen;
+            state.half_open_probe_inflight = false;
+            state.open_until = None;
+            self.metrics
+                .record_circuit_state(target_key.as_str(), CircuitState::HalfOpen);
+        }
+
+        if state.state == CircuitState::HalfOpen {
+            if state.half_open_probe_inflight {
+                self.metrics.record_circuit_reject(target_key.as_str());
+                return Err(OverloadError::new(format!(
+                    "server is overloaded: circuit breaker half-open for {}",
+                    target
+                ))
+                .into());
+            }
+            state.half_open_probe_inflight = true;
+            self.metrics
+                .record_circuit_state(target_key.as_str(), CircuitState::HalfOpen);
+            return Ok(CircuitAcquireToken {
+                kind: CircuitAcquireKind::HalfOpenProbe,
+            });
+        }
+
+        self.metrics
+            .record_circuit_state(target_key.as_str(), CircuitState::Closed);
+        Ok(CircuitAcquireToken {
+            kind: CircuitAcquireKind::Closed,
+        })
+    }
+
+    fn circuit_on_success(&self, target: SocketAddr, token: CircuitAcquireToken) {
+        if !self.circuit_breaker_config.enabled {
+            return;
+        }
+        let target_key = target.to_string();
+        let mut by_target = self
+            .circuit_by_target
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = by_target.entry(target).or_default();
+        state.consecutive_failures = 0;
+        state.open_until = None;
+        state.half_open_probe_inflight = false;
+        if token.kind == CircuitAcquireKind::HalfOpenProbe || state.state != CircuitState::Closed {
+            state.state = CircuitState::Closed;
+            self.metrics
+                .record_circuit_state(target_key.as_str(), CircuitState::Closed);
+        }
+    }
+
+    fn circuit_on_failure(&self, target: SocketAddr, token: CircuitAcquireToken) {
+        if !self.circuit_breaker_config.enabled {
+            return;
+        }
+        let target_key = target.to_string();
+        let mut by_target = self
+            .circuit_by_target
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = by_target.entry(target).or_default();
+
+        if token.kind == CircuitAcquireKind::HalfOpenProbe {
+            state.state = CircuitState::Open;
+            state.half_open_probe_inflight = false;
+            state.open_until = Some(Instant::now() + self.circuit_breaker_config.open_duration);
+            state.consecutive_failures = 0;
+            self.metrics.record_circuit_open(target_key.as_str());
+            return;
+        }
+
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        if state.consecutive_failures >= self.circuit_breaker_config.failure_threshold {
+            state.state = CircuitState::Open;
+            state.open_until = Some(Instant::now() + self.circuit_breaker_config.open_duration);
+            state.consecutive_failures = 0;
+            state.half_open_probe_inflight = false;
+            self.metrics.record_circuit_open(target_key.as_str());
         }
     }
 }
@@ -2644,15 +3925,8 @@ impl DataSink for HoloStoreInsertSink {
         mut data: SendableRecordBatchStream,
         _context: &Arc<TaskContext>,
     ) -> DFResult<u64> {
-        let mut batches = Vec::new();
-        while let Some(batch) = data.next().await.transpose()? {
-            self.schema
-                .logically_equivalent_names_and_types(&batch.schema())?;
-            batches.push(batch);
-        }
-
         self.provider
-            .write_batches(&batches)
+            .write_streaming_insert(&mut data)
             .await
             .map_err(df_external)
     }
@@ -3868,9 +5142,18 @@ fn decode_orders_row_value(bytes: &[u8]) -> Result<Option<DecodedRowValue>> {
     }))
 }
 
+/// Returns whether one row payload encodes a SQL tombstone marker.
+fn row_payload_is_sql_tombstone(value: &[u8]) -> bool {
+    if value.len() < 2 {
+        return false;
+    }
+    matches!(value[0], ROW_FORMAT_VERSION_V1 | ROW_FORMAT_VERSION_V2)
+        && (value[1] & ROW_FLAG_TOMBSTONE != 0)
+}
+
 /// Executes `decode primary key` for this component.
 fn decode_primary_key(key: &[u8], expected_table_id: u64) -> Result<i64> {
-    // Decision: evaluate `key.len() < 1 + 8 + 1 + 1 + 8` to choose the correct SQL/storage control path.
+    // Decision: evaluate minimum key length to choose the correct SQL/storage control path.
     if key.len() < 1 + 8 + 1 + 1 + 8 {
         return Err(anyhow!("primary key too short"));
     }
@@ -3892,18 +5175,25 @@ fn decode_primary_key(key: &[u8], expected_table_id: u64) -> Result<i64> {
         ));
     }
 
-    // Decision: evaluate `key[9] != TUPLE_TAG_INT64` to choose the correct SQL/storage control path.
-    if key[9] != TUPLE_TAG_INT64 {
+    let tuple_offset = if key[9] == TUPLE_TAG_INT64 {
+        9usize
+    } else if key[9] == HASH_BUCKET_TAG {
+        if key.len() < 1 + 8 + 1 + 2 + 1 + 1 + 8 {
+            return Err(anyhow!("hash primary key too short"));
+        }
+        12usize
+    } else {
         return Err(anyhow!("unsupported tuple tag {}", key[9]));
+    };
+    if key[tuple_offset] != TUPLE_TAG_INT64 {
+        return Err(anyhow!("unsupported tuple tag {}", key[tuple_offset]));
     }
-
-    // Decision: evaluate `key[10] != 0` to choose the correct SQL/storage control path.
-    if key[10] != 0 {
+    if key[tuple_offset + 1] != 0 {
         return Err(anyhow!("primary key cannot be null"));
     }
 
     let mut payload = [0u8; 8];
-    payload.copy_from_slice(&key[11..19]);
+    payload.copy_from_slice(&key[(tuple_offset + 2)..(tuple_offset + 10)]);
     Ok(decode_i64_ordered(payload))
 }
 
@@ -3912,6 +5202,20 @@ fn table_key_prefix(table_id: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + 8);
     out.push(DATA_PREFIX_PRIMARY_ROW);
     out.extend_from_slice(&table_id.to_be_bytes());
+    out
+}
+
+/// Executes `table hash prefix` for this component.
+fn table_hash_prefix(table_id: u64) -> Vec<u8> {
+    let mut out = table_key_prefix(table_id);
+    out.push(HASH_BUCKET_TAG);
+    out
+}
+
+/// Executes `table hash bucket prefix` for this component.
+fn table_hash_bucket_prefix(table_id: u64, bucket: u16) -> Vec<u8> {
+    let mut out = table_hash_prefix(table_id);
+    out.extend_from_slice(&bucket.to_be_bytes());
     out
 }
 
@@ -3924,6 +5228,49 @@ fn encode_primary_key(table_id: u64, key: i64) -> Vec<u8> {
     out.push(0);
     out.extend_from_slice(&encode_i64_ordered(key));
     out
+}
+
+/// Executes `encode primary key hash` for this component.
+fn encode_primary_key_hash(table_id: u64, bucket: u16, key: i64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 8 + 1 + 2 + 1 + 1 + 8);
+    out.push(DATA_PREFIX_PRIMARY_ROW);
+    out.extend_from_slice(&table_id.to_be_bytes());
+    out.push(HASH_BUCKET_TAG);
+    out.extend_from_slice(&bucket.to_be_bytes());
+    out.push(TUPLE_TAG_INT64);
+    out.push(0);
+    out.extend_from_slice(&encode_i64_ordered(key));
+    out
+}
+
+/// Executes `hash bucket for primary key` for this component.
+fn hash_bucket_for_primary_key(primary_key: i64, bucket_count: usize) -> u16 {
+    let count = bucket_count.max(1).min(u16::MAX as usize);
+    // Stable splitmix64 mixer over signed PK payload for deterministic bucket assignment.
+    let mut mixed = (primary_key as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    mixed ^= mixed >> 31;
+    (mixed % (count as u64)) as u16
+}
+
+/// Encodes one PK key according to table-level primary-key distribution metadata.
+fn encode_primary_key_with_distribution(
+    table_id: u64,
+    key: i64,
+    distribution: PrimaryKeyDistribution,
+    hash_bucket_count: Option<usize>,
+) -> Vec<u8> {
+    match distribution {
+        PrimaryKeyDistribution::Range => encode_primary_key(table_id, key),
+        PrimaryKeyDistribution::Hash => {
+            let bucket = hash_bucket_for_primary_key(
+                key,
+                hash_bucket_count.unwrap_or(DEFAULT_HASH_PK_BUCKETS),
+            );
+            encode_primary_key_hash(table_id, bucket, key)
+        }
+    }
 }
 
 /// Executes `prefix end` for this component.
@@ -4159,9 +5506,22 @@ mod tests {
         let err = anyhow::anyhow!(
             "apply conditional insert batch table=sales_facts shard=1 target=127.0.0.1:15051 chunk=15/20 failed: range_write_latest_conditional rpc failed for 127.0.0.1:15051: rpc status: key routed to shard 2, but request targeted shard 1"
         );
-        assert!(is_retryable_conditional_write_error(&err));
+        assert!(classify_write_error_message(err.to_string().as_str()).is_retryable());
 
         let non_retryable = anyhow::anyhow!("conditional insert response missing applied versions");
-        assert!(!is_retryable_conditional_write_error(&non_retryable));
+        assert!(!classify_write_error_message(non_retryable.to_string().as_str()).is_retryable());
+    }
+
+    #[test]
+    fn overload_error_classifier_matches_circuit_and_budget_messages() {
+        assert!(is_overload_error_message(
+            "server is overloaded: circuit breaker open for 127.0.0.1:15051"
+        ));
+        assert!(is_overload_error_message(
+            "server is overloaded: write inflight budget exceeded in write_batch"
+        ));
+        assert!(!is_overload_error_message(
+            "duplicate key value violates unique constraint"
+        ));
     }
 }

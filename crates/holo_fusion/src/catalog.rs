@@ -14,6 +14,22 @@ use crate::metadata::{is_supported_table_model, list_table_metadata, TableMetada
 use crate::metrics::PushdownMetrics;
 use crate::provider::HoloStoreTableProvider;
 
+fn provider_matches_metadata(
+    existing: &HoloStoreTableProvider,
+    table: &TableMetadataRecord,
+) -> bool {
+    existing.table_name() == table.table_name
+        && existing.table_id() == table.table_id
+        && existing.table_model() == table.table_model
+        && existing.columns() == table.columns
+        && existing.check_constraints() == table.check_constraints
+        && existing.primary_key_column() == table.primary_key_column.as_deref().unwrap_or_default()
+        && existing.primary_key_distribution() == table.primary_key_distribution
+        && existing.primary_key_hash_buckets() == table.primary_key_hash_buckets
+        && existing.preferred_shards() == table.preferred_shards
+        && existing.page_size() == table.page_size.max(1)
+}
+
 /// Summary of tables registered during one bootstrap pass.
 #[derive(Debug, Clone)]
 pub struct CatalogBootstrapResult {
@@ -69,13 +85,21 @@ pub async fn register_table_from_metadata(
         return Ok(false);
     }
 
-    // Decision: treat already-present providers as idempotent no-op.
-    if session_context
+    if let Ok(existing_provider) = session_context
         .table_provider(table.table_name.as_str())
         .await
-        .is_ok()
     {
-        return Ok(false);
+        if let Some(existing_holo) = existing_provider
+            .as_any()
+            .downcast_ref::<HoloStoreTableProvider>()
+        {
+            if provider_matches_metadata(existing_holo, table) {
+                return Ok(false);
+            }
+        }
+        let _ = session_context
+            .deregister_table(table.table_name.as_str())
+            .with_context(|| format!("deregister stale table {}", table.table_name))?;
     }
 
     let provider = Arc::new(

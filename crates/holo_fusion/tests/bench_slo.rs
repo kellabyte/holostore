@@ -256,6 +256,12 @@ impl BenchHarness {
             dml_prewrite_delay: Duration::ZERO,
             dml_statement_timeout: Duration::ZERO,
             dml_max_inflight_statements: 1024,
+            dml_max_inflight_reads: 1024,
+            dml_max_inflight_writes: 1024,
+            dml_max_inflight_txns: ((1024) / 2).max(1),
+            dml_max_inflight_background: ((1024) / 4).max(1),
+            dml_admission_queue_limit: 4096,
+            dml_admission_wait_timeout: Duration::ZERO,
             dml_max_scan_rows: 100_000,
             dml_max_txn_staged_rows: 100_000,
             holostore: EmbeddedNodeConfig {

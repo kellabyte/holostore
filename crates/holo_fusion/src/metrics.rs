@@ -10,6 +10,7 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const TIMELINE_RING_CAPACITY: usize = 1024;
+const INGEST_JOB_HISTORY_CAPACITY: usize = 256;
 
 /// One active query execution tracked by session id.
 #[derive(Debug, Clone)]
@@ -47,6 +48,116 @@ pub struct DistributedShardMetrics {
     pub rollback_latency_ns: u64,
     /// Number of conflict responses observed on this shard.
     pub conflicts: u64,
+}
+
+/// Circuit-breaker state used for per-target flow-control diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CircuitState {
+    /// Normal request flow.
+    Closed,
+    /// Requests are being shed until open timeout elapses.
+    Open,
+    /// One probe request is allowed to test recovery.
+    HalfOpen,
+}
+
+impl CircuitState {
+    fn as_metric_value(self) -> u64 {
+        match self {
+            Self::Closed => 0,
+            Self::Open => 1,
+            Self::HalfOpen => 2,
+        }
+    }
+}
+
+/// Per-target distributed-write and circuit-breaker aggregates.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DistributedTargetMetrics {
+    /// Number of apply RPC failures.
+    pub apply_failures: u64,
+    /// Number of retryable apply failures.
+    pub retryable_failures: u64,
+    /// Number of non-retryable apply failures.
+    pub non_retryable_failures: u64,
+    /// Number of times breaker transitioned to open.
+    pub circuit_open_count: u64,
+    /// Number of requests rejected while breaker was open/half-open.
+    pub circuit_reject_count: u64,
+    /// Current breaker state (`0=closed,1=open,2=half_open`).
+    pub circuit_state: u64,
+}
+
+/// Admission rejection reason used for per-class overload diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionRejectKind {
+    /// Request waited longer than the configured queue timeout.
+    QueueTimeout,
+    /// Request was rejected because queue depth exceeded configured limit.
+    QueueLimit,
+}
+
+impl AdmissionRejectKind {
+    fn as_metric_suffix(self) -> &'static str {
+        match self {
+            Self::QueueTimeout => "queue_timeout",
+            Self::QueueLimit => "queue_limit",
+        }
+    }
+}
+
+/// Per-class admission-control metrics used for workload-management visibility.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AdmissionClassMetrics {
+    /// Number of admitted statements for this class.
+    pub admitted: u64,
+    /// Number of overload rejections for this class.
+    pub rejected: u64,
+    /// Number of queue-timeout rejections for this class.
+    pub rejected_queue_timeout: u64,
+    /// Number of queue-depth-limit rejections for this class.
+    pub rejected_queue_limit: u64,
+    /// Number of times statements had to queue for this class.
+    pub wait_count: u64,
+    /// Sum of queue wait time in nanoseconds for this class.
+    pub wait_ns_total: u64,
+    /// Current observed queue depth.
+    pub queue_depth: u64,
+    /// Peak observed queue depth.
+    pub queue_depth_peak: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IngestJobStatus {
+    Running,
+    Completed,
+    Failed,
+}
+
+impl IngestJobStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct IngestJobMetrics {
+    table_name: String,
+    status: IngestJobStatus,
+    started_at_unix_ns: u64,
+    updated_at_unix_ns: u64,
+    finished_at_unix_ns: u64,
+    rows_ingested: u64,
+    queue_depth: u64,
+    inflight_rows: u64,
+    inflight_bytes: u64,
+    inflight_rpcs: u64,
+    per_shard_lag: BTreeMap<usize, u64>,
+    last_error: String,
 }
 
 /// Aggregated counters for pushdown support checks and scan execution.
@@ -120,6 +231,20 @@ pub struct PushdownMetrics {
     next_stage_execution_id: AtomicU64,
     /// Per-shard distributed write aggregates.
     distributed_by_shard: Mutex<BTreeMap<usize, DistributedShardMetrics>>,
+    /// Per-target distributed write/circuit-breaker aggregates.
+    distributed_by_target: Mutex<BTreeMap<String, DistributedTargetMetrics>>,
+    /// Per-class admission-control counters/gauges.
+    admission_by_class: Mutex<BTreeMap<String, AdmissionClassMetrics>>,
+    /// Total rows ingested through streaming bulk paths.
+    ingest_rows_ingested_total: AtomicU64,
+    /// Number of bulk ingest jobs started.
+    ingest_jobs_started: AtomicU64,
+    /// Number of bulk ingest jobs completed successfully.
+    ingest_jobs_completed: AtomicU64,
+    /// Number of bulk ingest jobs completed with failure.
+    ingest_jobs_failed: AtomicU64,
+    /// Active/recent ingest job status by job id.
+    ingest_jobs_by_id: Mutex<BTreeMap<String, IngestJobMetrics>>,
     /// Active query execution per session id.
     active_queries_by_session: Mutex<BTreeMap<String, ActiveQueryExecution>>,
     /// Ring buffer of recent stage/query timeline events.
@@ -193,6 +318,16 @@ pub struct PushdownMetricsSnapshot {
     pub scan_duplicate_rows_skipped: u64,
     /// Number of sessions with active query execution context.
     pub active_query_sessions: u64,
+    /// Number of rows ingested through streaming bulk paths.
+    pub ingest_rows_ingested_total: u64,
+    /// Number of ingest jobs started.
+    pub ingest_jobs_started: u64,
+    /// Number of ingest jobs completed successfully.
+    pub ingest_jobs_completed: u64,
+    /// Number of ingest jobs completed with failure.
+    pub ingest_jobs_failed: u64,
+    /// Number of active/recent ingest jobs tracked.
+    pub ingest_jobs_tracked: u64,
 }
 
 impl PushdownMetrics {
@@ -480,6 +615,52 @@ impl PushdownMetrics {
         shard.rollback_latency_ns = shard.rollback_latency_ns.saturating_add(latency_ns);
     }
 
+    /// Records one distributed apply failure for a target endpoint.
+    pub fn record_distributed_apply_failure(&self, target: &str, retryable: bool) {
+        let mut by_target = self
+            .distributed_by_target
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = by_target.entry(target.to_string()).or_default();
+        entry.apply_failures = entry.apply_failures.saturating_add(1);
+        if retryable {
+            entry.retryable_failures = entry.retryable_failures.saturating_add(1);
+        } else {
+            entry.non_retryable_failures = entry.non_retryable_failures.saturating_add(1);
+        }
+    }
+
+    /// Records a circuit-breaker state transition/refresh for one target.
+    pub fn record_circuit_state(&self, target: &str, state: CircuitState) {
+        let mut by_target = self
+            .distributed_by_target
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = by_target.entry(target.to_string()).or_default();
+        entry.circuit_state = state.as_metric_value();
+    }
+
+    /// Records one transition into `open` for a target circuit breaker.
+    pub fn record_circuit_open(&self, target: &str) {
+        let mut by_target = self
+            .distributed_by_target
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = by_target.entry(target.to_string()).or_default();
+        entry.circuit_open_count = entry.circuit_open_count.saturating_add(1);
+        entry.circuit_state = CircuitState::Open.as_metric_value();
+    }
+
+    /// Records one request rejected because the breaker was not closed.
+    pub fn record_circuit_reject(&self, target: &str) {
+        let mut by_target = self
+            .distributed_by_target
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = by_target.entry(target.to_string()).or_default();
+        entry.circuit_reject_count = entry.circuit_reject_count.saturating_add(1);
+    }
+
     /// Records one statement timeout.
     pub fn record_statement_timeout(&self) {
         self.statement_timeout_count.fetch_add(1, Ordering::Relaxed);
@@ -488,6 +669,51 @@ impl PushdownMetrics {
     /// Records one admission-control rejection.
     pub fn record_admission_reject(&self) {
         self.admission_reject_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records current queue depth for one admission class.
+    pub fn record_admission_queue_depth(&self, class: &str, queue_depth: u64) {
+        let mut by_class = self
+            .admission_by_class
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = by_class.entry(class.to_string()).or_default();
+        entry.queue_depth = queue_depth;
+        if queue_depth > entry.queue_depth_peak {
+            entry.queue_depth_peak = queue_depth;
+        }
+    }
+
+    /// Records one admitted statement for an admission class.
+    pub fn record_admission_grant(&self, class: &str, wait: Duration) {
+        let wait_ns = wait.as_nanos().min(u64::MAX as u128) as u64;
+        let mut by_class = self
+            .admission_by_class
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = by_class.entry(class.to_string()).or_default();
+        entry.admitted = entry.admitted.saturating_add(1);
+        entry.wait_count = entry.wait_count.saturating_add(1);
+        entry.wait_ns_total = entry.wait_ns_total.saturating_add(wait_ns);
+    }
+
+    /// Records one admission rejection for an admission class and reason.
+    pub fn record_admission_reject_class(&self, class: &str, reason: AdmissionRejectKind) {
+        self.record_admission_reject();
+        let mut by_class = self
+            .admission_by_class
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = by_class.entry(class.to_string()).or_default();
+        entry.rejected = entry.rejected.saturating_add(1);
+        match reason {
+            AdmissionRejectKind::QueueTimeout => {
+                entry.rejected_queue_timeout = entry.rejected_queue_timeout.saturating_add(1)
+            }
+            AdmissionRejectKind::QueueLimit => {
+                entry.rejected_queue_limit = entry.rejected_queue_limit.saturating_add(1)
+            }
+        }
     }
 
     /// Records one scan row limit rejection.
@@ -502,10 +728,112 @@ impl PushdownMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Starts/refreshes one bulk ingest job status entry.
+    pub fn begin_ingest_job(&self, job_id: &str, table_name: &str) {
+        let now = unix_timestamp_nanos();
+        self.ingest_jobs_started.fetch_add(1, Ordering::Relaxed);
+        let mut jobs = self
+            .ingest_jobs_by_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        jobs.insert(
+            job_id.to_string(),
+            IngestJobMetrics {
+                table_name: table_name.to_string(),
+                status: IngestJobStatus::Running,
+                started_at_unix_ns: now,
+                updated_at_unix_ns: now,
+                finished_at_unix_ns: 0,
+                rows_ingested: 0,
+                queue_depth: 0,
+                inflight_rows: 0,
+                inflight_bytes: 0,
+                inflight_rpcs: 0,
+                per_shard_lag: BTreeMap::new(),
+                last_error: String::new(),
+            },
+        );
+        while jobs.len() > INGEST_JOB_HISTORY_CAPACITY {
+            if let Some(first_key) = jobs.keys().next().cloned() {
+                jobs.remove(first_key.as_str());
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Updates progress counters for one active bulk ingest job.
+    pub fn record_ingest_progress(
+        &self,
+        job_id: &str,
+        rows_delta: u64,
+        queue_depth: u64,
+        inflight_rows: u64,
+        inflight_bytes: u64,
+        inflight_rpcs: u64,
+        per_shard_lag: &[(usize, u64)],
+    ) {
+        if rows_delta > 0 {
+            self.ingest_rows_ingested_total
+                .fetch_add(rows_delta, Ordering::Relaxed);
+        }
+        let now = unix_timestamp_nanos();
+        let mut jobs = self
+            .ingest_jobs_by_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(job) = jobs.get_mut(job_id) {
+            job.rows_ingested = job.rows_ingested.saturating_add(rows_delta);
+            job.queue_depth = queue_depth;
+            job.inflight_rows = inflight_rows;
+            job.inflight_bytes = inflight_bytes;
+            job.inflight_rpcs = inflight_rpcs;
+            job.updated_at_unix_ns = now;
+            job.per_shard_lag.clear();
+            for (shard, lag) in per_shard_lag {
+                job.per_shard_lag.insert(*shard, *lag);
+            }
+        }
+    }
+
+    /// Marks one ingest job as completed (success/failure) and stores final status.
+    pub fn finish_ingest_job(&self, job_id: &str, success: bool, last_error: Option<&str>) {
+        let now = unix_timestamp_nanos();
+        if success {
+            self.ingest_jobs_completed.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.ingest_jobs_failed.fetch_add(1, Ordering::Relaxed);
+        }
+        let mut jobs = self
+            .ingest_jobs_by_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(job) = jobs.get_mut(job_id) {
+            job.status = if success {
+                IngestJobStatus::Completed
+            } else {
+                IngestJobStatus::Failed
+            };
+            job.finished_at_unix_ns = now;
+            job.updated_at_unix_ns = now;
+            job.inflight_rows = 0;
+            job.inflight_bytes = 0;
+            job.inflight_rpcs = 0;
+            if let Some(err) = last_error {
+                job.last_error = err.to_string();
+            }
+        }
+    }
+
     /// Captures a point-in-time copy of all counters.
     pub fn snapshot(&self) -> PushdownMetricsSnapshot {
         let active_query_sessions = self
             .active_queries_by_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len() as u64;
+        let ingest_jobs_tracked = self
+            .ingest_jobs_by_id
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .len() as u64;
@@ -550,6 +878,11 @@ impl PushdownMetrics {
             scan_chunk_count: self.scan_chunk_count.load(Ordering::Relaxed),
             scan_duplicate_rows_skipped: self.scan_duplicate_rows_skipped.load(Ordering::Relaxed),
             active_query_sessions,
+            ingest_rows_ingested_total: self.ingest_rows_ingested_total.load(Ordering::Relaxed),
+            ingest_jobs_started: self.ingest_jobs_started.load(Ordering::Relaxed),
+            ingest_jobs_completed: self.ingest_jobs_completed.load(Ordering::Relaxed),
+            ingest_jobs_failed: self.ingest_jobs_failed.load(Ordering::Relaxed),
+            ingest_jobs_tracked,
         }
     }
 
@@ -557,7 +890,7 @@ impl PushdownMetrics {
     pub fn render_text(&self) -> String {
         let s = self.snapshot();
         let mut out = format!(
-            "pushdown_support_exact={}\npushdown_support_unsupported={}\nscan_requests={}\nscan_rpc_pages={}\nscan_rows_scanned={}\nscan_rows_returned={}\nscan_bytes_scanned={}\ntx_begin_count={}\ntx_commit_count={}\ntx_rollback_count={}\ntx_conflict_count={}\ntx_commit_latency_ns_total={}\ndistributed_write_apply_ops={}\ndistributed_write_apply_rows={}\ndistributed_write_apply_latency_ns_total={}\ndistributed_write_rollback_ops={}\ndistributed_write_rollback_rows={}\ndistributed_write_rollback_latency_ns_total={}\ndistributed_write_conflicts={}\nstatement_timeout_count={}\nadmission_reject_count={}\nscan_row_limit_reject_count={}\ntxn_stage_limit_reject_count={}\nquery_execution_started={}\nquery_execution_completed={}\nquery_execution_failed={}\nstage_events={}\nscan_retry_count={}\nscan_reroute_count={}\nscan_chunk_count={}\nscan_duplicate_rows_skipped={}\nactive_query_sessions={}\n",
+            "pushdown_support_exact={}\npushdown_support_unsupported={}\nscan_requests={}\nscan_rpc_pages={}\nscan_rows_scanned={}\nscan_rows_returned={}\nscan_bytes_scanned={}\ntx_begin_count={}\ntx_commit_count={}\ntx_rollback_count={}\ntx_conflict_count={}\ntx_commit_latency_ns_total={}\ndistributed_write_apply_ops={}\ndistributed_write_apply_rows={}\ndistributed_write_apply_latency_ns_total={}\ndistributed_write_rollback_ops={}\ndistributed_write_rollback_rows={}\ndistributed_write_rollback_latency_ns_total={}\ndistributed_write_conflicts={}\nstatement_timeout_count={}\nadmission_reject_count={}\nscan_row_limit_reject_count={}\ntxn_stage_limit_reject_count={}\nquery_execution_started={}\nquery_execution_completed={}\nquery_execution_failed={}\nstage_events={}\nscan_retry_count={}\nscan_reroute_count={}\nscan_chunk_count={}\nscan_duplicate_rows_skipped={}\nactive_query_sessions={}\ningest_rows_ingested_total={}\ningest_jobs_started={}\ningest_jobs_completed={}\ningest_jobs_failed={}\ningest_jobs_tracked={}\n",
             s.supports_exact,
             s.supports_unsupported,
             s.scans,
@@ -590,6 +923,11 @@ impl PushdownMetrics {
             s.scan_chunk_count,
             s.scan_duplicate_rows_skipped,
             s.active_query_sessions,
+            s.ingest_rows_ingested_total,
+            s.ingest_jobs_started,
+            s.ingest_jobs_completed,
+            s.ingest_jobs_failed,
+            s.ingest_jobs_tracked,
         );
         let by_shard = self
             .distributed_by_shard
@@ -611,6 +949,96 @@ impl PushdownMetrics {
             );
         }
         drop(by_shard);
+
+        let by_target = self
+            .distributed_by_target
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (target, metrics) in by_target.iter() {
+            let target = sanitize_metric_key(target.as_str());
+            out.push_str(
+                format!(
+                    "distributed_write_target_{target}_apply_failures={}\ndistributed_write_target_{target}_retryable_failures={}\ndistributed_write_target_{target}_non_retryable_failures={}\ndistributed_write_target_{target}_circuit_open_count={}\ndistributed_write_target_{target}_circuit_reject_count={}\ndistributed_write_target_{target}_circuit_state={}\n",
+                    metrics.apply_failures,
+                    metrics.retryable_failures,
+                    metrics.non_retryable_failures,
+                    metrics.circuit_open_count,
+                    metrics.circuit_reject_count,
+                    metrics.circuit_state,
+                )
+                .as_str(),
+            );
+        }
+        drop(by_target);
+
+        let by_class = self
+            .admission_by_class
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (class, metrics) in by_class.iter() {
+            let class = sanitize_metric_key(class.as_str());
+            out.push_str(
+                format!(
+                    "admission_{class}_admitted={}\nadmission_{class}_rejected={}\nadmission_{class}_rejected_{}={}\nadmission_{class}_rejected_{}={}\nadmission_{class}_wait_count={}\nadmission_{class}_wait_ns_total={}\nadmission_{class}_queue_depth={}\nadmission_{class}_queue_depth_peak={}\n",
+                    metrics.admitted,
+                    metrics.rejected,
+                    AdmissionRejectKind::QueueTimeout.as_metric_suffix(),
+                    metrics.rejected_queue_timeout,
+                    AdmissionRejectKind::QueueLimit.as_metric_suffix(),
+                    metrics.rejected_queue_limit,
+                    metrics.wait_count,
+                    metrics.wait_ns_total,
+                    metrics.queue_depth,
+                    metrics.queue_depth_peak,
+                )
+                .as_str(),
+            );
+        }
+        drop(by_class);
+
+        let ingest_jobs = self
+            .ingest_jobs_by_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (idx, (job_id, job)) in ingest_jobs.iter().enumerate() {
+            let elapsed_ns = if job.finished_at_unix_ns > 0 {
+                job.finished_at_unix_ns
+                    .saturating_sub(job.started_at_unix_ns)
+            } else {
+                unix_timestamp_nanos().saturating_sub(job.started_at_unix_ns)
+            };
+            let rows_per_second = if elapsed_ns == 0 {
+                0u64
+            } else {
+                ((job.rows_ingested as u128)
+                    .saturating_mul(1_000_000_000u128)
+                    .saturating_div(elapsed_ns as u128))
+                .min(u64::MAX as u128) as u64
+            };
+            out.push_str(
+                format!(
+                    "ingest_job_{idx}_id={}\ningest_job_{idx}_table={}\ningest_job_{idx}_status={}\ningest_job_{idx}_rows_ingested={}\ningest_job_{idx}_rows_per_second={}\ningest_job_{idx}_queue_depth={}\ningest_job_{idx}_inflight_rows={}\ningest_job_{idx}_inflight_bytes={}\ningest_job_{idx}_inflight_rpcs={}\ningest_job_{idx}_started_at_unix_ns={}\ningest_job_{idx}_updated_at_unix_ns={}\ningest_job_{idx}_finished_at_unix_ns={}\ningest_job_{idx}_last_error={}\n",
+                    sanitize_metric_value(job_id.as_str()),
+                    sanitize_metric_value(job.table_name.as_str()),
+                    job.status.as_str(),
+                    job.rows_ingested,
+                    rows_per_second,
+                    job.queue_depth,
+                    job.inflight_rows,
+                    job.inflight_bytes,
+                    job.inflight_rpcs,
+                    job.started_at_unix_ns,
+                    job.updated_at_unix_ns,
+                    job.finished_at_unix_ns,
+                    sanitize_metric_value(job.last_error.as_str()),
+                )
+                .as_str(),
+            );
+            for (shard, lag) in &job.per_shard_lag {
+                out.push_str(format!("ingest_job_{idx}_shard_{shard}_lag={lag}\n").as_str());
+            }
+        }
+        drop(ingest_jobs);
 
         let active_queries = self
             .active_queries_by_session
@@ -648,4 +1076,20 @@ fn sanitize_metric_value(value: &str) -> String {
             _ => ch,
         })
         .collect()
+}
+
+fn sanitize_metric_key(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "unknown".to_string()
+    } else {
+        out
+    }
 }

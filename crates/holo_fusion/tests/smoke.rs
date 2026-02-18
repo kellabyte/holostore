@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use holo_fusion::metadata::find_table_metadata_by_name;
+use holo_fusion::metadata::{
+    find_table_metadata_by_name, update_table_primary_key_distribution, PrimaryKeyDistribution,
+};
 use holo_fusion::metrics::PushdownMetrics;
 use holo_fusion::provider::{HoloStoreTableProvider, OrdersSeedRow};
 use holo_fusion::{run_with_shutdown, HoloFusionConfig};
@@ -394,6 +396,58 @@ async fn phase4_insert_select_generate_series_round_trip() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase10_insert_select_max_pk_fast_path_scales_past_scan_guardrail() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    let insert_stmt = "INSERT INTO orders (order_id, customer_id, status, total_cents, created_at)
+         WITH base AS (
+           SELECT COALESCE(MAX(order_id), 0) AS max_id
+           FROM orders
+         )
+         SELECT
+           base.max_id + i,
+           2000 + (i % 500),
+           CASE
+             WHEN i % 4 = 0 THEN 'paid'
+             WHEN i % 4 = 1 THEN 'pending'
+             WHEN i % 4 = 2 THEN 'shipped'
+             ELSE 'cancelled'
+           END,
+           500 + ((i * 37) % 50000),
+           TIMESTAMP '2026-02-11 00:00:00' + (i || ' seconds')::interval
+         FROM base
+         CROSS JOIN generate_series(1, 20000) AS g(i)";
+
+    for run in 1..=7 {
+        let inserted = client
+            .execute(insert_stmt, &[])
+            .await
+            .with_context(|| format!("run insert-select max-pk batch iteration {run}"))?;
+        assert_eq!(inserted, 20_000);
+    }
+
+    let max_order_id = client
+        .query_one("SELECT COALESCE(MAX(order_id), 0) FROM orders", &[])
+        .await
+        .context("read max order_id after repeated insert-select batches")?
+        .try_get::<_, i64>(0)?;
+    assert_eq!(max_order_id, 140_000);
+
+    let terminal_row_count = client
+        .query_one(
+            "SELECT COUNT(*)::BIGINT FROM orders WHERE order_id = 140000",
+            &[],
+        )
+        .await
+        .context("verify terminal inserted row exists")?
+        .try_get::<_, i64>(0)?;
+    assert_eq!(terminal_row_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn phase4_insert_values_duplicate_primary_key_returns_23505() -> Result<()> {
     let harness = TestHarness::start().await?;
     let (client, _guard) = harness.connect_pg().await?;
@@ -569,6 +623,190 @@ async fn phase4_create_table_registers_metadata_and_supports_insert_select() -> 
         )
         .await
         .context("create table if not exists should succeed")?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase10_hash_primary_key_create_insert_and_scan() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    client
+        .batch_execute(
+            "CREATE TABLE sales_hash (
+                order_id BIGINT NOT NULL,
+                amount_cents BIGINT NOT NULL,
+                status TEXT,
+                PRIMARY KEY (order_id) USING HASH
+            ) WITH (hash_buckets = 8);",
+        )
+        .await
+        .context("create hash-distributed primary-key table")?;
+
+    let inserted = client
+        .execute(
+            "INSERT INTO sales_hash (order_id, amount_cents, status)
+             SELECT i, 100 + (i % 5000), CASE WHEN i % 2 = 0 THEN 'ok' ELSE 'hold' END
+             FROM generate_series(1, 2000) AS g(i);",
+            &[],
+        )
+        .await
+        .context("insert rows into hash primary-key table")?;
+    assert_eq!(inserted, 2_000);
+
+    let count = client
+        .query_one("SELECT COUNT(*)::BIGINT FROM sales_hash", &[])
+        .await
+        .context("count rows from hash table")?
+        .try_get::<_, i64>(0)?;
+    assert_eq!(count, 2_000);
+
+    let bounded = client
+        .query_one(
+            "SELECT COUNT(*)::BIGINT
+             FROM sales_hash
+             WHERE order_id >= 500 AND order_id <= 520",
+            &[],
+        )
+        .await
+        .context("bounded PK scan over hash table")?
+        .try_get::<_, i64>(0)?;
+    assert_eq!(bounded, 21);
+
+    let metadata = find_table_metadata_by_name(&harness.holostore_client(), "sales_hash")
+        .await
+        .context("lookup sales_hash metadata")?
+        .context("sales_hash metadata should exist")?;
+    assert_eq!(
+        metadata.primary_key_distribution,
+        PrimaryKeyDistribution::Hash
+    );
+    assert_eq!(metadata.primary_key_hash_buckets, Some(8));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase10_hash_primary_key_migration_backfills_online() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    client
+        .batch_execute(
+            "CREATE TABLE sales_migrate (
+                order_id BIGINT NOT NULL,
+                amount_cents BIGINT NOT NULL,
+                status TEXT NOT NULL,
+                PRIMARY KEY (order_id)
+            );",
+        )
+        .await
+        .context("create range-distributed migration table")?;
+
+    let inserted = client
+        .execute(
+            "INSERT INTO sales_migrate (order_id, amount_cents, status)
+             SELECT i, 100 + (i % 500), 'seed'
+             FROM generate_series(1, 1500) AS g(i);",
+            &[],
+        )
+        .await
+        .context("seed migration source rows")?;
+    assert_eq!(inserted, 1_500);
+
+    let metadata_before = find_table_metadata_by_name(&harness.holostore_client(), "sales_migrate")
+        .await
+        .context("read sales_migrate metadata before migration")?
+        .context("sales_migrate metadata should exist")?;
+    assert_eq!(
+        metadata_before.primary_key_distribution,
+        PrimaryKeyDistribution::Range
+    );
+    let source_provider = HoloStoreTableProvider::from_table_metadata(
+        &metadata_before,
+        harness.holostore_client(),
+        Arc::new(PushdownMetrics::default()),
+    )
+    .context("build source provider before hash migration")?;
+    let source_rows = source_provider
+        .scan_generic_rows_with_versions_by_primary_key_bounds(None, None, None)
+        .await
+        .context("scan source rows before hash migration")?;
+    assert_eq!(source_rows.len(), 1_500);
+    let cleanup_keys = source_rows
+        .iter()
+        .map(|row| row.primary_key)
+        .collect::<Vec<_>>();
+
+    let mut metadata_after = metadata_before.clone();
+    metadata_after.primary_key_distribution = PrimaryKeyDistribution::Hash;
+    metadata_after.primary_key_hash_buckets = Some(16);
+    let target_provider = HoloStoreTableProvider::from_table_metadata(
+        &metadata_after,
+        harness.holostore_client(),
+        Arc::new(PushdownMetrics::default()),
+    )
+    .context("build target hash provider for migration")?;
+    let migrated_values = source_rows
+        .iter()
+        .map(|row| row.values.clone())
+        .collect::<Vec<_>>();
+    let migrated = target_provider
+        .upsert_generic_rows(migrated_values.as_slice())
+        .await
+        .context("backfill hash layout rows")?;
+    assert_eq!(migrated, 1_500);
+
+    update_table_primary_key_distribution(
+        &harness.holostore_client(),
+        "sales_migrate",
+        PrimaryKeyDistribution::Hash,
+        Some(16),
+    )
+    .await
+    .context("persist hash distribution metadata after backfill")?;
+
+    source_provider
+        .tombstone_generic_rows_by_primary_key(cleanup_keys.as_slice())
+        .await
+        .context("cleanup stale range-layout rows after hash migration")?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let metadata = find_table_metadata_by_name(&harness.holostore_client(), "sales_migrate")
+        .await
+        .context("lookup migrated table metadata")?
+        .context("sales_migrate metadata should exist")?;
+    assert_eq!(
+        metadata.primary_key_distribution,
+        PrimaryKeyDistribution::Hash
+    );
+    assert_eq!(metadata.primary_key_hash_buckets, Some(16));
+
+    let count = client
+        .query_one("SELECT COUNT(*)::BIGINT FROM sales_migrate", &[])
+        .await
+        .context("count rows after hash migration")?
+        .try_get::<_, i64>(0)?;
+    assert_eq!(count, 1_500);
+
+    let inserted_after = client
+        .execute(
+            "INSERT INTO sales_migrate (order_id, amount_cents, status)
+             SELECT 1500 + i, 200 + (i % 700), 'post'
+             FROM generate_series(1, 500) AS g(i);",
+            &[],
+        )
+        .await
+        .context("insert rows after hash migration")?;
+    assert_eq!(inserted_after, 500);
+
+    let total = client
+        .query_one("SELECT COUNT(*)::BIGINT FROM sales_migrate", &[])
+        .await
+        .context("count rows after post-migration insert")?
+        .try_get::<_, i64>(0)?;
+    assert_eq!(total, 2_000);
 
     Ok(())
 }
@@ -1442,12 +1680,65 @@ async fn phase7_metrics_expose_txn_distributed_and_guardrail_counters() -> Resul
         "scan_chunk_count=",
         "scan_duplicate_rows_skipped=",
         "active_query_sessions=",
+        "ingest_rows_ingested_total=",
+        "ingest_jobs_started=",
+        "ingest_jobs_completed=",
+        "ingest_jobs_failed=",
+        "ingest_jobs_tracked=",
     ] {
         assert!(
             metrics.contains(key),
             "missing metric key '{key}' in body: {metrics}"
         );
     }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase10_metrics_expose_circuit_and_ingest_status() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    client
+        .batch_execute(
+            "CREATE TABLE phase10_metrics_ingest (
+                order_id BIGINT NOT NULL,
+                amount_cents BIGINT NOT NULL,
+                status TEXT NOT NULL,
+                PRIMARY KEY (order_id) USING HASH
+            ) WITH (hash_buckets = 4);",
+        )
+        .await
+        .context("create phase10 metrics ingest table")?;
+
+    client
+        .execute(
+            "INSERT INTO phase10_metrics_ingest (order_id, amount_cents, status)
+             SELECT i, 100 + (i % 1000), 'ok'
+             FROM generate_series(1, 2000) AS g(i);",
+            &[],
+        )
+        .await
+        .context("run bulk ingest for metrics exposure test")?;
+
+    let metrics = harness.metrics_body().context("fetch metrics body")?;
+    assert!(
+        metrics.contains("distributed_write_target_"),
+        "expected per-target metrics in body: {metrics}"
+    );
+    assert!(
+        metrics.contains("_circuit_state="),
+        "expected circuit state metrics in body: {metrics}"
+    );
+    assert!(
+        metrics.contains("ingest_job_"),
+        "expected ingest job metrics in body: {metrics}"
+    );
+    assert!(
+        metrics.contains("status=completed"),
+        "expected completed ingest status in body: {metrics}"
+    );
+
     Ok(())
 }
 
@@ -1677,6 +1968,12 @@ impl TestHarness {
             dml_prewrite_delay: dml.prewrite_delay,
             dml_statement_timeout: dml.statement_timeout,
             dml_max_inflight_statements: dml.max_inflight_statements,
+            dml_max_inflight_reads: dml.max_inflight_statements,
+            dml_max_inflight_writes: dml.max_inflight_statements,
+            dml_max_inflight_txns: ((dml.max_inflight_statements) / 2).max(1),
+            dml_max_inflight_background: ((dml.max_inflight_statements) / 4).max(1),
+            dml_admission_queue_limit: 4096,
+            dml_admission_wait_timeout: Duration::ZERO,
             dml_max_scan_rows: dml.max_scan_rows,
             dml_max_txn_staged_rows: dml.max_txn_staged_rows,
             holostore: EmbeddedNodeConfig {

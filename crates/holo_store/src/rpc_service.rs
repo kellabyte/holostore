@@ -1349,6 +1349,7 @@ impl rpc::HoloRpc for RpcService {
                 req.end_key.as_ref(),
                 req.cursor.as_ref(),
                 limit,
+                req.reverse,
             )
             .map_err(|e| volo_grpc::Status::internal(format!("range snapshot failed: {e}")))?;
         let entries = entries

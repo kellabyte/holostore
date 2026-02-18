@@ -130,6 +130,18 @@ pub struct HoloFusionConfig {
     pub dml_statement_timeout: Duration,
     /// Maximum number of concurrent hook-managed statements admitted at once.
     pub dml_max_inflight_statements: usize,
+    /// Maximum concurrent read statements admitted by the SQL admission controller.
+    pub dml_max_inflight_reads: usize,
+    /// Maximum concurrent write statements admitted by the SQL admission controller.
+    pub dml_max_inflight_writes: usize,
+    /// Maximum concurrent explicit-transaction statements admitted by the SQL admission controller.
+    pub dml_max_inflight_txns: usize,
+    /// Maximum concurrent background/elastic statements admitted by the SQL admission controller.
+    pub dml_max_inflight_background: usize,
+    /// Maximum queued statements allowed per admission class before overload rejection.
+    pub dml_admission_queue_limit: usize,
+    /// Maximum time one statement may wait in admission queue (`0` disables wait and rejects immediately).
+    pub dml_admission_wait_timeout: Duration,
     /// Maximum number of rows a single mutation/snapshot scan can materialize.
     pub dml_max_scan_rows: usize,
     /// Maximum number of staged rows allowed in one explicit transaction.
@@ -163,6 +175,35 @@ impl HoloFusionConfig {
             1024,
         )?
         .max(1);
+        let dml_max_inflight_reads = parse_usize(
+            std::env::var("HOLO_FUSION_DML_MAX_INFLIGHT_READS").ok(),
+            dml_max_inflight_statements,
+        )?
+        .max(1);
+        let dml_max_inflight_writes = parse_usize(
+            std::env::var("HOLO_FUSION_DML_MAX_INFLIGHT_WRITES").ok(),
+            dml_max_inflight_statements,
+        )?
+        .max(1);
+        let dml_max_inflight_txns = parse_usize(
+            std::env::var("HOLO_FUSION_DML_MAX_INFLIGHT_TXNS").ok(),
+            (dml_max_inflight_statements / 2).max(1),
+        )?
+        .max(1);
+        let dml_max_inflight_background = parse_usize(
+            std::env::var("HOLO_FUSION_DML_MAX_INFLIGHT_BACKGROUND").ok(),
+            (dml_max_inflight_statements / 4).max(1),
+        )?
+        .max(1);
+        let dml_admission_queue_limit = parse_usize(
+            std::env::var("HOLO_FUSION_DML_ADMISSION_QUEUE_LIMIT").ok(),
+            4096,
+        )?
+        .max(1);
+        let dml_admission_wait_timeout_ms = parse_u64(
+            std::env::var("HOLO_FUSION_DML_ADMISSION_WAIT_TIMEOUT_MS").ok(),
+            0,
+        )?;
         let dml_max_scan_rows =
             parse_usize(std::env::var("HOLO_FUSION_DML_MAX_SCAN_ROWS").ok(), 100_000)?.max(1);
         let dml_max_txn_staged_rows = parse_usize(
@@ -219,6 +260,12 @@ impl HoloFusionConfig {
             dml_prewrite_delay: Duration::from_millis(dml_prewrite_delay_ms),
             dml_statement_timeout: Duration::from_millis(dml_statement_timeout_ms),
             dml_max_inflight_statements,
+            dml_max_inflight_reads,
+            dml_max_inflight_writes,
+            dml_max_inflight_txns,
+            dml_max_inflight_background,
+            dml_admission_queue_limit,
+            dml_admission_wait_timeout: Duration::from_millis(dml_admission_wait_timeout_ms),
             dml_max_scan_rows,
             dml_max_txn_staged_rows,
             holostore: EmbeddedNodeConfig {
@@ -351,6 +398,12 @@ where
         prewrite_delay: config.dml_prewrite_delay,
         statement_timeout: config.dml_statement_timeout,
         max_inflight_statements: config.dml_max_inflight_statements,
+        max_inflight_reads: config.dml_max_inflight_reads,
+        max_inflight_writes: config.dml_max_inflight_writes,
+        max_inflight_txns: config.dml_max_inflight_txns,
+        max_inflight_background: config.dml_max_inflight_background,
+        admission_queue_limit: config.dml_admission_queue_limit,
+        admission_wait_timeout: config.dml_admission_wait_timeout,
         max_scan_rows: config.dml_max_scan_rows,
         max_txn_staged_rows: config.dml_max_txn_staged_rows,
     };

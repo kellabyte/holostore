@@ -674,6 +674,7 @@ impl LocalRangeStats {
         end_key: &[u8],
         cursor: &[u8],
         limit: usize,
+        reverse: bool,
     ) -> anyhow::Result<(Vec<RangeSnapshotLatestEntry>, Vec<u8>, bool)> {
         let limit = limit.clamp(1, 10_000);
         let latest_name = self.latest_partition_name(shard_index);
@@ -681,15 +682,34 @@ impl LocalRangeStats {
             .keyspace
             .open_partition(&latest_name, PartitionCreateOptions::default())?;
 
-        let mut lower = start_key.to_vec();
-        if !cursor.is_empty() && cursor > lower.as_slice() {
-            lower = cursor.to_vec();
-        }
-        let mut iter: Box<dyn Iterator<Item = fjall::Result<fjall::KvPair>>> = if end_key.is_empty()
-        {
-            Box::new(latest.range(lower..))
+        let mut iter: Box<dyn Iterator<Item = fjall::Result<fjall::KvPair>>> = if reverse {
+            let lower = start_key.to_vec();
+            let mut upper = if end_key.is_empty() {
+                Vec::new()
+            } else {
+                end_key.to_vec()
+            };
+            if !cursor.is_empty() && (upper.is_empty() || cursor < upper.as_slice()) {
+                upper = cursor.to_vec();
+            }
+            if !upper.is_empty() && lower >= upper {
+                return Ok((Vec::new(), Vec::new(), true));
+            }
+            if upper.is_empty() {
+                Box::new(latest.range(lower..).rev())
+            } else {
+                Box::new(latest.range(lower..upper).rev())
+            }
         } else {
-            Box::new(latest.range(lower..end_key.to_vec()))
+            let mut lower = start_key.to_vec();
+            if !cursor.is_empty() && cursor > lower.as_slice() {
+                lower = cursor.to_vec();
+            }
+            if end_key.is_empty() {
+                Box::new(latest.range(lower..))
+            } else {
+                Box::new(latest.range(lower..end_key.to_vec()))
+            }
         };
 
         let mut out = Vec::with_capacity(limit);
@@ -698,8 +718,13 @@ impl LocalRangeStats {
         while let Some(item) = iter.next() {
             let (key, value) = item?;
             let key = key.to_vec();
-            if !cursor.is_empty() && key.as_slice() <= cursor {
-                continue;
+            if !cursor.is_empty() {
+                if reverse && key.as_slice() >= cursor {
+                    continue;
+                }
+                if !reverse && key.as_slice() <= cursor {
+                    continue;
+                }
             }
             let (version, row) = kv::decode_latest_value(&value)?;
             last_key = key.clone();
@@ -2021,9 +2046,16 @@ impl NodeState {
         end_key: &[u8],
         cursor: &[u8],
         limit: usize,
+        reverse: bool,
     ) -> anyhow::Result<(Vec<RangeSnapshotLatestEntry>, Vec<u8>, bool)> {
-        self.range_stats
-            .snapshot_latest_page(shard_index, start_key, end_key, cursor, limit)
+        self.range_stats.snapshot_latest_page(
+            shard_index,
+            start_key,
+            end_key,
+            cursor,
+            limit,
+            reverse,
+        )
     }
 
     /// Apply one page of latest rows into a local shard range.

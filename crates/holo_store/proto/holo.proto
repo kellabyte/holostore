@@ -364,6 +364,7 @@ message RangeSnapshotLatestRequest {
   bytes end_key = 3;
   bytes cursor = 4;
   uint32 limit = 5;
+  bool reverse = 6;
 }
 
 message RangeSnapshotLatestEntry {
