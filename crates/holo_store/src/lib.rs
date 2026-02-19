@@ -69,6 +69,13 @@ impl EmbeddedNodeHandle {
 pub fn build_node_args(config: &EmbeddedNodeConfig) -> anyhow::Result<NodeArgs> {
     use clap::Parser;
 
+    let effective_max_shards = resolve_data_shards(config.max_shards);
+    let initial_ranges = if config.max_shards == 0 {
+        config.initial_ranges.max(1)
+    } else {
+        config.initial_ranges.max(1).min(effective_max_shards)
+    };
+
     let mut argv = vec![
         "holo-store-node".to_string(),
         "--node-id".to_string(),
@@ -82,13 +89,9 @@ pub fn build_node_args(config: &EmbeddedNodeConfig) -> anyhow::Result<NodeArgs> 
         "--data-dir".to_string(),
         config.data_dir.display().to_string(),
         "--max-shards".to_string(),
-        config.max_shards.max(1).to_string(),
+        config.max_shards.to_string(),
         "--initial-ranges".to_string(),
-        config
-            .initial_ranges
-            .max(1)
-            .min(config.max_shards.max(1))
-            .to_string(),
+        initial_ranges.to_string(),
     ];
 
     if config.bootstrap {

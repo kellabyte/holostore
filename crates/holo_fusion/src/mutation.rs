@@ -19,11 +19,12 @@ use datafusion::logical_expr::expr::Placeholder;
 use datafusion::logical_expr::{Expr as DfExpr, LogicalPlan, LogicalPlanBuilder};
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::{
-    AlterTableOperation, Assignment, AssignmentTarget, BinaryOperator, ColumnDef, ColumnOption,
-    CreateTable, CreateTableOptions, DataType, Delete, Expr as SqlExpr, FromTable, FunctionArg,
-    FunctionArgExpr, FunctionArguments, IndexColumn, IndexOption, IndexType, Insert, ObjectName,
-    Query, SelectItem, SetExpr, SqlOption, Statement, TableConstraint, TableFactor, TableObject,
-    TableWithJoins, TimezoneInfo, UnaryOperator, Value, ValueWithSpan,
+    AlterTableOperation, AnalyzeFormat, Assignment, AssignmentTarget, BinaryOperator, ColumnDef,
+    ColumnOption, CreateIndex, CreateTable, CreateTableOptions, DataType, Delete, Expr as SqlExpr,
+    FromTable, FunctionArg, FunctionArgExpr, FunctionArguments, IndexColumn, IndexOption,
+    IndexType, Insert, LimitClause, ObjectName, ObjectType, OrderByKind, Query, SelectItem,
+    SetExpr, SqlOption, Statement, TableConstraint, TableFactor, TableObject, TableWithJoins,
+    TimezoneInfo, UnaryOperator, UtilityOption, Value, ValueWithSpan,
 };
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::sqlparser::parser::Parser;
@@ -38,7 +39,12 @@ use holo_store::{HoloStoreClient, RpcVersion};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{info_span, Instrument};
 
-use crate::catalog::register_table_from_metadata;
+use crate::catalog::{register_table_from_metadata, sync_catalog_from_metadata};
+use crate::indexing::{
+    create_secondary_index_metadata, drop_secondary_index_metadata_by_name,
+    update_secondary_index_state, CreateSecondaryIndexMetadataSpec, SecondaryIndexDistribution,
+    SecondaryIndexState, DEFAULT_SECONDARY_INDEX_HASH_BUCKETS, MAX_SECONDARY_INDEX_HASH_BUCKETS,
+};
 use crate::metadata::{
     apply_column_defaults_for_missing, create_table_metadata, find_table_metadata_by_name,
     table_model_orders_v1, table_model_row_v1, update_table_primary_key_distribution,
@@ -50,9 +56,11 @@ use crate::metrics::PushdownMetrics;
 use crate::provider::{
     encode_orders_row_value, encode_orders_tombstone_value, is_duplicate_key_violation_message,
     is_overload_error_message, orders_schema, ConditionalOrderWrite, ConditionalPrimaryWrite,
-    ConditionalWriteOutcome, DuplicateKeyViolation, HoloStoreTableProvider, OrdersSeedRow,
+    ConditionalWriteOutcome, DuplicateKeyViolation, GroupedAggregateFilter,
+    GroupedAggregateTopKRow, GroupedAggregateTopKSpec, HoloStoreTableProvider, OrdersSeedRow,
     PrimaryKeyExtreme, VersionedOrdersRow,
 };
+use crate::topology::{fetch_topology, ClusterTopology};
 
 #[derive(Debug, Clone, Copy)]
 /// Represents the `DmlRuntimeConfig` component used by the holo_fusion runtime.
@@ -456,9 +464,11 @@ impl DmlHook {
                     protocol,
                     statement_admission_class(statement, false, session_id),
                     async {
-                        execute_explain_dist(
+                        execute_explain_statement(
                             statement,
                             session_context,
+                            &self.holostore_client,
+                            self.pushdown_metrics.as_ref(),
                             client,
                             protocol,
                             query_execution_id.as_str(),
@@ -481,6 +491,28 @@ impl DmlHook {
                     async {
                         execute_create_table(
                             create,
+                            session_context,
+                            self.holostore_client.clone(),
+                            self.pushdown_metrics.clone(),
+                        )
+                        .await
+                    },
+                )
+                .await,
+            );
+        }
+
+        if let Statement::CreateIndex(create_index) = statement {
+            return Some(
+                self.run_statement_with_controls(
+                    statement,
+                    session_id,
+                    query_execution_id.as_str(),
+                    protocol,
+                    statement_admission_class(statement, false, session_id),
+                    async {
+                        execute_create_index(
+                            create_index,
                             session_context,
                             self.holostore_client.clone(),
                             self.pushdown_metrics.clone(),
@@ -518,6 +550,44 @@ impl DmlHook {
             );
         }
 
+        if let Statement::Drop {
+            object_type: ObjectType::Index,
+            if_exists,
+            names,
+            cascade,
+            restrict,
+            purge,
+            temporary,
+            table,
+        } = statement
+        {
+            return Some(
+                self.run_statement_with_controls(
+                    statement,
+                    session_id,
+                    query_execution_id.as_str(),
+                    protocol,
+                    statement_admission_class(statement, false, session_id),
+                    async {
+                        execute_drop_index(
+                            *if_exists,
+                            names.as_slice(),
+                            *cascade,
+                            *restrict,
+                            *purge,
+                            *temporary,
+                            table.as_ref(),
+                            session_context,
+                            self.holostore_client.clone(),
+                            self.pushdown_metrics.clone(),
+                        )
+                        .await
+                    },
+                )
+                .await,
+            );
+        }
+
         if let Statement::Insert(insert) = statement {
             return Some(
                 self.run_statement_with_controls(
@@ -532,30 +602,68 @@ impl DmlHook {
             );
         }
 
-        if let Some(spec) = extract_fast_primary_key_aggregate_statement(statement) {
-            if let Some(provider) =
-                try_get_holo_provider_for_table(session_context, spec.table_name.as_str()).await
-            {
-                if spec
-                    .column_name
-                    .eq_ignore_ascii_case(provider.primary_key_column())
+        // Extended-protocol hooks currently cannot observe portal result format; keep custom
+        // fast SELECT responses on simple protocol until hook APIs expose bind/portal formats.
+        if protocol == QueryProtocol::Simple {
+            if let Some(spec) = extract_fast_grouped_aggregate_topk_statement(statement, params) {
+                if let Some(provider) =
+                    try_get_holo_provider_for_table(session_context, spec.table_name.as_str()).await
                 {
-                    return Some(
-                        self.run_statement_with_controls(
-                            statement,
-                            session_id,
-                            query_execution_id.as_str(),
-                            protocol,
-                            statement_admission_class(statement, false, session_id),
-                            async move {
-                                execute_fast_primary_key_aggregate_query(
-                                    provider, spec, client, protocol,
-                                )
-                                .await
-                            },
-                        )
-                        .await,
-                    );
+                    if provider.is_row_v1_table() {
+                        let pushdown_metrics = self.pushdown_metrics.clone();
+                        let query_execution_id_owned = query_execution_id.clone();
+                        return Some(
+                            self.run_statement_with_controls(
+                                statement,
+                                session_id,
+                                query_execution_id.as_str(),
+                                protocol,
+                                statement_admission_class(statement, false, session_id),
+                                async move {
+                                    execute_fast_grouped_aggregate_topk_query(
+                                        provider,
+                                        spec,
+                                        pushdown_metrics.as_ref(),
+                                        query_execution_id_owned.as_str(),
+                                        client,
+                                        protocol,
+                                    )
+                                    .await
+                                },
+                            )
+                            .await,
+                        );
+                    }
+                }
+            }
+        }
+
+        if protocol == QueryProtocol::Simple {
+            if let Some(spec) = extract_fast_primary_key_aggregate_statement(statement) {
+                if let Some(provider) =
+                    try_get_holo_provider_for_table(session_context, spec.table_name.as_str()).await
+                {
+                    if spec
+                        .column_name
+                        .eq_ignore_ascii_case(provider.primary_key_column())
+                    {
+                        return Some(
+                            self.run_statement_with_controls(
+                                statement,
+                                session_id,
+                                query_execution_id.as_str(),
+                                protocol,
+                                statement_admission_class(statement, false, session_id),
+                                async move {
+                                    execute_fast_primary_key_aggregate_query(
+                                        provider, spec, client, protocol,
+                                    )
+                                    .await
+                                },
+                            )
+                            .await,
+                        );
+                    }
                 }
             }
         }
@@ -831,6 +939,14 @@ impl QueryProtocol {
             QueryProtocol::Simple => "simple",
             QueryProtocol::Extended => "extended",
         }
+    }
+}
+
+/// Maps query protocol to the wire format used by hook-built query responses.
+fn hook_query_wire_format(protocol: QueryProtocol) -> Format {
+    match protocol {
+        QueryProtocol::Simple => Format::UnifiedText,
+        QueryProtocol::Extended => Format::UnifiedBinary,
     }
 }
 
@@ -1226,7 +1342,12 @@ fn statement_kind(statement: &Statement) -> &'static str {
         Statement::Commit { .. } => "COMMIT",
         Statement::Rollback { .. } => "ROLLBACK",
         Statement::CreateTable(_) => "CREATE_TABLE",
+        Statement::CreateIndex(_) => "CREATE_INDEX",
         Statement::AlterTable { .. } => "ALTER_TABLE",
+        Statement::Drop {
+            object_type: ObjectType::Index,
+            ..
+        } => "DROP_INDEX",
         Statement::Update { .. } => "UPDATE",
         Statement::Delete(_) => "DELETE",
         Statement::Insert(_) => "INSERT",
@@ -1439,6 +1560,403 @@ fn parse_i64_literal(expr: &SqlExpr) -> Option<i64> {
         } => parse_i64_literal(expr),
         _ => None,
     }
+}
+
+#[derive(Debug, Clone)]
+struct FastGroupedAggregateTopKSpec {
+    table_name: String,
+    group_columns: Vec<String>,
+    sum_column: String,
+    filters: Vec<FastGroupedFilterSpec>,
+    having_min_count: u64,
+    limit: usize,
+    output_columns: Vec<FastGroupedOutputColumn>,
+}
+
+#[derive(Debug, Clone)]
+struct FastGroupedFilterSpec {
+    column: String,
+    allowed_values: Vec<ScalarValue>,
+}
+
+#[derive(Debug, Clone)]
+enum FastGroupedOutputColumn {
+    GroupColumn { column: String, output_name: String },
+    Count { output_name: String },
+    Sum { output_name: String },
+}
+
+/// Extracts grouped aggregate + top-k shape from a statement for provider pushdown fast path.
+fn extract_fast_grouped_aggregate_topk_statement(
+    statement: &Statement,
+    params: &ParamValues,
+) -> Option<FastGroupedAggregateTopKSpec> {
+    let Statement::Query(query) = statement else {
+        return None;
+    };
+    extract_fast_grouped_aggregate_topk_query(query.as_ref(), params)
+}
+
+/// Extracts grouped aggregate + top-k shape from a query for provider pushdown fast path.
+fn extract_fast_grouped_aggregate_topk_query(
+    query: &Query,
+    params: &ParamValues,
+) -> Option<FastGroupedAggregateTopKSpec> {
+    if query.with.is_some()
+        || query.fetch.is_some()
+        || !query.locks.is_empty()
+        || query.for_clause.is_some()
+        || query.settings.is_some()
+        || query.format_clause.is_some()
+        || !query.pipe_operators.is_empty()
+    {
+        return None;
+    }
+
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    if select.distinct.is_some()
+        || select.top.is_some()
+        || select.exclude.is_some()
+        || select.into.is_some()
+        || !select.lateral_views.is_empty()
+        || !select.cluster_by.is_empty()
+        || !select.distribute_by.is_empty()
+        || !select.sort_by.is_empty()
+        || !select.named_window.is_empty()
+        || select.qualify.is_some()
+        || select.value_table_mode.is_some()
+        || select.connect_by.is_some()
+    {
+        return None;
+    }
+
+    if select.from.len() != 1 {
+        return None;
+    }
+    let from = select.from.first()?;
+    if !from.joins.is_empty() {
+        return None;
+    }
+    let TableFactor::Table { name, .. } = &from.relation else {
+        return None;
+    };
+    let table_name = object_name_leaf(name).ok()?;
+
+    let group_columns = match &select.group_by {
+        datafusion::sql::sqlparser::ast::GroupByExpr::Expressions(exprs, _)
+            if !exprs.is_empty() =>
+        {
+            let mut out = Vec::<String>::with_capacity(exprs.len());
+            for expr in exprs {
+                out.push(sql_expr_column_name(expr)?);
+            }
+            out
+        }
+        _ => return None,
+    };
+
+    let mut output_columns = Vec::<FastGroupedOutputColumn>::with_capacity(select.projection.len());
+    let mut count_output_name = None::<String>;
+    let mut sum_output_name = None::<String>;
+    let mut sum_column = None::<String>;
+    for item in &select.projection {
+        let (expr, alias) = match item {
+            SelectItem::UnnamedExpr(expr) => (expr, None),
+            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(normalize_ident(alias))),
+            _ => return None,
+        };
+
+        if let Some(column) = sql_expr_column_name(expr) {
+            if !group_columns
+                .iter()
+                .any(|group_col| group_col.eq_ignore_ascii_case(column.as_str()))
+            {
+                return None;
+            }
+            output_columns.push(FastGroupedOutputColumn::GroupColumn {
+                column: column.clone(),
+                output_name: alias.unwrap_or(column),
+            });
+            continue;
+        }
+
+        if is_count_star_expr(expr) {
+            if count_output_name.is_some() {
+                return None;
+            }
+            let name = alias.unwrap_or_else(|| "count".to_string());
+            count_output_name = Some(name.clone());
+            output_columns.push(FastGroupedOutputColumn::Count { output_name: name });
+            continue;
+        }
+
+        if let Some(column) = extract_sum_column(expr) {
+            if sum_column.is_some() {
+                return None;
+            }
+            sum_column = Some(column);
+            let name = alias.unwrap_or_else(|| "sum".to_string());
+            sum_output_name = Some(name.clone());
+            output_columns.push(FastGroupedOutputColumn::Sum { output_name: name });
+            continue;
+        }
+
+        return None;
+    }
+
+    let sum_column = sum_column?;
+    let _count_output_name = count_output_name?;
+    let sum_output_name = sum_output_name?;
+
+    let filters = parse_grouped_where_filters(select.selection.as_ref(), params)?;
+    let having_min_count = parse_grouped_having_min_count(select.having.as_ref())?;
+
+    let order_by = query.order_by.as_ref()?;
+    let OrderByKind::Expressions(ordering) = &order_by.kind else {
+        return None;
+    };
+    if ordering.len() != 1 || ordering[0].options.asc != Some(false) {
+        return None;
+    }
+    if ordering[0].with_fill.is_some() {
+        return None;
+    }
+    if !matches_order_by_sum(
+        &ordering[0].expr,
+        sum_output_name.as_str(),
+        sum_column.as_str(),
+    ) {
+        return None;
+    }
+
+    let limit = parse_topk_limit(query.limit_clause.as_ref())?;
+    Some(FastGroupedAggregateTopKSpec {
+        table_name,
+        group_columns,
+        sum_column,
+        filters,
+        having_min_count,
+        limit,
+        output_columns,
+    })
+}
+
+fn parse_grouped_where_filters(
+    selection: Option<&SqlExpr>,
+    params: &ParamValues,
+) -> Option<Vec<FastGroupedFilterSpec>> {
+    let Some(selection) = selection else {
+        return Some(Vec::new());
+    };
+    let mut terms = Vec::<&SqlExpr>::new();
+    collect_sql_conjuncts(selection, &mut terms);
+    let mut by_column = BTreeMap::<String, Vec<ScalarValue>>::new();
+    for term in terms {
+        let (column, values) = parse_grouped_filter_term(term, params)?;
+        by_column.entry(column).or_default().extend(values);
+    }
+
+    let mut filters = Vec::<FastGroupedFilterSpec>::with_capacity(by_column.len());
+    for (column, mut values) in by_column {
+        values.dedup();
+        if values.is_empty() {
+            return Some(Vec::new());
+        }
+        filters.push(FastGroupedFilterSpec {
+            column,
+            allowed_values: values,
+        });
+    }
+    Some(filters)
+}
+
+fn collect_sql_conjuncts<'a>(expr: &'a SqlExpr, out: &mut Vec<&'a SqlExpr>) {
+    match expr {
+        SqlExpr::BinaryOp { left, op, right } if *op == BinaryOperator::And => {
+            collect_sql_conjuncts(left.as_ref(), out);
+            collect_sql_conjuncts(right.as_ref(), out);
+        }
+        _ => out.push(expr),
+    }
+}
+
+fn parse_grouped_filter_term(
+    term: &SqlExpr,
+    params: &ParamValues,
+) -> Option<(String, Vec<ScalarValue>)> {
+    match term {
+        SqlExpr::BinaryOp { left, op, right } if *op == BinaryOperator::Eq => {
+            if let (Some(column), Some(value)) = (
+                sql_expr_column_name(left.as_ref()),
+                resolve_sql_expr_scalar(right.as_ref(), params)
+                    .ok()
+                    .flatten(),
+            ) {
+                return Some((column, vec![value]));
+            }
+            if let (Some(column), Some(value)) = (
+                sql_expr_column_name(right.as_ref()),
+                resolve_sql_expr_scalar(left.as_ref(), params)
+                    .ok()
+                    .flatten(),
+            ) {
+                return Some((column, vec![value]));
+            }
+            None
+        }
+        SqlExpr::InList {
+            expr,
+            list,
+            negated,
+        } if !negated => {
+            let column = sql_expr_column_name(expr.as_ref())?;
+            if list.is_empty() {
+                return None;
+            }
+            let mut values = Vec::<ScalarValue>::with_capacity(list.len());
+            for value_expr in list {
+                values.push(resolve_sql_expr_scalar(value_expr, params).ok().flatten()?);
+            }
+            Some((column, values))
+        }
+        _ => None,
+    }
+}
+
+fn resolve_sql_expr_scalar(
+    expr: &SqlExpr,
+    params: &ParamValues,
+) -> PgWireResult<Option<ScalarValue>> {
+    match expr {
+        SqlExpr::Value(value) => Ok(Some(resolve_sql_value(value, params)?)),
+        SqlExpr::Nested(inner) => resolve_sql_expr_scalar(inner, params),
+        SqlExpr::Cast { expr, .. } => resolve_sql_expr_scalar(expr, params),
+        SqlExpr::UnaryOp { op, expr } => {
+            let Some(value) = resolve_sql_expr_scalar(expr, params)? else {
+                return Ok(None);
+            };
+            match op {
+                UnaryOperator::Plus => Ok(Some(value)),
+                UnaryOperator::Minus => {
+                    let Some(int_value) = scalar_to_i64(value) else {
+                        return Ok(None);
+                    };
+                    Ok(Some(ScalarValue::Int64(Some(int_value.saturating_neg()))))
+                }
+                _ => Ok(None),
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+fn parse_grouped_having_min_count(having: Option<&SqlExpr>) -> Option<u64> {
+    let Some(expr) = having else {
+        return Some(0);
+    };
+    let SqlExpr::BinaryOp { left, op, right } = expr else {
+        return None;
+    };
+    match op {
+        BinaryOperator::GtEq => {
+            if is_count_star_expr(left.as_ref()) {
+                return parse_i64_literal(right.as_ref()).and_then(|v| u64::try_from(v).ok());
+            }
+            if is_count_star_expr(right.as_ref()) {
+                return parse_i64_literal(left.as_ref()).and_then(|v| u64::try_from(v).ok());
+            }
+            None
+        }
+        BinaryOperator::Gt => {
+            if is_count_star_expr(left.as_ref()) {
+                return parse_i64_literal(right.as_ref())
+                    .and_then(|v| v.checked_add(1))
+                    .and_then(|v| u64::try_from(v).ok());
+            }
+            if is_count_star_expr(right.as_ref()) {
+                return parse_i64_literal(left.as_ref()).and_then(|v| u64::try_from(v).ok());
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn parse_topk_limit(limit_clause: Option<&LimitClause>) -> Option<usize> {
+    match limit_clause? {
+        LimitClause::LimitOffset {
+            limit,
+            offset,
+            limit_by,
+        } => {
+            if offset.is_some() || !limit_by.is_empty() {
+                return None;
+            }
+            let limit = limit.as_ref()?;
+            let value = parse_i64_literal(limit)?;
+            usize::try_from(value).ok()
+        }
+        LimitClause::OffsetCommaLimit { .. } => None,
+    }
+}
+
+fn is_count_star_expr(expr: &SqlExpr) -> bool {
+    let SqlExpr::Function(function) = expr else {
+        return false;
+    };
+    if !is_function_named(function, "count")
+        || function.parameters != FunctionArguments::None
+        || function.filter.is_some()
+        || function.null_treatment.is_some()
+        || function.over.is_some()
+        || !function.within_group.is_empty()
+    {
+        return false;
+    }
+    let Some(args) = function_args_list(function) else {
+        return false;
+    };
+    if args.len() != 1 {
+        return false;
+    }
+    matches!(
+        args[0],
+        FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+            | FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(_))
+    )
+}
+
+fn extract_sum_column(expr: &SqlExpr) -> Option<String> {
+    let SqlExpr::Function(function) = expr else {
+        return None;
+    };
+    if !is_function_named(function, "sum")
+        || function.parameters != FunctionArguments::None
+        || function.filter.is_some()
+        || function.null_treatment.is_some()
+        || function.over.is_some()
+        || !function.within_group.is_empty()
+    {
+        return None;
+    }
+    let args = function_args_list(function)?;
+    if args.len() != 1 {
+        return None;
+    }
+    sql_expr_column_name(function_arg_as_expr(args.first()?)?)
+}
+
+fn matches_order_by_sum(order_expr: &SqlExpr, sum_alias: &str, sum_column: &str) -> bool {
+    if let Some(name) = sql_expr_column_name(order_expr) {
+        if name.eq_ignore_ascii_case(sum_alias) {
+            return true;
+        }
+    }
+    extract_sum_column(order_expr)
+        .map(|column| column.eq_ignore_ascii_case(sum_column))
+        .unwrap_or(false)
 }
 
 /// Maps one statement/session context to an admission workload class.
@@ -1861,6 +2379,357 @@ async fn execute_create_table(
     .map_err(|err| api_error(format!("register created table '{}': {err}", table_name)))?;
 
     Ok(Response::Execution(Tag::new("CREATE TABLE")))
+}
+
+/// Executes CREATE INDEX in the SQL hook path.
+async fn execute_create_index(
+    create: &CreateIndex,
+    session_context: &SessionContext,
+    holostore_client: HoloStoreClient,
+    pushdown_metrics: Arc<PushdownMetrics>,
+) -> PgWireResult<Response> {
+    if create.concurrently {
+        return Err(to_user_error(
+            "0A000",
+            "CREATE INDEX CONCURRENTLY is not supported",
+        ));
+    }
+    if create.predicate.is_some() {
+        return Err(to_user_error(
+            "0A000",
+            "partial indexes (CREATE INDEX ... WHERE ...) are not supported",
+        ));
+    }
+    if matches!(create.nulls_distinct, Some(false)) {
+        return Err(to_user_error(
+            "0A000",
+            "CREATE INDEX NULLS NOT DISTINCT is not supported",
+        ));
+    }
+
+    let table_name = parse_create_table_name(&create.table_name)?;
+    let table = find_table_metadata_by_name(&holostore_client, table_name.as_str())
+        .await
+        .map_err(map_runtime_error)?
+        .ok_or_else(|| {
+            to_user_error("42P01", format!("relation '{}' does not exist", table_name))
+        })?;
+    table.validate().map_err(map_runtime_error)?;
+
+    let spec = compile_create_index_metadata_spec(create, &table)?;
+    let outcome = create_secondary_index_metadata(&holostore_client, &table, &spec)
+        .await
+        .map_err(map_runtime_error)?;
+
+    register_table_from_metadata(
+        session_context,
+        holostore_client.clone(),
+        pushdown_metrics.clone(),
+        &table,
+    )
+    .await
+    .map_err(|err| {
+        api_error(format!(
+            "register table '{}' after CREATE INDEX: {err}",
+            table_name
+        ))
+    })?;
+
+    if outcome.created {
+        let provider = get_provider_for_table(session_context, table_name.as_str()).await?;
+        let backfill_result = provider
+            .backfill_secondary_index(&outcome.record)
+            .await
+            .map_err(map_runtime_error);
+        if let Err(err) = backfill_result {
+            let _ = drop_secondary_index_metadata_by_name(
+                &holostore_client,
+                outcome.record.index_name.as_str(),
+                true,
+            )
+            .await;
+            return Err(err);
+        }
+
+        update_secondary_index_state(
+            &holostore_client,
+            outcome.record.table_id,
+            outcome.record.index_id,
+            SecondaryIndexState::Public,
+        )
+        .await
+        .map_err(map_runtime_error)?;
+
+        let refreshed = find_table_metadata_by_name(&holostore_client, table_name.as_str())
+            .await
+            .map_err(map_runtime_error)?
+            .ok_or_else(|| {
+                api_error(format!(
+                    "metadata for relation '{}' is not visible after CREATE INDEX",
+                    table_name
+                ))
+            })?;
+        register_table_from_metadata(
+            session_context,
+            holostore_client.clone(),
+            pushdown_metrics,
+            &refreshed,
+        )
+        .await
+        .map_err(|err| {
+            api_error(format!(
+                "register table '{}' after index backfill state transition: {err}",
+                table_name
+            ))
+        })?;
+    }
+
+    Ok(Response::Execution(Tag::new("CREATE INDEX")))
+}
+
+fn compile_create_index_metadata_spec(
+    create: &CreateIndex,
+    table: &crate::metadata::TableMetadataRecord,
+) -> PgWireResult<CreateSecondaryIndexMetadataSpec> {
+    if table.table_model != table_model_row_v1() {
+        return Err(to_user_error(
+            "0A000",
+            "CREATE INDEX is currently supported only for row_v1 tables",
+        ));
+    }
+    if create.columns.is_empty() {
+        return Err(to_user_error(
+            "42601",
+            "CREATE INDEX requires at least one key column",
+        ));
+    }
+    let mut key_columns = Vec::<String>::with_capacity(create.columns.len());
+    let mut seen_keys = BTreeSet::<String>::new();
+    for index_column in &create.columns {
+        if matches!(index_column.column.options.asc, Some(false)) {
+            return Err(to_user_error(
+                "0A000",
+                "CREATE INDEX with DESC key columns is not supported",
+            ));
+        }
+        let Some(column_name) = index_column_name(index_column) else {
+            return Err(to_user_error(
+                "0A000",
+                "CREATE INDEX key columns must reference plain column names",
+            ));
+        };
+        if !seen_keys.insert(column_name.clone()) {
+            return Err(to_user_error(
+                "42601",
+                format!(
+                    "CREATE INDEX key column '{}' specified more than once",
+                    column_name
+                ),
+            ));
+        }
+        key_columns.push(column_name);
+    }
+
+    let mut include_columns = Vec::<String>::with_capacity(create.include.len());
+    let mut seen_include = BTreeSet::<String>::new();
+    for ident in &create.include {
+        let name = normalize_ident(ident);
+        if !seen_include.insert(name.clone()) {
+            return Err(to_user_error(
+                "42601",
+                format!(
+                    "CREATE INDEX include column '{}' specified more than once",
+                    name
+                ),
+            ));
+        }
+        include_columns.push(name);
+    }
+
+    let distribution = match create.using.as_ref() {
+        Some(IndexType::Hash) => SecondaryIndexDistribution::Hash,
+        Some(IndexType::BTree) | None => SecondaryIndexDistribution::Range,
+        Some(other) => {
+            return Err(to_user_error(
+                "0A000",
+                format!("CREATE INDEX USING {} is not supported", other),
+            ))
+        }
+    };
+
+    let hash_bucket_count =
+        parse_secondary_index_hash_bucket_count_from_with(create.with.as_slice())?;
+    if distribution == SecondaryIndexDistribution::Range && hash_bucket_count.is_some() {
+        return Err(to_user_error(
+            "0A000",
+            "CREATE INDEX WITH hash bucket options requires USING HASH",
+        ));
+    }
+
+    let index_name = if let Some(name) = &create.name {
+        parse_index_name(name)?
+    } else {
+        default_index_name(table.table_name.as_str(), key_columns.as_slice())
+    };
+
+    let spec = CreateSecondaryIndexMetadataSpec {
+        index_name,
+        unique: create.unique,
+        key_columns,
+        include_columns,
+        distribution,
+        hash_bucket_count: if distribution == SecondaryIndexDistribution::Hash {
+            Some(hash_bucket_count.unwrap_or(DEFAULT_SECONDARY_INDEX_HASH_BUCKETS))
+        } else {
+            None
+        },
+        if_not_exists: create.if_not_exists,
+    };
+    spec.validate_against_table(table)
+        .map_err(map_runtime_error)?;
+    Ok(spec)
+}
+
+fn parse_secondary_index_hash_bucket_count_from_with(
+    with: &[SqlExpr],
+) -> PgWireResult<Option<usize>> {
+    let mut bucket_count = None::<usize>;
+    for expr in with {
+        let SqlExpr::BinaryOp { left, op, right } = expr else {
+            return Err(to_user_error(
+                "0A000",
+                format!("CREATE INDEX WITH option '{}' is not supported", expr),
+            ));
+        };
+        if *op != BinaryOperator::Eq {
+            return Err(to_user_error(
+                "0A000",
+                format!("CREATE INDEX WITH option '{}' is not supported", expr),
+            ));
+        }
+        let key = match left.as_ref() {
+            SqlExpr::Identifier(ident) => normalize_ident(ident).to_ascii_lowercase(),
+            _ => {
+                return Err(to_user_error(
+                    "0A000",
+                    format!("CREATE INDEX WITH option '{}' is not supported", expr),
+                ))
+            }
+        };
+        if !matches!(
+            key.as_str(),
+            "hash_shards" | "hash_buckets" | "bucket_count" | "buckets"
+        ) {
+            return Err(to_user_error(
+                "0A000",
+                format!("CREATE INDEX WITH option '{}' is not supported", key),
+            ));
+        }
+        if bucket_count.is_some() {
+            return Err(to_user_error(
+                "42601",
+                format!(
+                    "CREATE INDEX WITH option '{}' specified more than once",
+                    key
+                ),
+            ));
+        }
+        let parsed = parse_positive_usize_sql_expr(right.as_ref())?;
+        if parsed > MAX_SECONDARY_INDEX_HASH_BUCKETS {
+            return Err(to_user_error(
+                "22023",
+                format!(
+                    "hash bucket count {} exceeds supported max {}",
+                    parsed, MAX_SECONDARY_INDEX_HASH_BUCKETS
+                ),
+            ));
+        }
+        bucket_count = Some(parsed);
+    }
+    Ok(bucket_count)
+}
+
+fn parse_index_name(name: &ObjectName) -> PgWireResult<String> {
+    let parts = name
+        .0
+        .iter()
+        .map(|part| {
+            part.as_ident()
+                .map(normalize_ident)
+                .ok_or_else(|| to_user_error("42601", "invalid index name"))
+        })
+        .collect::<PgWireResult<Vec<_>>>()?;
+    let index_name = match parts.as_slice() {
+        [index] => index.clone(),
+        [schema, index] if schema == "public" => index.clone(),
+        [catalog, schema, index] if catalog == "datafusion" && schema == "public" => index.clone(),
+        _ => return Err(to_user_error("42601", "invalid CREATE INDEX name format")),
+    };
+    if index_name.trim().is_empty() {
+        return Err(to_user_error("42601", "index name cannot be empty"));
+    }
+    Ok(index_name)
+}
+
+fn default_index_name(table_name: &str, key_columns: &[String]) -> String {
+    let mut out = String::new();
+    out.push_str(table_name);
+    for column in key_columns {
+        out.push('_');
+        out.push_str(column.as_str());
+    }
+    out.push_str("_idx");
+    out
+}
+
+/// Executes DROP INDEX in the SQL hook path.
+async fn execute_drop_index(
+    if_exists: bool,
+    names: &[ObjectName],
+    cascade: bool,
+    restrict: bool,
+    purge: bool,
+    temporary: bool,
+    table: Option<&ObjectName>,
+    session_context: &SessionContext,
+    holostore_client: HoloStoreClient,
+    pushdown_metrics: Arc<PushdownMetrics>,
+) -> PgWireResult<Response> {
+    if cascade || restrict || purge || temporary || table.is_some() {
+        return Err(to_user_error(
+            "0A000",
+            "DROP INDEX options are not supported",
+        ));
+    }
+    if names.is_empty() {
+        return Err(to_user_error(
+            "42601",
+            "DROP INDEX requires at least one index name",
+        ));
+    }
+
+    let mut dropped = 0u64;
+    for name in names {
+        let index_name = parse_index_name(name)?;
+        let removed = drop_secondary_index_metadata_by_name(
+            &holostore_client,
+            index_name.as_str(),
+            if_exists,
+        )
+        .await
+        .map_err(map_runtime_error)?;
+        if removed {
+            dropped = dropped.saturating_add(1);
+        }
+    }
+
+    sync_catalog_from_metadata(session_context, holostore_client, pushdown_metrics)
+        .await
+        .map_err(|err| api_error(format!("catalog sync after DROP INDEX failed: {err}")))?;
+
+    Ok(Response::Execution(
+        Tag::new("DROP INDEX").with_rows(dropped as usize),
+    ))
 }
 
 fn configured_hash_pk_migration_enabled() -> bool {
@@ -3949,11 +4818,7 @@ async fn execute_query_in_transaction(
         .await
         .map_err(|err| api_error(err.to_string()))?;
     let format_options = Arc::new(FormatOptions::from_client_metadata(client.metadata()));
-    // Decision: evaluate `protocol` to choose the correct SQL/storage control path.
-    let wire_format = match protocol {
-        QueryProtocol::Simple => Format::UnifiedText,
-        QueryProtocol::Extended => Format::UnifiedBinary,
-    };
+    let wire_format = hook_query_wire_format(protocol);
     let query = df::encode_dataframe(dataframe, &wire_format, Some(format_options))
         .await
         .map_err(|err| api_error(err.to_string()))?;
@@ -3968,16 +4833,7 @@ async fn execute_fast_primary_key_aggregate_query(
     protocol: QueryProtocol,
 ) -> PgWireResult<Response> {
     let value = evaluate_fast_primary_key_aggregate(provider, &spec).await?;
-    let column_name = spec.output_alias.clone().unwrap_or_else(|| {
-        if spec.coalesce_fallback.is_some() {
-            "coalesce".to_string()
-        } else {
-            match spec.extreme {
-                PrimaryKeyExtreme::Min => "min".to_string(),
-                PrimaryKeyExtreme::Max => "max".to_string(),
-            }
-        }
-    });
+    let column_name = fast_primary_key_aggregate_output_name(&spec);
 
     let schema = Arc::new(Schema::new(vec![Field::new(
         column_name.as_str(),
@@ -4005,42 +4861,368 @@ async fn execute_fast_primary_key_aggregate_query(
         .map_err(|err| api_error(err.to_string()))?;
 
     let format_options = Arc::new(FormatOptions::from_client_metadata(client.metadata()));
-    let wire_format = match protocol {
-        QueryProtocol::Simple => Format::UnifiedText,
-        QueryProtocol::Extended => Format::UnifiedBinary,
-    };
+    let wire_format = hook_query_wire_format(protocol);
     let query = df::encode_dataframe(dataframe, &wire_format, Some(format_options))
         .await
         .map_err(|err| api_error(err.to_string()))?;
     Ok(Response::Query(query))
 }
 
-/// Executes `EXPLAIN DIST`-style plan classification with placement annotations.
-async fn execute_explain_dist(
+/// Executes grouped aggregate + top-k query using provider-native pushdown.
+async fn execute_fast_grouped_aggregate_topk_query(
+    provider: HoloStoreTableProvider,
+    spec: FastGroupedAggregateTopKSpec,
+    pushdown_metrics: &PushdownMetrics,
+    query_execution_id: &str,
+    client: &(dyn ClientInfo + Send + Sync),
+    protocol: QueryProtocol,
+) -> PgWireResult<Response> {
+    let stage_id = pushdown_metrics.next_stage_execution_id();
+    pushdown_metrics.record_stage_event(
+        query_execution_id,
+        stage_id,
+        "aggregate_pushdown_entry",
+        format!(
+            "table={} groups={} filters={} having_min_count={} limit={}",
+            spec.table_name,
+            spec.group_columns.len(),
+            spec.filters.len(),
+            spec.having_min_count,
+            spec.limit
+        ),
+    );
+
+    let provider_spec = GroupedAggregateTopKSpec {
+        group_columns: spec.group_columns.clone(),
+        sum_column: spec.sum_column.clone(),
+        filters: spec
+            .filters
+            .iter()
+            .map(|filter| GroupedAggregateFilter {
+                column: filter.column.clone(),
+                allowed_values: filter.allowed_values.clone(),
+            })
+            .collect::<Vec<_>>(),
+        having_min_count: spec.having_min_count,
+        limit: spec.limit,
+    };
+    let rows = provider
+        .execute_grouped_aggregate_topk(query_execution_id, stage_id, &provider_spec)
+        .await
+        .map_err(|err| api_error(err.to_string()))?;
+
+    let batch = grouped_aggregate_rows_to_batch(&provider, &spec, rows.as_slice())?;
+    let mem = MemTable::try_new(batch.schema(), vec![vec![batch]])
+        .map_err(|err| api_error(err.to_string()))?;
+
+    let query_ctx = SessionContext::new();
+    query_ctx
+        .register_table("holo_fast_grouped_aggregate", Arc::new(mem))
+        .map_err(|err| api_error(err.to_string()))?;
+    let dataframe = query_ctx
+        .sql("SELECT * FROM holo_fast_grouped_aggregate")
+        .await
+        .map_err(|err| api_error(err.to_string()))?;
+
+    let format_options = Arc::new(FormatOptions::from_client_metadata(client.metadata()));
+    let wire_format = hook_query_wire_format(protocol);
+    let query = df::encode_dataframe(dataframe, &wire_format, Some(format_options))
+        .await
+        .map_err(|err| api_error(err.to_string()))?;
+    Ok(Response::Query(query))
+}
+
+fn grouped_aggregate_rows_to_batch(
+    provider: &HoloStoreTableProvider,
+    spec: &FastGroupedAggregateTopKSpec,
+    rows: &[GroupedAggregateTopKRow],
+) -> PgWireResult<RecordBatch> {
+    let mut group_position_by_name = BTreeMap::<String, usize>::new();
+    for (idx, column) in spec.group_columns.iter().enumerate() {
+        group_position_by_name.insert(column.to_ascii_lowercase(), idx);
+    }
+
+    let output_layout = spec
+        .output_columns
+        .iter()
+        .map(|column| match column {
+            FastGroupedOutputColumn::GroupColumn {
+                column,
+                output_name,
+            } => {
+                let position = group_position_by_name
+                    .get(column.to_ascii_lowercase().as_str())
+                    .copied()
+                    .ok_or_else(|| {
+                        api_error(format!(
+                            "grouped aggregate output references missing group column '{}'",
+                            column
+                        ))
+                    })?;
+                Ok(CompiledGroupedOutput::Group {
+                    group_position: position,
+                    output_name: output_name.clone(),
+                    data_type: output_group_arrow_type(provider, column.as_str())?,
+                })
+            }
+            FastGroupedOutputColumn::Count { output_name } => Ok(CompiledGroupedOutput::Count {
+                output_name: output_name.clone(),
+            }),
+            FastGroupedOutputColumn::Sum { output_name } => Ok(CompiledGroupedOutput::Sum {
+                output_name: output_name.clone(),
+            }),
+        })
+        .collect::<PgWireResult<Vec<_>>>()?;
+
+    if rows.is_empty() {
+        let mut fields = Vec::<Field>::with_capacity(output_layout.len());
+        for output in &output_layout {
+            match output {
+                CompiledGroupedOutput::Group {
+                    output_name,
+                    data_type,
+                    ..
+                } => fields.push(Field::new(output_name.as_str(), data_type.clone(), true)),
+                CompiledGroupedOutput::Count { output_name }
+                | CompiledGroupedOutput::Sum { output_name } => {
+                    fields.push(Field::new(
+                        output_name.as_str(),
+                        ArrowDataType::Int64,
+                        false,
+                    ));
+                }
+            }
+        }
+        let schema = Arc::new(Schema::new(fields));
+        return Ok(RecordBatch::new_empty(schema));
+    }
+
+    let mut column_values =
+        vec![Vec::<ScalarValue>::with_capacity(rows.len()); output_layout.len()];
+    for row in rows {
+        for (idx, output) in output_layout.iter().enumerate() {
+            match output {
+                CompiledGroupedOutput::Group { group_position, .. } => {
+                    let value = row
+                        .group_values
+                        .get(*group_position)
+                        .cloned()
+                        .unwrap_or(ScalarValue::Null);
+                    column_values[idx].push(value);
+                }
+                CompiledGroupedOutput::Count { .. } => {
+                    let count = i64::try_from(row.count).map_err(|_| {
+                        api_error(format!("aggregate COUNT overflow for value {}", row.count))
+                    })?;
+                    column_values[idx].push(ScalarValue::Int64(Some(count)));
+                }
+                CompiledGroupedOutput::Sum { .. } => {
+                    column_values[idx].push(ScalarValue::Int64(Some(row.sum)));
+                }
+            }
+        }
+    }
+
+    let mut arrays = Vec::<ArrayRef>::with_capacity(column_values.len());
+    let mut fields = Vec::<Field>::with_capacity(output_layout.len());
+    for (idx, values) in column_values.into_iter().enumerate() {
+        let array = ScalarValue::iter_to_array(values.into_iter())
+            .map_err(|err| api_error(err.to_string()))?;
+        let field = match &output_layout[idx] {
+            CompiledGroupedOutput::Group { output_name, .. } => {
+                Field::new(output_name.as_str(), array.data_type().clone(), true)
+            }
+            CompiledGroupedOutput::Count { output_name }
+            | CompiledGroupedOutput::Sum { output_name } => {
+                Field::new(output_name.as_str(), ArrowDataType::Int64, false)
+            }
+        };
+        arrays.push(array);
+        fields.push(field);
+    }
+    let schema = Arc::new(Schema::new(fields));
+    RecordBatch::try_new(schema, arrays).map_err(|err| api_error(err.to_string()))
+}
+
+#[derive(Debug, Clone)]
+enum CompiledGroupedOutput {
+    Group {
+        group_position: usize,
+        output_name: String,
+        data_type: ArrowDataType,
+    },
+    Count {
+        output_name: String,
+    },
+    Sum {
+        output_name: String,
+    },
+}
+
+fn output_group_arrow_type(
+    provider: &HoloStoreTableProvider,
+    column_name: &str,
+) -> PgWireResult<ArrowDataType> {
+    let column = provider
+        .columns()
+        .iter()
+        .find(|column| column.name.eq_ignore_ascii_case(column_name))
+        .ok_or_else(|| {
+            api_error(format!(
+                "grouped aggregate column '{}' not found in table metadata",
+                column_name
+            ))
+        })?;
+    Ok(match column.column_type {
+        TableColumnType::Int8 => ArrowDataType::Int8,
+        TableColumnType::Int16 => ArrowDataType::Int16,
+        TableColumnType::Int32 => ArrowDataType::Int32,
+        TableColumnType::Int64 => ArrowDataType::Int64,
+        TableColumnType::UInt8 => ArrowDataType::UInt8,
+        TableColumnType::UInt16 => ArrowDataType::UInt16,
+        TableColumnType::UInt32 => ArrowDataType::UInt32,
+        TableColumnType::UInt64 => ArrowDataType::UInt64,
+        TableColumnType::Float64 => ArrowDataType::Float64,
+        TableColumnType::Boolean => ArrowDataType::Boolean,
+        TableColumnType::Utf8 => ArrowDataType::Utf8,
+        TableColumnType::TimestampNanosecond => {
+            ArrowDataType::Timestamp(TimeUnit::Nanosecond, None)
+        }
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExplainOutputFormat {
+    Text,
+    Json,
+}
+
+#[derive(Debug, Clone)]
+struct ExplainRequest {
+    analyze: bool,
+    verbose: bool,
+    dist: bool,
+    format: ExplainOutputFormat,
+    explained_sql: String,
+}
+
+#[derive(Debug, Clone)]
+struct ExplainDistPlacementRow {
+    stage: String,
+    placement: String,
+    detail: String,
+    stage_id: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ExplainDistOutputRow {
+    stage: String,
+    placement: String,
+    detail: String,
+    query_execution_id: String,
+    stage_id: u64,
+}
+
+#[derive(Debug, Default, Clone)]
+struct ExplainDistRuntimeSummary {
+    grpc_calls: u64,
+    network_bytes: u64,
+    retries: u64,
+    reroutes: u64,
+    involved_shards: BTreeSet<usize>,
+    involved_targets: BTreeSet<String>,
+}
+
+/// Executes PostgreSQL-style `EXPLAIN` with optional distributed (`DIST`) extensions.
+async fn execute_explain_statement(
     statement: &Statement,
     session_context: &SessionContext,
+    holostore_client: &HoloStoreClient,
+    pushdown_metrics: &PushdownMetrics,
     client: &(dyn ClientInfo + Send + Sync),
     protocol: QueryProtocol,
     query_execution_id: &str,
 ) -> PgWireResult<Response> {
-    let Statement::Explain {
-        statement: explained,
-        analyze,
-        verbose,
-        ..
-    } = statement
-    else {
-        return Err(api_error("expected EXPLAIN statement"));
-    };
+    let explain = parse_explain_request(statement)?;
+    let started_at_unix_ns = now_unix_nanos();
+    let metrics_before = pushdown_metrics.snapshot();
+    let mut plan_lines = collect_explain_plan_lines(session_context, &explain).await?;
+    let finished_at_unix_ns = now_unix_nanos();
+    let metrics_after = pushdown_metrics.snapshot();
 
-    let explain_sql = if *analyze {
-        format!("EXPLAIN ANALYZE VERBOSE {}", explained)
-    } else if *verbose {
-        format!("EXPLAIN VERBOSE {}", explained)
-    } else {
-        format!("EXPLAIN {}", explained)
-    };
+    let timeline = collect_explain_timeline_events(
+        pushdown_metrics,
+        query_execution_id,
+        started_at_unix_ns,
+        finished_at_unix_ns,
+    );
 
+    if !explain.dist {
+        if let Some(access_path_line) = derive_explain_access_path_annotation(timeline.as_slice()) {
+            plan_lines.push(access_path_line);
+        }
+        return match explain.format {
+            ExplainOutputFormat::Text => {
+                let batch = explain_text_lines_to_batch(plan_lines.as_slice())?;
+                encode_record_batch_query_response(batch, "holo_explain_text", client, protocol)
+                    .await
+            }
+            ExplainOutputFormat::Json => {
+                let doc = build_explain_json_document(
+                    query_execution_id,
+                    &explain,
+                    plan_lines.as_slice(),
+                    timeline.as_slice(),
+                );
+                let batch = explain_json_to_batch(doc.as_str())?;
+                encode_record_batch_query_response(batch, "holo_explain_json", client, protocol)
+                    .await
+            }
+        };
+    }
+
+    let topology = fetch_topology(holostore_client).await.ok();
+    let runtime =
+        summarize_explain_dist_runtime(timeline.as_slice(), &metrics_before, &metrics_after);
+    let placement_rows = classify_explain_placement(plan_lines.as_slice(), query_execution_id);
+    let dist_rows = build_explain_dist_output_rows(
+        placement_rows.as_slice(),
+        query_execution_id,
+        holostore_client.target().to_string().as_str(),
+        topology.as_ref(),
+        &runtime,
+        timeline.as_slice(),
+    );
+
+    match explain.format {
+        ExplainOutputFormat::Text => {
+            let batch = explain_dist_rows_to_batch(dist_rows.as_slice())?;
+            encode_record_batch_query_response(batch, "holo_explain_dist", client, protocol).await
+        }
+        ExplainOutputFormat::Json => {
+            let json = build_explain_dist_json_document(
+                query_execution_id,
+                &explain,
+                plan_lines.as_slice(),
+                dist_rows.as_slice(),
+                timeline.as_slice(),
+                topology.as_ref(),
+                &runtime,
+            );
+            let batch = explain_json_to_batch(json.as_str())?;
+            encode_record_batch_query_response(batch, "holo_explain_dist_json", client, protocol)
+                .await
+        }
+    }
+}
+
+/// Executes one explain statement against DataFusion and extracts text plan lines.
+async fn collect_explain_plan_lines(
+    session_context: &SessionContext,
+    explain: &ExplainRequest,
+) -> PgWireResult<Vec<String>> {
+    let explain_sql =
+        build_engine_explain_sql(explain.analyze, explain.verbose, &explain.explained_sql);
     let explain_df = session_context
         .sql(explain_sql.as_str())
         .await
@@ -4058,57 +5240,271 @@ async fn execute_explain_dist(
                     .map_err(|err| api_error(err.to_string()))?;
                 match scalar {
                     ScalarValue::Utf8(Some(text)) | ScalarValue::LargeUtf8(Some(text)) => {
-                        if !text.trim().is_empty() {
-                            plan_lines.push(text);
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            plan_lines.push(trimmed.to_string());
                         }
                     }
-                    _ => {}
+                    ScalarValue::Null => {}
+                    other => {
+                        let rendered = other.to_string();
+                        if !rendered.trim().is_empty() {
+                            plan_lines.push(rendered);
+                        }
+                    }
                 }
             }
         }
     }
 
-    let rows = classify_explain_placement(plan_lines.as_slice(), query_execution_id);
-    let batch = explain_dist_rows_to_batch(rows.as_slice())?;
+    if plan_lines.is_empty() {
+        plan_lines.push("empty explain plan".to_string());
+    }
+    Ok(plan_lines)
+}
+
+/// Builds one engine explain SQL string for a statement.
+fn build_engine_explain_sql(analyze: bool, verbose: bool, explained_sql: &str) -> String {
+    let mut out = String::from("EXPLAIN ");
+    if analyze {
+        out.push_str("ANALYZE ");
+    }
+    if verbose {
+        out.push_str("VERBOSE ");
+    }
+    out.push_str(explained_sql);
+    out
+}
+
+/// Parses one SQL `EXPLAIN` statement into execution options.
+fn parse_explain_request(statement: &Statement) -> PgWireResult<ExplainRequest> {
+    let Statement::Explain {
+        statement: explained,
+        analyze,
+        verbose,
+        format,
+        options,
+        ..
+    } = statement
+    else {
+        return Err(api_error("expected EXPLAIN statement"));
+    };
+
+    let mut analyze_enabled = *analyze;
+    let mut verbose_enabled = *verbose;
+    let mut dist_enabled = false;
+    let mut output_format = match format {
+        None | Some(AnalyzeFormat::TEXT) => ExplainOutputFormat::Text,
+        Some(AnalyzeFormat::JSON) => ExplainOutputFormat::Json,
+        Some(AnalyzeFormat::GRAPHVIZ) => {
+            return Err(to_user_error(
+                "0A000",
+                "EXPLAIN FORMAT GRAPHVIZ is not supported",
+            ));
+        }
+    };
+
+    if let Some(raw_options) = options {
+        for option in raw_options {
+            let option_name = normalize_ident(&option.name).to_ascii_lowercase();
+            match option_name.as_str() {
+                "analyze" => {
+                    analyze_enabled = parse_explain_bool_option(option, true)?;
+                }
+                "verbose" => {
+                    verbose_enabled = parse_explain_bool_option(option, true)?;
+                }
+                "dist" | "distributed" => {
+                    dist_enabled = parse_explain_bool_option(option, true)?;
+                }
+                "format" => {
+                    output_format = parse_explain_format_option(option)?;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(ExplainRequest {
+        analyze: analyze_enabled,
+        verbose: verbose_enabled,
+        dist: dist_enabled,
+        format: output_format,
+        explained_sql: explained.to_string(),
+    })
+}
+
+/// Parses one boolean-style utility option (`ON/OFF/TRUE/FALSE`).
+fn parse_explain_bool_option(
+    option: &UtilityOption,
+    default_if_missing: bool,
+) -> PgWireResult<bool> {
+    let Some(expr) = option.arg.as_ref() else {
+        return Ok(default_if_missing);
+    };
+    parse_sql_bool_expr(expr).ok_or_else(|| {
+        to_user_error(
+            "42601",
+            format!(
+                "invalid EXPLAIN option value for '{}': {}",
+                option.name, expr
+            ),
+        )
+    })
+}
+
+/// Parses one `FORMAT` explain option.
+fn parse_explain_format_option(option: &UtilityOption) -> PgWireResult<ExplainOutputFormat> {
+    let Some(expr) = option.arg.as_ref() else {
+        return Err(to_user_error(
+            "42601",
+            "EXPLAIN FORMAT option requires a value (TEXT or JSON)",
+        ));
+    };
+    let Some(word) = parse_sql_identifierish(expr) else {
+        return Err(to_user_error(
+            "42601",
+            format!("invalid EXPLAIN FORMAT option value: {}", expr),
+        ));
+    };
+    match word.to_ascii_uppercase().as_str() {
+        "TEXT" => Ok(ExplainOutputFormat::Text),
+        "JSON" => Ok(ExplainOutputFormat::Json),
+        "GRAPHVIZ" => Err(to_user_error(
+            "0A000",
+            "EXPLAIN FORMAT GRAPHVIZ is not supported",
+        )),
+        other => Err(to_user_error(
+            "42601",
+            format!("unsupported EXPLAIN FORMAT '{}'", other),
+        )),
+    }
+}
+
+/// Parses one SQL expression into a boolean value when possible.
+fn parse_sql_bool_expr(expr: &SqlExpr) -> Option<bool> {
+    match expr {
+        SqlExpr::Value(value) => match &value.value {
+            Value::Boolean(v) => Some(*v),
+            Value::SingleQuotedString(raw)
+            | Value::DoubleQuotedString(raw)
+            | Value::EscapedStringLiteral(raw)
+            | Value::NationalStringLiteral(raw) => parse_sql_bool_word(raw),
+            _ => None,
+        },
+        SqlExpr::Identifier(ident) => parse_sql_bool_word(normalize_ident(ident).as_str()),
+        SqlExpr::CompoundIdentifier(idents) => idents
+            .last()
+            .and_then(|ident| parse_sql_bool_word(normalize_ident(ident).as_str())),
+        _ => None,
+    }
+}
+
+/// Parses one SQL token-like value into TEXT/JSON keyword text.
+fn parse_sql_identifierish(expr: &SqlExpr) -> Option<String> {
+    match expr {
+        SqlExpr::Identifier(ident) => Some(normalize_ident(ident)),
+        SqlExpr::CompoundIdentifier(idents) => idents.last().map(normalize_ident),
+        SqlExpr::Value(value) => match &value.value {
+            Value::SingleQuotedString(raw)
+            | Value::DoubleQuotedString(raw)
+            | Value::EscapedStringLiteral(raw)
+            | Value::NationalStringLiteral(raw) => Some(raw.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Parses one SQL boolean word.
+fn parse_sql_bool_word(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "on" | "yes" | "1" => Some(true),
+        "false" | "off" | "no" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// Builds one plain-text PostgreSQL-style explain batch (`QUERY PLAN` column).
+fn explain_text_lines_to_batch(plan_lines: &[String]) -> PgWireResult<RecordBatch> {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "QUERY PLAN",
+        ArrowDataType::Utf8,
+        false,
+    )]));
+    let mut lines = StringBuilder::new();
+    for line in plan_lines {
+        lines.append_value(line.as_str());
+    }
+    RecordBatch::try_new(schema, vec![Arc::new(lines.finish()) as ArrayRef])
+        .map_err(|err| api_error(err.to_string()))
+}
+
+/// Builds one JSON explain response batch (`QUERY PLAN` column).
+fn explain_json_to_batch(json_payload: &str) -> PgWireResult<RecordBatch> {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "QUERY PLAN",
+        ArrowDataType::Utf8,
+        false,
+    )]));
+    let mut values = StringBuilder::new();
+    values.append_value(json_payload);
+    RecordBatch::try_new(schema, vec![Arc::new(values.finish()) as ArrayRef])
+        .map_err(|err| api_error(err.to_string()))
+}
+
+/// Encodes one record batch into a query response.
+async fn encode_record_batch_query_response(
+    batch: RecordBatch,
+    table_name: &str,
+    client: &(dyn ClientInfo + Send + Sync),
+    protocol: QueryProtocol,
+) -> PgWireResult<Response> {
     let schema = batch.schema();
     let mem =
         MemTable::try_new(schema, vec![vec![batch]]).map_err(|err| api_error(err.to_string()))?;
-
     let query_ctx = SessionContext::new();
     query_ctx
-        .register_table("holo_explain_dist", Arc::new(mem))
+        .register_table(table_name, Arc::new(mem))
         .map_err(|err| api_error(err.to_string()))?;
     let dataframe = query_ctx
-        .sql("SELECT stage, placement, detail FROM holo_explain_dist")
+        .sql(format!("SELECT * FROM {}", quote_sql_ident(table_name)).as_str())
         .await
         .map_err(|err| api_error(err.to_string()))?;
-
     let format_options = Arc::new(FormatOptions::from_client_metadata(client.metadata()));
-    let wire_format = match protocol {
-        QueryProtocol::Simple => Format::UnifiedText,
-        QueryProtocol::Extended => Format::UnifiedBinary,
-    };
+    let wire_format = hook_query_wire_format(protocol);
     let query = df::encode_dataframe(dataframe, &wire_format, Some(format_options))
         .await
         .map_err(|err| api_error(err.to_string()))?;
     Ok(Response::Query(query))
 }
 
+/// Builds one quoted SQL identifier.
+fn quote_sql_ident(ident: &str) -> String {
+    format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
 /// Converts explain placement rows into a record batch.
-fn explain_dist_rows_to_batch(rows: &[(String, String, String)]) -> PgWireResult<RecordBatch> {
+fn explain_dist_rows_to_batch(rows: &[ExplainDistOutputRow]) -> PgWireResult<RecordBatch> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("stage", ArrowDataType::Utf8, false),
         Field::new("placement", ArrowDataType::Utf8, false),
         Field::new("detail", ArrowDataType::Utf8, false),
+        Field::new("query_execution_id", ArrowDataType::Utf8, false),
+        Field::new("stage_id", ArrowDataType::UInt64, false),
     ]));
 
     let mut stage_builder = StringBuilder::new();
     let mut placement_builder = StringBuilder::new();
     let mut detail_builder = StringBuilder::new();
+    let mut query_builder = StringBuilder::new();
+    let mut stage_id_builder = datafusion::arrow::array::UInt64Builder::new();
     for row in rows {
-        stage_builder.append_value(row.0.as_str());
-        placement_builder.append_value(row.1.as_str());
-        detail_builder.append_value(row.2.as_str());
+        stage_builder.append_value(row.stage.as_str());
+        placement_builder.append_value(row.placement.as_str());
+        detail_builder.append_value(row.detail.as_str());
+        query_builder.append_value(row.query_execution_id.as_str());
+        stage_id_builder.append_value(row.stage_id);
     }
 
     RecordBatch::try_new(
@@ -4117,95 +5513,761 @@ fn explain_dist_rows_to_batch(rows: &[(String, String, String)]) -> PgWireResult
             Arc::new(stage_builder.finish()) as ArrayRef,
             Arc::new(placement_builder.finish()) as ArrayRef,
             Arc::new(detail_builder.finish()) as ArrayRef,
+            Arc::new(query_builder.finish()) as ArrayRef,
+            Arc::new(stage_id_builder.finish()) as ArrayRef,
         ],
     )
     .map_err(|err| api_error(err.to_string()))
+}
+
+/// Builds one PostgreSQL-style JSON explain payload for non-distributed mode.
+fn build_explain_json_document(
+    query_execution_id: &str,
+    explain: &ExplainRequest,
+    plan_lines: &[String],
+    timeline: &[crate::metrics::QueryStageEvent],
+) -> String {
+    let timeline_json = build_explain_timeline_json(timeline);
+    let mut plan_json = serde_json::Map::new();
+    plan_json.insert(
+        "query_execution_id".to_string(),
+        serde_json::Value::String(query_execution_id.to_string()),
+    );
+    plan_json.insert(
+        "analyze".to_string(),
+        serde_json::Value::Bool(explain.analyze),
+    );
+    plan_json.insert(
+        "verbose".to_string(),
+        serde_json::Value::Bool(explain.verbose),
+    );
+    plan_json.insert(
+        "plan_lines".to_string(),
+        serde_json::Value::Array(
+            plan_lines
+                .iter()
+                .map(|line| serde_json::Value::String(line.clone()))
+                .collect::<Vec<_>>(),
+        ),
+    );
+    plan_json.insert(
+        "timeline".to_string(),
+        serde_json::Value::Array(timeline_json),
+    );
+
+    if explain.verbose {
+        let optimizer_trace = build_explain_optimizer_trace_json(timeline);
+        if !optimizer_trace.is_empty() {
+            plan_json.insert(
+                "optimizer_trace".to_string(),
+                serde_json::Value::Array(optimizer_trace),
+            );
+        }
+    }
+
+    serde_json::json!([
+        {
+            "Plan": serde_json::Value::Object(plan_json)
+        }
+    ])
+    .to_string()
+}
+
+/// Builds one PostgreSQL-style JSON explain payload for distributed mode.
+fn build_explain_dist_json_document(
+    query_execution_id: &str,
+    explain: &ExplainRequest,
+    plan_lines: &[String],
+    dist_rows: &[ExplainDistOutputRow],
+    timeline: &[crate::metrics::QueryStageEvent],
+    topology: Option<&ClusterTopology>,
+    runtime: &ExplainDistRuntimeSummary,
+) -> String {
+    let topology_json = topology.map(|topology| {
+        let nodes = topology
+            .members
+            .values()
+            .map(|member| {
+                serde_json::json!({
+                    "node_id": member.node_id,
+                    "grpc_addr": member.grpc_addr.to_string(),
+                    "state": member.state,
+                })
+            })
+            .collect::<Vec<_>>();
+        let shards = topology
+            .shards
+            .iter()
+            .map(|shard| {
+                serde_json::json!({
+                    "shard_id": shard.shard_id,
+                    "shard_index": shard.shard_index,
+                    "leaseholder": shard.leaseholder,
+                    "start_key_hex": hex::encode(&shard.start_key),
+                    "end_key_hex": hex::encode(&shard.end_key),
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "sql_nodes": nodes,
+            "kv_nodes": nodes,
+            "shards": shards,
+        })
+    });
+    let timeline_json = build_explain_timeline_json(timeline);
+    let dist_rows_json = dist_rows
+        .iter()
+        .map(|row| {
+            serde_json::json!({
+                "stage": row.stage,
+                "placement": row.placement,
+                "detail": row.detail,
+                "query_execution_id": row.query_execution_id,
+                "stage_id": row.stage_id,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut plan_json = serde_json::Map::new();
+    plan_json.insert(
+        "query_execution_id".to_string(),
+        serde_json::Value::String(query_execution_id.to_string()),
+    );
+    plan_json.insert(
+        "analyze".to_string(),
+        serde_json::Value::Bool(explain.analyze),
+    );
+    plan_json.insert(
+        "verbose".to_string(),
+        serde_json::Value::Bool(explain.verbose),
+    );
+    plan_json.insert("distributed".to_string(), serde_json::Value::Bool(true));
+    plan_json.insert(
+        "plan_lines".to_string(),
+        serde_json::Value::Array(
+            plan_lines
+                .iter()
+                .map(|line| serde_json::Value::String(line.clone()))
+                .collect::<Vec<_>>(),
+        ),
+    );
+    plan_json.insert(
+        "distribution".to_string(),
+        serde_json::json!({
+            "grpc_calls": runtime.grpc_calls,
+            "network_bytes": runtime.network_bytes,
+            "retries": runtime.retries,
+            "reroutes": runtime.reroutes,
+            "involved_shards": runtime.involved_shards.iter().copied().collect::<Vec<_>>(),
+            "involved_targets": runtime.involved_targets.iter().cloned().collect::<Vec<_>>(),
+        }),
+    );
+    plan_json.insert(
+        "topology".to_string(),
+        topology_json.unwrap_or(serde_json::Value::Null),
+    );
+    plan_json.insert(
+        "stages".to_string(),
+        serde_json::Value::Array(dist_rows_json),
+    );
+    plan_json.insert(
+        "timeline".to_string(),
+        serde_json::Value::Array(timeline_json),
+    );
+
+    if explain.verbose {
+        let optimizer_trace = build_explain_optimizer_trace_json(timeline);
+        if !optimizer_trace.is_empty() {
+            plan_json.insert(
+                "optimizer_trace".to_string(),
+                serde_json::Value::Array(optimizer_trace),
+            );
+        }
+    }
+
+    serde_json::json!([
+        {
+            "Plan": serde_json::Value::Object(plan_json)
+        }
+    ])
+    .to_string()
+}
+
+/// Converts timeline events to JSON entries for EXPLAIN output.
+fn build_explain_timeline_json(
+    timeline: &[crate::metrics::QueryStageEvent],
+) -> Vec<serde_json::Value> {
+    timeline
+        .iter()
+        .map(|event| {
+            serde_json::json!({
+                "query_execution_id": event.query_execution_id,
+                "stage_id": event.stage_id,
+                "kind": event.kind,
+                "detail": event.detail,
+                "at_unix_ns": event.at_unix_ns,
+            })
+        })
+        .collect::<Vec<_>>()
+}
+
+/// Builds a compact, typed optimizer trace from timeline events.
+///
+/// This is only emitted in EXPLAIN JSON when verbose mode is enabled.
+fn build_explain_optimizer_trace_json(
+    timeline: &[crate::metrics::QueryStageEvent],
+) -> Vec<serde_json::Value> {
+    timeline
+        .iter()
+        .filter(|event| is_optimizer_trace_event_kind(event.kind.as_str()))
+        .map(|event| {
+            let mut entry = serde_json::Map::new();
+            entry.insert(
+                "kind".to_string(),
+                serde_json::Value::String(event.kind.clone()),
+            );
+            entry.insert(
+                "stage_id".to_string(),
+                serde_json::Value::Number(event.stage_id.into()),
+            );
+            entry.insert(
+                "at_unix_ns".to_string(),
+                serde_json::Value::Number(event.at_unix_ns.into()),
+            );
+            entry.insert(
+                "detail".to_string(),
+                serde_json::Value::String(event.detail.clone()),
+            );
+            let fields = parse_explain_kv_detail_typed(event.detail.as_str());
+            if !fields.is_empty() {
+                entry.insert("fields".to_string(), serde_json::Value::Object(fields));
+            }
+            serde_json::Value::Object(entry)
+        })
+        .collect::<Vec<_>>()
+}
+
+/// Returns true when one timeline event should appear in optimizer traces.
+fn is_optimizer_trace_event_kind(kind: &str) -> bool {
+    kind.starts_with("optimizer_")
+        || kind.contains("_optimizer_")
+        || kind == "aggregate_pushdown_plan_choice"
+}
+
+/// Parses explain event details into typed JSON key/value fields.
+fn parse_explain_kv_detail_typed(detail: &str) -> serde_json::Map<String, serde_json::Value> {
+    let mut fields = serde_json::Map::new();
+    let mut raw_fields = parse_explain_kv_detail(detail)
+        .into_iter()
+        .collect::<Vec<_>>();
+    raw_fields.sort_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+    for (key, value) in raw_fields {
+        fields.insert(key, parse_explain_kv_value(value.as_str()));
+    }
+
+    // Preserve full access-path strings even when they contain spaces.
+    if let Some(path) = extract_optimizer_path_token(detail) {
+        fields.insert("path".to_string(), serde_json::Value::String(path));
+    }
+    fields
+}
+
+/// Converts one key/value token into a typed JSON scalar.
+fn parse_explain_kv_value(raw: &str) -> serde_json::Value {
+    let value = raw.trim().trim_matches(|ch| ch == '"' || ch == '\'');
+    match value.to_ascii_lowercase().as_str() {
+        "true" => return serde_json::Value::Bool(true),
+        "false" => return serde_json::Value::Bool(false),
+        _ => {}
+    }
+
+    if let Ok(parsed) = value.parse::<i64>() {
+        return serde_json::Value::Number(parsed.into());
+    }
+    if let Ok(parsed) = value.parse::<u64>() {
+        return serde_json::Value::Number(parsed.into());
+    }
+    if let Ok(parsed) = value.parse::<f64>() {
+        if let Some(number) = serde_json::Number::from_f64(parsed) {
+            return serde_json::Value::Number(number);
+        }
+    }
+    serde_json::Value::String(value.to_string())
+}
+
+/// Collects timeline events associated with one explain request.
+fn collect_explain_timeline_events(
+    pushdown_metrics: &PushdownMetrics,
+    query_execution_id: &str,
+    started_at_unix_ns: u64,
+    finished_at_unix_ns: u64,
+) -> Vec<crate::metrics::QueryStageEvent> {
+    let mut direct = pushdown_metrics
+        .recent_stage_events(4096)
+        .into_iter()
+        .filter(|event| event.query_execution_id == query_execution_id)
+        .collect::<Vec<_>>();
+    direct.sort_by_key(|event| (event.at_unix_ns, event.stage_id));
+    if direct
+        .iter()
+        .any(|event| event.kind.starts_with("scan_") || event.kind.starts_with("optimizer_"))
+    {
+        return direct;
+    }
+
+    let slack = 5_000_000u64;
+    let window_start = started_at_unix_ns.saturating_sub(slack);
+    let window_end = finished_at_unix_ns.saturating_add(slack);
+    let mut fallback = pushdown_metrics
+        .recent_stage_events(4096)
+        .into_iter()
+        .filter(|event| {
+            event.at_unix_ns >= window_start
+                && event.at_unix_ns <= window_end
+                && (event.kind.starts_with("scan_") || event.kind.starts_with("optimizer_"))
+        })
+        .collect::<Vec<_>>();
+    fallback.sort_by_key(|event| (event.at_unix_ns, event.stage_id));
+    fallback
+}
+
+/// Derives one human-readable access-path line from optimizer timeline events.
+fn derive_explain_access_path_annotation(
+    timeline: &[crate::metrics::QueryStageEvent],
+) -> Option<String> {
+    let path = timeline.iter().rev().find_map(|event| {
+        if !event.kind.ends_with("plan_choice") {
+            return None;
+        }
+        extract_optimizer_path_token(event.detail.as_str())
+    })?;
+    Some(format!(
+        "AccessPath: {}",
+        render_access_path_summary(path.as_str())
+    ))
+}
+
+/// Extracts the `path=...` token from one optimizer-plan detail string.
+fn extract_optimizer_path_token(detail: &str) -> Option<String> {
+    let marker = "path=";
+    let start = detail.find(marker)? + marker.len();
+    let tail = &detail[start..];
+    if tail.starts_with("index_scan[") {
+        let end = tail.find(']')?;
+        return Some(tail[..=end].to_string());
+    }
+    let end = tail.find(char::is_whitespace).unwrap_or(tail.len());
+    Some(tail[..end].to_string())
+}
+
+/// Renders one compact access-path summary for explain text.
+fn render_access_path_summary(path: &str) -> String {
+    if path == "table_scan" {
+        return "table_scan".to_string();
+    }
+    if let Some(inner) = path
+        .strip_prefix("index_scan[")
+        .and_then(|token| token.strip_suffix(']'))
+    {
+        let mut index_name = None::<&str>;
+        let mut covering = false;
+        for token in inner.split_whitespace() {
+            if let Some(value) = token.strip_prefix("index=") {
+                index_name = Some(value);
+            } else if let Some(value) = token.strip_prefix("covering=") {
+                covering = value.eq_ignore_ascii_case("true");
+            }
+        }
+        let kind = if covering { "index_only" } else { "index_scan" };
+        if let Some(name) = index_name {
+            return format!("{kind} index={name}");
+        }
+        return kind.to_string();
+    }
+    path.to_string()
+}
+
+/// Summarizes distributed explain runtime counters from timeline and metric deltas.
+fn summarize_explain_dist_runtime(
+    timeline: &[crate::metrics::QueryStageEvent],
+    before: &crate::metrics::PushdownMetricsSnapshot,
+    after: &crate::metrics::PushdownMetricsSnapshot,
+) -> ExplainDistRuntimeSummary {
+    let mut runtime = ExplainDistRuntimeSummary {
+        grpc_calls: after.scan_rpc_pages.saturating_sub(before.scan_rpc_pages),
+        network_bytes: after
+            .scan_bytes_scanned
+            .saturating_sub(before.scan_bytes_scanned),
+        retries: after
+            .scan_retry_count
+            .saturating_sub(before.scan_retry_count),
+        reroutes: after
+            .scan_reroute_count
+            .saturating_sub(before.scan_reroute_count),
+        ..ExplainDistRuntimeSummary::default()
+    };
+
+    let mut grpc_calls_from_timeline = 0u64;
+    let mut network_bytes_from_timeline = 0u64;
+    let mut retries_from_timeline = 0u64;
+    let mut reroutes_from_timeline = 0u64;
+    for event in timeline {
+        if event.kind == "scan_chunk" {
+            grpc_calls_from_timeline = grpc_calls_from_timeline.saturating_add(1);
+        } else if event.kind == "scan_retry" {
+            retries_from_timeline = retries_from_timeline.saturating_add(1);
+        } else if event.kind == "scan_reroute" {
+            reroutes_from_timeline = reroutes_from_timeline.saturating_add(1);
+        }
+
+        let kv = parse_explain_kv_detail(event.detail.as_str());
+        if let Some(bytes) = kv
+            .get("bytes_scanned")
+            .and_then(|raw| raw.parse::<u64>().ok())
+        {
+            network_bytes_from_timeline = network_bytes_from_timeline.saturating_add(bytes);
+        }
+        if let Some(shard) = kv.get("shard").and_then(|raw| raw.parse::<usize>().ok()) {
+            runtime.involved_shards.insert(shard);
+        }
+        if let Some(shard) = kv
+            .get("from_shard")
+            .and_then(|raw| raw.parse::<usize>().ok())
+        {
+            runtime.involved_shards.insert(shard);
+        }
+        if let Some(shard) = kv.get("to_shard").and_then(|raw| raw.parse::<usize>().ok()) {
+            runtime.involved_shards.insert(shard);
+        }
+        if let Some(target) = kv.get("target") {
+            runtime.involved_targets.insert(target.to_string());
+        }
+        if let Some(target) = kv.get("from_target") {
+            runtime.involved_targets.insert(target.to_string());
+        }
+        if let Some(target) = kv.get("to_target") {
+            runtime.involved_targets.insert(target.to_string());
+        }
+    }
+
+    runtime.grpc_calls = runtime.grpc_calls.max(grpc_calls_from_timeline);
+    runtime.network_bytes = runtime.network_bytes.max(network_bytes_from_timeline);
+    runtime.retries = runtime.retries.max(retries_from_timeline);
+    runtime.reroutes = runtime.reroutes.max(reroutes_from_timeline);
+    runtime
+}
+
+/// Extracts key-value tokens from one stage-event detail string.
+fn parse_explain_kv_detail(detail: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for token in detail.split_whitespace() {
+        let token = token.trim_matches(|ch: char| ch == ',' || ch == ';');
+        let Some((key, value)) = token.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim().trim_matches(',').to_string();
+        if key.is_empty() || value.is_empty() {
+            continue;
+        }
+        out.insert(key, value);
+    }
+    out
+}
+
+/// Builds distributed explain output rows including Cockroach-style sections.
+fn build_explain_dist_output_rows(
+    placement_rows: &[ExplainDistPlacementRow],
+    query_execution_id: &str,
+    gateway: &str,
+    topology: Option<&ClusterTopology>,
+    runtime: &ExplainDistRuntimeSummary,
+    timeline: &[crate::metrics::QueryStageEvent],
+) -> Vec<ExplainDistOutputRow> {
+    let mut rows = Vec::new();
+    let sql_node_count = topology.map(|topology| topology.members.len()).unwrap_or(1);
+    let kv_node_count = sql_node_count;
+    rows.push(ExplainDistOutputRow {
+        stage: "distribution".to_string(),
+        placement: "gateway".to_string(),
+        detail: "mode=distributed".to_string(),
+        query_execution_id: query_execution_id.to_string(),
+        stage_id: 0,
+    });
+    rows.push(ExplainDistOutputRow {
+        stage: "gateway".to_string(),
+        placement: "gateway".to_string(),
+        detail: format!("target={gateway}"),
+        query_execution_id: query_execution_id.to_string(),
+        stage_id: 0,
+    });
+    rows.push(ExplainDistOutputRow {
+        stage: "sql_nodes".to_string(),
+        placement: "control-plane".to_string(),
+        detail: format!("count={sql_node_count}"),
+        query_execution_id: query_execution_id.to_string(),
+        stage_id: 0,
+    });
+    rows.push(ExplainDistOutputRow {
+        stage: "kv_nodes".to_string(),
+        placement: "control-plane".to_string(),
+        detail: format!("count={kv_node_count}"),
+        query_execution_id: query_execution_id.to_string(),
+        stage_id: 0,
+    });
+    rows.push(ExplainDistOutputRow {
+        stage: "regions".to_string(),
+        placement: "control-plane".to_string(),
+        detail: "regions=unknown".to_string(),
+        query_execution_id: query_execution_id.to_string(),
+        stage_id: 0,
+    });
+    rows.push(ExplainDistOutputRow {
+        stage: "runtime_network".to_string(),
+        placement: "rpc".to_string(),
+        detail: format!(
+            "grpc_calls={} network_bytes={}",
+            runtime.grpc_calls, runtime.network_bytes
+        ),
+        query_execution_id: query_execution_id.to_string(),
+        stage_id: 0,
+    });
+    rows.push(ExplainDistOutputRow {
+        stage: "runtime_retries".to_string(),
+        placement: "rpc".to_string(),
+        detail: format!("retries={} reroutes={}", runtime.retries, runtime.reroutes),
+        query_execution_id: query_execution_id.to_string(),
+        stage_id: 0,
+    });
+
+    if let Some(topology) = topology {
+        let involved = if runtime.involved_shards.is_empty() {
+            topology
+                .shards
+                .iter()
+                .map(|shard| shard.shard_index)
+                .collect::<BTreeSet<_>>()
+        } else {
+            runtime.involved_shards.clone()
+        };
+        rows.push(ExplainDistOutputRow {
+            stage: "range_spans".to_string(),
+            placement: "kv".to_string(),
+            detail: format!("count={}", involved.len()),
+            query_execution_id: query_execution_id.to_string(),
+            stage_id: 0,
+        });
+        for shard_index in involved {
+            if let Some(shard) = topology
+                .shards
+                .iter()
+                .find(|shard| shard.shard_index == shard_index)
+            {
+                rows.push(ExplainDistOutputRow {
+                    stage: "range_span".to_string(),
+                    placement: "kv".to_string(),
+                    detail: format!(
+                        "shard={} shard_id={} start={} end={}",
+                        shard.shard_index,
+                        shard.shard_id,
+                        hex::encode(&shard.start_key),
+                        hex::encode(&shard.end_key)
+                    ),
+                    query_execution_id: query_execution_id.to_string(),
+                    stage_id: 0,
+                });
+            }
+        }
+    } else {
+        rows.push(ExplainDistOutputRow {
+            stage: "range_spans".to_string(),
+            placement: "kv".to_string(),
+            detail: "count=unknown topology=unavailable".to_string(),
+            query_execution_id: query_execution_id.to_string(),
+            stage_id: 0,
+        });
+    }
+
+    for row in placement_rows {
+        rows.push(ExplainDistOutputRow {
+            stage: row.stage.clone(),
+            placement: row.placement.clone(),
+            detail: row.detail.clone(),
+            query_execution_id: query_execution_id.to_string(),
+            stage_id: row.stage_id,
+        });
+    }
+
+    for event in timeline.iter().take(128) {
+        rows.push(ExplainDistOutputRow {
+            stage: "timeline".to_string(),
+            placement: "runtime".to_string(),
+            detail: format!(
+                "kind={} at_unix_ns={} detail={}",
+                event.kind, event.at_unix_ns, event.detail
+            ),
+            query_execution_id: query_execution_id.to_string(),
+            stage_id: event.stage_id,
+        });
+    }
+    rows
+}
+
+/// Inserts one placement row with de-duplication and stage-id assignment.
+fn push_explain_placement_row(
+    rows: &mut Vec<ExplainDistPlacementRow>,
+    seen: &mut BTreeSet<(String, String, String)>,
+    next_stage_id: &mut u64,
+    stage: &str,
+    placement: &str,
+    detail: String,
+) {
+    let key = (stage.to_string(), placement.to_string(), detail.clone());
+    if !seen.insert(key) {
+        return;
+    }
+    rows.push(ExplainDistPlacementRow {
+        stage: stage.to_string(),
+        placement: placement.to_string(),
+        detail,
+        stage_id: *next_stage_id,
+    });
+    *next_stage_id = next_stage_id.saturating_add(1);
 }
 
 /// Classifies physical plan lines into placement-oriented stage rows.
 fn classify_explain_placement(
     plan_lines: &[String],
     query_execution_id: &str,
-) -> Vec<(String, String, String)> {
-    let mut rows = vec![(
-        "query".to_string(),
-        "gateway".to_string(),
+) -> Vec<ExplainDistPlacementRow> {
+    let mut seen = BTreeSet::<(String, String, String)>::new();
+    let mut rows = Vec::<ExplainDistPlacementRow>::new();
+    let mut next_stage_id = 1u64;
+
+    push_explain_placement_row(
+        &mut rows,
+        &mut seen,
+        &mut next_stage_id,
+        "query",
+        "gateway",
         format!("query_execution_id={query_execution_id}"),
-    )];
+    );
 
     for line in plan_lines {
         let lower = line.to_ascii_lowercase();
         if lower.contains("holostoretableprovider") || lower.contains("tablescan") {
-            rows.push((
-                "scan".to_string(),
-                "executor+leaseholder".to_string(),
+            push_explain_placement_row(
+                &mut rows,
+                &mut seen,
+                &mut next_stage_id,
+                "scan",
+                "executor+leaseholder",
                 line.clone(),
-            ));
+            );
+            continue;
+        }
+        if lower.contains("index") && lower.contains("scan") {
+            push_explain_placement_row(
+                &mut rows,
+                &mut seen,
+                &mut next_stage_id,
+                "index_scan",
+                "executor+leaseholder",
+                line.clone(),
+            );
             continue;
         }
         if lower.contains("filterexec") || lower.contains("projectionexec") {
-            rows.push((
-                "filter_projection".to_string(),
-                "executor-local".to_string(),
+            push_explain_placement_row(
+                &mut rows,
+                &mut seen,
+                &mut next_stage_id,
+                "filter_projection",
+                "executor-local",
                 line.clone(),
-            ));
+            );
             continue;
         }
         if lower.contains("aggregateexec") && lower.contains("mode=partial") {
-            rows.push((
-                "aggregate_partial".to_string(),
-                "executor-local".to_string(),
+            push_explain_placement_row(
+                &mut rows,
+                &mut seen,
+                &mut next_stage_id,
+                "aggregate_partial",
+                "executor-local",
                 line.clone(),
-            ));
+            );
             continue;
         }
         if lower.contains("aggregateexec") && lower.contains("mode=final") {
-            rows.push((
-                "aggregate_final".to_string(),
-                "merge/gateway".to_string(),
+            push_explain_placement_row(
+                &mut rows,
+                &mut seen,
+                &mut next_stage_id,
+                "aggregate_final",
+                "merge/gateway",
                 line.clone(),
-            ));
+            );
             continue;
         }
         if (lower.contains("sortexec") && lower.contains("fetch="))
             || lower.contains("sortpreservingmergeexec")
         {
-            rows.push((
-                "topk".to_string(),
-                "executor+merge".to_string(),
+            push_explain_placement_row(
+                &mut rows,
+                &mut seen,
+                &mut next_stage_id,
+                "topk",
+                "executor+merge",
                 line.clone(),
-            ));
+            );
             continue;
         }
         if lower.contains("hashjoinexec") || lower.contains("sortmergejoinexec") {
-            rows.push((
-                "join".to_string(),
-                "distributed-executor".to_string(),
+            push_explain_placement_row(
+                &mut rows,
+                &mut seen,
+                &mut next_stage_id,
+                "join",
+                "distributed-executor",
                 line.clone(),
-            ));
+            );
             continue;
         }
         if lower.contains("repartitionexec")
             || lower.contains("coalescepartitionsexec")
             || lower.contains("coalescebatchesexec")
         {
-            rows.push((
-                "exchange".to_string(),
-                "networked-executor".to_string(),
+            push_explain_placement_row(
+                &mut rows,
+                &mut seen,
+                &mut next_stage_id,
+                "exchange",
+                "networked-executor",
                 line.clone(),
-            ));
+            );
         }
     }
 
-    rows.dedup();
-    if rows.len() == 1 {
-        rows.push((
-            "plan".to_string(),
-            "gateway".to_string(),
+    if next_stage_id == 2 {
+        push_explain_placement_row(
+            &mut rows,
+            &mut seen,
+            &mut next_stage_id,
+            "plan",
+            "gateway",
             "no distributed physical operators detected".to_string(),
-        ));
+        );
     }
     rows
+}
+
+/// Returns current unix timestamp in nanoseconds.
+fn now_unix_nanos() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_nanos().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
 }
 
 /// Executes `with active txn mut` for this component.
@@ -4366,20 +6428,11 @@ fn dml_placeholder_plan(statement: &Statement) -> PgWireResult<LogicalPlan> {
     let inferred_types = infer_placeholder_types(statement);
     // Decision: evaluate `placeholders.is_empty()` to choose the correct SQL/storage control path.
     if placeholders.is_empty() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
+        return placeholder_plan_for_schema(Arc::new(Schema::new(vec![Field::new(
             "__dml_placeholder__",
             ArrowDataType::Null,
             true,
-        )]));
-        let df_schema = schema
-            .to_dfschema()
-            .map_err(|err| api_error(err.to_string()))?;
-        return Ok(LogicalPlan::EmptyRelation(
-            datafusion::logical_expr::EmptyRelation {
-                produce_one_row: false,
-                schema: Arc::new(df_schema),
-            },
-        ));
+        )])));
     }
 
     let exprs = placeholders
@@ -4392,6 +6445,31 @@ fn dml_placeholder_plan(statement: &Statement) -> PgWireResult<LogicalPlan> {
     LogicalPlanBuilder::values(vec![exprs])
         .and_then(|builder| builder.build())
         .map_err(|err| api_error(err.to_string()))
+}
+
+fn placeholder_plan_for_schema(schema: Arc<Schema>) -> PgWireResult<LogicalPlan> {
+    let df_schema = schema
+        .to_dfschema()
+        .map_err(|err| api_error(err.to_string()))?;
+    Ok(LogicalPlan::EmptyRelation(
+        datafusion::logical_expr::EmptyRelation {
+            produce_one_row: false,
+            schema: Arc::new(df_schema),
+        },
+    ))
+}
+
+fn fast_primary_key_aggregate_output_name(spec: &FastPrimaryKeyAggregateSpec) -> String {
+    spec.output_alias.clone().unwrap_or_else(|| {
+        if spec.coalesce_fallback.is_some() {
+            "coalesce".to_string()
+        } else {
+            match spec.extreme {
+                PrimaryKeyExtreme::Min => "min".to_string(),
+                PrimaryKeyExtreme::Max => "max".to_string(),
+            }
+        }
+    })
 }
 
 /// Executes `extract placeholder ids` for this component.
@@ -5764,12 +7842,238 @@ mod tests {
         ];
 
         let rows = classify_explain_placement(lines.as_slice(), "q0000000000000001");
-        assert!(rows.iter().any(|row| row.0 == "query"));
-        assert!(rows.iter().any(|row| row.0 == "scan"));
-        assert!(rows.iter().any(|row| row.0 == "aggregate_partial"));
-        assert!(rows.iter().any(|row| row.0 == "aggregate_final"));
-        assert!(rows.iter().any(|row| row.0 == "join"));
-        assert!(rows.iter().any(|row| row.0 == "exchange"));
-        assert!(rows.iter().any(|row| row.0 == "topk"));
+        assert!(rows.iter().any(|row| row.stage == "query"));
+        assert!(rows.iter().any(|row| row.stage == "scan"));
+        assert!(rows.iter().any(|row| row.stage == "aggregate_partial"));
+        assert!(rows.iter().any(|row| row.stage == "aggregate_final"));
+        assert!(rows.iter().any(|row| row.stage == "join"));
+        assert!(rows.iter().any(|row| row.stage == "exchange"));
+        assert!(rows.iter().any(|row| row.stage == "topk"));
+        assert!(
+            rows.iter().all(|row| row.stage_id > 0),
+            "expected all placement rows to include stage ids"
+        );
+    }
+
+    #[test]
+    fn parse_explain_request_supports_dist_and_format_json_options() {
+        let dialect = PostgreSqlDialect {};
+        let mut statements =
+            Parser::parse_sql(&dialect, "EXPLAIN (ANALYZE, DIST, FORMAT JSON) SELECT 1;")
+                .expect("parse explain statement");
+        assert_eq!(statements.len(), 1);
+        let statement = statements.remove(0);
+        let explain = parse_explain_request(&statement).expect("parse request");
+        assert!(explain.analyze);
+        assert!(explain.dist);
+        assert_eq!(explain.format, ExplainOutputFormat::Json);
+    }
+
+    #[test]
+    fn parse_explain_request_defaults_to_standard_text_mode() {
+        let dialect = PostgreSqlDialect {};
+        let mut statements =
+            Parser::parse_sql(&dialect, "EXPLAIN SELECT 1;").expect("parse explain statement");
+        assert_eq!(statements.len(), 1);
+        let statement = statements.remove(0);
+        let explain = parse_explain_request(&statement).expect("parse request");
+        assert!(!explain.analyze);
+        assert!(!explain.dist);
+        assert_eq!(explain.format, ExplainOutputFormat::Text);
+    }
+
+    #[test]
+    fn build_explain_json_document_omits_optimizer_trace_when_not_verbose() {
+        let explain = ExplainRequest {
+            analyze: true,
+            verbose: false,
+            dist: false,
+            format: ExplainOutputFormat::Json,
+            explained_sql: "SELECT 1".to_string(),
+        };
+        let timeline = vec![crate::metrics::QueryStageEvent {
+            query_execution_id: "q1".to_string(),
+            stage_id: 42,
+            kind: "optimizer_plan_decision".to_string(),
+            detail:
+                "reason=lowest_total_cost winner=table_scan winner_cost=4272.866 candidate_count=2"
+                    .to_string(),
+            at_unix_ns: 100,
+        }];
+        let payload = build_explain_json_document(
+            "q1",
+            &explain,
+            &["Plan with Metrics".to_string()],
+            timeline.as_slice(),
+        );
+        let value: serde_json::Value = serde_json::from_str(payload.as_str()).expect("json value");
+        let plan = value
+            .as_array()
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("Plan"))
+            .expect("plan object");
+        assert!(
+            plan.get("optimizer_trace").is_none(),
+            "non-verbose explain output should not include optimizer_trace"
+        );
+    }
+
+    #[test]
+    fn build_explain_json_document_includes_optimizer_trace_when_verbose() {
+        let explain = ExplainRequest {
+            analyze: true,
+            verbose: true,
+            dist: false,
+            format: ExplainOutputFormat::Json,
+            explained_sql: "SELECT 1".to_string(),
+        };
+        let timeline = vec![
+            crate::metrics::QueryStageEvent {
+                query_execution_id: "q1".to_string(),
+                stage_id: 42,
+                kind: "optimizer_plan_decision".to_string(),
+                detail: "reason=lowest_total_cost winner=table_scan winner_cost=4272.866 runner_up=index_only:idx_sales_status_day_merchant_cover runner_up_cost=44107.980 cost_delta=39835.114 cost_ratio=10.322 candidate_count=2".to_string(),
+                at_unix_ns: 100,
+            },
+            crate::metrics::QueryStageEvent {
+                query_execution_id: "q1".to_string(),
+                stage_id: 42,
+                kind: "optimizer_candidate_eval".to_string(),
+                detail: "rank=1 name=table_scan total_cost=4272.866 estimated_output_rows=2459.00 estimated_scan_rows=4096.00 uncertainty=0.024 feedback_multiplier=1.000".to_string(),
+                at_unix_ns: 101,
+            },
+        ];
+        let payload = build_explain_json_document(
+            "q1",
+            &explain,
+            &["Plan with Metrics".to_string()],
+            timeline.as_slice(),
+        );
+        let value: serde_json::Value = serde_json::from_str(payload.as_str()).expect("json value");
+        let plan = value
+            .as_array()
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("Plan"))
+            .expect("plan object");
+        let trace = plan
+            .get("optimizer_trace")
+            .and_then(|node| node.as_array())
+            .expect("optimizer trace array");
+        assert_eq!(trace.len(), 2);
+        assert_eq!(trace[0]["fields"]["reason"], "lowest_total_cost");
+        assert_eq!(trace[0]["fields"]["candidate_count"], serde_json::json!(2));
+        assert!(
+            trace[0]["fields"]["winner_cost"]
+                .as_f64()
+                .expect("winner cost")
+                > 4272.8
+        );
+        assert_eq!(trace[1]["fields"]["rank"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn build_explain_optimizer_trace_json_preserves_full_path_field() {
+        let timeline = vec![crate::metrics::QueryStageEvent {
+            query_execution_id: "q1".to_string(),
+            stage_id: 9,
+            kind: "optimizer_plan_choice".to_string(),
+            detail: "path=index_scan[index=idx_sales_status_day_merchant_cover prefix_columns=2 probes=4 covering=true ordered=false] estimated_output_rows=10.00".to_string(),
+            at_unix_ns: 88,
+        }];
+        let trace = build_explain_optimizer_trace_json(timeline.as_slice());
+        assert_eq!(trace.len(), 1);
+        assert_eq!(
+            trace[0]["fields"]["path"],
+            "index_scan[index=idx_sales_status_day_merchant_cover prefix_columns=2 probes=4 covering=true ordered=false]"
+        );
+    }
+
+    #[test]
+    fn derive_explain_access_path_annotation_prefers_latest_plan_choice() {
+        let timeline = vec![
+            crate::metrics::QueryStageEvent {
+                query_execution_id: "q1".to_string(),
+                stage_id: 1,
+                kind: "optimizer_plan_choice".to_string(),
+                detail: "path=table_scan estimated_output_rows=100".to_string(),
+                at_unix_ns: 1,
+            },
+            crate::metrics::QueryStageEvent {
+                query_execution_id: "q1".to_string(),
+                stage_id: 1,
+                kind: "optimizer_plan_choice".to_string(),
+                detail: "path=index_scan[index=idx_sales_status_day_merchant_cover prefix_columns=1 probes=1 covering=true ordered=false] estimated_output_rows=10".to_string(),
+                at_unix_ns: 2,
+            },
+        ];
+        let line = derive_explain_access_path_annotation(timeline.as_slice())
+            .expect("access path annotation");
+        assert_eq!(
+            line,
+            "AccessPath: index_only index=idx_sales_status_day_merchant_cover"
+        );
+    }
+
+    #[test]
+    fn render_access_path_summary_formats_table_and_index_modes() {
+        assert_eq!(render_access_path_summary("table_scan"), "table_scan");
+        assert_eq!(
+            render_access_path_summary(
+                "index_scan[index=idx_orders covering=false prefix_columns=1 probes=1 ordered=false]"
+            ),
+            "index_scan index=idx_orders"
+        );
+        assert_eq!(
+            render_access_path_summary(
+                "index_scan[index=idx_orders covering=true prefix_columns=1 probes=1 ordered=false]"
+            ),
+            "index_only index=idx_orders"
+        );
+    }
+
+    #[test]
+    fn extract_fast_grouped_aggregate_topk_supports_sales_shape() {
+        let dialect = PostgreSqlDialect {};
+        let sql =
+            "SELECT merchant_id, event_day, COUNT(*) AS orders, SUM(amount_cents) AS gross_cents
+                   FROM sales_facts
+                   WHERE event_day = 1 AND status IN ('paid', 'shipped')
+                   GROUP BY merchant_id, event_day
+                   HAVING COUNT(*) >= 1
+                   ORDER BY gross_cents DESC
+                   LIMIT 200;";
+        let mut statements = Parser::parse_sql(&dialect, sql).expect("parse grouped query");
+        let statement = statements.remove(0);
+        let params = ParamValues::List(Vec::new());
+        let spec = extract_fast_grouped_aggregate_topk_statement(&statement, &params)
+            .expect("expected grouped aggregate top-k fast path");
+        assert_eq!(spec.table_name, "sales_facts");
+        assert_eq!(
+            spec.group_columns,
+            vec!["merchant_id".to_string(), "event_day".to_string()]
+        );
+        assert_eq!(spec.sum_column, "amount_cents");
+        assert_eq!(spec.having_min_count, 1);
+        assert_eq!(spec.limit, 200);
+        assert_eq!(spec.filters.len(), 2);
+    }
+
+    #[test]
+    fn extract_fast_grouped_aggregate_topk_rejects_missing_limit() {
+        let dialect = PostgreSqlDialect {};
+        let sql =
+            "SELECT merchant_id, event_day, COUNT(*) AS orders, SUM(amount_cents) AS gross_cents
+                   FROM sales_facts
+                   WHERE event_day = 1
+                   GROUP BY merchant_id, event_day
+                   HAVING COUNT(*) >= 1
+                   ORDER BY gross_cents DESC;";
+        let mut statements = Parser::parse_sql(&dialect, sql).expect("parse grouped query");
+        let statement = statements.remove(0);
+        let params = ParamValues::List(Vec::new());
+        assert!(
+            extract_fast_grouped_aggregate_topk_statement(&statement, &params).is_none(),
+            "query without LIMIT should stay on standard planner path"
+        );
     }
 }

@@ -10,6 +10,7 @@ use datafusion::prelude::SessionContext;
 use holo_store::HoloStoreClient;
 use tracing::warn;
 
+use crate::indexing::list_secondary_index_metadata_for_table;
 use crate::metadata::{is_supported_table_model, list_table_metadata, TableMetadataRecord};
 use crate::metrics::PushdownMetrics;
 use crate::provider::HoloStoreTableProvider;
@@ -85,6 +86,11 @@ pub async fn register_table_from_metadata(
         return Ok(false);
     }
 
+    let secondary_indexes =
+        list_secondary_index_metadata_for_table(&holostore_client, table.table_id)
+            .await
+            .with_context(|| format!("load secondary indexes for table {}", table.table_name))?;
+
     if let Ok(existing_provider) = session_context
         .table_provider(table.table_name.as_str())
         .await
@@ -93,7 +99,9 @@ pub async fn register_table_from_metadata(
             .as_any()
             .downcast_ref::<HoloStoreTableProvider>()
         {
-            if provider_matches_metadata(existing_holo, table) {
+            if provider_matches_metadata(existing_holo, table)
+                && existing_holo.secondary_indexes() == secondary_indexes.as_slice()
+            {
                 return Ok(false);
             }
         }
@@ -103,8 +111,13 @@ pub async fn register_table_from_metadata(
     }
 
     let provider = Arc::new(
-        HoloStoreTableProvider::from_table_metadata(table, holostore_client, pushdown_metrics)
-            .with_context(|| format!("build provider for table {}", table.table_name))?,
+        HoloStoreTableProvider::from_table_metadata_with_indexes(
+            table,
+            secondary_indexes,
+            holostore_client,
+            pushdown_metrics,
+        )
+        .with_context(|| format!("build provider for table {}", table.table_name))?,
     );
 
     // Decision: map concurrent registrar races to `Ok(false)` instead of failure.

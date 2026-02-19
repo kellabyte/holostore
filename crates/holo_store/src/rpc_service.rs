@@ -892,6 +892,7 @@ impl rpc::HoloRpc for RpcService {
         let lag_by_index = self.state.meta_group_lag_by_index().await;
         let recovery = self.state.recovery_checkpoint_snapshot();
         let proposal = self.state.meta_proposal_stats_peek();
+        let split_health = self.state.split_health_snapshot();
         let proposal_total_avg_us = if proposal.total.count == 0 {
             0.0
         } else {
@@ -962,6 +963,9 @@ impl rpc::HoloRpc for RpcService {
             "last_free_pct": recovery.last_free_pct,
             "last_error": recovery.last_error,
         });
+        root["split_health"] = serde_json::to_value(&split_health).map_err(|e| {
+            volo_grpc::Status::internal(format!("serialize split health failed: {e}"))
+        })?;
 
         let json = serde_json::to_string_pretty(&root)
             .map_err(|e| volo_grpc::Status::internal(format!("serialize state failed: {e}")))?;

@@ -149,7 +149,7 @@ cargo run -p holo_fusion --bin holo-fusion
 - `HOLO_FUSION_DML_MAX_TXN_STAGED_ROWS`
 - `HOLO_FUSION_DML_WRITE_MAX_BATCH_ENTRIES`
 - `HOLO_FUSION_DML_WRITE_MAX_BATCH_BYTES`
-- `HOLO_FUSION_SCAN_MAX_ROWS`
+- `HOLO_FUSION_SCAN_MAX_ROWS` (`0` disables scan-row rejection; default `0`)
 - `HOLO_FUSION_SQL_TARGET_PARTITIONS`
 - `HOLO_FUSION_SQL_SORT_SPILL_RESERVATION_BYTES`
 - `HOLO_FUSION_SQL_SPILL_COMPRESSION` (`lz4_frame`, `zstd`, `uncompressed`)
@@ -183,7 +183,8 @@ Key test files:
 - `crates/holo_fusion/docs/DATA_FUSION.md`
 - `crates/holo_fusion/docs/HOLO_FUSION_STORAGE_MODEL.md`
 - `crates/holo_fusion/docs/HOLO_FUSION_SQL_SCOPE.md`
-- `crates/holo_fusion/docs/DATA_FUSION_TODO.md`
+- `crates/holo_fusion/docs/HOLO_FUSION_TODO.md`
+- `crates/holo_fusion/docs/HOLO_FUSION_INDEXING.md`
 - `crates/holo_fusion/docs/DISTRIBUTED_SQL_EXECUTION_DESIGN.md`
 - `crates/holo_fusion/docs/METADATA_MIGRATION.md`
 - `crates/holo_fusion/docs/PHASE7_BENCHMARK_SLO.md`

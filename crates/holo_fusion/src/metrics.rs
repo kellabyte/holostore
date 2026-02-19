@@ -225,6 +225,18 @@ pub struct PushdownMetrics {
     scan_chunk_count: AtomicU64,
     /// Number of duplicate rows skipped during idempotent scan merge.
     scan_duplicate_rows_skipped: AtomicU64,
+    /// Number of optimizer-selected table scan access paths.
+    optimizer_plan_table_scan: AtomicU64,
+    /// Number of optimizer-selected index scan access paths.
+    optimizer_plan_index_scan: AtomicU64,
+    /// Number of optimizer-selected index-only scan access paths.
+    optimizer_plan_index_only: AtomicU64,
+    /// Number of observed high-error estimate misses (`>=4x`).
+    optimizer_bad_miss_count: AtomicU64,
+    /// Sum of optimizer estimated output rows at plan time.
+    optimizer_estimated_rows_total: AtomicU64,
+    /// Sum of optimizer actual output rows observed at runtime.
+    optimizer_actual_rows_total: AtomicU64,
     /// Monotonic query execution id sequence.
     next_query_execution_id: AtomicU64,
     /// Monotonic stage execution id sequence.
@@ -316,6 +328,18 @@ pub struct PushdownMetricsSnapshot {
     pub scan_chunk_count: u64,
     /// Number of duplicate scan rows skipped.
     pub scan_duplicate_rows_skipped: u64,
+    /// Number of optimizer table-scan selections.
+    pub optimizer_plan_table_scan: u64,
+    /// Number of optimizer index-scan selections.
+    pub optimizer_plan_index_scan: u64,
+    /// Number of optimizer index-only-scan selections.
+    pub optimizer_plan_index_only: u64,
+    /// Number of high-error optimizer estimate misses (`>=4x`).
+    pub optimizer_bad_miss_count: u64,
+    /// Sum of optimizer estimated output rows.
+    pub optimizer_estimated_rows_total: u64,
+    /// Sum of optimizer observed output rows.
+    pub optimizer_actual_rows_total: u64,
     /// Number of sessions with active query execution context.
     pub active_query_sessions: u64,
     /// Number of rows ingested through streaming bulk paths.
@@ -492,6 +516,22 @@ impl PushdownMetrics {
             .collect()
     }
 
+    /// Returns per-shard distributed-write aggregates.
+    pub fn distributed_shard_metrics(&self) -> BTreeMap<usize, DistributedShardMetrics> {
+        self.distributed_by_shard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Returns per-target distributed-write/circuit-breaker aggregates.
+    pub fn distributed_target_metrics(&self) -> BTreeMap<String, DistributedTargetMetrics> {
+        self.distributed_by_target
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     /// Records one scan retry.
     pub fn record_scan_retry(&self) {
         self.scan_retry_count.fetch_add(1, Ordering::Relaxed);
@@ -511,6 +551,38 @@ impl PushdownMetrics {
     pub fn record_scan_duplicate_rows_skipped(&self, rows: u64) {
         self.scan_duplicate_rows_skipped
             .fetch_add(rows, Ordering::Relaxed);
+    }
+
+    /// Records one optimizer access-path decision.
+    pub fn record_optimizer_plan_choice(&self, path_kind: &str) {
+        match path_kind {
+            "table_scan" => {
+                self.optimizer_plan_table_scan
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            "index_only" => {
+                self.optimizer_plan_index_only
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {
+                self.optimizer_plan_index_scan
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Records optimizer estimate-vs-actual feedback.
+    pub fn record_optimizer_feedback(&self, estimated_rows: f64, actual_rows: u64, bad_miss: bool) {
+        self.optimizer_estimated_rows_total.fetch_add(
+            estimated_rows.max(0.0).min(u64::MAX as f64) as u64,
+            Ordering::Relaxed,
+        );
+        self.optimizer_actual_rows_total
+            .fetch_add(actual_rows, Ordering::Relaxed);
+        if bad_miss {
+            self.optimizer_bad_miss_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Records whether a filter expression can be executed exactly at storage.
@@ -877,6 +949,14 @@ impl PushdownMetrics {
             scan_reroute_count: self.scan_reroute_count.load(Ordering::Relaxed),
             scan_chunk_count: self.scan_chunk_count.load(Ordering::Relaxed),
             scan_duplicate_rows_skipped: self.scan_duplicate_rows_skipped.load(Ordering::Relaxed),
+            optimizer_plan_table_scan: self.optimizer_plan_table_scan.load(Ordering::Relaxed),
+            optimizer_plan_index_scan: self.optimizer_plan_index_scan.load(Ordering::Relaxed),
+            optimizer_plan_index_only: self.optimizer_plan_index_only.load(Ordering::Relaxed),
+            optimizer_bad_miss_count: self.optimizer_bad_miss_count.load(Ordering::Relaxed),
+            optimizer_estimated_rows_total: self
+                .optimizer_estimated_rows_total
+                .load(Ordering::Relaxed),
+            optimizer_actual_rows_total: self.optimizer_actual_rows_total.load(Ordering::Relaxed),
             active_query_sessions,
             ingest_rows_ingested_total: self.ingest_rows_ingested_total.load(Ordering::Relaxed),
             ingest_jobs_started: self.ingest_jobs_started.load(Ordering::Relaxed),
@@ -928,6 +1008,18 @@ impl PushdownMetrics {
             s.ingest_jobs_completed,
             s.ingest_jobs_failed,
             s.ingest_jobs_tracked,
+        );
+        out.push_str(
+            format!(
+                "optimizer_plan_table_scan={}\noptimizer_plan_index_scan={}\noptimizer_plan_index_only={}\noptimizer_bad_miss_count={}\noptimizer_estimated_rows_total={}\noptimizer_actual_rows_total={}\n",
+                s.optimizer_plan_table_scan,
+                s.optimizer_plan_index_scan,
+                s.optimizer_plan_index_only,
+                s.optimizer_bad_miss_count,
+                s.optimizer_estimated_rows_total,
+                s.optimizer_actual_rows_total,
+            )
+            .as_str(),
         );
         let by_shard = self
             .distributed_by_shard

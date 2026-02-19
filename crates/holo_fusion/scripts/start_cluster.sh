@@ -35,7 +35,6 @@ NODE3_GRPC_PORT="${NODE3_GRPC_PORT:-15053}"
 
 HOLO_FUSION_ENABLE_BALLISTA_SQL="${HOLO_FUSION_ENABLE_BALLISTA_SQL:-false}"
 HOLO_FUSION_DML_PREWRITE_DELAY_MS="${HOLO_FUSION_DML_PREWRITE_DELAY_MS:-0}"
-HOLO_FUSION_HOLOSTORE_MAX_SHARDS="${HOLO_FUSION_HOLOSTORE_MAX_SHARDS:-3}"
 HOLO_FUSION_HOLOSTORE_INITIAL_RANGES="${HOLO_FUSION_HOLOSTORE_INITIAL_RANGES:-1}"
 HOLO_FUSION_HOLOSTORE_ROUTING_MODE="${HOLO_FUSION_HOLOSTORE_ROUTING_MODE:-range}"
 
@@ -49,6 +48,14 @@ if [[ -z "${HOLO_FUSION_BIN:-}" ]]; then
     HOLO_FUSION_BIN="$ROOT_DIR/target/release/holo-fusion"
   else
     HOLO_FUSION_BIN="$ROOT_DIR/target/debug/holo-fusion"
+  fi
+fi
+
+if [[ -z "${HOLOCTL_BIN:-}" ]]; then
+  if [[ "$HOLO_FUSION_BUILD_PROFILE" == "release" ]]; then
+    HOLOCTL_BIN="$ROOT_DIR/target/release/holoctl"
+  else
+    HOLOCTL_BIN="$ROOT_DIR/target/debug/holoctl"
   fi
 fi
 
@@ -143,8 +150,10 @@ mkdir -p "$LOG_DIR" "$DATA_DIR"
 if [[ "$HOLO_FUSION_BUILD" != "0" ]]; then
   if [[ "$HOLO_FUSION_BUILD_PROFILE" == "release" ]]; then
     cargo build -p holo_fusion --release
+    cargo build -p holo_store --bin holoctl --release
   else
     cargo build -p holo_fusion
+    cargo build -p holo_store --bin holoctl
   fi
 fi
 
@@ -183,7 +192,6 @@ start_node() {
     HOLO_FUSION_BOOTSTRAP="$bootstrap"
     HOLO_FUSION_INITIAL_MEMBERS="$INITIAL_MEMBERS"
     HOLO_FUSION_HOLOSTORE_DATA_DIR="$node_data_dir"
-    HOLO_FUSION_HOLOSTORE_MAX_SHARDS="$HOLO_FUSION_HOLOSTORE_MAX_SHARDS"
     HOLO_FUSION_HOLOSTORE_INITIAL_RANGES="$HOLO_FUSION_HOLOSTORE_INITIAL_RANGES"
     HOLO_FUSION_HOLOSTORE_ROUTING_MODE="$HOLO_FUSION_HOLOSTORE_ROUTING_MODE"
   )
@@ -232,4 +240,7 @@ logs:
 
 stop:
   ${ROOT_DIR}/crates/holo_fusion/scripts/stop_cluster.sh
+
+holoctl:
+  ${HOLOCTL_BIN} --target ${GRPC_HOST}:${NODE1_GRPC_PORT} topology
 EOF

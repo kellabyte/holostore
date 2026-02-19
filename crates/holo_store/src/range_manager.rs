@@ -6,10 +6,11 @@
 //! - proposes a safe split when a range is too big or too hot and there is a free shard index
 //! - proposes a safe merge when adjacent ranges become too small
 //!
-//! Safety: range splits are coordinated with a cluster-wide "freeze" flag stored
-//! in the meta group. While frozen, nodes block client traffic so there are no
-//! in-flight writes during migration + descriptor updates.
+//! Safety: range splits are coordinated with shard-scoped fences in the meta
+//! group. Only the split source/target shards are paused while migration +
+//! descriptor updates run.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,6 +22,48 @@ use crate::cluster::{ClusterCommand, ControllerDomain, MemberState, ShardDesc};
 use crate::load::ShardLoadSnapshot;
 use crate::volo_gen::holo_store::rpc;
 use crate::NodeState;
+
+const SPLIT_FENCE_PREFIX: &str = "split-op";
+const SPLIT_FENCE_STALE_TIMEOUT: Duration = Duration::from_secs(20);
+const SPLIT_SHARD_DRAIN_LOW_WATERMARK: u64 = 8;
+const SPLIT_SHARD_DRAIN_STABLE_FOR: Duration = Duration::from_millis(100);
+const SPLIT_SHARD_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const SPLIT_FENCE_SYNC_TIMEOUT: Duration = Duration::from_secs(15);
+const SPLIT_CLUSTER_SYNC_TIMEOUT: Duration = Duration::from_secs(15);
+const SPLIT_FAILURE_BACKOFF_BASE: Duration = Duration::from_millis(250);
+const SPLIT_FAILURE_BACKOFF_MAX: Duration = Duration::from_secs(15);
+const SPLIT_FAILURE_BACKOFF_MAX_SHIFT: u32 = 6;
+const SPLIT_KEY_SAMPLE_SIZE: usize = 256;
+static SPLIT_TOKEN_SEQ: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy)]
+struct SplitFailureBackoff {
+    failures: u32,
+    retry_after: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct SplitFenceOp {
+    token: String,
+    started_ms: u64,
+    reason: String,
+    source_shard_id: u64,
+}
+
+impl SplitFenceOp {
+    fn new(node_id: u64, source_shard_id: u64) -> Self {
+        let started_ms = now_unix_ms();
+        let seq = SPLIT_TOKEN_SEQ.fetch_add(1, Ordering::Relaxed);
+        let token = format!("n{node_id}-{started_ms}-{seq}");
+        let reason = encode_split_fence_reason(&token, started_ms);
+        Self {
+            token,
+            started_ms,
+            reason,
+            source_shard_id,
+        }
+    }
+}
 
 /// Configuration for the range manager.
 #[derive(Clone, Copy, Debug)]
@@ -78,6 +121,8 @@ pub fn spawn(state: Arc<NodeState>, keyspace: Arc<Keyspace>, cfg: RangeManagerCo
         let mut sustained: Vec<u8> = vec![0; state.shard_load.shards()];
         let mut cooldown_until: Vec<std::time::Instant> =
             vec![std::time::Instant::now(); state.shard_load.shards()];
+        let mut split_failure_backoff =
+            std::collections::BTreeMap::<u64, SplitFailureBackoff>::new();
         let mut merge_cooldown_until = std::collections::BTreeMap::<u64, std::time::Instant>::new();
         let mut merge_sustained = std::collections::BTreeMap::<u64, u8>::new();
         loop {
@@ -88,6 +133,9 @@ pub fn spawn(state: Arc<NodeState>, keyspace: Arc<Keyspace>, cfg: RangeManagerCo
             {
                 continue;
             }
+            if let Err(err) = recover_stale_split_fences(state.clone()).await {
+                tracing::warn!(error = ?err, "range manager stale split-fence recovery failed");
+            }
             let now = std::time::Instant::now();
             if let Err(err) = maybe_split_once(
                 state.clone(),
@@ -97,6 +145,7 @@ pub fn spawn(state: Arc<NodeState>, keyspace: Arc<Keyspace>, cfg: RangeManagerCo
                 &mut baseline_set_ops,
                 &mut sustained,
                 &mut cooldown_until,
+                &mut split_failure_backoff,
                 &mut merge_cooldown_until,
                 &mut merge_sustained,
                 now,
@@ -117,6 +166,7 @@ async fn maybe_split_once(
     baseline_set_ops: &mut [u64],
     sustained: &mut [u8],
     cooldown_until: &mut [std::time::Instant],
+    split_failure_backoff: &mut std::collections::BTreeMap<u64, SplitFailureBackoff>,
     merge_cooldown_until: &mut std::collections::BTreeMap<u64, std::time::Instant>,
     merge_sustained: &mut std::collections::BTreeMap<u64, u8>,
     now: std::time::Instant,
@@ -126,11 +176,19 @@ async fn maybe_split_once(
     }
 
     let cluster_state = state.cluster_store.state();
-    // Keep range-split freeze windows out of the way while replica moves are
-    // in progress; rebalancing has higher correctness priority.
+    // Keep split operations out of the way while replica moves are in
+    // progress; rebalancing has higher correctness priority.
     if !cluster_state.shard_rebalances.is_empty() || !cluster_state.shard_merges.is_empty() {
         return Ok(());
     }
+    let live_shards = cluster_state
+        .shards
+        .iter()
+        .map(|s| s.shard_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    split_failure_backoff
+        .retain(|shard_id, entry| live_shards.contains(shard_id) && entry.retry_after > now);
+    state.set_split_backoff_active(split_failure_backoff.len() as u64);
 
     let shard_limit = state.data_shards.max(1);
     let Some(target_idx) = state.cluster_store.first_free_shard_index(shard_limit) else {
@@ -146,6 +204,7 @@ async fn maybe_split_once(
         baseline_set_ops,
         sustained,
         cooldown_until,
+        split_failure_backoff,
         &mut qps_by_idx,
         now,
     )? {
@@ -157,46 +216,67 @@ async fn maybe_split_once(
             }
             return Ok(());
         };
+        let split_fence_op = SplitFenceOp::new(state.node_id, shard.shard_id);
+        let fenced_shards = vec![split_fence_op.source_shard_id];
 
         tracing::info!(
             shard_id = shard.shard_id,
             shard_index = shard.shard_index,
             reason = reason,
             target_shard_index = target_idx,
+            split_token = %split_fence_op.token,
+            split_started_ms = split_fence_op.started_ms,
             split_key = %String::from_utf8_lossy(&split_key),
             "range manager proposing split"
         );
+        state.record_split_attempt(reason);
 
-        // Freeze traffic to avoid in-flight proposals during key migration + reroute.
-        let freeze_before_epoch = state.cluster_store.epoch();
-        propose_meta(state.clone(), ClusterCommand::SetFrozen { frozen: true }).await?;
-        // Any error after freeze must still unfreeze before returning.
         let split_res = async {
-            let freeze_epoch = wait_for_local_state(
+            ensure_range_controller_leader(state.clone()).await?;
+            let fence_before_epoch = state.cluster_store.epoch();
+            for shard_id in &fenced_shards {
+                propose_meta(
+                    state.clone(),
+                    ClusterCommand::SetShardFence {
+                        shard_id: *shard_id,
+                        fenced: true,
+                        reason: split_fence_op.reason.clone(),
+                    },
+                )
+                .await?;
+            }
+            let required_fences =
+                fenced_shards_to_expectations(&fenced_shards, &split_fence_op.reason);
+            let fence_epoch = wait_for_local_fences(
                 state.clone(),
-                freeze_before_epoch,
-                true,
-                Duration::from_secs(5),
+                fence_before_epoch,
+                &required_fences,
+                &[],
+                SPLIT_FENCE_SYNC_TIMEOUT,
             )
             .await?;
             wait_for_cluster_converged(
                 state.clone(),
-                freeze_epoch,
-                true,
+                fence_epoch,
                 None,
-                Duration::from_secs(5),
+                &required_fences,
+                &[],
+                SPLIT_CLUSTER_SYNC_TIMEOUT,
             )
             .await?;
 
-            // While frozen, wait until the source group has drained all in-flight
-            // consensus work. This avoids migrating from a state that is still
-            // catching up committed writes.
-            // Drain any client operations that already passed the freeze check.
-            state
-                .wait_for_client_ops_drained(Duration::from_secs(5))
-                .await?;
-            wait_for_shard_quiesced(state.clone(), shard.shard_index, Duration::from_secs(5))
-                .await?;
+            // Drain only the source shard to a low watermark; global client
+            // drains under sustained ingest can starve split progress.
+            wait_for_shard_low_watermark(
+                state.clone(),
+                shard.shard_index,
+                SPLIT_SHARD_DRAIN_LOW_WATERMARK,
+                SPLIT_SHARD_DRAIN_STABLE_FOR,
+                SPLIT_SHARD_DRAIN_TIMEOUT,
+            )
+            .await?;
+
+            ensure_range_controller_leader(state.clone()).await?;
             let split_before_epoch = state.cluster_store.epoch();
             propose_meta(
                 state.clone(),
@@ -207,48 +287,74 @@ async fn maybe_split_once(
             )
             .await?;
             let split_epoch =
-                wait_for_local_epoch(state.clone(), split_before_epoch, Duration::from_secs(5))
+                wait_for_local_epoch(state.clone(), split_before_epoch, SPLIT_FENCE_SYNC_TIMEOUT)
                     .await?;
+            state
+                .cluster_store
+                .state()
+                .shards
+                .iter()
+                .find(|s| s.shard_index == target_idx)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("split finished without target shard index {target_idx}")
+                })?;
             let shard_count = state.cluster_store.state().shards.len();
             wait_for_cluster_converged(
                 state.clone(),
                 split_epoch,
-                true,
                 Some(shard_count),
-                Duration::from_secs(8),
+                &required_fences,
+                &[],
+                SPLIT_CLUSTER_SYNC_TIMEOUT,
             )
             .await?;
             Ok::<(), anyhow::Error>(())
         }
         .await;
 
-        // Always unfreeze, even if split failed.
-        let unfreeze_before_epoch = state.cluster_store.epoch();
-        let unfreeze_res =
-            propose_meta(state.clone(), ClusterCommand::SetFrozen { frozen: false }).await;
+        let clear_res = clear_split_fences(
+            state.clone(),
+            &fenced_shards,
+            &split_fence_op.reason,
+            SPLIT_FENCE_SYNC_TIMEOUT,
+        )
+        .await;
         if let Err(err) = split_res {
-            if let Err(unfreeze_err) = unfreeze_res {
-                tracing::warn!(error = ?unfreeze_err, "failed to unfreeze after split failure");
+            let reason = classify_split_failure(&err);
+            let (delay, failures) =
+                schedule_split_failure_backoff(split_failure_backoff, shard.shard_id, now);
+            state.record_split_failure(reason, &err.to_string());
+            state.set_split_backoff_active(split_failure_backoff.len() as u64);
+            tracing::warn!(
+                shard_id = shard.shard_id,
+                reason = reason,
+                failures,
+                retry_after_ms = delay.as_millis(),
+                "range split failed; backoff scheduled"
+            );
+            if let Err(clear_err) = clear_res {
+                tracing::warn!(error = ?clear_err, "failed to clear split fences after split failure");
             }
             return Err(err);
         }
-        unfreeze_res?;
-        let unfreeze_epoch = wait_for_local_state(
-            state.clone(),
-            unfreeze_before_epoch,
-            false,
-            Duration::from_secs(5),
-        )
-        .await?;
-        let shard_count = state.cluster_store.state().shards.len();
-        wait_for_cluster_converged(
-            state.clone(),
-            unfreeze_epoch,
-            false,
-            Some(shard_count),
-            Duration::from_secs(5),
-        )
-        .await?;
+        if let Err(err) = clear_res {
+            let reason = classify_split_failure(&err);
+            let (delay, failures) =
+                schedule_split_failure_backoff(split_failure_backoff, shard.shard_id, now);
+            state.record_split_failure(reason, &err.to_string());
+            state.set_split_backoff_active(split_failure_backoff.len() as u64);
+            tracing::warn!(
+                shard_id = shard.shard_id,
+                reason = reason,
+                failures,
+                retry_after_ms = delay.as_millis(),
+                "range split fence cleanup failed; backoff scheduled"
+            );
+            return Err(err);
+        }
+        split_failure_backoff.remove(&shard.shard_id);
+        state.set_split_backoff_active(split_failure_backoff.len() as u64);
+        state.record_split_success();
 
         // Apply cooldown to the *source* shard index to avoid rapid re-splitting.
         if let Some(slot) = cooldown_until.get_mut(shard.shard_index) {
@@ -305,9 +411,11 @@ async fn maybe_split_once(
     Ok(())
 }
 
-async fn wait_for_shard_quiesced(
+async fn wait_for_shard_low_watermark(
     state: Arc<NodeState>,
     shard_index: usize,
+    max_pending: u64,
+    stable_for: Duration,
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let group_id = crate::GROUP_DATA_BASE + shard_index as u64;
@@ -316,21 +424,35 @@ async fn wait_for_shard_quiesced(
         .ok_or_else(|| anyhow::anyhow!("missing group for shard index {}", shard_index))?;
     let deadline = Instant::now() + timeout;
 
+    let mut stable_since: Option<Instant> = None;
     loop {
+        ensure_range_controller_leader(state.clone()).await?;
         let stats = group.debug_stats().await;
-        let pending = stats.records_status_preaccepted_len
+        let pending = (stats.records_status_preaccepted_len
             + stats.records_status_accepted_len
             + stats.records_status_committed_len
             + stats.records_status_executing_len
             + stats.committed_queue_len
-            + stats.read_waiters_len;
-        if pending == 0 {
-            return Ok(());
+            + stats.read_waiters_len) as u64;
+        if pending <= max_pending {
+            let now = Instant::now();
+            if let Some(since) = stable_since {
+                if now.saturating_duration_since(since) >= stable_for {
+                    return Ok(());
+                }
+            } else {
+                stable_since = Some(now);
+            }
+        } else {
+            stable_since = None;
         }
         if Instant::now() >= deadline {
             anyhow::bail!(
-                "timed out waiting for shard {} to quiesce (preaccepted={}, accepted={}, committed={}, executing={}, committed_queue={}, read_waiters={})",
+                "timed out waiting for shard {} low-watermark drain (pending={}, watermark={}, stable_for_ms={}, preaccepted={}, accepted={}, committed={}, executing={}, committed_queue={}, read_waiters={})",
                 shard_index,
+                pending,
+                max_pending,
+                stable_for.as_millis(),
                 stats.records_status_preaccepted_len,
                 stats.records_status_accepted_len,
                 stats.records_status_committed_len,
@@ -346,8 +468,201 @@ async fn wait_for_shard_quiesced(
 #[derive(Debug, Deserialize)]
 struct ClusterProbe {
     epoch: u64,
-    frozen: bool,
     shards: Vec<serde_json::Value>,
+    #[serde(default)]
+    shard_fences: std::collections::BTreeMap<String, String>,
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+fn encode_split_fence_reason(token: &str, started_ms: u64) -> String {
+    format!("{SPLIT_FENCE_PREFIX}:{token}:{started_ms}")
+}
+
+fn parse_split_fence_reason(reason: &str) -> Option<(String, u64)> {
+    let mut parts = reason.split(':');
+    let prefix = parts.next()?;
+    if prefix != SPLIT_FENCE_PREFIX {
+        return None;
+    }
+    let token = parts.next()?.to_string();
+    let started_ms = parts.next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((token, started_ms))
+}
+
+fn fenced_shards_to_expectations(shard_ids: &[u64], reason: &str) -> Vec<(u64, String)> {
+    shard_ids
+        .iter()
+        .copied()
+        .map(|shard_id| (shard_id, reason.to_string()))
+        .collect()
+}
+
+fn local_has_required_fences(
+    snapshot: &crate::cluster::ClusterState,
+    required_fences: &[(u64, String)],
+) -> bool {
+    required_fences.iter().all(|(shard_id, reason)| {
+        snapshot
+            .shard_fences
+            .get(shard_id)
+            .map(|current| current == reason)
+            .unwrap_or(false)
+    })
+}
+
+fn local_has_cleared_fences(
+    snapshot: &crate::cluster::ClusterState,
+    cleared_fences: &[u64],
+) -> bool {
+    cleared_fences
+        .iter()
+        .all(|shard_id| !snapshot.shard_fences.contains_key(shard_id))
+}
+
+fn probe_has_required_fences(probe: &ClusterProbe, required_fences: &[(u64, String)]) -> bool {
+    required_fences.iter().all(|(shard_id, reason)| {
+        probe
+            .shard_fences
+            .get(&shard_id.to_string())
+            .map(|current| current == reason)
+            .unwrap_or(false)
+    })
+}
+
+fn probe_has_cleared_fences(probe: &ClusterProbe, cleared_fences: &[u64]) -> bool {
+    cleared_fences
+        .iter()
+        .all(|shard_id| !probe.shard_fences.contains_key(&shard_id.to_string()))
+}
+
+async fn ensure_range_controller_leader(state: Arc<NodeState>) -> anyhow::Result<()> {
+    if state
+        .ensure_controller_leader(ControllerDomain::Range)
+        .await
+    {
+        Ok(())
+    } else {
+        anyhow::bail!("lost range controller lease during split operation")
+    }
+}
+
+async fn recover_stale_split_fences(state: Arc<NodeState>) -> anyhow::Result<()> {
+    ensure_range_controller_leader(state.clone()).await?;
+    let snapshot = state.cluster_store.state();
+    if snapshot.shard_fences.is_empty() {
+        return Ok(());
+    }
+
+    let now_ms = now_unix_ms();
+    let stale_after_ms = SPLIT_FENCE_STALE_TIMEOUT
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    let mut stale_by_reason = std::collections::BTreeMap::<String, Vec<u64>>::new();
+    for (shard_id, reason) in &snapshot.shard_fences {
+        let Some((_token, started_ms)) = parse_split_fence_reason(reason) else {
+            continue;
+        };
+        if now_ms.saturating_sub(started_ms) >= stale_after_ms {
+            stale_by_reason
+                .entry(reason.clone())
+                .or_default()
+                .push(*shard_id);
+        }
+    }
+
+    for (reason, shard_ids) in stale_by_reason {
+        let (token, started_ms) = parse_split_fence_reason(&reason)
+            .ok_or_else(|| anyhow::anyhow!("invalid split fence reason format: {reason}"))?;
+        tracing::warn!(
+            split_token = %token,
+            started_ms,
+            stale_for_ms = now_ms.saturating_sub(started_ms),
+            shard_ids = ?shard_ids,
+            "clearing stale split fences"
+        );
+
+        ensure_range_controller_leader(state.clone()).await?;
+        let clear_before_epoch = state.cluster_store.epoch();
+        for shard_id in &shard_ids {
+            propose_meta(
+                state.clone(),
+                ClusterCommand::SetShardFence {
+                    shard_id: *shard_id,
+                    fenced: false,
+                    reason: reason.clone(),
+                },
+            )
+            .await?;
+        }
+        let local_epoch = wait_for_local_fences(
+            state.clone(),
+            clear_before_epoch,
+            &[],
+            &shard_ids,
+            Duration::from_secs(5),
+        )
+        .await?;
+        wait_for_cluster_converged(
+            state.clone(),
+            local_epoch,
+            None,
+            &[],
+            &shard_ids,
+            Duration::from_secs(5),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn clear_split_fences(
+    state: Arc<NodeState>,
+    fenced_shards: &[u64],
+    reason: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    if fenced_shards.is_empty() {
+        return Ok(());
+    }
+    ensure_range_controller_leader(state.clone()).await?;
+    let clear_before_epoch = state.cluster_store.epoch();
+    for shard_id in fenced_shards {
+        propose_meta(
+            state.clone(),
+            ClusterCommand::SetShardFence {
+                shard_id: *shard_id,
+                fenced: false,
+                reason: reason.to_string(),
+            },
+        )
+        .await?;
+    }
+    let local_epoch = wait_for_local_fences(
+        state.clone(),
+        clear_before_epoch,
+        &[],
+        fenced_shards,
+        timeout,
+    )
+    .await?;
+    wait_for_cluster_converged(
+        state.clone(),
+        local_epoch,
+        None,
+        &[],
+        fenced_shards,
+        timeout,
+    )
+    .await
 }
 
 async fn wait_for_local_epoch(
@@ -357,6 +672,7 @@ async fn wait_for_local_epoch(
 ) -> anyhow::Result<u64> {
     let deadline = Instant::now() + timeout;
     loop {
+        ensure_range_controller_leader(state.clone()).await?;
         let local_epoch = state.cluster_store.epoch();
         if local_epoch > min_epoch {
             return Ok(local_epoch);
@@ -370,23 +686,30 @@ async fn wait_for_local_epoch(
     }
 }
 
-async fn wait_for_local_state(
+async fn wait_for_local_fences(
     state: Arc<NodeState>,
     min_epoch: u64,
-    frozen: bool,
+    required_fences: &[(u64, String)],
+    cleared_fences: &[u64],
     timeout: Duration,
 ) -> anyhow::Result<u64> {
     let deadline = Instant::now() + timeout;
     loop {
+        ensure_range_controller_leader(state.clone()).await?;
         let snapshot = state.cluster_store.state();
-        if snapshot.epoch > min_epoch && snapshot.frozen == frozen {
+        if snapshot.epoch >= min_epoch
+            && local_has_required_fences(&snapshot, required_fences)
+            && local_has_cleared_fences(&snapshot, cleared_fences)
+        {
             return Ok(snapshot.epoch);
         }
         if Instant::now() >= deadline {
             anyhow::bail!(
-                "timed out waiting for local state (epoch>{min_epoch}, frozen={frozen}) (now_epoch={}, now_frozen={})",
+                "timed out waiting for local fence state (epoch>={min_epoch}, required_fences={:?}, cleared_fences={:?}) (now_epoch={}, now_fences={:?})",
+                required_fences,
+                cleared_fences,
                 snapshot.epoch,
-                snapshot.frozen
+                snapshot.shard_fences
             );
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -396,12 +719,14 @@ async fn wait_for_local_state(
 async fn wait_for_cluster_converged(
     state: Arc<NodeState>,
     min_epoch: u64,
-    frozen: bool,
     min_shards: Option<usize>,
+    required_fences: &[(u64, String)],
+    cleared_fences: &[u64],
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
+        ensure_range_controller_leader(state.clone()).await?;
         let members = state
             .cluster_store
             .state()
@@ -417,14 +742,16 @@ async fn wait_for_cluster_converged(
         for (node_id, grpc_addr) in members {
             if node_id == state.node_id {
                 let shard_ok = min_shards.map(|n| local.shards.len() >= n).unwrap_or(true);
-                if !(local.epoch >= min_epoch && local.frozen == frozen && shard_ok) {
+                let fences_ok = local_has_required_fences(&local, required_fences)
+                    && local_has_cleared_fences(&local, cleared_fences);
+                if !(local.epoch >= min_epoch && shard_ok && fences_ok) {
                     all_ok = false;
                     last_err = format!(
-                        "local node {} not converged (epoch={}, frozen={}, shards={})",
+                        "local node {} not converged (epoch={}, shards={}, fences={:?})",
                         node_id,
                         local.epoch,
-                        local.frozen,
-                        local.shards.len()
+                        local.shards.len(),
+                        local.shard_fences
                     );
                     break;
                 }
@@ -434,14 +761,16 @@ async fn wait_for_cluster_converged(
             match fetch_remote_probe(&grpc_addr, Duration::from_secs(1)).await {
                 Ok(remote) => {
                     let shard_ok = min_shards.map(|n| remote.shards.len() >= n).unwrap_or(true);
-                    if !(remote.epoch >= min_epoch && remote.frozen == frozen && shard_ok) {
+                    let fences_ok = probe_has_required_fences(&remote, required_fences)
+                        && probe_has_cleared_fences(&remote, cleared_fences);
+                    if !(remote.epoch >= min_epoch && shard_ok && fences_ok) {
                         all_ok = false;
                         last_err = format!(
-                            "node {} not converged (epoch={}, frozen={}, shards={})",
+                            "node {} not converged (epoch={}, shards={}, fences={:?})",
                             node_id,
                             remote.epoch,
-                            remote.frozen,
-                            remote.shards.len()
+                            remote.shards.len(),
+                            remote.shard_fences
                         );
                         break;
                     }
@@ -459,10 +788,11 @@ async fn wait_for_cluster_converged(
         }
         if Instant::now() >= deadline {
             anyhow::bail!(
-                "timed out waiting for cluster convergence (min_epoch={}, frozen={}, min_shards={:?}): {}",
+                "timed out waiting for cluster convergence (min_epoch={}, min_shards={:?}, required_fences={:?}, cleared_fences={:?}): {}",
                 min_epoch,
-                frozen,
                 min_shards,
+                required_fences,
+                cleared_fences,
                 last_err
             );
         }
@@ -483,6 +813,7 @@ async fn fetch_remote_probe(addr: &str, timeout: Duration) -> anyhow::Result<Clu
 }
 
 async fn propose_meta(state: Arc<NodeState>, cmd: ClusterCommand) -> anyhow::Result<()> {
+    ensure_range_controller_leader(state.clone()).await?;
     state
         .propose_meta_command_guarded(ControllerDomain::Range, cmd)
         .await
@@ -496,6 +827,7 @@ fn pick_split_candidate(
     baseline_set_ops: &mut [u64],
     sustained: &mut [u8],
     cooldown_until: &mut [std::time::Instant],
+    split_failure_backoff: &std::collections::BTreeMap<u64, SplitFailureBackoff>,
     qps_by_idx_out: &mut Vec<u64>,
     now: std::time::Instant,
 ) -> anyhow::Result<Option<(&'static str, ShardDesc)>> {
@@ -540,6 +872,13 @@ fn pick_split_candidate(
     // 1) Prefer load-based splitting (hottest shard that is sustained above threshold).
     let mut best_load: Option<(u64, ShardDesc)> = None;
     for shard in shards {
+        if split_failure_backoff
+            .get(&shard.shard_id)
+            .map(|entry| entry.retry_after > now)
+            .unwrap_or(false)
+        {
+            continue;
+        }
         let idx = shard.shard_index;
         if idx >= qps_by_idx.len() || idx >= sustained.len() {
             continue;
@@ -563,6 +902,13 @@ fn pick_split_candidate(
     }
     let mut best_size: Option<(u64, ShardDesc)> = None;
     for shard in shards {
+        if split_failure_backoff
+            .get(&shard.shard_id)
+            .map(|entry| entry.retry_after > now)
+            .unwrap_or(false)
+        {
+            continue;
+        }
         let idx = shard.shard_index;
         if idx >= last.set_ops.len() || idx >= baseline_set_ops.len() {
             continue;
@@ -700,42 +1046,112 @@ fn pick_split_key_from_range(
     let latest_name = format!("kv_latest_{}", shard.shard_index);
     let latest = keyspace.open_partition(&latest_name, PartitionCreateOptions::default())?;
 
-    // Pick a split key by median key position in this range.
-    // This avoids pathological splits from min/max midpoint when key prefixes
-    // are long and only a suffix differs (e.g. key:000...).
-    let mut total = 0usize;
+    // Approximate median with one-pass reservoir sampling. This avoids a full
+    // two-pass scan of the range while still spreading split points.
+    let mut seen = 0usize;
+    let mut sample = Vec::<Vec<u8>>::with_capacity(SPLIT_KEY_SAMPLE_SIZE);
     for item in latest_range(&latest, &shard.start_key, &shard.end_key) {
-        let _ = item?;
-        total += 1;
-    }
-    if total < 2 {
-        return Ok(None);
-    }
-    let mid = total / 2;
-
-    let mut prev_key: Option<Vec<u8>> = None;
-    for (idx, item) in latest_range(&latest, &shard.start_key, &shard.end_key).enumerate() {
         let (key, _) = item?;
         let key_vec = key.to_vec();
-        if idx == mid {
-            // Ensure the split point is strictly between neighbors/bounds.
-            if let Some(prev) = prev_key.as_ref() {
-                if prev >= &key_vec {
-                    return Ok(None);
-                }
-            }
-            if !shard.start_key.is_empty() && key_vec <= shard.start_key {
-                return Ok(None);
-            }
-            if !shard.end_key.is_empty() && key_vec >= shard.end_key {
-                return Ok(None);
-            }
-            return Ok(Some(key_vec));
+        seen = seen.saturating_add(1);
+        if sample.len() < SPLIT_KEY_SAMPLE_SIZE {
+            sample.push(key_vec);
+            continue;
         }
-        prev_key = Some(key_vec);
+        let replace = reservoir_replace_index(shard.shard_id, seen, &key_vec);
+        if replace < SPLIT_KEY_SAMPLE_SIZE {
+            sample[replace] = key_vec;
+        }
     }
-
+    if seen < 2 || sample.len() < 2 {
+        return Ok(None);
+    }
+    sample.sort();
+    let mid = sample.len() / 2;
+    let in_bounds = |key: &Vec<u8>| {
+        (shard.start_key.is_empty() || key.as_slice() > shard.start_key.as_slice())
+            && (shard.end_key.is_empty() || key.as_slice() < shard.end_key.as_slice())
+    };
+    if let Some(candidate) = sample[mid..].iter().find(|k| in_bounds(k)) {
+        return Ok(Some(candidate.clone()));
+    }
+    if let Some(candidate) = sample[..mid].iter().rev().find(|k| in_bounds(k)) {
+        return Ok(Some(candidate.clone()));
+    }
     Ok(None)
+}
+
+fn reservoir_replace_index(shard_id: u64, seen: usize, key: &[u8]) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    shard_id.hash(&mut hasher);
+    seen.hash(&mut hasher);
+    key.hash(&mut hasher);
+    (hasher.finish() as usize) % seen.max(1)
+}
+
+fn classify_split_failure(err: &anyhow::Error) -> &'static str {
+    let text = err.to_string().to_lowercase();
+    if text.contains("controller lease") {
+        "lease_lost"
+    } else if text.contains("cluster convergence") {
+        "cluster_convergence_timeout"
+    } else if text.contains("fence") {
+        "fence_sync_failed"
+    } else if text.contains("low-watermark drain")
+        || text.contains("timed out waiting for shard")
+        || text.contains("quiesce")
+    {
+        "shard_drain_timeout"
+    } else if text.contains("split finished without target shard") || text.contains("split key") {
+        "split_apply_failed"
+    } else {
+        "other"
+    }
+}
+
+fn schedule_split_failure_backoff(
+    split_failure_backoff: &mut std::collections::BTreeMap<u64, SplitFailureBackoff>,
+    shard_id: u64,
+    now: Instant,
+) -> (Duration, u32) {
+    let entry = split_failure_backoff
+        .entry(shard_id)
+        .or_insert(SplitFailureBackoff {
+            failures: 0,
+            retry_after: now,
+        });
+    entry.failures = entry.failures.saturating_add(1);
+    let delay = split_failure_backoff_delay(shard_id, entry.failures);
+    entry.retry_after = now + delay;
+    (delay, entry.failures)
+}
+
+fn split_failure_backoff_delay(shard_id: u64, failures: u32) -> Duration {
+    use std::hash::{Hash, Hasher};
+
+    let shift = failures
+        .saturating_sub(1)
+        .min(SPLIT_FAILURE_BACKOFF_MAX_SHIFT);
+    let multiplier = 1u64 << shift;
+    let base_ms = SPLIT_FAILURE_BACKOFF_BASE
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    let raw_ms = base_ms.saturating_mul(multiplier);
+    let capped_ms = raw_ms.min(
+        SPLIT_FAILURE_BACKOFF_MAX
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64,
+    );
+
+    // Deterministic jitter in [80%, 120%] to avoid synchronized retries.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    shard_id.hash(&mut hasher);
+    failures.hash(&mut hasher);
+    now_unix_ms().hash(&mut hasher);
+    let jitter_percent = 80u64 + (hasher.finish() % 41);
+    let jittered_ms = capped_ms.saturating_mul(jitter_percent) / 100;
+    Duration::from_millis(jittered_ms.max(1))
 }
 
 fn latest_range(

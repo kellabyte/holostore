@@ -5,11 +5,15 @@ use std::net::SocketAddr;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use futures_util::stream::FuturesUnordered;
+use futures_util::StreamExt;
 use serde::Deserialize;
 
 include!(concat!(env!("OUT_DIR"), "/volo_gen.rs"));
 
 use volo_gen::holo_store::rpc;
+
+const DEFAULT_RANGE_BOUND_MAX_CHARS: usize = 24;
 
 #[derive(Parser)]
 #[command(name = "holoctl")]
@@ -137,6 +141,8 @@ struct ClusterStateView {
     meta_health: MetaHealthView,
     #[serde(default)]
     recovery_health: RecoveryHealthView,
+    #[serde(default)]
+    split_health: SplitHealthView,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -221,6 +227,30 @@ struct MetaProposalIndexView {
     avg_us: f64,
     #[serde(default)]
     max_us: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct SplitHealthView {
+    #[serde(default)]
+    attempts: u64,
+    #[serde(default)]
+    successes: u64,
+    #[serde(default)]
+    failures: u64,
+    #[serde(default)]
+    backoff_active: u64,
+    #[serde(default)]
+    last_attempt_ms: u64,
+    #[serde(default)]
+    last_success_ms: u64,
+    #[serde(default)]
+    last_failure_ms: u64,
+    #[serde(default)]
+    last_failure_reason: String,
+    #[serde(default)]
+    attempt_reasons: BTreeMap<String, u64>,
+    #[serde(default)]
+    failure_reasons: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -379,6 +409,10 @@ async fn main() -> anyhow::Result<()> {
                 serde_json::from_str(&resp.json).context("parse cluster state json")?;
             let mut members = state.members.values().cloned().collect::<Vec<_>>();
             members.sort_by_key(|m| m.node_id);
+            let mut member_state_counts = BTreeMap::<String, usize>::new();
+            for member in &members {
+                *member_state_counts.entry(member.state.clone()).or_default() += 1;
+            }
             let mut moves_by_shard = HashMap::new();
             for (shard_id, mv) in &state.shard_rebalances {
                 if let Ok(id) = shard_id.parse::<u64>() {
@@ -396,16 +430,52 @@ async fn main() -> anyhow::Result<()> {
             // Query local record counts from each non-removed member.
             let mut counts_by_node: HashMap<u64, HashMap<u64, u64>> = HashMap::new();
             let mut fetch_errors: HashMap<u64, String> = HashMap::new();
+            let mut range_stats_tasks = FuturesUnordered::new();
             for member in &members {
                 if member.state == "Removed" {
                     continue;
                 }
-                match fetch_range_stats(&member.grpc_addr).await {
+                let node_id = member.node_id;
+                let grpc_addr = member.grpc_addr.clone();
+                range_stats_tasks
+                    .push(async move { (node_id, fetch_range_stats(&grpc_addr).await) });
+            }
+            while let Some((node_id, result)) = range_stats_tasks.next().await {
+                match result {
                     Ok(map) => {
-                        counts_by_node.insert(member.node_id, map);
+                        counts_by_node.insert(node_id, map);
                     }
                     Err(err) => {
-                        fetch_errors.insert(member.node_id, err.to_string());
+                        fetch_errors.insert(node_id, err.to_string());
+                    }
+                }
+            }
+
+            let mut total_unique_keys = 0u64;
+            let mut unique_keys_complete = true;
+            let mut total_replicated_keys = 0u64;
+            let mut replicated_keys_complete = true;
+            for shard in &state.shards {
+                match shard_record_count(
+                    shard.leaseholder,
+                    shard.shard_id,
+                    &counts_by_node,
+                    &fetch_errors,
+                ) {
+                    Some(count) => total_unique_keys = total_unique_keys.saturating_add(count),
+                    None => unique_keys_complete = false,
+                }
+                for replica in &shard.replicas {
+                    match shard_record_count(
+                        *replica,
+                        shard.shard_id,
+                        &counts_by_node,
+                        &fetch_errors,
+                    ) {
+                        Some(count) => {
+                            total_replicated_keys = total_replicated_keys.saturating_add(count);
+                        }
+                        None => replicated_keys_complete = false,
                     }
                 }
             }
@@ -429,7 +499,7 @@ async fn main() -> anyhow::Result<()> {
                         counts_by_node
                             .get(&member.node_id)
                             .and_then(|m| m.get(&shard.shard_id))
-                            .map(|v| v.to_string())
+                            .map(|v| format_count_u64(*v))
                             .unwrap_or_else(|| "n/a".to_string())
                     };
                     let move_status =
@@ -469,21 +539,59 @@ async fn main() -> anyhow::Result<()> {
                 (an, ashard).cmp(&(bn, bshard))
             });
 
+            let headers = [
+                "NODE",
+                "NODE_STATE",
+                "ROLE",
+                "SHARD",
+                "RANGE",
+                "RECORDS",
+                "STATE",
+            ];
+            let mut footer_lines = vec![vec![
+                "TOTALS".to_string(),
+                format!("nodes: {}", format_count_usize(members.len())),
+                format!("states: {}", format_state_counts(&member_state_counts)),
+                format!("shards: {}", format_count_usize(state.shards.len())),
+                format!(
+                    "unique: {}",
+                    format_total_count(total_unique_keys, unique_keys_complete)
+                ),
+                format!(
+                    "replicated: {}",
+                    format_total_count(total_replicated_keys, replicated_keys_complete)
+                ),
+                String::new(),
+            ]];
+            footer_lines.push(vec![
+                "SPLIT".to_string(),
+                format!(
+                    "attempts: {}",
+                    format_count_u64(state.split_health.attempts)
+                ),
+                format!(
+                    "success: {}",
+                    format_count_u64(state.split_health.successes)
+                ),
+                format!(
+                    "failures: {}",
+                    format_count_u64(state.split_health.failures)
+                ),
+                format!(
+                    "backoff: {}",
+                    format_count_u64(state.split_health.backoff_active)
+                ),
+                format!(
+                    "attempts_by: {}",
+                    format_top_reasons(&state.split_health.attempt_reasons),
+                ),
+                String::new(),
+            ]);
             if rows.is_empty() {
                 println!("no shard responsibilities found");
+                print_ascii_table(&headers, &footer_lines);
             } else {
-                print_ascii_table(
-                    &[
-                        "NODE",
-                        "NODE_STATE",
-                        "ROLE",
-                        "SHARD",
-                        "RANGE",
-                        "RECORDS",
-                        "STATE",
-                    ],
-                    &rows,
-                );
+                print_ascii_table_with_footer(&headers, &rows, &footer_lines);
             }
         }
         Command::MetaStatus => {
@@ -950,10 +1058,11 @@ fn format_key_bound(key: &[u8], is_start: bool) -> String {
     }
     if let Ok(s) = std::str::from_utf8(key) {
         if s.chars().all(|c| !c.is_control()) {
-            return s.to_string();
+            return truncate_middle(s, DEFAULT_RANGE_BOUND_MAX_CHARS);
         }
     }
-    format!("0x{}", hex_encode(key))
+    let hex = format!("0x{}", hex_encode(key));
+    truncate_middle(&hex, DEFAULT_RANGE_BOUND_MAX_CHARS)
 }
 
 fn format_hash_range(start: u64, end: u64) -> String {
@@ -984,6 +1093,167 @@ fn hex_encode(bytes: &[u8]) -> String {
         out.push(char::from(b"0123456789abcdef"[(b & 0x0f) as usize]));
     }
     out
+}
+
+fn shard_record_count(
+    node_id: u64,
+    shard_id: u64,
+    counts_by_node: &HashMap<u64, HashMap<u64, u64>>,
+    fetch_errors: &HashMap<u64, String>,
+) -> Option<u64> {
+    if fetch_errors.contains_key(&node_id) {
+        return None;
+    }
+    counts_by_node
+        .get(&node_id)
+        .and_then(|counts| counts.get(&shard_id))
+        .copied()
+}
+
+fn format_state_counts(counts: &BTreeMap<String, usize>) -> String {
+    if counts.is_empty() {
+        return "-".to_string();
+    }
+    counts
+        .iter()
+        .map(|(state, count)| format!("{state}: {}", format_count_usize(*count)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_total_count(total: u64, complete: bool) -> String {
+    if complete {
+        format_count_u64(total)
+    } else {
+        format!("{} (partial)", format_count_u64(total))
+    }
+}
+
+fn format_top_reasons(reasons: &BTreeMap<String, u64>) -> String {
+    if reasons.is_empty() {
+        return "-".to_string();
+    }
+    let mut entries = reasons
+        .iter()
+        .map(|(reason, count)| (reason.clone(), *count))
+        .collect::<Vec<_>>();
+    entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    entries
+        .into_iter()
+        .take(2)
+        .map(|(reason, count)| format!("{reason}={}", format_count_u64(count)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn truncate_middle(input: &str, max_chars: usize) -> String {
+    let char_count = input.chars().count();
+    if char_count <= max_chars {
+        return input.to_string();
+    }
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+    let keep = max_chars - 3;
+    let head = (keep + 1) / 2;
+    let tail = keep / 2;
+    let head_str = input.chars().take(head).collect::<String>();
+    let tail_str = input
+        .chars()
+        .rev()
+        .take(tail)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("{head_str}...{tail_str}")
+}
+
+fn format_count_usize(value: usize) -> String {
+    format_count_u64(value as u64)
+}
+
+fn format_count_u64(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    let head = if digits.len() % 3 == 0 {
+        3
+    } else {
+        digits.len() % 3
+    };
+    out.push_str(&digits[..head]);
+    let mut idx = head;
+    while idx < digits.len() {
+        out.push(',');
+        out.push_str(&digits[idx..idx + 3]);
+        idx += 3;
+    }
+    out
+}
+
+fn print_ascii_table_with_footer(
+    headers: &[&str],
+    rows: &[Vec<String>],
+    footer_rows: &[Vec<String>],
+) {
+    if footer_rows.is_empty() {
+        print_ascii_table(headers, rows);
+        return;
+    }
+    let mut widths = headers.iter().map(|h| h.len()).collect::<Vec<_>>();
+    for row in rows {
+        for (idx, cell) in row.iter().enumerate() {
+            if idx >= widths.len() {
+                widths.push(cell.len());
+            } else {
+                widths[idx] = widths[idx].max(cell.len());
+            }
+        }
+    }
+    for row in footer_rows {
+        for (idx, cell) in row.iter().enumerate() {
+            if idx >= widths.len() {
+                widths.push(cell.len());
+            } else {
+                widths[idx] = widths[idx].max(cell.len());
+            }
+        }
+    }
+    let separator = {
+        let mut s = String::from("+");
+        for w in &widths {
+            s.push_str(&"-".repeat(*w + 2));
+            s.push('+');
+        }
+        s
+    };
+    println!("{separator}");
+    print!("|");
+    for (idx, header) in headers.iter().enumerate() {
+        print!(" {:width$} |", header, width = widths[idx]);
+    }
+    println!();
+    println!("{separator}");
+    for row in rows {
+        print!("|");
+        for (idx, cell) in row.iter().enumerate() {
+            print!(" {:width$} |", cell, width = widths[idx]);
+        }
+        println!();
+    }
+    println!("{separator}");
+    for (row_idx, row) in footer_rows.iter().enumerate() {
+        print!("|");
+        for (idx, width) in widths.iter().enumerate() {
+            let cell = row.get(idx).map(String::as_str).unwrap_or("");
+            print!(" {:width$} |", cell, width = width);
+        }
+        println!();
+        if row_idx + 1 < footer_rows.len() {
+            println!("{separator}");
+        }
+    }
+    println!("{separator}");
 }
 
 fn print_ascii_table(headers: &[&str], rows: &[Vec<String>]) {

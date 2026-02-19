@@ -31,9 +31,11 @@ use tracing::{info, warn};
 
 mod ballista_codec;
 mod catalog;
+pub mod indexing;
 pub mod metadata;
 pub mod metrics;
 mod mutation;
+pub mod optimizer;
 mod pg_catalog_ext;
 mod pg_compat;
 pub mod provider;
@@ -237,14 +239,15 @@ impl HoloFusionConfig {
             .transpose()?;
         let initial_members = std::env::var("HOLO_FUSION_INITIAL_MEMBERS")
             .unwrap_or_else(|_| format!("{node_id}@{grpc_addr}"));
-        let max_shards =
-            parse_usize(std::env::var("HOLO_FUSION_HOLOSTORE_MAX_SHARDS").ok(), 1)?.max(1);
-        let initial_ranges = parse_usize(
+        let max_shards = parse_usize(std::env::var("HOLO_FUSION_HOLOSTORE_MAX_SHARDS").ok(), 0)?;
+        let mut initial_ranges = parse_usize(
             std::env::var("HOLO_FUSION_HOLOSTORE_INITIAL_RANGES").ok(),
             1,
         )?
-        .max(1)
-        .min(max_shards);
+        .max(1);
+        if max_shards > 0 {
+            initial_ranges = initial_ranges.min(max_shards);
+        }
         // Decision: accept only known routing modes so invalid values do not
         // silently alter storage behavior.
         let routing_mode = std::env::var("HOLO_FUSION_HOLOSTORE_ROUTING_MODE")

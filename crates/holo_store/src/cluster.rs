@@ -342,14 +342,31 @@ pub trait RangeMigrator: Send + Sync + 'static {
     ) -> anyhow::Result<()>;
 }
 
+/// Callback used by range migration to publish moved-key deltas.
+pub type MigrationStatsHook = dyn Fn(usize, usize, u64) + Send + Sync + 'static;
+
 /// Fjall-backed range migrator that moves keys between shard partitions.
 pub struct FjallRangeMigrator {
     keyspace: Arc<Keyspace>,
+    migration_hook: Option<Arc<MigrationStatsHook>>,
 }
 
 impl FjallRangeMigrator {
     pub fn new(keyspace: Arc<Keyspace>) -> Self {
-        Self { keyspace }
+        Self {
+            keyspace,
+            migration_hook: None,
+        }
+    }
+
+    pub fn with_migration_hook(
+        keyspace: Arc<Keyspace>,
+        migration_hook: Option<Arc<MigrationStatsHook>>,
+    ) -> Self {
+        Self {
+            keyspace,
+            migration_hook,
+        }
     }
 
     fn open_shard_partitions(
@@ -398,6 +415,7 @@ impl RangeMigrator for FjallRangeMigrator {
             let (key, latest_val) = item?;
             latest_entries.push((key.to_vec(), latest_val.to_vec()));
         }
+        let moved_count = latest_entries.len() as u64;
 
         // Commit in chunks to keep batch sizes bounded.
         const CHUNK_ITEMS: usize = 10_000;
@@ -440,6 +458,10 @@ impl RangeMigrator for FjallRangeMigrator {
 
         if queued > 0 {
             batch.commit()?;
+        }
+
+        if let Some(hook) = &self.migration_hook {
+            hook(from_shard, to_shard, moved_count);
         }
 
         Ok(())
