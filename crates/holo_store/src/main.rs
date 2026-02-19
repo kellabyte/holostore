@@ -9,7 +9,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufWriter, IsTerminal, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -53,6 +53,19 @@ const GROUP_MEMBERSHIP: GroupId = 0;
 const GROUP_META_EXTRA_BASE: GroupId = 10_000;
 /// Base group id for data shards (shard index is added to this base).
 const GROUP_DATA_BASE: GroupId = 1;
+/// Auto shard-slot target used when `--max-shards=0` ("no explicit cap").
+///
+/// The current runtime pre-creates shard groups at startup, so this is a
+/// practical upper bound for automatic splitting rather than true infinity.
+const AUTO_MAX_SHARDS: usize = 64;
+
+fn resolve_data_shards(max_shards: usize) -> usize {
+    if max_shards == 0 {
+        AUTO_MAX_SHARDS
+    } else {
+        max_shards.max(1)
+    }
+}
 
 fn meta_group_id_for_index(meta_index: usize) -> GroupId {
     if meta_index == 0 {
@@ -116,6 +129,8 @@ pub struct NodeArgs {
     ///
     /// The node pre-creates this many data group slots at startup; the range
     /// manager can then split ranges dynamically up to this cap.
+    ///
+    /// Use `0` to run in auto mode (no explicit operator cap).
     #[arg(long = "max-shards", env = "HOLO_MAX_SHARDS", default_value_t = 1)]
     data_shards: usize,
 
@@ -200,7 +215,7 @@ pub struct NodeArgs {
     /// proxy for key growth, to avoid expensive keyspace scans.
     ///
     /// Set to 0 to disable growth-based splitting.
-    #[arg(long, env = "HOLO_RANGE_SPLIT_MIN_KEYS", default_value_t = 50_000)]
+    #[arg(long, env = "HOLO_RANGE_SPLIT_MIN_KEYS", default_value_t = 100_000)]
     range_split_min_keys: usize,
 
     /// Split a hot range when its sustained SET QPS exceeds this threshold.
@@ -540,6 +555,7 @@ struct NodeState {
     split_lock: Arc<std::sync::RwLock<()>>,
     sql_write_locks: Arc<Vec<tokio::sync::Mutex<()>>>,
     shard_load: ShardLoadTracker,
+    split_health: Arc<SplitHealthStats>,
     range_stats: Arc<LocalRangeStats>,
     recovery_checkpoints: Arc<RecoveryCheckpointStats>,
     recovery_checkpoint_controller: Option<RecoveryCheckpointController>,
@@ -613,15 +629,29 @@ struct LocalRangeStats {
     keyspace: Arc<Keyspace>,
     max_shards: usize,
     apply_lock: Arc<std::sync::Mutex<()>>,
+    record_counts: Arc<Vec<AtomicI64>>,
 }
 
 impl LocalRangeStats {
-    fn new(keyspace: Arc<Keyspace>, max_shards: usize) -> Self {
-        Self {
-            keyspace,
-            max_shards: max_shards.max(1),
+    fn new(keyspace: Arc<Keyspace>, max_shards: usize) -> anyhow::Result<Self> {
+        let max_shards = max_shards.max(1);
+        let mut counters = Vec::with_capacity(max_shards);
+        let probe = Self {
+            keyspace: keyspace.clone(),
+            max_shards,
             apply_lock: Arc::new(std::sync::Mutex::new(())),
+            record_counts: Arc::new(Vec::new()),
+        };
+        for shard_index in 0..max_shards {
+            let count = probe.scan_partition_count(shard_index)?;
+            counters.push(AtomicI64::new(count as i64));
         }
+        Ok(Self {
+            keyspace,
+            max_shards,
+            apply_lock: Arc::new(std::sync::Mutex::new(())),
+            record_counts: Arc::new(counters),
+        })
     }
 
     fn latest_partition_name(&self, shard_index: usize) -> String {
@@ -640,30 +670,59 @@ impl LocalRangeStats {
         }
     }
 
-    /// Count current visible records for a shard range from the latest index.
-    fn count_range(
-        &self,
-        shard_index: usize,
-        start_key: &[u8],
-        end_key: &[u8],
-    ) -> anyhow::Result<u64> {
+    /// Count all latest-index entries for one shard partition.
+    fn scan_partition_count(&self, shard_index: usize) -> anyhow::Result<u64> {
         let latest_name = self.latest_partition_name(shard_index);
         let latest = self
             .keyspace
             .open_partition(&latest_name, PartitionCreateOptions::default())?;
-        let start = start_key.to_vec();
-        let mut iter: Box<dyn Iterator<Item = fjall::Result<fjall::KvPair>>> = if end_key.is_empty()
-        {
-            Box::new(latest.range(start..))
-        } else {
-            Box::new(latest.range(start..end_key.to_vec()))
-        };
+        let mut iter: Box<dyn Iterator<Item = fjall::Result<fjall::KvPair>>> =
+            Box::new(latest.range(Vec::<u8>::new()..));
         let mut count = 0u64;
         while let Some(item) = iter.next() {
             let _ = item?;
             count = count.saturating_add(1);
         }
         Ok(count)
+    }
+
+    fn record_count(&self, shard_index: usize) -> u64 {
+        self.record_counts
+            .get(shard_index)
+            .map(|v| v.load(Ordering::Relaxed).max(0) as u64)
+            .unwrap_or(0)
+    }
+
+    fn adjust_record_count(&self, shard_index: usize, delta: i64) {
+        if delta == 0 {
+            return;
+        }
+        let Some(counter) = self.record_counts.get(shard_index) else {
+            return;
+        };
+        loop {
+            let cur = counter.load(Ordering::Relaxed);
+            let next = (i128::from(cur) + i128::from(delta)).clamp(0, i128::from(i64::MAX)) as i64;
+            if counter
+                .compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+        }
+    }
+
+    fn on_visible_insertions(&self, shard_index: usize, inserted_keys: i64) {
+        self.adjust_record_count(shard_index, inserted_keys);
+    }
+
+    fn on_range_migration(&self, from_shard: usize, to_shard: usize, moved_keys: u64) {
+        if moved_keys == 0 || from_shard == to_shard {
+            return;
+        }
+        let moved = moved_keys.min(i64::MAX as u64) as i64;
+        self.adjust_record_count(from_shard, -moved);
+        self.adjust_record_count(to_shard, moved);
     }
 
     /// Read one paged snapshot of latest-visible rows for `[start_key, end_key)`.
@@ -762,6 +821,7 @@ impl LocalRangeStats {
             Arc::new(FjallEngine::open_shard(self.keyspace.clone(), shard_index)?)
         };
         let mut applied = 0u64;
+        let mut inserted_latest = 0i64;
         for entry in entries {
             let in_start = start_key.is_empty() || entry.key.as_slice() >= start_key;
             let in_end = end_key.is_empty() || entry.key.as_slice() < end_key;
@@ -769,8 +829,13 @@ impl LocalRangeStats {
                 continue;
             }
             engine.set(entry.key.clone(), entry.value.clone(), entry.version);
-            engine.mark_visible(&entry.key, entry.version);
+            if engine.mark_visible(&entry.key, entry.version) {
+                inserted_latest += 1;
+            }
             applied = applied.saturating_add(1);
+        }
+        if inserted_latest != 0 {
+            self.on_visible_insertions(shard_index, inserted_latest);
         }
         Ok(applied)
     }
@@ -815,12 +880,14 @@ impl LocalRangeStats {
         }
 
         let mut conflicts = 0u64;
+        let mut inserted_latest = 0i64;
         for entry in &in_range {
             let Some(cur_bytes) = latest.get(entry.key.as_slice())? else {
                 // Allow insert-on-missing when the caller expects the zero version.
                 if entry.expected_version != kv::Version::zero() {
                     conflicts = conflicts.saturating_add(1);
                 }
+                inserted_latest += 1;
                 continue;
             };
             let (cur_version, cur_value) = kv::decode_latest_value(&cur_bytes)?;
@@ -857,6 +924,9 @@ impl LocalRangeStats {
         }
 
         batch.commit()?;
+        if inserted_latest != 0 {
+            self.on_visible_insertions(shard_index, inserted_latest);
+        }
         Ok(RangeConditionalApplyResult {
             applied: in_range.len() as u64,
             conflicts: 0,
@@ -1434,6 +1504,92 @@ impl Drop for InflightClientOpGuard {
     }
 }
 
+#[derive(Debug, Default)]
+struct SplitHealthStats {
+    attempts: AtomicU64,
+    successes: AtomicU64,
+    failures: AtomicU64,
+    backoff_active: AtomicU64,
+    last_attempt_ms: AtomicU64,
+    last_success_ms: AtomicU64,
+    last_failure_ms: AtomicU64,
+    last_failure_reason: std::sync::RwLock<String>,
+    attempt_reasons: std::sync::RwLock<BTreeMap<String, u64>>,
+    failure_reasons: std::sync::RwLock<BTreeMap<String, u64>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub(crate) struct SplitHealthSnapshot {
+    attempts: u64,
+    successes: u64,
+    failures: u64,
+    backoff_active: u64,
+    last_attempt_ms: u64,
+    last_success_ms: u64,
+    last_failure_ms: u64,
+    last_failure_reason: String,
+    attempt_reasons: BTreeMap<String, u64>,
+    failure_reasons: BTreeMap<String, u64>,
+}
+
+impl SplitHealthStats {
+    fn record_attempt(&self, reason: &str) {
+        self.attempts.fetch_add(1, Ordering::Relaxed);
+        self.last_attempt_ms
+            .store(unix_time_ms(), Ordering::Relaxed);
+        let mut reasons = self.attempt_reasons.write().unwrap();
+        reasons
+            .entry(reason.to_string())
+            .and_modify(|v| *v = v.saturating_add(1))
+            .or_insert(1);
+    }
+
+    fn record_success(&self) {
+        self.successes.fetch_add(1, Ordering::Relaxed);
+        self.last_success_ms
+            .store(unix_time_ms(), Ordering::Relaxed);
+    }
+
+    fn record_failure(&self, reason: &str, detail: &str) {
+        self.failures.fetch_add(1, Ordering::Relaxed);
+        self.last_failure_ms
+            .store(unix_time_ms(), Ordering::Relaxed);
+        let mut reasons = self.failure_reasons.write().unwrap();
+        reasons
+            .entry(format!("failure:{reason}"))
+            .and_modify(|v| *v = v.saturating_add(1))
+            .or_insert(1);
+        drop(reasons);
+
+        let detail_trimmed = detail.trim();
+        let mut last = self.last_failure_reason.write().unwrap();
+        if detail_trimmed.is_empty() {
+            *last = reason.to_string();
+        } else {
+            *last = format!("{reason}: {}", detail_trimmed);
+        }
+    }
+
+    fn set_backoff_active(&self, count: u64) {
+        self.backoff_active.store(count, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> SplitHealthSnapshot {
+        SplitHealthSnapshot {
+            attempts: self.attempts.load(Ordering::Relaxed),
+            successes: self.successes.load(Ordering::Relaxed),
+            failures: self.failures.load(Ordering::Relaxed),
+            backoff_active: self.backoff_active.load(Ordering::Relaxed),
+            last_attempt_ms: self.last_attempt_ms.load(Ordering::Relaxed),
+            last_success_ms: self.last_success_ms.load(Ordering::Relaxed),
+            last_failure_ms: self.last_failure_ms.load(Ordering::Relaxed),
+            last_failure_reason: self.last_failure_reason.read().unwrap().clone(),
+            attempt_reasons: self.attempt_reasons.read().unwrap().clone(),
+            failure_reasons: self.failure_reasons.read().unwrap().clone(),
+        }
+    }
+}
+
 impl ProposalStats {
     /// Record latency for a proposal kind.
     fn record(&self, kind: ProposalKind, dur_us: u64, ok: bool) {
@@ -1624,6 +1780,26 @@ impl NodeState {
 
     pub(crate) fn client_inflight_ops(&self) -> u64 {
         self.client_inflight_ops.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn record_split_attempt(&self, reason: &str) {
+        self.split_health.record_attempt(reason);
+    }
+
+    pub(crate) fn record_split_success(&self) {
+        self.split_health.record_success();
+    }
+
+    pub(crate) fn record_split_failure(&self, reason: &str, detail: &str) {
+        self.split_health.record_failure(reason, detail);
+    }
+
+    pub(crate) fn set_split_backoff_active(&self, count: u64) {
+        self.split_health.set_backoff_active(count);
+    }
+
+    pub(crate) fn split_health_snapshot(&self) -> SplitHealthSnapshot {
+        self.split_health.snapshot()
     }
 
     fn meta_proposal_stats_snapshot(&self) -> MetaProposalStatsSnapshot {
@@ -2012,11 +2188,7 @@ impl NodeState {
             if !shard.replicas.contains(&self.node_id) {
                 continue;
             }
-            let record_count = self.range_stats.count_range(
-                shard.shard_index,
-                &shard.start_key,
-                &shard.end_key,
-            )?;
+            let record_count = self.range_stats.record_count(shard.shard_index);
             out.push(LocalRangeStat {
                 shard_id: shard.shard_id,
                 shard_index: shard.shard_index,
@@ -4263,12 +4435,14 @@ where
         })
         .collect();
 
+    let data_shards = resolve_data_shards(args.data_shards);
+
     let cluster_state_path = data_dir.join("meta").join("cluster_state.json");
     let cluster_store = ClusterStateStore::load_or_init(
         cluster_state_path,
         member_infos,
         args.replication_factor.max(1),
-        args.initial_ranges.max(1).min(args.data_shards.max(1)),
+        args.initial_ranges.max(1).min(data_shards),
     )?;
     if let Some(snapshot) = join_snapshot {
         cluster_store.install_snapshot(snapshot)?;
@@ -4467,7 +4641,6 @@ where
         });
     }
 
-    let data_shards = args.data_shards.max(1);
     let mut kv_shards: Vec<Arc<dyn KvEngine>> = Vec::with_capacity(data_shards);
     if data_shards == 1 {
         // Single shard: reuse the default Fjall engine.
@@ -4533,9 +4706,19 @@ where
         Ok(wal)
     };
 
+    let range_stats = Arc::new(LocalRangeStats::new(keyspace.clone(), data_shards)?);
+    let migration_stats_hook: Arc<cluster::MigrationStatsHook> = {
+        let range_stats = range_stats.clone();
+        Arc::new(move |from_shard, to_shard, moved_keys| {
+            range_stats.on_range_migration(from_shard, to_shard, moved_keys);
+        })
+    };
     let cluster_sm = Arc::new(ClusterStateMachine::new(
         cluster_store.clone(),
-        Some(Arc::new(cluster::FjallRangeMigrator::new(keyspace.clone()))),
+        Some(Arc::new(cluster::FjallRangeMigrator::with_migration_hook(
+            keyspace.clone(),
+            Some(migration_stats_hook),
+        ))),
         data_shards,
     ));
     let meta_group_count = args.meta_groups.max(1);
@@ -4587,10 +4770,17 @@ where
                 .collect::<Vec<_>>();
             group.update_membership(members, reconfig.voters)
         });
+        let visibility_hook: Arc<kv::VisibilityDeltaHook> = {
+            let range_stats = range_stats.clone();
+            Arc::new(move |delta| {
+                range_stats.on_visible_insertions(shard, delta);
+            })
+        };
         let kv_sm = Arc::new(kv::KvStateMachine::with_membership_hook(
             kv_shards[shard].clone(),
             Some(split_lock.clone()),
             Some(membership_hook),
+            Some(visibility_hook),
         ));
         let data_group = Arc::new(accord::Group::new(
             mk_cfg(group_id),
@@ -4679,7 +4869,6 @@ where
         inflight: args.client_batch_inflight.max(1),
     };
 
-    let range_stats = Arc::new(LocalRangeStats::new(keyspace.clone(), data_shards));
     let state = Arc::new(NodeState {
         initial_members: cluster_store.members_string(),
         groups,
@@ -4723,6 +4912,7 @@ where
                 .collect(),
         ),
         shard_load: ShardLoadTracker::new(data_shards),
+        split_health: Arc::new(SplitHealthStats::default()),
         range_stats,
         recovery_checkpoints: recovery_checkpoint_stats.clone(),
         recovery_checkpoint_controller,

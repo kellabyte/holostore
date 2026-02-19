@@ -232,7 +232,7 @@ Primary runtime knobs:
 | `HOLO_FUSION_BULK_CHUNK_ROWS_MAX` | `8192` | Upper bound for adaptive bulk chunking. |
 | `HOLO_FUSION_BULK_CHUNK_LOW_LATENCY_MS` | `40` | Grow chunk when latency stays below threshold. |
 | `HOLO_FUSION_BULK_CHUNK_HIGH_LATENCY_MS` | `150` | Shrink chunk when latency exceeds threshold. |
-| `HOLO_FUSION_HOLOSTORE_MAX_SHARDS` | `1` | Total shards available for spread. |
+| `HOLO_FUSION_HOLOSTORE_MAX_SHARDS` | `0` | Shard slot cap (`0` = auto mode with no explicit cap). |
 | `HOLO_FUSION_HOLOSTORE_INITIAL_RANGES` | `1` | Starting split count before growth. |
 | `HOLO_FUSION_HOLOSTORE_ROUTING_MODE` | `range` | Key routing mode (`range`/`hash`). |
 | `HOLO_FUSION_PHASE10_HASH_PK_DDL_ENABLED` | `true` | Kill switch for new `USING HASH` DDL adoption. |

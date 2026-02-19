@@ -4,7 +4,8 @@
 //! mutation helpers, and DataFusion `TableProvider` integration.
 
 use std::any::Any;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
 use std::ops::Range;
@@ -28,7 +29,7 @@ use datafusion::common::{
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::dml::InsertOp;
-use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown, TableType};
+use datafusion::logical_expr::{col, Expr, Operator, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::display::{DisplayAs, DisplayFormatType};
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use futures_util::StreamExt;
@@ -38,12 +39,23 @@ use holo_store::{
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, info_span, warn, Instrument};
 
+use crate::indexing::{
+    decode_secondary_index_primary_key, decode_secondary_index_row_values,
+    encode_secondary_index_lookup_prefix_for_prefix, encode_secondary_index_row_key,
+    encode_secondary_index_row_value, encode_secondary_index_unique_key,
+    encode_secondary_index_unique_value, index_tombstone_value, is_sql_tombstone_value,
+    SecondaryIndexDistribution, SecondaryIndexRecord, SecondaryIndexState,
+};
 use crate::metadata::{
     apply_column_defaults_for_missing, table_model_row_v1, validate_row_against_metadata,
     PrimaryKeyDistribution, TableCheckConstraintRecord, TableColumnRecord, TableColumnType,
     TableMetadataRecord,
 };
 use crate::metrics::{CircuitState, PushdownMetrics};
+use crate::optimizer::planner::{AccessPath, PlannedAccessPath, QueryShape};
+use crate::optimizer::predicates::{extract_predicate_summary, ColumnPredicate, PredicateSummary};
+use crate::optimizer::stats::{build_table_stats_from_sample, TableStats};
+use crate::optimizer::OptimizerEngine;
 use crate::topology::{
     fetch_topology, min_end_bound, require_non_empty_topology, route_key, scan_targets,
 };
@@ -60,14 +72,14 @@ const ROW_FORMAT_VERSION_V1: u8 = 1;
 const ROW_FORMAT_VERSION_V2: u8 = 2;
 const ROW_FLAG_TOMBSTONE: u8 = 0x01;
 const SIGN_FLIP_MASK: u64 = 1u64 << 63;
-const DEFAULT_MAX_SCAN_ROWS: usize = 100_000;
+const DEFAULT_MAX_SCAN_ROWS: usize = 0;
 const DEFAULT_HASH_PK_BUCKETS: usize = 32;
 const DEFAULT_DISTRIBUTED_WRITE_MAX_BATCH_ENTRIES: usize = 1_024;
 const DEFAULT_DISTRIBUTED_WRITE_MAX_BATCH_BYTES: usize = 1_048_576;
 const DEFAULT_DISTRIBUTED_WRITE_RETRY_LIMIT: usize = 5;
 const DEFAULT_DISTRIBUTED_WRITE_RETRY_BASE_DELAY_MS: u64 = 50;
 const DEFAULT_DISTRIBUTED_WRITE_RETRY_MAX_DELAY_MS: u64 = 1_000;
-const DEFAULT_DISTRIBUTED_WRITE_RETRY_BUDGET_MS: u64 = 10_000;
+const DEFAULT_DISTRIBUTED_WRITE_RETRY_BUDGET_MS: u64 = 60_000;
 const DEFAULT_DISTRIBUTED_SCAN_RETRY_LIMIT: usize = 5;
 const DEFAULT_DISTRIBUTED_SCAN_RETRY_DELAY_MS: u64 = 60;
 const DEFAULT_DISTRIBUTED_CIRCUIT_BREAKER_FAILURE_THRESHOLD: u32 = 4;
@@ -75,11 +87,13 @@ const DEFAULT_DISTRIBUTED_CIRCUIT_BREAKER_OPEN_MS: u64 = 2_000;
 const DEFAULT_DISTRIBUTED_WRITE_MAX_INFLIGHT_ROWS: usize = 32_768;
 const DEFAULT_DISTRIBUTED_WRITE_MAX_INFLIGHT_BYTES: usize = 32 * 1_024 * 1_024;
 const DEFAULT_DISTRIBUTED_WRITE_MAX_INFLIGHT_RPCS: usize = 32;
+const DEFAULT_INDEX_BACKFILL_PAGE_SIZE: usize = 512;
 const DEFAULT_BULK_CHUNK_ROWS_INITIAL: usize = 1_024;
 const DEFAULT_BULK_CHUNK_ROWS_MIN: usize = 128;
 const DEFAULT_BULK_CHUNK_ROWS_MAX: usize = 8_192;
 const DEFAULT_BULK_CHUNK_LOW_LATENCY_MS: u64 = 40;
 const DEFAULT_BULK_CHUNK_HIGH_LATENCY_MS: u64 = 150;
+const DEFAULT_OPTIMIZER_BOOTSTRAP_ROW_COUNT: u64 = 4_096;
 
 /// Executes `default max scan rows` for this component.
 fn default_max_scan_rows() -> usize {
@@ -91,7 +105,6 @@ fn configured_max_scan_rows() -> usize {
     std::env::var("HOLO_FUSION_SCAN_MAX_ROWS")
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
-        .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_MAX_SCAN_ROWS)
 }
 
@@ -206,6 +219,19 @@ fn configured_scan_retry_delay_ms() -> u64 {
         .unwrap_or(DEFAULT_DISTRIBUTED_SCAN_RETRY_DELAY_MS)
 }
 
+fn configured_scan_parallelism() -> usize {
+    std::env::var("HOLO_FUSION_SCAN_PARALLELISM")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|parallelism| parallelism.get())
+                .unwrap_or(8)
+                .clamp(1, 64)
+        })
+}
+
 fn configured_write_inflight_max_rows() -> usize {
     std::env::var("HOLO_FUSION_DML_WRITE_MAX_INFLIGHT_ROWS")
         .ok()
@@ -228,6 +254,14 @@ fn configured_write_inflight_max_rpcs() -> usize {
         .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_DISTRIBUTED_WRITE_MAX_INFLIGHT_RPCS)
+}
+
+fn configured_index_backfill_page_size() -> usize {
+    std::env::var("HOLO_FUSION_INDEX_BACKFILL_PAGE_SIZE")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_INDEX_BACKFILL_PAGE_SIZE)
 }
 
 fn configured_circuit_breaker_failure_threshold() -> u32 {
@@ -437,6 +471,10 @@ fn classify_write_error_message(message: &str) -> RetryableErrorClass {
         || lower.contains("deadline")
         || lower.contains("temporarily unavailable")
         || lower.contains("unavailable")
+        || lower.contains("failed to reach quorum")
+        || lower.contains("quorum not reached")
+        || lower.contains("preaccept")
+        || lower.contains("pre-accept")
         || lower.contains("transport")
         || lower.contains("connection reset")
         || lower.contains("connection refused")
@@ -596,11 +634,53 @@ pub struct ConditionalPrimaryWrite {
 }
 
 #[derive(Debug, Clone)]
+/// Generic conditional write keyed directly by storage key bytes.
+struct ConditionalStorageWrite {
+    key: Vec<u8>,
+    expected_version: RpcVersion,
+    value: Vec<u8>,
+    rollback_value: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EncodedSecondaryIndexMutation {
+    row_key: Vec<u8>,
+    row_value: Vec<u8>,
+    unique_key: Option<Vec<u8>>,
+    unique_value: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
 /// Generic row decoded from a row_v1 table scan with storage version.
 pub struct VersionedGenericRow {
     pub primary_key: i64,
     pub values: Vec<ScalarValue>,
     pub version: RpcVersion,
+}
+
+#[derive(Debug, Clone)]
+/// One conjunction filter clause used by grouped aggregate pushdown.
+pub struct GroupedAggregateFilter {
+    pub column: String,
+    pub allowed_values: Vec<ScalarValue>,
+}
+
+#[derive(Debug, Clone)]
+/// Query shape supported by grouped aggregate + top-k pushdown path.
+pub struct GroupedAggregateTopKSpec {
+    pub group_columns: Vec<String>,
+    pub sum_column: String,
+    pub filters: Vec<GroupedAggregateFilter>,
+    pub having_min_count: u64,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone)]
+/// One output row emitted by grouped aggregate + top-k pushdown path.
+pub struct GroupedAggregateTopKRow {
+    pub group_values: Vec<ScalarValue>,
+    pub count: u64,
+    pub sum: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -659,6 +739,13 @@ impl DuplicateKeyViolation {
             constraint_name: format!("{table_name}_pkey"),
         }
     }
+
+    /// Creates a duplicate-key violation for an explicit constraint/index name.
+    fn for_constraint(constraint_name: impl Into<String>) -> Self {
+        Self {
+            constraint_name: constraint_name.into(),
+        }
+    }
 }
 
 impl fmt::Display for DuplicateKeyViolation {
@@ -694,6 +781,8 @@ pub struct HoloProviderCodecSpec {
     pub primary_key_distribution: PrimaryKeyDistribution,
     #[serde(default)]
     pub primary_key_hash_buckets: Option<usize>,
+    #[serde(default)]
+    pub secondary_indexes: Vec<SecondaryIndexRecord>,
     pub preferred_shards: Vec<usize>,
     pub page_size: usize,
     #[serde(default = "default_max_scan_rows")]
@@ -847,6 +936,7 @@ pub struct HoloStoreTableProvider {
     schema: SchemaRef,
     columns: Vec<TableColumnRecord>,
     check_constraints: Vec<TableCheckConstraintRecord>,
+    secondary_indexes: Vec<SecondaryIndexRecord>,
     table_name: String,
     table_id: u64,
     table_model: String,
@@ -863,10 +953,13 @@ pub struct HoloStoreTableProvider {
     write_retry_policy: RetryPolicy,
     scan_retry_limit: usize,
     scan_retry_delay: Duration,
+    scan_parallelism: usize,
     inflight_budget: InflightBudgetConfig,
     circuit_breaker_config: CircuitBreakerConfig,
     circuit_by_target: Arc<std::sync::Mutex<BTreeMap<SocketAddr, TargetCircuitState>>>,
     bulk_ingest_enabled: bool,
+    optimizer: OptimizerEngine,
+    optimizer_stats: Arc<std::sync::Mutex<OptimizerStatsCache>>,
     local_grpc_addr: SocketAddr,
     client: HoloStoreClient,
     metrics: Arc<PushdownMetrics>,
@@ -877,6 +970,25 @@ pub struct HoloStoreTableProvider {
 enum RowCodecMode {
     OrdersV1,
     RowV1,
+}
+
+#[derive(Debug, Clone)]
+struct OptimizerStatsCache {
+    stats: Option<TableStats>,
+    last_collected_at: Option<Instant>,
+    approx_row_count: u64,
+    stats_sample_cursor: Option<i64>,
+}
+
+impl Default for OptimizerStatsCache {
+    fn default() -> Self {
+        Self {
+            stats: None,
+            last_collected_at: None,
+            approx_row_count: DEFAULT_OPTIMIZER_BOOTSTRAP_ROW_COUNT,
+            stats_sample_cursor: None,
+        }
+    }
 }
 
 /// Builds a DataFusion schema from persisted metadata columns.
@@ -1039,6 +1151,7 @@ impl HoloStoreTableProvider {
             schema: orders_schema(),
             columns,
             check_constraints: Vec::new(),
+            secondary_indexes: Vec::new(),
             table_name: ORDERS_TABLE_NAME.to_string(),
             table_id: ORDERS_TABLE_ID,
             table_model: ORDERS_TABLE_MODEL.to_string(),
@@ -1055,10 +1168,13 @@ impl HoloStoreTableProvider {
             write_retry_policy: RetryPolicy::from_env(),
             scan_retry_limit: configured_scan_retry_limit().max(1),
             scan_retry_delay: Duration::from_millis(configured_scan_retry_delay_ms()),
+            scan_parallelism: configured_scan_parallelism().max(1),
             inflight_budget: InflightBudgetConfig::from_env(),
             circuit_breaker_config: CircuitBreakerConfig::from_env(),
             circuit_by_target: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             bulk_ingest_enabled: configured_bulk_ingest_enabled(),
+            optimizer: OptimizerEngine::default(),
+            optimizer_stats: Arc::new(std::sync::Mutex::new(OptimizerStatsCache::default())),
             local_grpc_addr,
             client,
             metrics,
@@ -1071,6 +1187,16 @@ impl HoloStoreTableProvider {
         client: HoloStoreClient,
         metrics: Arc<PushdownMetrics>,
     ) -> Result<Self> {
+        Self::from_table_metadata_with_indexes(table, Vec::new(), client, metrics)
+    }
+
+    /// Builds provider from table metadata plus persisted secondary index metadata.
+    pub fn from_table_metadata_with_indexes(
+        table: &TableMetadataRecord,
+        secondary_indexes: Vec<SecondaryIndexRecord>,
+        client: HoloStoreClient,
+        metrics: Arc<PushdownMetrics>,
+    ) -> Result<Self> {
         table.validate()?;
         let (schema, columns, row_codec_mode, primary_key_column, primary_key_index) =
             provider_layout_from_metadata(table)?;
@@ -1080,6 +1206,7 @@ impl HoloStoreTableProvider {
             schema,
             columns,
             check_constraints: table.check_constraints.clone(),
+            secondary_indexes,
             table_name: table.table_name.clone(),
             table_id: table.table_id,
             table_model: table.table_model.clone(),
@@ -1096,10 +1223,13 @@ impl HoloStoreTableProvider {
             write_retry_policy: RetryPolicy::from_env(),
             scan_retry_limit: configured_scan_retry_limit().max(1),
             scan_retry_delay: Duration::from_millis(configured_scan_retry_delay_ms()),
+            scan_parallelism: configured_scan_parallelism().max(1),
             inflight_budget: InflightBudgetConfig::from_env(),
             circuit_breaker_config: CircuitBreakerConfig::from_env(),
             circuit_by_target: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             bulk_ingest_enabled: configured_bulk_ingest_enabled(),
+            optimizer: OptimizerEngine::default(),
+            optimizer_stats: Arc::new(std::sync::Mutex::new(OptimizerStatsCache::default())),
             local_grpc_addr,
             client,
             metrics,
@@ -1114,6 +1244,7 @@ impl HoloStoreTableProvider {
             table_model: self.table_model.clone(),
             columns: self.columns.clone(),
             check_constraints: self.check_constraints.clone(),
+            secondary_indexes: self.secondary_indexes.clone(),
             primary_key_column: Some(self.primary_key_column.clone()),
             primary_key_distribution: self.primary_key_distribution,
             primary_key_hash_buckets: self.primary_key_hash_buckets,
@@ -1146,6 +1277,7 @@ impl HoloStoreTableProvider {
             schema,
             columns,
             check_constraints: spec.check_constraints,
+            secondary_indexes: spec.secondary_indexes,
             table_name: spec.table_name,
             table_id: spec.table_id,
             table_model: spec.table_model,
@@ -1156,16 +1288,19 @@ impl HoloStoreTableProvider {
             primary_key_hash_buckets: spec.primary_key_hash_buckets,
             preferred_shards: spec.preferred_shards,
             page_size: spec.page_size.max(1),
-            max_scan_rows: spec.max_scan_rows.max(1),
+            max_scan_rows: spec.max_scan_rows,
             distributed_write_max_batch_entries: configured_write_max_batch_entries(),
             distributed_write_max_batch_bytes: configured_write_max_batch_bytes(),
             write_retry_policy: RetryPolicy::from_env(),
             scan_retry_limit: configured_scan_retry_limit().max(1),
             scan_retry_delay: Duration::from_millis(configured_scan_retry_delay_ms()),
+            scan_parallelism: configured_scan_parallelism().max(1),
             inflight_budget: InflightBudgetConfig::from_env(),
             circuit_breaker_config: CircuitBreakerConfig::from_env(),
             circuit_by_target: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             bulk_ingest_enabled: configured_bulk_ingest_enabled(),
+            optimizer: OptimizerEngine::default(),
+            optimizer_stats: Arc::new(std::sync::Mutex::new(OptimizerStatsCache::default())),
             local_grpc_addr,
             client,
             metrics,
@@ -1200,6 +1335,11 @@ impl HoloStoreTableProvider {
     /// Returns persisted CHECK constraints for this table metadata.
     pub fn check_constraints(&self) -> &[TableCheckConstraintRecord] {
         self.check_constraints.as_slice()
+    }
+
+    /// Returns persisted secondary index metadata associated with this table.
+    pub fn secondary_indexes(&self) -> &[SecondaryIndexRecord] {
+        self.secondary_indexes.as_slice()
     }
 
     /// Returns physical primary-key distribution mode.
@@ -1298,6 +1438,294 @@ impl HoloStoreTableProvider {
             ranges.push((start, end));
         }
         Ok(ranges)
+    }
+
+    fn public_secondary_indexes(&self) -> Vec<&SecondaryIndexRecord> {
+        self.secondary_indexes
+            .iter()
+            .filter(|index| matches!(index.state, SecondaryIndexState::Public))
+            .collect::<Vec<_>>()
+    }
+
+    fn filter_supports_secondary_index_pushdown(&self, filter: &Expr) -> bool {
+        if self.row_codec_mode != RowCodecMode::RowV1 {
+            return false;
+        }
+        let indexes = self.public_secondary_indexes();
+        if indexes.is_empty() {
+            return false;
+        }
+
+        let summary = extract_predicate_summary(std::slice::from_ref(filter));
+        summary_supports_secondary_index_pushdown(&summary, indexes.as_slice())
+    }
+
+    fn required_columns_for_projection(&self, projection: Option<&Vec<usize>>) -> BTreeSet<String> {
+        match projection {
+            Some(projected) => projected
+                .iter()
+                .filter_map(|idx| self.columns.get(*idx))
+                .map(|column| column.name.to_ascii_lowercase())
+                .collect::<BTreeSet<_>>(),
+            None => self
+                .columns
+                .iter()
+                .map(|column| column.name.to_ascii_lowercase())
+                .collect::<BTreeSet<_>>(),
+        }
+    }
+
+    fn required_column_indexes(&self, required_columns: &BTreeSet<String>) -> BTreeSet<usize> {
+        let mut out = BTreeSet::<usize>::new();
+        out.insert(self.primary_key_index);
+        for (idx, column) in self.columns.iter().enumerate() {
+            if required_columns.contains(&column.name.to_ascii_lowercase()) {
+                out.insert(idx);
+            }
+        }
+        out
+    }
+
+    fn optimizer_bootstrap_stats(&self, approx_row_count: u64) -> TableStats {
+        let public_indexes = self
+            .public_secondary_indexes()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        build_table_stats_from_sample(
+            self.columns.as_slice(),
+            public_indexes.as_slice(),
+            &[],
+            approx_row_count.max(1),
+            now_unix_millis(),
+        )
+    }
+
+    async fn optimizer_collect_sample_rows(
+        &self,
+        sample_target: usize,
+        cursor: Option<i64>,
+    ) -> Result<Vec<VersionedGenericRow>> {
+        if sample_target == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut rows = Vec::<VersionedGenericRow>::new();
+        let mut seen_primary = BTreeSet::<i64>::new();
+
+        if let Some(last_primary_key) = cursor {
+            let mut tail_bounds = PkBounds::default();
+            tail_bounds.apply(Operator::Gt, last_primary_key);
+            for row in self
+                .scan_rows_with_bounds_with_versions_generic(tail_bounds, Some(sample_target), 0)
+                .await?
+            {
+                if seen_primary.insert(row.primary_key) {
+                    rows.push(row);
+                    if rows.len() >= sample_target {
+                        return Ok(rows);
+                    }
+                }
+            }
+        }
+
+        let remaining = sample_target.saturating_sub(rows.len());
+        if remaining > 0 {
+            for row in self
+                .scan_rows_with_bounds_with_versions_generic(
+                    PkBounds::default(),
+                    Some(remaining),
+                    0,
+                )
+                .await?
+            {
+                if seen_primary.insert(row.primary_key) {
+                    rows.push(row);
+                    if rows.len() >= sample_target {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(rows)
+    }
+
+    async fn optimizer_table_stats(&self) -> Result<TableStats> {
+        let now = Instant::now();
+        let (cached_stats, cached_at, approx_row_count, stats_sample_cursor) = {
+            let cache = self
+                .optimizer_stats
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (
+                cache.stats.clone(),
+                cache.last_collected_at,
+                cache.approx_row_count.max(1),
+                cache.stats_sample_cursor,
+            )
+        };
+
+        let refresh_interval = self.optimizer.config().stats_refresh_interval;
+        if let (Some(stats), Some(collected_at)) = (cached_stats.clone(), cached_at) {
+            if now.duration_since(collected_at) <= refresh_interval {
+                return Ok(stats);
+            }
+        }
+
+        if self.row_codec_mode != RowCodecMode::RowV1 {
+            let stats =
+                cached_stats.unwrap_or_else(|| self.optimizer_bootstrap_stats(approx_row_count));
+            return Ok(stats);
+        }
+
+        let sample_target = self.optimizer.config().stats_sample_rows.max(1);
+        let sampled_rows = self
+            .optimizer_collect_sample_rows(sample_target, stats_sample_cursor)
+            .await
+            .unwrap_or_default();
+        let next_sample_cursor = sampled_rows.last().map(|row| row.primary_key);
+        let sample_rows = sampled_rows
+            .into_iter()
+            .map(|row| row.values)
+            .collect::<Vec<Vec<ScalarValue>>>();
+        let observed = sample_rows.len() as u64;
+
+        let public_indexes = self
+            .public_secondary_indexes()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let stats = build_table_stats_from_sample(
+            self.columns.as_slice(),
+            public_indexes.as_slice(),
+            sample_rows.as_slice(),
+            approx_row_count.max(observed),
+            now_unix_millis(),
+        );
+
+        let mut cache = self
+            .optimizer_stats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.approx_row_count = cache.approx_row_count.max(observed).max(1);
+        cache.stats_sample_cursor = next_sample_cursor;
+        cache.last_collected_at = Some(now);
+        cache.stats = Some(stats.clone());
+        Ok(stats)
+    }
+
+    fn optimizer_record_row_count_delta(&self, delta: i64) {
+        let mut cache = self
+            .optimizer_stats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if delta >= 0 {
+            cache.approx_row_count = cache.approx_row_count.saturating_add(delta as u64).max(1);
+        } else {
+            cache.approx_row_count = cache
+                .approx_row_count
+                .saturating_sub((-delta) as u64)
+                .max(1);
+        }
+    }
+
+    fn optimizer_observe_row_count_lower_bound(&self, observed: usize) {
+        if observed == 0 {
+            return;
+        }
+        let mut cache = self
+            .optimizer_stats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.approx_row_count = cache.approx_row_count.max(observed as u64).max(1);
+    }
+
+    /// Emits structured optimizer decision traces for EXPLAIN/diagnostics.
+    fn emit_optimizer_decision_trace_events(
+        &self,
+        query_execution_id: &str,
+        stage_id: u64,
+        plan: &PlannedAccessPath,
+    ) {
+        if plan.considered.is_empty() {
+            return;
+        }
+
+        let mut ranked = plan.considered.clone();
+        ranked.sort_by(|left, right| {
+            left.total_cost
+                .partial_cmp(&right.total_cost)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let winner_name = optimizer_candidate_name_for_access_path(&plan.path);
+        let winner = ranked
+            .iter()
+            .find(|candidate| candidate.name == winner_name)
+            .or_else(|| ranked.first());
+        let runner_up = winner.and_then(|winner| {
+            ranked
+                .iter()
+                .find(|candidate| candidate.name != winner.name)
+        });
+
+        if let Some(winner) = winner {
+            let reason = if plan.fallback_decision.is_some() {
+                "uncertainty_fallback_applied"
+            } else if runner_up.is_some() {
+                "lowest_total_cost"
+            } else {
+                "single_candidate"
+            };
+            let (runner_up_name, runner_up_cost, cost_delta, cost_ratio) =
+                if let Some(runner_up) = runner_up {
+                    let delta = runner_up.total_cost - winner.total_cost;
+                    let ratio = if winner.total_cost.abs() <= f64::EPSILON {
+                        0.0
+                    } else {
+                        runner_up.total_cost / winner.total_cost
+                    };
+                    (runner_up.name.as_str(), runner_up.total_cost, delta, ratio)
+                } else {
+                    ("none", 0.0, 0.0, 0.0)
+                };
+            self.metrics.record_stage_event(
+                query_execution_id,
+                stage_id,
+                "optimizer_plan_decision",
+                format!(
+                    "reason={} winner={} winner_cost={:.3} runner_up={} runner_up_cost={:.3} cost_delta={:.3} cost_ratio={:.3} candidate_count={}",
+                    reason,
+                    winner.name,
+                    winner.total_cost,
+                    runner_up_name,
+                    runner_up_cost,
+                    cost_delta,
+                    cost_ratio,
+                    ranked.len(),
+                ),
+            );
+        }
+
+        // Keep trace compact while preserving enough ranked context for diagnosis.
+        for (rank, candidate) in ranked.iter().take(8).enumerate() {
+            self.metrics.record_stage_event(
+                query_execution_id,
+                stage_id,
+                "optimizer_candidate_eval",
+                format!(
+                    "rank={} name={} total_cost={:.3} estimated_output_rows={:.2} estimated_scan_rows={:.2} uncertainty={:.3} feedback_multiplier={:.3}",
+                    rank + 1,
+                    candidate.name,
+                    candidate.total_cost,
+                    candidate.estimated_output_rows,
+                    candidate.estimated_scan_rows,
+                    candidate.uncertainty,
+                    candidate.feedback_multiplier,
+                ),
+            );
+        }
     }
 
     /// Reads MIN/MAX(primary_key) using one directed page per scan target.
@@ -1469,6 +1897,606 @@ impl HoloStoreTableProvider {
         }
         self.scan_rows_with_bounds_with_versions_generic(bounds, limit, 1)
             .await
+    }
+
+    /// Executes grouped `COUNT(*)/SUM(column)` aggregation with top-k ordering using provider pushdown.
+    pub async fn execute_grouped_aggregate_topk(
+        &self,
+        query_execution_id: &str,
+        stage_id: u64,
+        spec: &GroupedAggregateTopKSpec,
+    ) -> Result<Vec<GroupedAggregateTopKRow>> {
+        if self.row_codec_mode != RowCodecMode::RowV1 {
+            return Err(anyhow!(
+                "grouped aggregate pushdown is only available for row_v1 tables"
+            ));
+        }
+        if spec.limit == 0 {
+            return Ok(Vec::new());
+        }
+        if spec.group_columns.is_empty() {
+            return Err(anyhow!(
+                "grouped aggregate pushdown requires at least one GROUP BY column"
+            ));
+        }
+
+        let mut by_name = BTreeMap::<String, usize>::new();
+        for (idx, column) in self.columns.iter().enumerate() {
+            by_name.insert(column.name.to_ascii_lowercase(), idx);
+        }
+
+        let mut group_indexes = Vec::<usize>::with_capacity(spec.group_columns.len());
+        let mut required_columns = BTreeSet::<String>::new();
+        for column in &spec.group_columns {
+            let normalized = column.to_ascii_lowercase();
+            let Some(idx) = by_name.get(normalized.as_str()).copied() else {
+                return Err(anyhow!(
+                    "grouped aggregate pushdown column '{}' does not exist",
+                    column
+                ));
+            };
+            group_indexes.push(idx);
+            required_columns.insert(normalized);
+        }
+
+        let sum_column_normalized = spec.sum_column.to_ascii_lowercase();
+        let Some(sum_column_index) = by_name.get(sum_column_normalized.as_str()).copied() else {
+            return Err(anyhow!(
+                "grouped aggregate pushdown SUM column '{}' does not exist",
+                spec.sum_column
+            ));
+        };
+        required_columns.insert(sum_column_normalized.clone());
+
+        let mut runtime_filters = Vec::<AggregateFilterRuntime>::new();
+        let mut pushed_filters = Vec::<Expr>::new();
+        for filter in &spec.filters {
+            if filter.allowed_values.is_empty() {
+                return Ok(Vec::new());
+            }
+            let normalized = filter.column.to_ascii_lowercase();
+            let Some(column_index) = by_name.get(normalized.as_str()).copied() else {
+                return Err(anyhow!(
+                    "grouped aggregate pushdown filter column '{}' does not exist",
+                    filter.column
+                ));
+            };
+            required_columns.insert(normalized.clone());
+            runtime_filters.push(AggregateFilterRuntime {
+                column_index,
+                allowed_values: filter.allowed_values.clone(),
+            });
+
+            let column_expr = col(normalized.as_str());
+            let filter_expr = if filter.allowed_values.len() == 1 {
+                column_expr.eq(Expr::Literal(filter.allowed_values[0].clone(), None))
+            } else {
+                let values = filter
+                    .allowed_values
+                    .iter()
+                    .cloned()
+                    .map(|value| Expr::Literal(value, None))
+                    .collect::<Vec<_>>();
+                column_expr.in_list(values, false)
+            };
+            pushed_filters.push(filter_expr);
+        }
+
+        let required_column_indexes = self.required_column_indexes(&required_columns);
+        let predicates = extract_predicate_summary(pushed_filters.as_slice());
+        self.metrics.record_stage_event(
+            query_execution_id,
+            stage_id,
+            "optimizer_predicate_summary",
+            format_optimizer_predicate_summary(&predicates),
+        );
+        let stats = match self.optimizer_table_stats().await {
+            Ok(stats) => stats,
+            Err(err) => {
+                self.metrics.record_stage_event(
+                    query_execution_id,
+                    stage_id,
+                    "aggregate_pushdown_optimizer_stats_fallback",
+                    format!("error={err}"),
+                );
+                self.optimizer_bootstrap_stats(DEFAULT_OPTIMIZER_BOOTSTRAP_ROW_COUNT)
+            }
+        };
+
+        let query_shape = QueryShape {
+            required_columns: required_columns.clone(),
+            limit: None,
+            preferred_shard_count: self.preferred_shards.len().max(1),
+        };
+        let public_indexes = self
+            .public_secondary_indexes()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let plan = self.optimizer.choose_access_path(
+            self.columns.as_slice(),
+            public_indexes.as_slice(),
+            self.primary_key_column.as_str(),
+            &stats,
+            &predicates,
+            &query_shape,
+        );
+        self.metrics.record_optimizer_plan_choice(match &plan.path {
+            AccessPath::TableScan => "table_scan",
+            AccessPath::Index {
+                index_only_table_covering: true,
+                ..
+            } => "index_only",
+            AccessPath::Index { .. } => "index_scan",
+        });
+        self.metrics.record_stage_event(
+            query_execution_id,
+            stage_id,
+            "aggregate_pushdown_plan_choice",
+            format!(
+                "path={} estimated_output_rows={:.2} estimated_scan_rows={:.2} uncertainty={:.3} cost={:.3}",
+                format_access_path(&plan.path),
+                plan.estimated_output_rows,
+                plan.estimated_scan_rows,
+                plan.uncertainty,
+                plan.total_cost
+            ),
+        );
+        if let Some(fallback) = plan.fallback_decision.as_ref() {
+            self.metrics.record_stage_event(
+                query_execution_id,
+                stage_id,
+                "optimizer_uncertainty_fallback",
+                format!(
+                    "reason={} source={} source_cost={:.3} fallback={} fallback_cost={:.3} uncertainty={:.3} threshold={:.3} cost_penalty_ratio={:.3}",
+                    fallback.reason,
+                    fallback.source_candidate,
+                    fallback.source_cost,
+                    fallback.fallback_candidate,
+                    fallback.fallback_cost,
+                    fallback.uncertainty,
+                    fallback.uncertainty_threshold,
+                    fallback.fallback_cost_penalty_ratio,
+                ),
+            );
+        }
+        self.emit_optimizer_decision_trace_events(query_execution_id, stage_id, &plan);
+
+        let mut global_groups = BTreeMap::<Vec<u8>, AggregateGroupState>::new();
+        let scan_stats = match &plan.path {
+            AccessPath::TableScan => {
+                self.aggregate_table_scan_streaming_ctx(
+                    query_execution_id,
+                    stage_id,
+                    &group_indexes,
+                    sum_column_index,
+                    runtime_filters.as_slice(),
+                    &required_column_indexes,
+                    &mut global_groups,
+                )
+                .await?
+            }
+            AccessPath::Index { .. } => {
+                match self
+                    .aggregate_index_scan_streaming_ctx(
+                        query_execution_id,
+                        stage_id,
+                        &plan,
+                        &group_indexes,
+                        sum_column_index,
+                        runtime_filters.as_slice(),
+                        &required_columns,
+                        &mut global_groups,
+                    )
+                    .await
+                {
+                    Ok(stats) => stats,
+                    Err(err) => {
+                        self.metrics.record_stage_event(
+                            query_execution_id,
+                            stage_id,
+                            "aggregate_pushdown_index_fallback",
+                            format!("error={err}"),
+                        );
+                        self.aggregate_table_scan_streaming_ctx(
+                            query_execution_id,
+                            stage_id,
+                            &group_indexes,
+                            sum_column_index,
+                            runtime_filters.as_slice(),
+                            &required_column_indexes,
+                            &mut global_groups,
+                        )
+                        .await?
+                    }
+                }
+            }
+        };
+        self.optimizer_observe_row_count_lower_bound(scan_stats.rows_scanned as usize);
+
+        let rows = finalize_grouped_topk_rows(global_groups, spec.having_min_count, spec.limit)?;
+
+        self.metrics.record_scan(
+            scan_stats.rpc_pages,
+            scan_stats.rows_scanned,
+            scan_stats.rows_output,
+            scan_stats.bytes_scanned,
+        );
+        if scan_stats.duplicate_rows_skipped > 0 {
+            self.metrics
+                .record_scan_duplicate_rows_skipped(scan_stats.duplicate_rows_skipped);
+        }
+        self.metrics.record_stage_event(
+            query_execution_id,
+            stage_id,
+            "aggregate_pushdown_complete",
+            format!(
+                "groups_emitted={} having_min_count={} limit={}",
+                rows.len(),
+                spec.having_min_count,
+                spec.limit
+            ),
+        );
+        Ok(rows)
+    }
+
+    fn writable_secondary_indexes(&self) -> Vec<&SecondaryIndexRecord> {
+        self.secondary_indexes
+            .iter()
+            .filter(|index| {
+                matches!(
+                    index.state,
+                    SecondaryIndexState::WriteOnly | SecondaryIndexState::Public
+                )
+            })
+            .collect::<Vec<_>>()
+    }
+
+    fn encode_secondary_index_mutation(
+        &self,
+        index: &SecondaryIndexRecord,
+        row_values: &[ScalarValue],
+        primary_key: i64,
+    ) -> Result<EncodedSecondaryIndexMutation> {
+        let row_key = encode_secondary_index_row_key(
+            index,
+            self.columns.as_slice(),
+            row_values,
+            primary_key,
+        )?;
+        let row_value =
+            encode_secondary_index_row_value(index, self.columns.as_slice(), row_values)?;
+        let unique_key =
+            encode_secondary_index_unique_key(index, self.columns.as_slice(), row_values)?;
+        let unique_value = unique_key
+            .as_ref()
+            .map(|_| encode_secondary_index_unique_value(primary_key));
+        Ok(EncodedSecondaryIndexMutation {
+            row_key,
+            row_value,
+            unique_key,
+            unique_value,
+        })
+    }
+
+    fn decode_row_payload_for_indexing(
+        &self,
+        primary_key: i64,
+        payload: &[u8],
+    ) -> Result<Option<Vec<ScalarValue>>> {
+        if self.row_codec_mode != RowCodecMode::RowV1 {
+            return Ok(None);
+        }
+        decode_generic_row_value(
+            payload,
+            self.columns.as_slice(),
+            self.primary_key_index,
+            primary_key,
+        )
+    }
+
+    async fn read_exact_latest_entry(&self, key: &[u8]) -> Result<Option<LatestEntry>> {
+        let topology = fetch_topology(&self.client).await?;
+        require_non_empty_topology(&topology)?;
+
+        let mut end = key.to_vec();
+        end.push(0x00);
+        let targets = scan_targets(&topology, self.local_grpc_addr, key, end.as_slice(), &[]);
+
+        let mut latest: Option<LatestEntry> = None;
+        for target in targets {
+            let scan_client = self.client_for(target.grpc_addr);
+            let (entries, _, _) = scan_client
+                .range_snapshot_latest(
+                    target.shard_index,
+                    target.start_key.as_slice(),
+                    target.end_key.as_slice(),
+                    &[],
+                    16,
+                    false,
+                )
+                .await?;
+            for entry in entries {
+                if entry.key != key {
+                    continue;
+                }
+                match latest.as_ref() {
+                    Some(current) if current.version >= entry.version => {}
+                    _ => latest = Some(entry),
+                }
+            }
+        }
+
+        Ok(latest)
+    }
+
+    async fn read_exact_latest_entry_cached(
+        &self,
+        key: &[u8],
+        cache: &mut BTreeMap<Vec<u8>, Option<LatestEntry>>,
+    ) -> Result<Option<LatestEntry>> {
+        if let Some(cached) = cache.get(key) {
+            return Ok(cached.clone());
+        }
+        let latest = self.read_exact_latest_entry(key).await?;
+        cache.insert(key.to_vec(), latest.clone());
+        Ok(latest)
+    }
+
+    async fn augment_primary_writes_with_secondary_indexes(
+        &self,
+        writes: &[ConditionalPrimaryWrite],
+    ) -> Result<Vec<ConditionalStorageWrite>> {
+        let mut out = writes
+            .iter()
+            .map(|write| ConditionalStorageWrite {
+                key: self.encode_storage_primary_key(write.primary_key),
+                expected_version: write.expected_version,
+                value: write.value.clone(),
+                rollback_value: write.rollback_value.clone(),
+            })
+            .collect::<Vec<_>>();
+
+        if self.row_codec_mode != RowCodecMode::RowV1 {
+            return Ok(out);
+        }
+        let writable_indexes = self.writable_secondary_indexes();
+        if writable_indexes.is_empty() {
+            return Ok(out);
+        }
+
+        let index_tombstone = index_tombstone_value();
+        let mut latest_cache = BTreeMap::<Vec<u8>, Option<LatestEntry>>::new();
+
+        for write in writes {
+            let old_values = self.decode_row_payload_for_indexing(
+                write.primary_key,
+                write.rollback_value.as_slice(),
+            )?;
+            let new_values =
+                self.decode_row_payload_for_indexing(write.primary_key, write.value.as_slice())?;
+
+            for index in &writable_indexes {
+                let old_encoded = old_values
+                    .as_ref()
+                    .map(|row| {
+                        self.encode_secondary_index_mutation(
+                            index,
+                            row.as_slice(),
+                            write.primary_key,
+                        )
+                    })
+                    .transpose()?;
+                let new_encoded = new_values
+                    .as_ref()
+                    .map(|row| {
+                        self.encode_secondary_index_mutation(
+                            index,
+                            row.as_slice(),
+                            write.primary_key,
+                        )
+                    })
+                    .transpose()?;
+
+                let row_key_changed = old_encoded.as_ref().map(|v| &v.row_key)
+                    != new_encoded.as_ref().map(|v| &v.row_key);
+                let row_value_changed = old_encoded.as_ref().map(|v| &v.row_value)
+                    != new_encoded.as_ref().map(|v| &v.row_value);
+                let unique_key_changed = old_encoded.as_ref().and_then(|v| v.unique_key.as_ref())
+                    != new_encoded.as_ref().and_then(|v| v.unique_key.as_ref());
+
+                // Remove stale row-index key when row disappears or key changes.
+                if let Some(old_entry) = old_encoded.as_ref() {
+                    if new_encoded.is_none() || row_key_changed {
+                        if let Some(existing) = self
+                            .read_exact_latest_entry_cached(
+                                old_entry.row_key.as_slice(),
+                                &mut latest_cache,
+                            )
+                            .await?
+                        {
+                            if !is_sql_tombstone_value(existing.value.as_slice()) {
+                                out.push(ConditionalStorageWrite {
+                                    key: old_entry.row_key.clone(),
+                                    expected_version: existing.version,
+                                    value: index_tombstone.clone(),
+                                    rollback_value: existing.value,
+                                });
+                            }
+                        }
+                    } else if row_value_changed {
+                        if let Some(existing) = self
+                            .read_exact_latest_entry_cached(
+                                old_entry.row_key.as_slice(),
+                                &mut latest_cache,
+                            )
+                            .await?
+                        {
+                            if !is_sql_tombstone_value(existing.value.as_slice()) {
+                                if let Some(new_entry) = new_encoded.as_ref() {
+                                    out.push(ConditionalStorageWrite {
+                                        key: old_entry.row_key.clone(),
+                                        expected_version: existing.version,
+                                        value: new_entry.row_value.clone(),
+                                        rollback_value: existing.value,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Insert fresh row-index key when row appears or key changes.
+                if let Some(new_entry) = new_encoded.as_ref() {
+                    if old_encoded.is_none() || row_key_changed {
+                        out.push(ConditionalStorageWrite {
+                            key: new_entry.row_key.clone(),
+                            expected_version: RpcVersion::zero(),
+                            value: new_entry.row_value.clone(),
+                            rollback_value: index_tombstone.clone(),
+                        });
+                    }
+                }
+
+                // Remove stale unique reservation when key changed or row deleted.
+                if let Some(old_unique_key) =
+                    old_encoded.as_ref().and_then(|v| v.unique_key.as_ref())
+                {
+                    if new_encoded.is_none() || unique_key_changed {
+                        if let Some(existing) = self
+                            .read_exact_latest_entry_cached(
+                                old_unique_key.as_slice(),
+                                &mut latest_cache,
+                            )
+                            .await?
+                        {
+                            if !is_sql_tombstone_value(existing.value.as_slice()) {
+                                out.push(ConditionalStorageWrite {
+                                    key: old_unique_key.clone(),
+                                    expected_version: existing.version,
+                                    value: index_tombstone.clone(),
+                                    rollback_value: existing.value,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Insert unique reservation for the new key (if present).
+                if let Some(new_unique_key) =
+                    new_encoded.as_ref().and_then(|v| v.unique_key.as_ref())
+                {
+                    if old_encoded.is_none() || unique_key_changed {
+                        if let Some(existing) = self
+                            .read_exact_latest_entry_cached(
+                                new_unique_key.as_slice(),
+                                &mut latest_cache,
+                            )
+                            .await?
+                        {
+                            if !is_sql_tombstone_value(existing.value.as_slice()) {
+                                return Err(DuplicateKeyViolation::for_constraint(
+                                    index.index_name.clone(),
+                                )
+                                .into());
+                            }
+                        }
+                        out.push(ConditionalStorageWrite {
+                            key: new_unique_key.clone(),
+                            expected_version: RpcVersion::zero(),
+                            value: new_encoded
+                                .as_ref()
+                                .and_then(|v| v.unique_value.clone())
+                                .unwrap_or_else(|| {
+                                    encode_secondary_index_unique_value(write.primary_key)
+                                }),
+                            rollback_value: index_tombstone.clone(),
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Backfills one secondary index from currently visible table rows.
+    pub async fn backfill_secondary_index(&self, index: &SecondaryIndexRecord) -> Result<u64> {
+        if self.row_codec_mode != RowCodecMode::RowV1 {
+            return Err(anyhow!(
+                "secondary indexes are currently supported only for row_v1 tables"
+            ));
+        }
+        if index.table_id != self.table_id {
+            return Err(anyhow!(
+                "secondary index '{}' targets table_id={}, provider table_id={}",
+                index.index_name,
+                index.table_id,
+                self.table_id
+            ));
+        }
+
+        // Keep index backfill batches smaller than generic scan pages to avoid
+        // long per-RPC conditional apply stalls under hot-shard pressure.
+        let page_size = self
+            .page_size
+            .min(configured_index_backfill_page_size())
+            .max(1);
+        let mut lower = None::<(i64, bool)>;
+        let mut backfilled_rows = 0u64;
+        let tombstone = index_tombstone_value();
+
+        loop {
+            let rows = self
+                .scan_generic_rows_with_versions_by_primary_key_bounds(lower, None, Some(page_size))
+                .await?;
+            if rows.is_empty() {
+                break;
+            }
+
+            let mut writes = Vec::<ConditionalStorageWrite>::new();
+            for row in &rows {
+                let encoded = self.encode_secondary_index_mutation(
+                    index,
+                    row.values.as_slice(),
+                    row.primary_key,
+                )?;
+                writes.push(ConditionalStorageWrite {
+                    key: encoded.row_key,
+                    expected_version: RpcVersion::zero(),
+                    value: encoded.row_value,
+                    rollback_value: tombstone.clone(),
+                });
+                if let Some(unique_key) = encoded.unique_key {
+                    writes.push(ConditionalStorageWrite {
+                        key: unique_key,
+                        expected_version: RpcVersion::zero(),
+                        value: encoded.unique_value.unwrap_or_else(|| {
+                            encode_secondary_index_unique_value(row.primary_key)
+                        }),
+                        rollback_value: tombstone.clone(),
+                    });
+                }
+            }
+
+            match self
+                .apply_storage_writes_conditional_detailed(writes.as_slice(), "index_backfill")
+                .await?
+            {
+                ConditionalWriteDetailedOutcome::Applied(_) => {}
+                ConditionalWriteDetailedOutcome::Conflict => {
+                    return Err(
+                        DuplicateKeyViolation::for_constraint(index.index_name.clone()).into(),
+                    );
+                }
+            }
+
+            backfilled_rows = backfilled_rows.saturating_add(rows.len() as u64);
+            let last_pk = rows.last().map(|row| row.primary_key).unwrap_or(i64::MAX);
+            lower = Some((last_pk, false));
+        }
+
+        Ok(backfilled_rows)
     }
 
     /// Executes `upsert orders rows` for this component.
@@ -1696,10 +2724,41 @@ impl HoloStoreTableProvider {
         }
     }
 
-    /// Applies conditional writes and returns detailed rollback metadata on success.
+    /// Applies primary-key writes and any required secondary-index writes atomically.
     async fn apply_primary_writes_conditional_detailed(
         &self,
         writes: &[ConditionalPrimaryWrite],
+        op: &'static str,
+    ) -> Result<ConditionalWriteDetailedOutcome> {
+        if writes.is_empty() {
+            return Ok(ConditionalWriteDetailedOutcome::Applied(
+                ConditionalWriteAppliedBatch {
+                    applied_rows: 0,
+                    applied_targets: Vec::new(),
+                },
+            ));
+        }
+        let storage_writes = self
+            .augment_primary_writes_with_secondary_indexes(writes)
+            .await?;
+        match self
+            .apply_storage_writes_conditional_detailed(storage_writes.as_slice(), op)
+            .await?
+        {
+            ConditionalWriteDetailedOutcome::Applied(mut applied) => {
+                applied.applied_rows = writes.len() as u64;
+                Ok(ConditionalWriteDetailedOutcome::Applied(applied))
+            }
+            ConditionalWriteDetailedOutcome::Conflict => {
+                Ok(ConditionalWriteDetailedOutcome::Conflict)
+            }
+        }
+    }
+
+    /// Applies generic storage-key conditional writes and returns rollback metadata.
+    async fn apply_storage_writes_conditional_detailed(
+        &self,
+        writes: &[ConditionalStorageWrite],
         op: &'static str,
     ) -> Result<ConditionalWriteDetailedOutcome> {
         if writes.is_empty() {
@@ -1762,7 +2821,7 @@ impl HoloStoreTableProvider {
 
             let mut by_target = BTreeMap::<WriteTarget, Vec<PreparedConditionalEntry>>::new();
             for write in writes {
-                let key = self.encode_storage_primary_key(write.primary_key);
+                let key = write.key.clone();
                 let route = match route_key(
                     &topology,
                     self.local_grpc_addr,
@@ -1772,9 +2831,9 @@ impl HoloStoreTableProvider {
                     Some(route) => route,
                     None => {
                         let err = anyhow!(
-                            "no shard route found for key table={} primary_key={}",
+                            "no shard route found for key table={} key={}",
                             self.table_name,
-                            write.primary_key
+                            hex::encode(&write.key)
                         );
                         let class = classify_write_error_message(err.to_string().as_str());
                         if class.is_retryable() && attempt + 1 < retry_limit {
@@ -2139,7 +3198,10 @@ impl HoloStoreTableProvider {
                     }
                 }
             } else {
-                unsupported_filters = unsupported_filters.saturating_add(1);
+                let supports_secondary = self.filter_supports_secondary_index_pushdown(filter);
+                if !supports_secondary {
+                    unsupported_filters = unsupported_filters.saturating_add(1);
+                }
             }
         }
         if unsupported_filters > 0 {
@@ -2226,7 +3288,7 @@ impl HoloStoreTableProvider {
             if let Some(row) = row {
                 if spec.bounds.matches(row.row.order_id) {
                     rows.push(row);
-                    if rows.len() > self.max_scan_rows {
+                    if self.max_scan_rows > 0 && rows.len() > self.max_scan_rows {
                         self.metrics.record_scan_row_limit_reject();
                         return Err(anyhow!(
                             "scan row limit exceeded for table '{}': max_scan_rows={}, rows_returned_so_far={}",
@@ -2280,6 +3342,7 @@ impl HoloStoreTableProvider {
         query_execution_id: &str,
         stage_id: u64,
         pushed_filters: &[Expr],
+        projection: Option<&Vec<usize>>,
         limit: Option<usize>,
     ) -> Result<Vec<Vec<ScalarValue>>> {
         let mut bounds = PkBounds::default();
@@ -2300,7 +3363,10 @@ impl HoloStoreTableProvider {
                     }
                 }
             } else {
-                unsupported_filters = unsupported_filters.saturating_add(1);
+                let supports_secondary = self.filter_supports_secondary_index_pushdown(filter);
+                if !supports_secondary {
+                    unsupported_filters = unsupported_filters.saturating_add(1);
+                }
             }
         }
         if unsupported_filters > 0 {
@@ -2318,17 +3384,167 @@ impl HoloStoreTableProvider {
         } else {
             Some(ScanPredicateExpr::And(predicate_terms))
         };
-
-        let rows = self
-            .scan_rows_with_bounds_with_versions_generic_ctx(
+        let default_scan = || async {
+            self.scan_rows_with_bounds_with_versions_generic_ctx(
                 query_execution_id,
                 stage_id,
                 bounds,
                 limit,
                 pushed_filters.len(),
-                predicate,
+                predicate.clone(),
             )
-            .await?;
+            .await
+        };
+
+        let stats = match self.optimizer_table_stats().await {
+            Ok(stats) => stats,
+            Err(err) => {
+                self.metrics.record_stage_event(
+                    query_execution_id,
+                    stage_id,
+                    "optimizer_stats_fallback",
+                    format!("error={err}"),
+                );
+                let rows = default_scan().await?;
+                return Ok(rows.into_iter().map(|entry| entry.values).collect());
+            }
+        };
+
+        let predicates = extract_predicate_summary(pushed_filters);
+        self.metrics.record_stage_event(
+            query_execution_id,
+            stage_id,
+            "optimizer_predicate_summary",
+            format_optimizer_predicate_summary(&predicates),
+        );
+        let mut required_columns = self.required_columns_for_projection(projection);
+        for (column, column_predicate) in predicates.columns() {
+            if column_predicate.has_any_constraint() {
+                required_columns.insert(column.to_ascii_lowercase());
+            }
+        }
+        let query_shape = QueryShape {
+            required_columns: required_columns.clone(),
+            limit,
+            preferred_shard_count: self.preferred_shards.len().max(1),
+        };
+        let public_indexes = self
+            .public_secondary_indexes()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let plan = self.optimizer.choose_access_path(
+            self.columns.as_slice(),
+            public_indexes.as_slice(),
+            self.primary_key_column.as_str(),
+            &stats,
+            &predicates,
+            &query_shape,
+        );
+        self.metrics.record_optimizer_plan_choice(match &plan.path {
+            AccessPath::TableScan => "table_scan",
+            AccessPath::Index {
+                index_only_table_covering: true,
+                ..
+            } => "index_only",
+            AccessPath::Index { .. } => "index_scan",
+        });
+        self.metrics.record_stage_event(
+            query_execution_id,
+            stage_id,
+            "optimizer_plan_choice",
+            format!(
+                "path={} estimated_output_rows={:.2} estimated_scan_rows={:.2} uncertainty={:.3} cost={:.3} model=distributed_v1",
+                format_access_path(&plan.path),
+                plan.estimated_output_rows,
+                plan.estimated_scan_rows,
+                plan.uncertainty,
+                plan.total_cost
+            ),
+        );
+        let considered_preview = plan
+            .considered
+            .iter()
+            .take(4)
+            .map(|candidate| format!("{}:{:.3}", candidate.name, candidate.total_cost))
+            .collect::<Vec<_>>()
+            .join(",");
+        self.metrics.record_stage_event(
+            query_execution_id,
+            stage_id,
+            "optimizer_plan_candidates",
+            format!("candidates={considered_preview}"),
+        );
+        if let Some(fallback) = plan.fallback_decision.as_ref() {
+            self.metrics.record_stage_event(
+                query_execution_id,
+                stage_id,
+                "optimizer_uncertainty_fallback",
+                format!(
+                    "reason={} source={} source_cost={:.3} fallback={} fallback_cost={:.3} uncertainty={:.3} threshold={:.3} cost_penalty_ratio={:.3}",
+                    fallback.reason,
+                    fallback.source_candidate,
+                    fallback.source_cost,
+                    fallback.fallback_candidate,
+                    fallback.fallback_cost,
+                    fallback.uncertainty,
+                    fallback.uncertainty_threshold,
+                    fallback.fallback_cost_penalty_ratio,
+                ),
+            );
+        }
+        self.emit_optimizer_decision_trace_events(query_execution_id, stage_id, &plan);
+
+        let rows = match &plan.path {
+            AccessPath::TableScan => default_scan().await?,
+            AccessPath::Index { .. } => {
+                match self
+                    .scan_rows_with_index_plan_ctx(
+                        query_execution_id,
+                        stage_id,
+                        &plan,
+                        limit,
+                        pushed_filters.len(),
+                        predicate.clone(),
+                        bounds,
+                        &required_columns,
+                    )
+                    .await
+                {
+                    Ok(rows) => rows,
+                    Err(err) => {
+                        self.metrics.record_stage_event(
+                            query_execution_id,
+                            stage_id,
+                            "optimizer_index_fallback",
+                            format!("error={err}"),
+                        );
+                        default_scan().await?
+                    }
+                }
+            }
+        };
+
+        self.optimizer_observe_row_count_lower_bound(rows.len());
+        let feedback = self.optimizer.observe_execution(&plan, rows.len() as u64);
+        self.metrics.record_optimizer_feedback(
+            plan.estimated_output_rows,
+            rows.len() as u64,
+            feedback.bad_miss,
+        );
+        self.metrics.record_stage_event(
+            query_execution_id,
+            stage_id,
+            "optimizer_feedback",
+            format!(
+                "multiplier_before={:.3} multiplier_after={:.3} abs_error_ratio={:.3} bad_miss={}",
+                feedback.multiplier_before,
+                feedback.multiplier_after,
+                feedback.absolute_error_ratio,
+                feedback.bad_miss
+            ),
+        );
+
         Ok(rows.into_iter().map(|entry| entry.values).collect())
     }
 
@@ -2390,7 +3606,7 @@ impl HoloStoreTableProvider {
             if let Some(row) = row {
                 if spec.bounds.matches(row.primary_key) {
                     rows.push(row);
-                    if rows.len() > self.max_scan_rows {
+                    if self.max_scan_rows > 0 && rows.len() > self.max_scan_rows {
                         self.metrics.record_scan_row_limit_reject();
                         return Err(anyhow!(
                             "scan row limit exceeded for table '{}': max_scan_rows={}, rows_returned_so_far={}",
@@ -2418,6 +3634,7 @@ impl HoloStoreTableProvider {
             self.metrics
                 .record_scan_duplicate_rows_skipped(execution.stats.duplicate_rows_skipped);
         }
+        self.optimizer_observe_row_count_lower_bound(execution.stats.rows_scanned as usize);
         info!(
             query_execution_id = query_execution_id,
             stage_id,
@@ -2434,6 +3651,1154 @@ impl HoloStoreTableProvider {
             "holofusion scan completed"
         );
         Ok(rows)
+    }
+
+    async fn scan_rows_with_index_plan_ctx(
+        &self,
+        query_execution_id: &str,
+        stage_id: u64,
+        plan: &PlannedAccessPath,
+        limit: Option<usize>,
+        pushed_filter_count: usize,
+        predicate: Option<ScanPredicateExpr>,
+        pk_bounds: PkBounds,
+        required_columns: &BTreeSet<String>,
+    ) -> Result<Vec<VersionedGenericRow>> {
+        let AccessPath::Index {
+            index_name,
+            prefix,
+            ordered_limit_scan,
+            ..
+        } = &plan.path
+        else {
+            return Err(anyhow!("scan_rows_with_index_plan_ctx requires index plan"));
+        };
+        let Some(index) = self
+            .public_secondary_indexes()
+            .into_iter()
+            .find(|candidate| candidate.index_name.eq_ignore_ascii_case(index_name))
+            .cloned()
+        else {
+            return Err(anyhow!(
+                "optimizer selected missing secondary index '{}'",
+                index_name
+            ));
+        };
+
+        let probe_ranges = self.build_secondary_index_probe_ranges(&index, prefix.as_slice())?;
+        if probe_ranges.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let index_scan = self
+            .execute_scan_ranges_ctx(
+                query_execution_id,
+                stage_id,
+                probe_ranges.as_slice(),
+                if *ordered_limit_scan { None } else { limit },
+                "index_scan_stage",
+            )
+            .await?;
+        let mut rows = Vec::<VersionedGenericRow>::new();
+        let mut primary_lookup_rpc_pages = 0u64;
+        let mut primary_lookup_rows_scanned = 0u64;
+        let mut primary_lookup_bytes_scanned = 0u64;
+        let mut index_entries = index_scan.entries;
+        if *ordered_limit_scan {
+            self.metrics.record_stage_event(
+                query_execution_id,
+                stage_id,
+                "index_ordered_scan",
+                "enabled=true",
+            );
+        }
+        if *ordered_limit_scan {
+            index_entries.sort_by(|left, right| left.key.cmp(&right.key));
+        }
+
+        let index_only_table_covering = matches!(
+            &plan.path,
+            AccessPath::Index {
+                index_only_table_covering: true,
+                ..
+            }
+        );
+        if index_only_table_covering {
+            if !index_covers_required_columns(
+                &index,
+                self.primary_key_column.as_str(),
+                required_columns,
+            ) {
+                return Err(anyhow!(
+                    "optimizer selected index-only path for non-covering required columns on index '{}'",
+                    index.index_name
+                ));
+            }
+            let mut seen_primary = BTreeSet::<i64>::new();
+            for entry in index_entries {
+                let primary_key = decode_secondary_index_primary_key(&index, entry.key.as_slice())
+                    .with_context(|| {
+                        format!(
+                            "decode secondary index key '{}' from index '{}'",
+                            hex::encode(&entry.key),
+                            index.index_name
+                        )
+                    })?;
+                if !seen_primary.insert(primary_key) || !pk_bounds.matches(primary_key) {
+                    continue;
+                }
+                let values = decode_secondary_index_row_values(
+                    &index,
+                    self.columns.as_slice(),
+                    self.primary_key_column.as_str(),
+                    entry.key.as_slice(),
+                    entry.value.as_slice(),
+                )?;
+                rows.push(VersionedGenericRow {
+                    primary_key,
+                    values,
+                    version: entry.version,
+                });
+                if self.max_scan_rows > 0 && rows.len() > self.max_scan_rows {
+                    self.metrics.record_scan_row_limit_reject();
+                    return Err(anyhow!(
+                        "scan row limit exceeded for table '{}': max_scan_rows={}, rows_returned_so_far={}",
+                        self.table_name,
+                        self.max_scan_rows,
+                        rows.len()
+                    ));
+                }
+                if let Some(scan_limit) = limit {
+                    if rows.len() >= scan_limit {
+                        break;
+                    }
+                }
+            }
+        } else {
+            let required_column_indexes = self.required_column_indexes(required_columns);
+            let mut primary_keys = Vec::<i64>::new();
+            let mut seen_primary = BTreeSet::<i64>::new();
+            for entry in &index_entries {
+                let primary_key = decode_secondary_index_primary_key(&index, entry.key.as_slice())
+                    .with_context(|| {
+                        format!(
+                            "decode secondary index key '{}' from index '{}'",
+                            hex::encode(&entry.key),
+                            index.index_name
+                        )
+                    })?;
+                if seen_primary.insert(primary_key) {
+                    primary_keys.push(primary_key);
+                }
+            }
+
+            let lookup = self
+                .fetch_primary_entries_for_keys_batched_ctx(
+                    query_execution_id,
+                    stage_id,
+                    primary_keys.as_slice(),
+                )
+                .await?;
+            primary_lookup_rpc_pages = lookup.stats.rpc_pages;
+            primary_lookup_rows_scanned = lookup.stats.rows_scanned;
+            primary_lookup_bytes_scanned = lookup.stats.bytes_scanned;
+            for primary_key in primary_keys {
+                if !pk_bounds.matches(primary_key) {
+                    continue;
+                }
+                let Some(entry) = lookup.entries_by_primary.get(&primary_key) else {
+                    continue;
+                };
+                let decoded = decode_generic_entry_with_version_projected(
+                    self.table_id,
+                    self.columns.as_slice(),
+                    self.primary_key_index,
+                    &required_column_indexes,
+                    entry,
+                )?;
+                if let Some(row) = decoded {
+                    rows.push(row);
+                    if self.max_scan_rows > 0 && rows.len() > self.max_scan_rows {
+                        self.metrics.record_scan_row_limit_reject();
+                        return Err(anyhow!(
+                            "scan row limit exceeded for table '{}': max_scan_rows={}, rows_returned_so_far={}",
+                            self.table_name,
+                            self.max_scan_rows,
+                            rows.len()
+                        ));
+                    }
+                    if let Some(scan_limit) = limit {
+                        if rows.len() >= scan_limit {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        self.metrics.record_scan(
+            index_scan
+                .stats
+                .rpc_pages
+                .saturating_add(primary_lookup_rpc_pages),
+            index_scan
+                .stats
+                .rows_scanned
+                .saturating_add(primary_lookup_rows_scanned),
+            rows.len() as u64,
+            index_scan
+                .stats
+                .bytes_scanned
+                .saturating_add(primary_lookup_bytes_scanned),
+        );
+        self.optimizer_observe_row_count_lower_bound(index_scan.stats.rows_scanned as usize);
+        if index_scan.stats.duplicate_rows_skipped > 0 {
+            self.metrics
+                .record_scan_duplicate_rows_skipped(index_scan.stats.duplicate_rows_skipped);
+        }
+        if let Some(predicate) = predicate.as_ref() {
+            self.metrics.record_stage_event(
+                query_execution_id,
+                stage_id,
+                "index_scan_predicate",
+                format!("predicate={}", format_scan_predicate_expr(predicate)),
+            );
+        }
+        info!(
+            query_execution_id = query_execution_id,
+            stage_id,
+            table = %self.table_name,
+            index = %index.index_name,
+            pushed_filter_count,
+            rpc_pages = index_scan.stats.rpc_pages,
+            rows_scanned = index_scan.stats.rows_scanned,
+            rows_returned = rows.len(),
+            bytes_scanned = index_scan.stats.bytes_scanned,
+            retries = index_scan.stats.retries,
+            reroutes = index_scan.stats.reroutes,
+            chunks = index_scan.stats.chunks,
+            primary_lookup_rpc_pages,
+            primary_lookup_rows_scanned,
+            "holofusion index scan completed"
+        );
+        Ok(rows)
+    }
+
+    async fn fetch_primary_entries_for_keys_batched_ctx(
+        &self,
+        query_execution_id: &str,
+        stage_id: u64,
+        primary_keys: &[i64],
+    ) -> Result<PrimaryLookupBatchResult> {
+        if primary_keys.is_empty() {
+            return Ok(PrimaryLookupBatchResult::default());
+        }
+
+        const MAX_KEYS_PER_RANGE: usize = 256;
+        const MAX_PRIMARY_KEY_GAP_PER_RANGE: i64 = 2_048;
+
+        let mut unique_sorted_keys = primary_keys.to_vec();
+        unique_sorted_keys.sort_unstable();
+        unique_sorted_keys.dedup();
+
+        let mut encoded = Vec::<(i64, Vec<u8>)>::with_capacity(unique_sorted_keys.len());
+        for key in unique_sorted_keys {
+            encoded.push((key, self.encode_storage_primary_key(key)));
+        }
+        encoded.sort_by(|left, right| left.1.cmp(&right.1));
+
+        let mut ranges = Vec::<(Vec<u8>, Vec<u8>)>::new();
+        let mut group_start = 0usize;
+        while group_start < encoded.len() {
+            let mut group_end = group_start + 1;
+            let mut last_pk = encoded[group_start].0;
+            while group_end < encoded.len() {
+                if group_end - group_start >= MAX_KEYS_PER_RANGE {
+                    break;
+                }
+                let next_pk = encoded[group_end].0;
+                if next_pk.saturating_sub(last_pk) > MAX_PRIMARY_KEY_GAP_PER_RANGE {
+                    break;
+                }
+                last_pk = next_pk;
+                group_end += 1;
+            }
+            let start = encoded[group_start].1.clone();
+            let mut end = prefix_end(encoded[group_end - 1].1.as_slice()).unwrap_or_default();
+            if end.is_empty() {
+                end = encoded[group_end - 1].1.clone();
+                end.push(0x00);
+            }
+            if start < end {
+                ranges.push((start, end));
+            }
+            group_start = group_end;
+        }
+        if ranges.is_empty() {
+            return Ok(PrimaryLookupBatchResult::default());
+        }
+
+        self.metrics.record_stage_event(
+            query_execution_id,
+            stage_id,
+            "index_primary_lookup_plan",
+            format!(
+                "requested_keys={} ranges={} max_keys_per_range={} max_pk_gap={}",
+                encoded.len(),
+                ranges.len(),
+                MAX_KEYS_PER_RANGE,
+                MAX_PRIMARY_KEY_GAP_PER_RANGE
+            ),
+        );
+
+        let scan = self
+            .execute_scan_ranges_ctx(
+                query_execution_id,
+                stage_id,
+                ranges.as_slice(),
+                None,
+                "index_primary_lookup_stage",
+            )
+            .await?;
+        let mut key_to_primary = BTreeMap::<Vec<u8>, i64>::new();
+        for (primary_key, key) in encoded {
+            key_to_primary.insert(key, primary_key);
+        }
+
+        let mut entries_by_primary = BTreeMap::<i64, LatestEntry>::new();
+        for entry in scan.entries {
+            let Some(primary_key) = key_to_primary.get(entry.key.as_slice()).copied() else {
+                continue;
+            };
+            match entries_by_primary.get(&primary_key) {
+                Some(existing) if existing.version >= entry.version => {}
+                _ => {
+                    entries_by_primary.insert(primary_key, entry);
+                }
+            }
+        }
+
+        Ok(PrimaryLookupBatchResult {
+            entries_by_primary,
+            stats: scan.stats,
+        })
+    }
+
+    fn build_secondary_index_probe_ranges(
+        &self,
+        index: &SecondaryIndexRecord,
+        prefix: &[crate::optimizer::planner::IndexPrefixConstraint],
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if prefix.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut value_matrix = Vec::<Vec<ScalarValue>>::new();
+        for column in prefix {
+            if column.values.is_empty() {
+                return Ok(Vec::new());
+            }
+            value_matrix.push(column.values.clone());
+        }
+        let mut combinations = Vec::<Vec<ScalarValue>>::new();
+        let mut current = Vec::<ScalarValue>::new();
+        expand_scalar_combinations(
+            value_matrix.as_slice(),
+            0,
+            &mut current,
+            self.optimizer.config().planner.max_index_probes,
+            &mut combinations,
+        );
+        let mut ranges = Vec::with_capacity(combinations.len());
+        for combo in combinations {
+            let start = encode_secondary_index_lookup_prefix_for_prefix(
+                index,
+                self.columns.as_slice(),
+                combo.as_slice(),
+            )?;
+            let end = prefix_end(start.as_slice()).unwrap_or_default();
+            if !end.is_empty() && start < end {
+                ranges.push((start, end));
+            }
+        }
+
+        if matches!(index.distribution, SecondaryIndexDistribution::Hash) {
+            ranges.sort_by(|left, right| left.0.cmp(&right.0));
+            ranges.dedup_by(|left, right| left.0 == right.0 && left.1 == right.1);
+        }
+        Ok(ranges)
+    }
+
+    async fn build_scan_range_tasks(&self, ranges: &[(Vec<u8>, Vec<u8>)]) -> Vec<ScanRangeTask> {
+        let mut tasks = Vec::<ScanRangeTask>::new();
+        for (range_start_key, range_end_key) in ranges {
+            let targets = self
+                .scan_targets_for_range(range_start_key.as_slice(), range_end_key.as_slice())
+                .await;
+            for target in targets {
+                tasks.push(ScanRangeTask {
+                    task_id: tasks.len(),
+                    range_end_key: range_end_key.clone(),
+                    target,
+                });
+            }
+        }
+        tasks
+    }
+
+    async fn execute_single_scan_range_task_ctx(
+        &self,
+        query_execution_id: &str,
+        stage_id: u64,
+        task: ScanRangeTask,
+        limit: Option<usize>,
+        stage_label: &str,
+        chunk_sequence: &std::sync::atomic::AtomicU64,
+    ) -> Result<ScanExecutionResult> {
+        let mut result = ScanExecutionResult::default();
+        let mut seen_keys = BTreeSet::<Vec<u8>>::new();
+        let mut target = task.target;
+        let mut cursor = Vec::new();
+        let mut retries = 0usize;
+
+        loop {
+            let remaining = limit.map(|max| max.saturating_sub(result.entries.len()));
+            if matches!(remaining, Some(0)) {
+                break;
+            }
+            let page_limit = remaining
+                .map(|remaining| remaining.min(self.page_size).max(1))
+                .unwrap_or(self.page_size);
+
+            let scan_client = self.client_for(target.grpc_addr);
+            match scan_client
+                .range_snapshot_latest(
+                    target.shard_index,
+                    target.start_key.as_slice(),
+                    target.end_key.as_slice(),
+                    cursor.as_slice(),
+                    page_limit,
+                    false,
+                )
+                .await
+            {
+                Ok((entries, next_cursor, done)) => {
+                    retries = 0;
+                    result.stats.rpc_pages = result.stats.rpc_pages.saturating_add(1);
+                    let mut chunk = ScanChunk {
+                        sequence: chunk_sequence
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            .saturating_add(1),
+                        resume_cursor: next_cursor.clone(),
+                        rows_scanned: 0,
+                        bytes_scanned: 0,
+                    };
+
+                    for entry in entries {
+                        let bytes = entry.key.len() as u64 + entry.value.len() as u64;
+                        result.stats.rows_scanned = result.stats.rows_scanned.saturating_add(1);
+                        result.stats.bytes_scanned =
+                            result.stats.bytes_scanned.saturating_add(bytes);
+                        chunk.rows_scanned = chunk.rows_scanned.saturating_add(1);
+                        chunk.bytes_scanned = chunk.bytes_scanned.saturating_add(bytes);
+                        if !seen_keys.insert(entry.key.clone()) {
+                            result.stats.duplicate_rows_skipped =
+                                result.stats.duplicate_rows_skipped.saturating_add(1);
+                            continue;
+                        }
+                        result.entries.push(entry);
+                    }
+
+                    result.stats.chunks = result.stats.chunks.saturating_add(1);
+                    self.metrics.record_scan_chunk();
+                    self.metrics.record_stage_event(
+                        query_execution_id,
+                        stage_id,
+                        "scan_chunk",
+                        format!(
+                            "sequence={} shard={} target={} rows_scanned={} bytes_scanned={} resume_cursor={}",
+                            chunk.sequence,
+                            target.shard_index,
+                            target.grpc_addr,
+                            chunk.rows_scanned,
+                            chunk.bytes_scanned,
+                            hex::encode(&chunk.resume_cursor)
+                        ),
+                    );
+
+                    if done
+                        || next_cursor.is_empty()
+                        || matches!(limit, Some(max) if result.entries.len() >= max)
+                    {
+                        break;
+                    }
+                    cursor = next_cursor;
+                }
+                Err(err) => {
+                    if retries + 1 >= self.scan_retry_limit.max(1) {
+                        return Err(anyhow!(
+                            "snapshot stage={} table={} shard={} target={} start={} end={} cursor={} limit={} failed after {} retries: {}",
+                            stage_label,
+                            self.table_name,
+                            target.shard_index,
+                            target.grpc_addr,
+                            hex::encode(&target.start_key),
+                            hex::encode(&target.end_key),
+                            hex::encode(&cursor),
+                            page_limit,
+                            retries,
+                            err
+                        ));
+                    }
+                    retries = retries.saturating_add(1);
+                    result.stats.retries = result.stats.retries.saturating_add(1);
+                    self.metrics.record_scan_retry();
+                    self.metrics.record_stage_event(
+                        query_execution_id,
+                        stage_id,
+                        "scan_retry",
+                        format!(
+                            "attempt={} shard={} target={} error={}",
+                            retries, target.shard_index, target.grpc_addr, err
+                        ),
+                    );
+
+                    let resume_key = if cursor.is_empty() {
+                        target.start_key.clone()
+                    } else {
+                        cursor.clone()
+                    };
+                    if let Some(rerouted) = self
+                        .reroute_scan_target(resume_key.as_slice(), task.range_end_key.as_slice())
+                        .await
+                    {
+                        if rerouted.grpc_addr != target.grpc_addr
+                            || rerouted.shard_index != target.shard_index
+                        {
+                            result.stats.reroutes = result.stats.reroutes.saturating_add(1);
+                            self.metrics.record_scan_reroute();
+                            self.metrics.record_stage_event(
+                                query_execution_id,
+                                stage_id,
+                                "scan_reroute",
+                                format!(
+                                    "from_shard={} from_target={} to_shard={} to_target={}",
+                                    target.shard_index,
+                                    target.grpc_addr,
+                                    rerouted.shard_index,
+                                    rerouted.grpc_addr
+                                ),
+                            );
+                        }
+                        target = rerouted;
+                    }
+                    tokio::time::sleep(self.scan_retry_delay).await;
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    async fn execute_scan_ranges_ctx(
+        &self,
+        query_execution_id: &str,
+        stage_id: u64,
+        ranges: &[(Vec<u8>, Vec<u8>)],
+        limit: Option<usize>,
+        stage_label: &str,
+    ) -> Result<ScanExecutionResult> {
+        let mut result = ScanExecutionResult::default();
+        let mut seen_keys = BTreeSet::<Vec<u8>>::new();
+
+        self.metrics.record_stage_event(
+            query_execution_id,
+            stage_id,
+            stage_label,
+            format!(
+                "ranges={} limit={}",
+                ranges.len(),
+                limit
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            ),
+        );
+
+        let tasks = self.build_scan_range_tasks(ranges).await;
+        self.metrics.record_stage_event(
+            query_execution_id,
+            stage_id,
+            "scan_partition_plan",
+            format!(
+                "ranges={} tasks={} parallelism={} limit={}",
+                ranges.len(),
+                tasks.len(),
+                self.scan_parallelism.max(1),
+                limit
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            ),
+        );
+        if tasks.is_empty() {
+            return Ok(result);
+        }
+
+        let chunk_sequence = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let allow_parallel = limit.is_none() && tasks.len() > 1;
+        if allow_parallel {
+            let concurrency = self.scan_parallelism.max(1).min(tasks.len());
+            let mut completed = futures_util::stream::iter(tasks.into_iter().map(|task| async {
+                let task_id = task.task_id;
+                let scan = self
+                    .execute_single_scan_range_task_ctx(
+                        query_execution_id,
+                        stage_id,
+                        task,
+                        None,
+                        stage_label,
+                        chunk_sequence.as_ref(),
+                    )
+                    .await;
+                (task_id, scan)
+            }))
+            .buffer_unordered(concurrency)
+            .collect::<Vec<_>>()
+            .await;
+            completed.sort_by_key(|(task_id, _)| *task_id);
+
+            for (_task_id, task_scan) in completed {
+                let task_scan = task_scan?;
+                result.stats.rpc_pages = result
+                    .stats
+                    .rpc_pages
+                    .saturating_add(task_scan.stats.rpc_pages);
+                result.stats.rows_scanned = result
+                    .stats
+                    .rows_scanned
+                    .saturating_add(task_scan.stats.rows_scanned);
+                result.stats.bytes_scanned = result
+                    .stats
+                    .bytes_scanned
+                    .saturating_add(task_scan.stats.bytes_scanned);
+                result.stats.retries = result.stats.retries.saturating_add(task_scan.stats.retries);
+                result.stats.reroutes = result
+                    .stats
+                    .reroutes
+                    .saturating_add(task_scan.stats.reroutes);
+                result.stats.chunks = result.stats.chunks.saturating_add(task_scan.stats.chunks);
+                result.stats.duplicate_rows_skipped = result
+                    .stats
+                    .duplicate_rows_skipped
+                    .saturating_add(task_scan.stats.duplicate_rows_skipped);
+                for entry in task_scan.entries {
+                    if !seen_keys.insert(entry.key.clone()) {
+                        result.stats.duplicate_rows_skipped =
+                            result.stats.duplicate_rows_skipped.saturating_add(1);
+                        continue;
+                    }
+                    result.stats.rows_output = result.stats.rows_output.saturating_add(1);
+                    result.entries.push(entry);
+                }
+            }
+            return Ok(result);
+        }
+
+        for task in tasks {
+            let remaining = limit.map(|max| max.saturating_sub(result.entries.len()));
+            if matches!(remaining, Some(0)) {
+                break;
+            }
+            let task_scan = self
+                .execute_single_scan_range_task_ctx(
+                    query_execution_id,
+                    stage_id,
+                    task,
+                    remaining,
+                    stage_label,
+                    chunk_sequence.as_ref(),
+                )
+                .await?;
+            result.stats.rpc_pages = result
+                .stats
+                .rpc_pages
+                .saturating_add(task_scan.stats.rpc_pages);
+            result.stats.rows_scanned = result
+                .stats
+                .rows_scanned
+                .saturating_add(task_scan.stats.rows_scanned);
+            result.stats.bytes_scanned = result
+                .stats
+                .bytes_scanned
+                .saturating_add(task_scan.stats.bytes_scanned);
+            result.stats.retries = result.stats.retries.saturating_add(task_scan.stats.retries);
+            result.stats.reroutes = result
+                .stats
+                .reroutes
+                .saturating_add(task_scan.stats.reroutes);
+            result.stats.chunks = result.stats.chunks.saturating_add(task_scan.stats.chunks);
+            result.stats.duplicate_rows_skipped = result
+                .stats
+                .duplicate_rows_skipped
+                .saturating_add(task_scan.stats.duplicate_rows_skipped);
+            for entry in task_scan.entries {
+                if !seen_keys.insert(entry.key.clone()) {
+                    result.stats.duplicate_rows_skipped =
+                        result.stats.duplicate_rows_skipped.saturating_add(1);
+                    continue;
+                }
+                result.stats.rows_output = result.stats.rows_output.saturating_add(1);
+                result.entries.push(entry);
+                if matches!(limit, Some(max) if result.entries.len() >= max) {
+                    break;
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    async fn aggregate_single_index_scan_task_ctx(
+        &self,
+        query_execution_id: &str,
+        stage_id: u64,
+        index: &SecondaryIndexRecord,
+        task: ScanRangeTask,
+        group_indexes: &[usize],
+        sum_column_index: usize,
+        runtime_filters: &[AggregateFilterRuntime],
+        chunk_sequence: &std::sync::atomic::AtomicU64,
+    ) -> Result<(BTreeMap<Vec<u8>, AggregateGroupState>, ScanStats)> {
+        let mut local_groups = BTreeMap::<Vec<u8>, AggregateGroupState>::new();
+        let mut stats = ScanStats::default();
+        let mut seen_keys = BTreeSet::<Vec<u8>>::new();
+        let mut target = task.target;
+        let mut cursor = Vec::new();
+        let mut retries = 0usize;
+
+        loop {
+            let page_limit = self.page_size.max(1);
+            let scan_client = self.client_for(target.grpc_addr);
+            match scan_client
+                .range_snapshot_latest(
+                    target.shard_index,
+                    target.start_key.as_slice(),
+                    target.end_key.as_slice(),
+                    cursor.as_slice(),
+                    page_limit,
+                    false,
+                )
+                .await
+            {
+                Ok((entries, next_cursor, done)) => {
+                    retries = 0;
+                    stats.rpc_pages = stats.rpc_pages.saturating_add(1);
+                    stats.chunks = stats.chunks.saturating_add(1);
+                    self.metrics.record_scan_chunk();
+                    let mut chunk = ScanChunk {
+                        sequence: chunk_sequence
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            .saturating_add(1),
+                        resume_cursor: next_cursor.clone(),
+                        rows_scanned: 0,
+                        bytes_scanned: 0,
+                    };
+                    for entry in entries {
+                        let bytes = entry.key.len() as u64 + entry.value.len() as u64;
+                        stats.rows_scanned = stats.rows_scanned.saturating_add(1);
+                        stats.bytes_scanned = stats.bytes_scanned.saturating_add(bytes);
+                        chunk.rows_scanned = chunk.rows_scanned.saturating_add(1);
+                        chunk.bytes_scanned = chunk.bytes_scanned.saturating_add(bytes);
+                        if !seen_keys.insert(entry.key.clone()) {
+                            stats.duplicate_rows_skipped =
+                                stats.duplicate_rows_skipped.saturating_add(1);
+                            continue;
+                        }
+                        let row_values = decode_secondary_index_row_values(
+                            index,
+                            self.columns.as_slice(),
+                            self.primary_key_column.as_str(),
+                            entry.key.as_slice(),
+                            entry.value.as_slice(),
+                        )?;
+                        if !row_matches_grouped_filters(row_values.as_slice(), runtime_filters) {
+                            continue;
+                        }
+                        stats.rows_output = stats.rows_output.saturating_add(1);
+                        aggregate_grouped_row(
+                            &mut local_groups,
+                            self.columns.as_slice(),
+                            group_indexes,
+                            sum_column_index,
+                            row_values.as_slice(),
+                        )?;
+                    }
+                    self.metrics.record_stage_event(
+                        query_execution_id,
+                        stage_id,
+                        "scan_chunk",
+                        format!(
+                            "sequence={} shard={} target={} rows_scanned={} bytes_scanned={} resume_cursor={}",
+                            chunk.sequence,
+                            target.shard_index,
+                            target.grpc_addr,
+                            chunk.rows_scanned,
+                            chunk.bytes_scanned,
+                            hex::encode(&chunk.resume_cursor)
+                        ),
+                    );
+                    if done || next_cursor.is_empty() {
+                        break;
+                    }
+                    cursor = next_cursor;
+                }
+                Err(err) => {
+                    if retries + 1 >= self.scan_retry_limit.max(1) {
+                        return Err(anyhow!(
+                            "aggregate index scan failed after {} retries for shard={} target={}: {}",
+                            retries,
+                            target.shard_index,
+                            target.grpc_addr,
+                            err
+                        ));
+                    }
+                    retries = retries.saturating_add(1);
+                    stats.retries = stats.retries.saturating_add(1);
+                    self.metrics.record_scan_retry();
+                    self.metrics.record_stage_event(
+                        query_execution_id,
+                        stage_id,
+                        "aggregate_pushdown_scan_retry",
+                        format!(
+                            "attempt={} shard={} target={} error={}",
+                            retries, target.shard_index, target.grpc_addr, err
+                        ),
+                    );
+                    let resume_key = if cursor.is_empty() {
+                        target.start_key.clone()
+                    } else {
+                        cursor.clone()
+                    };
+                    if let Some(rerouted) = self
+                        .reroute_scan_target(resume_key.as_slice(), task.range_end_key.as_slice())
+                        .await
+                    {
+                        if rerouted.grpc_addr != target.grpc_addr
+                            || rerouted.shard_index != target.shard_index
+                        {
+                            stats.reroutes = stats.reroutes.saturating_add(1);
+                            self.metrics.record_scan_reroute();
+                            self.metrics.record_stage_event(
+                                query_execution_id,
+                                stage_id,
+                                "aggregate_pushdown_scan_reroute",
+                                format!(
+                                    "from_shard={} from_target={} to_shard={} to_target={}",
+                                    target.shard_index,
+                                    target.grpc_addr,
+                                    rerouted.shard_index,
+                                    rerouted.grpc_addr
+                                ),
+                            );
+                        }
+                        target = rerouted;
+                    }
+                    tokio::time::sleep(self.scan_retry_delay).await;
+                }
+            }
+        }
+
+        Ok((local_groups, stats))
+    }
+
+    async fn aggregate_index_scan_streaming_ctx(
+        &self,
+        query_execution_id: &str,
+        stage_id: u64,
+        plan: &PlannedAccessPath,
+        group_indexes: &[usize],
+        sum_column_index: usize,
+        runtime_filters: &[AggregateFilterRuntime],
+        required_columns: &BTreeSet<String>,
+        global_groups: &mut BTreeMap<Vec<u8>, AggregateGroupState>,
+    ) -> Result<ScanStats> {
+        let AccessPath::Index {
+            index_name, prefix, ..
+        } = &plan.path
+        else {
+            return Err(anyhow!(
+                "aggregate index scan requires an index access path"
+            ));
+        };
+        let Some(index) = self
+            .public_secondary_indexes()
+            .into_iter()
+            .find(|candidate| candidate.index_name.eq_ignore_ascii_case(index_name))
+            .cloned()
+        else {
+            return Err(anyhow!(
+                "optimizer selected missing secondary index '{}'",
+                index_name
+            ));
+        };
+        if !index_covers_required_columns(
+            &index,
+            self.primary_key_column.as_str(),
+            required_columns,
+        ) {
+            return Err(anyhow!(
+                "aggregate index scan requires covering index '{}' for required columns",
+                index.index_name
+            ));
+        }
+
+        let probe_ranges = self.build_secondary_index_probe_ranges(&index, prefix.as_slice())?;
+        if probe_ranges.is_empty() {
+            return Ok(ScanStats::default());
+        }
+        let tasks = self.build_scan_range_tasks(probe_ranges.as_slice()).await;
+        if tasks.is_empty() {
+            return Ok(ScanStats::default());
+        }
+        self.metrics.record_stage_event(
+            query_execution_id,
+            stage_id,
+            "aggregate_pushdown_index_scan_start",
+            format!(
+                "index={} ranges={} tasks={} parallelism={}",
+                index.index_name,
+                probe_ranges.len(),
+                tasks.len(),
+                self.scan_parallelism.max(1)
+            ),
+        );
+
+        let chunk_sequence = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let concurrency = self.scan_parallelism.max(1).min(tasks.len());
+        let mut completed = futures_util::stream::iter(tasks.into_iter().map(|task| async {
+            let task_id = task.task_id;
+            let result = self
+                .aggregate_single_index_scan_task_ctx(
+                    query_execution_id,
+                    stage_id,
+                    &index,
+                    task,
+                    group_indexes,
+                    sum_column_index,
+                    runtime_filters,
+                    chunk_sequence.as_ref(),
+                )
+                .await;
+            (task_id, result)
+        }))
+        .buffer_unordered(concurrency)
+        .collect::<Vec<_>>()
+        .await;
+        completed.sort_by_key(|(task_id, _)| *task_id);
+
+        let mut stats = ScanStats::default();
+        for (task_id, item) in completed {
+            let (local_groups, local_stats) = item?;
+            stats.rpc_pages = stats.rpc_pages.saturating_add(local_stats.rpc_pages);
+            stats.rows_scanned = stats.rows_scanned.saturating_add(local_stats.rows_scanned);
+            stats.rows_output = stats.rows_output.saturating_add(local_stats.rows_output);
+            stats.bytes_scanned = stats
+                .bytes_scanned
+                .saturating_add(local_stats.bytes_scanned);
+            stats.retries = stats.retries.saturating_add(local_stats.retries);
+            stats.reroutes = stats.reroutes.saturating_add(local_stats.reroutes);
+            stats.chunks = stats.chunks.saturating_add(local_stats.chunks);
+            stats.duplicate_rows_skipped = stats
+                .duplicate_rows_skipped
+                .saturating_add(local_stats.duplicate_rows_skipped);
+
+            let local_group_count = local_groups.len();
+            merge_aggregate_group_maps(global_groups, local_groups)?;
+            self.metrics.record_stage_event(
+                query_execution_id,
+                stage_id,
+                "aggregate_pushdown_partial_merge",
+                format!(
+                    "task={} local_groups={} global_groups={}",
+                    task_id,
+                    local_group_count,
+                    global_groups.len()
+                ),
+            );
+        }
+        Ok(stats)
+    }
+
+    /// Streams a full-table scan and maintains per-target partial aggregates, then merges globally.
+    async fn aggregate_table_scan_streaming_ctx(
+        &self,
+        query_execution_id: &str,
+        stage_id: u64,
+        group_indexes: &[usize],
+        sum_column_index: usize,
+        runtime_filters: &[AggregateFilterRuntime],
+        required_column_indexes: &BTreeSet<usize>,
+        global_groups: &mut BTreeMap<Vec<u8>, AggregateGroupState>,
+    ) -> Result<ScanStats> {
+        let scan_ranges = self.scan_ranges_for_bounds(PkBounds::default(), self.table_id)?;
+        if scan_ranges.is_empty() {
+            return Ok(ScanStats::default());
+        }
+
+        self.metrics.record_stage_event(
+            query_execution_id,
+            stage_id,
+            "aggregate_pushdown_table_scan_start",
+            format!("ranges={}", scan_ranges.len()),
+        );
+
+        let mut stats = ScanStats::default();
+        let mut seen_keys = BTreeSet::<Vec<u8>>::new();
+
+        for (range_start_key, range_end_key) in scan_ranges {
+            let targets = self
+                .scan_targets_for_range(range_start_key.as_slice(), range_end_key.as_slice())
+                .await;
+            for base_target in targets {
+                let mut local_groups = BTreeMap::<Vec<u8>, AggregateGroupState>::new();
+                let mut target = base_target;
+                let mut cursor = Vec::new();
+                let mut retries = 0usize;
+
+                loop {
+                    let page_limit = self.page_size.max(1);
+                    let scan_client = self.client_for(target.grpc_addr);
+                    match scan_client
+                        .range_snapshot_latest(
+                            target.shard_index,
+                            target.start_key.as_slice(),
+                            target.end_key.as_slice(),
+                            cursor.as_slice(),
+                            page_limit,
+                            false,
+                        )
+                        .await
+                    {
+                        Ok((entries, next_cursor, done)) => {
+                            retries = 0;
+                            stats.rpc_pages = stats.rpc_pages.saturating_add(1);
+                            stats.chunks = stats.chunks.saturating_add(1);
+                            self.metrics.record_scan_chunk();
+
+                            for entry in entries {
+                                let bytes = entry.key.len() as u64 + entry.value.len() as u64;
+                                stats.rows_scanned = stats.rows_scanned.saturating_add(1);
+                                stats.bytes_scanned = stats.bytes_scanned.saturating_add(bytes);
+                                if !seen_keys.insert(entry.key.clone()) {
+                                    stats.duplicate_rows_skipped =
+                                        stats.duplicate_rows_skipped.saturating_add(1);
+                                    continue;
+                                }
+                                let decoded = decode_generic_entry_with_version_projected(
+                                    self.table_id,
+                                    self.columns.as_slice(),
+                                    self.primary_key_index,
+                                    required_column_indexes,
+                                    &entry,
+                                )?;
+                                let Some(row) = decoded else {
+                                    continue;
+                                };
+                                if !row_matches_grouped_filters(
+                                    row.values.as_slice(),
+                                    runtime_filters,
+                                ) {
+                                    continue;
+                                }
+                                stats.rows_output = stats.rows_output.saturating_add(1);
+                                aggregate_grouped_row(
+                                    &mut local_groups,
+                                    self.columns.as_slice(),
+                                    group_indexes,
+                                    sum_column_index,
+                                    row.values.as_slice(),
+                                )?;
+                            }
+
+                            if done || next_cursor.is_empty() {
+                                break;
+                            }
+                            cursor = next_cursor;
+                        }
+                        Err(err) => {
+                            if retries + 1 >= self.scan_retry_limit.max(1) {
+                                return Err(anyhow!(
+                                    "aggregate table scan failed after {} retries for shard={} target={}: {}",
+                                    retries,
+                                    target.shard_index,
+                                    target.grpc_addr,
+                                    err
+                                ));
+                            }
+                            retries = retries.saturating_add(1);
+                            stats.retries = stats.retries.saturating_add(1);
+                            self.metrics.record_scan_retry();
+                            self.metrics.record_stage_event(
+                                query_execution_id,
+                                stage_id,
+                                "aggregate_pushdown_scan_retry",
+                                format!(
+                                    "attempt={} shard={} target={} error={}",
+                                    retries, target.shard_index, target.grpc_addr, err
+                                ),
+                            );
+
+                            let resume_key = if cursor.is_empty() {
+                                target.start_key.clone()
+                            } else {
+                                cursor.clone()
+                            };
+                            if let Some(rerouted) = self
+                                .reroute_scan_target(
+                                    resume_key.as_slice(),
+                                    range_end_key.as_slice(),
+                                )
+                                .await
+                            {
+                                if rerouted.grpc_addr != target.grpc_addr
+                                    || rerouted.shard_index != target.shard_index
+                                {
+                                    stats.reroutes = stats.reroutes.saturating_add(1);
+                                    self.metrics.record_scan_reroute();
+                                    self.metrics.record_stage_event(
+                                        query_execution_id,
+                                        stage_id,
+                                        "aggregate_pushdown_scan_reroute",
+                                        format!(
+                                            "from_shard={} from_target={} to_shard={} to_target={}",
+                                            target.shard_index,
+                                            target.grpc_addr,
+                                            rerouted.shard_index,
+                                            rerouted.grpc_addr
+                                        ),
+                                    );
+                                }
+                                target = rerouted;
+                            }
+                            tokio::time::sleep(self.scan_retry_delay).await;
+                        }
+                    }
+                }
+
+                let local_group_count = local_groups.len();
+                merge_aggregate_group_maps(global_groups, local_groups)?;
+                self.metrics.record_stage_event(
+                    query_execution_id,
+                    stage_id,
+                    "aggregate_pushdown_partial_merge",
+                    format!(
+                        "shard={} target={} local_groups={} global_groups={}",
+                        target.shard_index,
+                        target.grpc_addr,
+                        local_group_count,
+                        global_groups.len()
+                    ),
+                );
+            }
+        }
+
+        Ok(stats)
     }
 
     /// Builds initial scan targets for a bounded key range.
@@ -2544,170 +4909,25 @@ impl HoloStoreTableProvider {
             );
         }
 
-        let mut result = ScanExecutionResult::default();
-        let mut seen_keys = BTreeSet::<Vec<u8>>::new();
-
-        for (range_start_key, range_end_key) in scan_ranges {
-            let targets = self
-                .scan_targets_for_range(range_start_key.as_slice(), range_end_key.as_slice())
-                .await;
-            for base_target in targets {
-                let mut target = base_target;
-                let mut cursor = Vec::new();
-                let mut retries = 0usize;
-                loop {
-                    let remaining = spec
-                        .limit
-                        .map(|limit| limit.saturating_sub(result.entries.len()));
-                    if matches!(remaining, Some(0)) {
-                        break;
-                    }
-
-                    let page_limit = remaining
-                        .map(|remaining| remaining.min(self.page_size).max(1))
-                        .unwrap_or(self.page_size);
-
-                    let scan_client = self.client_for(target.grpc_addr);
-                    match scan_client
-                        .range_snapshot_latest(
-                            target.shard_index,
-                            target.start_key.as_slice(),
-                            target.end_key.as_slice(),
-                            cursor.as_slice(),
-                            page_limit,
-                            false,
-                        )
-                        .await
-                    {
-                        Ok((entries, next_cursor, done)) => {
-                            retries = 0;
-                            result.stats.rpc_pages = result.stats.rpc_pages.saturating_add(1);
-
-                            let mut chunk = ScanChunk {
-                                sequence: result.stats.chunks.saturating_add(1),
-                                resume_cursor: next_cursor.clone(),
-                                rows_scanned: 0,
-                                bytes_scanned: 0,
-                            };
-
-                            for entry in entries {
-                                let bytes = entry.key.len() as u64 + entry.value.len() as u64;
-                                result.stats.rows_scanned =
-                                    result.stats.rows_scanned.saturating_add(1);
-                                result.stats.bytes_scanned =
-                                    result.stats.bytes_scanned.saturating_add(bytes);
-                                chunk.rows_scanned = chunk.rows_scanned.saturating_add(1);
-                                chunk.bytes_scanned = chunk.bytes_scanned.saturating_add(bytes);
-
-                                if !seen_keys.insert(entry.key.clone()) {
-                                    result.stats.duplicate_rows_skipped =
-                                        result.stats.duplicate_rows_skipped.saturating_add(1);
-                                    continue;
-                                }
-                                result.entries.push(entry);
-                            }
-
-                            result.stats.chunks = result.stats.chunks.saturating_add(1);
-                            self.metrics.record_scan_chunk();
-                            self.metrics.record_stage_event(
-                            spec.query_execution_id.as_str(),
-                            spec.stage_id,
-                            "scan_chunk",
-                            format!(
-                                "sequence={} shard={} target={} rows_scanned={} bytes_scanned={} resume_cursor={}",
-                                chunk.sequence,
-                                target.shard_index,
-                                target.grpc_addr,
-                                chunk.rows_scanned,
-                                chunk.bytes_scanned,
-                                hex::encode(&chunk.resume_cursor)
-                            ),
-                        );
-
-                            if done
-                                || next_cursor.is_empty()
-                                || matches!(spec.limit, Some(limit) if result.entries.len() >= limit)
-                            {
-                                break;
-                            }
-                            cursor = next_cursor;
-                        }
-                        Err(err) => {
-                            if retries + 1 >= self.scan_retry_limit.max(1) {
-                                return Err(anyhow!(
-                                "snapshot table={} shard={} target={} start={} end={} cursor={} limit={} failed after {} retries: {}",
-                                self.table_name,
-                                target.shard_index,
-                                target.grpc_addr,
-                                hex::encode(&target.start_key),
-                                hex::encode(&target.end_key),
-                                hex::encode(&cursor),
-                                page_limit,
-                                retries,
-                                err
-                            ));
-                            }
-                            retries = retries.saturating_add(1);
-                            result.stats.retries = result.stats.retries.saturating_add(1);
-                            self.metrics.record_scan_retry();
-                            self.metrics.record_stage_event(
-                                spec.query_execution_id.as_str(),
-                                spec.stage_id,
-                                "scan_retry",
-                                format!(
-                                    "attempt={} shard={} target={} error={}",
-                                    retries, target.shard_index, target.grpc_addr, err
-                                ),
-                            );
-
-                            let resume_key = if cursor.is_empty() {
-                                target.start_key.clone()
-                            } else {
-                                cursor.clone()
-                            };
-                            if let Some(rerouted) = self
-                                .reroute_scan_target(
-                                    resume_key.as_slice(),
-                                    range_end_key.as_slice(),
-                                )
-                                .await
-                            {
-                                if rerouted.grpc_addr != target.grpc_addr
-                                    || rerouted.shard_index != target.shard_index
-                                {
-                                    result.stats.reroutes = result.stats.reroutes.saturating_add(1);
-                                    self.metrics.record_scan_reroute();
-                                    self.metrics.record_stage_event(
-                                        spec.query_execution_id.as_str(),
-                                        spec.stage_id,
-                                        "scan_reroute",
-                                        format!(
-                                            "from_shard={} from_target={} to_shard={} to_target={}",
-                                            target.shard_index,
-                                            target.grpc_addr,
-                                            rerouted.shard_index,
-                                            rerouted.grpc_addr
-                                        ),
-                                    );
-                                }
-                                target = rerouted;
-                            }
-
-                            tokio::time::sleep(self.scan_retry_delay).await;
-                        }
-                    }
-                }
-            }
-        }
+        let result = self
+            .execute_scan_ranges_ctx(
+                spec.query_execution_id.as_str(),
+                spec.stage_id,
+                scan_ranges.as_slice(),
+                spec.limit,
+                "scan_stage_plan",
+            )
+            .await?;
 
         self.metrics.record_stage_event(
             spec.query_execution_id.as_str(),
             spec.stage_id,
             "scan_stage_finish",
             format!(
-                "rpc_pages={} rows_scanned={} bytes_scanned={} retries={} reroutes={} chunks={} duplicate_rows_skipped={}",
+                "rpc_pages={} rows_scanned={} rows_output={} bytes_scanned={} retries={} reroutes={} chunks={} duplicate_rows_skipped={}",
                 result.stats.rpc_pages,
                 result.stats.rows_scanned,
+                result.stats.rows_output,
                 result.stats.bytes_scanned,
                 result.stats.retries,
                 result.stats.reroutes,
@@ -2774,6 +4994,13 @@ impl HoloStoreTableProvider {
                 .collect::<Vec<_>>()
         };
 
+        let retry_policy = self.write_retry_policy;
+        let retry_limit = retry_policy.max_attempts();
+        let retry_deadline = if retry_policy.enabled && retry_policy.max_elapsed > Duration::ZERO {
+            Some(Instant::now() + retry_policy.max_elapsed)
+        } else {
+            None
+        };
         let mut first_err: Option<anyhow::Error> = None;
         for (target, entries) in rollback_targets {
             let client = self.client_for(target.grpc_addr);
@@ -2799,111 +5026,187 @@ impl HoloStoreTableProvider {
                     .iter()
                     .map(prepared_conditional_entry_size)
                     .fold(0usize, |acc, next| acc.saturating_add(next));
-                if let Err(err) = self.enforce_inflight_budget(
-                    expected as usize,
-                    rollback_bytes,
-                    1,
-                    "rollback_batch",
-                ) {
-                    warn!(error = %err, "rollback budget rejection");
-                    if first_err.is_none() {
-                        first_err = Some(err);
-                    }
-                    continue;
-                }
-                let circuit_token = match self.circuit_acquire(target.grpc_addr) {
-                    Ok(token) => token,
-                    Err(err) => {
-                        warn!(error = %err, "rollback circuit rejection");
-                        if first_err.is_none() {
-                            first_err = Some(err);
-                        }
-                        continue;
-                    }
-                };
-                let rollback_span = info_span!(
-                    "holo_fusion.distributed_write_rollback",
-                    table = %self.table_name,
-                    op = op,
-                    shard_index = target.shard_index,
-                    target = %target.grpc_addr,
-                    batch_index = batch_idx + 1,
-                    batch_count = batch_count
-                );
-                let rollback_started = Instant::now();
-                // Decision: evaluate `client` to choose the correct SQL/storage control path.
-                match client
-                    .range_write_latest_conditional(
-                        target.shard_index,
-                        target.start_key.as_slice(),
-                        target.end_key.as_slice(),
-                        rollback_entries,
-                    )
-                    .instrument(rollback_span)
-                    .await
-                {
-                    Ok(result) => {
-                        self.circuit_on_success(target.grpc_addr, circuit_token);
-                        self.metrics.record_distributed_rollback(
-                            target.shard_index,
-                            expected,
-                            rollback_started.elapsed(),
-                        );
-                        // Decision: evaluate `result.conflicts > 0` to choose the correct SQL/storage control path.
-                        if result.conflicts > 0 {
-                            self.metrics.record_distributed_conflict(target.shard_index);
-                            let err = anyhow!(
-                                "rollback for {op} conflicted on shard {} chunk {}/{} (conflicts={})",
-                                target.shard_index,
-                                batch_idx + 1,
-                                batch_count,
-                                result.conflicts
-                            );
-                            warn!(error = %err, "conditional rollback conflict");
-                            // Decision: evaluate `first_err.is_none()` to choose the correct SQL/storage control path.
-                            if first_err.is_none() {
-                                first_err = Some(err);
-                            }
-                        // Decision: evaluate `result.applied != expected` to choose the correct SQL/storage control path.
-                        } else if result.applied != expected {
-                            let err = anyhow!(
-                                "rollback for {op} partially applied on shard {} chunk {}/{}: expected {}, applied {}",
-                                target.shard_index,
-                                batch_idx + 1,
-                                batch_count,
-                                expected,
-                                result.applied
-                            );
-                            warn!(error = %err, "conditional rollback partial apply");
-                            // Decision: evaluate `first_err.is_none()` to choose the correct SQL/storage control path.
-                            if first_err.is_none() {
-                                first_err = Some(err);
-                            }
+                let mut batch_succeeded = false;
+                let mut batch_err: Option<anyhow::Error> = None;
+                for attempt in 0..retry_limit {
+                    if let Some(deadline) = retry_deadline {
+                        if Instant::now() >= deadline {
+                            break;
                         }
                     }
-                    Err(err) => {
-                        self.circuit_on_failure(target.grpc_addr, circuit_token);
-                        self.metrics.record_distributed_apply_failure(
-                            target.grpc_addr.to_string().as_str(),
-                            classify_write_error_message(err.to_string().as_str()).is_retryable(),
-                        );
-                        self.metrics.record_distributed_rollback(
-                            target.shard_index,
-                            expected,
-                            rollback_started.elapsed(),
-                        );
-                        let err = anyhow!(
-                            "rollback for {op} failed on shard {} chunk {}/{} target={} with error: {err}",
+
+                    if let Err(err) = self.enforce_inflight_budget(
+                        expected as usize,
+                        rollback_bytes,
+                        1,
+                        "rollback_batch",
+                    ) {
+                        let wrapped = anyhow!(
+                            "rollback for {op} budget rejected on shard {} chunk {}/{} target={}: {err}",
                             target.shard_index,
                             batch_idx + 1,
                             batch_count,
                             target.grpc_addr
                         );
-                        warn!(error = %err, "conditional rollback rpc failure");
-                        // Decision: evaluate `first_err.is_none()` to choose the correct SQL/storage control path.
-                        if first_err.is_none() {
-                            first_err = Some(err);
+                        warn!(error = %wrapped, "rollback budget rejection");
+                        batch_err = Some(wrapped);
+                        break;
+                    }
+
+                    let circuit_token = match self.circuit_acquire(target.grpc_addr) {
+                        Ok(token) => token,
+                        Err(err) => {
+                            let wrapped = anyhow!(
+                                "rollback for {op} circuit rejection on shard {} chunk {}/{} target={}: {err}",
+                                target.shard_index,
+                                batch_idx + 1,
+                                batch_count,
+                                target.grpc_addr
+                            );
+                            let class = classify_write_error_message(wrapped.to_string().as_str());
+                            warn!(
+                                error = %wrapped,
+                                attempt = attempt + 1,
+                                retry_limit = retry_limit,
+                                retryable = class.is_retryable(),
+                                "rollback circuit rejection"
+                            );
+                            batch_err = Some(wrapped);
+                            if class.is_retryable() && attempt + 1 < retry_limit {
+                                if let Some(deadline) = retry_deadline {
+                                    if Instant::now() >= deadline {
+                                        break;
+                                    }
+                                }
+                                tokio::time::sleep(retry_backoff(
+                                    retry_policy,
+                                    attempt,
+                                    target.grpc_addr.port() as u64,
+                                ))
+                                .await;
+                                continue;
+                            }
+                            break;
                         }
+                    };
+
+                    let rollback_span = info_span!(
+                        "holo_fusion.distributed_write_rollback",
+                        table = %self.table_name,
+                        op = op,
+                        shard_index = target.shard_index,
+                        target = %target.grpc_addr,
+                        batch_index = batch_idx + 1,
+                        batch_count = batch_count
+                    );
+                    let rollback_started = Instant::now();
+                    // Decision: evaluate `client` to choose the correct SQL/storage control path.
+                    match client
+                        .range_write_latest_conditional(
+                            target.shard_index,
+                            target.start_key.as_slice(),
+                            target.end_key.as_slice(),
+                            rollback_entries.clone(),
+                        )
+                        .instrument(rollback_span)
+                        .await
+                    {
+                        Ok(result) => {
+                            self.circuit_on_success(target.grpc_addr, circuit_token);
+                            self.metrics.record_distributed_rollback(
+                                target.shard_index,
+                                expected,
+                                rollback_started.elapsed(),
+                            );
+                            // Decision: evaluate `result.conflicts > 0` to choose the correct SQL/storage control path.
+                            if result.conflicts > 0 {
+                                self.metrics.record_distributed_conflict(target.shard_index);
+                                let wrapped = anyhow!(
+                                    "rollback for {op} conflicted on shard {} chunk {}/{} (conflicts={})",
+                                    target.shard_index,
+                                    batch_idx + 1,
+                                    batch_count,
+                                    result.conflicts
+                                );
+                                warn!(error = %wrapped, "conditional rollback conflict");
+                                batch_err = Some(wrapped);
+                            // Decision: evaluate `result.applied != expected` to choose the correct SQL/storage control path.
+                            } else if result.applied != expected {
+                                let wrapped = anyhow!(
+                                    "rollback for {op} partially applied on shard {} chunk {}/{}: expected {}, applied {}",
+                                    target.shard_index,
+                                    batch_idx + 1,
+                                    batch_count,
+                                    expected,
+                                    result.applied
+                                );
+                                warn!(error = %wrapped, "conditional rollback partial apply");
+                                batch_err = Some(wrapped);
+                            } else {
+                                batch_succeeded = true;
+                                batch_err = None;
+                            }
+                            break;
+                        }
+                        Err(err) => {
+                            self.circuit_on_failure(target.grpc_addr, circuit_token);
+                            self.metrics.record_distributed_apply_failure(
+                                target.grpc_addr.to_string().as_str(),
+                                classify_write_error_message(err.to_string().as_str())
+                                    .is_retryable(),
+                            );
+                            self.metrics.record_distributed_rollback(
+                                target.shard_index,
+                                expected,
+                                rollback_started.elapsed(),
+                            );
+                            let wrapped = anyhow!(
+                                "rollback for {op} failed on shard {} chunk {}/{} target={} with error: {err}",
+                                target.shard_index,
+                                batch_idx + 1,
+                                batch_count,
+                                target.grpc_addr
+                            );
+                            let class = classify_write_error_message(wrapped.to_string().as_str());
+                            warn!(
+                                error = %wrapped,
+                                attempt = attempt + 1,
+                                retry_limit = retry_limit,
+                                retryable = class.is_retryable(),
+                                "conditional rollback rpc failure"
+                            );
+                            batch_err = Some(wrapped);
+                            if class.is_retryable() && attempt + 1 < retry_limit {
+                                if let Some(deadline) = retry_deadline {
+                                    if Instant::now() >= deadline {
+                                        break;
+                                    }
+                                }
+                                tokio::time::sleep(retry_backoff(
+                                    retry_policy,
+                                    attempt,
+                                    target.grpc_addr.port() as u64,
+                                ))
+                                .await;
+                                continue;
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                if !batch_succeeded {
+                    let err = batch_err.unwrap_or_else(|| {
+                        anyhow!(
+                            "rollback for {op} retries exhausted on shard {} chunk {}/{} target={}",
+                            target.shard_index,
+                            batch_idx + 1,
+                            batch_count,
+                            target.grpc_addr
+                        )
+                    });
+                    if first_err.is_none() {
+                        first_err = Some(err);
                     }
                 }
             }
@@ -3007,26 +5310,26 @@ impl HoloStoreTableProvider {
                 ))
             }
             Ok(ConditionalWriteDetailedOutcome::Conflict) => {
-                self.rollback_conditional_targets(applied_targets.as_slice(), "bulk_insert")
+                if let Err(rollback_err) = self
+                    .rollback_conditional_targets(applied_targets.as_slice(), "bulk_insert")
                     .await
-                    .with_context(|| {
-                        format!(
-                            "rollback previously applied bulk insert chunks after conflict in {}",
-                            chunk_id
-                        )
-                    })?;
+                {
+                    return Err(anyhow!(
+                        "bulk insert conflict in {chunk_id}; rollback previously applied chunks also failed: {rollback_err}"
+                    ));
+                }
                 Err(DuplicateKeyViolation::for_table(self.table_name.as_str()).into())
             }
             Err(err) => {
-                self.rollback_conditional_targets(applied_targets.as_slice(), "bulk_insert")
+                if let Err(rollback_err) = self
+                    .rollback_conditional_targets(applied_targets.as_slice(), "bulk_insert")
                     .await
-                    .with_context(|| {
-                        format!(
-                            "rollback previously applied bulk insert chunks after failure in {}",
-                            chunk_id
-                        )
-                    })?;
-                Err(err)
+                {
+                    return Err(anyhow!(
+                        "bulk insert chunk {chunk_id} failed: {err}; rollback previously applied chunks also failed: {rollback_err}"
+                    ));
+                }
+                Err(err).with_context(|| format!("bulk insert chunk failed in {chunk_id}"))
             }
         }
     }
@@ -3069,14 +5372,14 @@ impl HoloStoreTableProvider {
                 let entries = self.decode_batch_to_primary_entries(&batch)?;
                 for (primary_key, value) in entries {
                     if !seen_keys.insert(primary_key) {
-                        self.rollback_conditional_targets(applied_targets.as_slice(), "bulk_insert")
+                        if let Err(rollback_err) = self
+                            .rollback_conditional_targets(applied_targets.as_slice(), "bulk_insert")
                             .await
-                            .with_context(|| {
-                                format!(
-                                    "rollback previously applied bulk insert chunks after duplicate key primary_key={}",
-                                    primary_key
-                                )
-                            })?;
+                        {
+                            return Err(anyhow!(
+                                "duplicate key in streaming bulk insert primary_key={primary_key}; rollback previously applied chunks also failed: {rollback_err}"
+                            ));
+                        }
                         return Err(DuplicateKeyViolation::for_table(self.table_name.as_str()).into());
                     }
                     pending_bytes = pending_bytes
@@ -3158,6 +5461,7 @@ impl HoloStoreTableProvider {
             Ok(written_rows) => {
                 self.metrics
                     .finish_ingest_job(statement_id.as_str(), true, None);
+                self.optimizer_record_row_count_delta(written_rows as i64);
                 Ok(written_rows)
             }
             Err(err) => {
@@ -3198,7 +5502,10 @@ impl HoloStoreTableProvider {
             .apply_primary_writes_conditional(writes.as_slice(), "insert")
             .await?
         {
-            ConditionalWriteOutcome::Applied(applied) => Ok(applied),
+            ConditionalWriteOutcome::Applied(applied) => {
+                self.optimizer_record_row_count_delta(applied as i64);
+                Ok(applied)
+            }
             ConditionalWriteOutcome::Conflict => {
                 Err(DuplicateKeyViolation::for_table(self.table_name.as_str()).into())
             }
@@ -3676,26 +5983,56 @@ impl TableProvider for HoloStoreTableProvider {
             "starting holofusion table scan"
         );
 
-        let batch = if self.row_codec_mode == RowCodecMode::RowV1 {
+        let table_schema = self.schema();
+        let (batch, mem_schema, mem_projection) = if self.row_codec_mode == RowCodecMode::RowV1 {
             let rows = self
                 .scan_rows_generic_with_context(
                     query_execution_id.as_str(),
                     stage_id,
                     filters,
+                    projection,
                     limit,
                 )
                 .await
                 .map_err(df_external)?;
-            rows_to_batch_generic(self.schema(), rows.as_slice()).map_err(df_external)?
+            if let Some(projected_columns) = projection {
+                // Row-v1 decode materializes only required columns and leaves omitted columns as
+                // Null placeholders. Build the scan batch on projected schema to avoid emitting
+                // impossible NULLs for omitted non-nullable columns.
+                let projected_schema = Arc::new(
+                    table_schema
+                        .project(projected_columns.as_slice())
+                        .map_err(|err| DataFusionError::Execution(err.to_string()))?,
+                );
+                let projected_rows = project_generic_rows(rows.as_slice(), projected_columns)
+                    .map_err(df_external)?;
+                (
+                    rows_to_batch_generic(projected_schema.clone(), projected_rows.as_slice())
+                        .map_err(df_external)?,
+                    projected_schema,
+                    None,
+                )
+            } else {
+                (
+                    rows_to_batch_generic(table_schema.clone(), rows.as_slice())
+                        .map_err(df_external)?,
+                    table_schema.clone(),
+                    None,
+                )
+            }
         } else {
             let rows = self
                 .scan_rows_with_context(query_execution_id.as_str(), stage_id, filters, limit)
                 .await
                 .map_err(df_external)?;
-            rows_to_batch(self.schema(), &rows).map_err(df_external)?
+            (
+                rows_to_batch(table_schema.clone(), &rows).map_err(df_external)?,
+                table_schema,
+                projection.cloned(),
+            )
         };
-        let mem = MemTable::try_new(self.schema(), vec![vec![batch]])?;
-        mem.scan(state, projection, &[], limit).await
+        let mem = MemTable::try_new(mem_schema, vec![vec![batch]])?;
+        mem.scan(state, mem_projection.as_ref(), &[], limit).await
     }
 
     /// Executes `insert into` for this component.
@@ -3723,11 +6060,17 @@ impl TableProvider for HoloStoreTableProvider {
     ) -> DFResult<Vec<TableProviderFilterPushDown>> {
         let mut support = Vec::with_capacity(filters.len());
         for filter in filters {
-            let exact =
+            let exact_primary_key =
                 extract_supported_predicates(filter, self.primary_key_column.as_str()).is_some();
-            self.metrics.record_filter_support(exact);
-            support.push(if exact {
+            let inexact_index =
+                !exact_primary_key && self.filter_supports_secondary_index_pushdown(filter);
+
+            self.metrics
+                .record_filter_support(exact_primary_key || inexact_index);
+            support.push(if exact_primary_key {
                 TableProviderFilterPushDown::Exact
+            } else if inexact_index {
+                TableProviderFilterPushDown::Inexact
             } else {
                 TableProviderFilterPushDown::Unsupported
             });
@@ -3743,6 +6086,13 @@ struct LocalScanTarget {
     grpc_addr: SocketAddr,
     start_key: Vec<u8>,
     end_key: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct ScanRangeTask {
+    task_id: usize,
+    range_end_key: Vec<u8>,
+    target: LocalScanTarget,
 }
 
 impl From<crate::topology::ScanTarget> for LocalScanTarget {
@@ -3849,6 +6199,7 @@ struct ScanChunk {
 struct ScanStats {
     rpc_pages: u64,
     rows_scanned: u64,
+    rows_output: u64,
     bytes_scanned: u64,
     retries: u64,
     reroutes: u64,
@@ -3863,6 +6214,46 @@ struct ScanExecutionResult {
     stats: ScanStats,
 }
 
+/// Batched primary-row lookup result keyed by decoded primary key.
+#[derive(Debug, Default)]
+struct PrimaryLookupBatchResult {
+    entries_by_primary: BTreeMap<i64, LatestEntry>,
+    stats: ScanStats,
+}
+
+#[derive(Debug, Clone)]
+struct AggregateFilterRuntime {
+    column_index: usize,
+    allowed_values: Vec<ScalarValue>,
+}
+
+#[derive(Debug, Clone)]
+struct AggregateGroupState {
+    group_values: Vec<ScalarValue>,
+    count: u64,
+    sum: i128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TopKRankedGroup {
+    sum: i128,
+    tie_key: Vec<u8>,
+}
+
+impl Ord for TopKRankedGroup {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.sum
+            .cmp(&other.sum)
+            .then_with(|| self.tie_key.cmp(&other.tie_key))
+    }
+}
+
+impl PartialOrd for TopKRankedGroup {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// Formats typed scan predicate IR into a compact textual form.
 fn format_scan_predicate_expr(expr: &ScanPredicateExpr) -> String {
     match expr {
@@ -3875,6 +6266,232 @@ fn format_scan_predicate_expr(expr: &ScanPredicateExpr) -> String {
             format!("{column} {} {value}", op.as_sql())
         }
     }
+}
+
+fn finalize_grouped_topk_rows(
+    groups: BTreeMap<Vec<u8>, AggregateGroupState>,
+    having_min_count: u64,
+    limit: usize,
+) -> Result<Vec<GroupedAggregateTopKRow>> {
+    if limit == 0 || groups.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut eligible = BTreeMap::<Vec<u8>, AggregateGroupState>::new();
+    let mut heap = BinaryHeap::<Reverse<TopKRankedGroup>>::new();
+    for (key, state) in groups {
+        if state.count < having_min_count {
+            continue;
+        }
+        let ranked = TopKRankedGroup {
+            sum: state.sum,
+            tie_key: key.clone(),
+        };
+        eligible.insert(key, state);
+        if heap.len() < limit {
+            heap.push(Reverse(ranked));
+            continue;
+        }
+        if let Some(Reverse(current_smallest)) = heap.peek() {
+            if ranked > *current_smallest {
+                heap.pop();
+                heap.push(Reverse(ranked));
+            }
+        }
+    }
+
+    let mut ranked = heap
+        .into_iter()
+        .map(|Reverse(item)| item)
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right
+            .sum
+            .cmp(&left.sum)
+            .then_with(|| left.tie_key.cmp(&right.tie_key))
+    });
+
+    let mut out = Vec::<GroupedAggregateTopKRow>::with_capacity(ranked.len());
+    for item in ranked {
+        let Some(state) = eligible.remove(&item.tie_key) else {
+            continue;
+        };
+        let sum = i64::try_from(state.sum).map_err(|_| {
+            anyhow!(
+                "aggregate SUM overflow: value {} exceeds signed 64-bit range",
+                state.sum
+            )
+        })?;
+        out.push(GroupedAggregateTopKRow {
+            group_values: state.group_values,
+            count: state.count,
+            sum,
+        });
+    }
+    Ok(out)
+}
+
+fn row_matches_grouped_filters(
+    row_values: &[ScalarValue],
+    filters: &[AggregateFilterRuntime],
+) -> bool {
+    filters.iter().all(|filter| {
+        let Some(value) = row_values.get(filter.column_index) else {
+            return false;
+        };
+        if scalar_is_nullish(value) {
+            return false;
+        }
+        filter
+            .allowed_values
+            .iter()
+            .any(|allowed| scalar_values_equal(value, allowed))
+    })
+}
+
+fn scalar_values_equal(left: &ScalarValue, right: &ScalarValue) -> bool {
+    if scalar_is_nullish(left) || scalar_is_nullish(right) {
+        return false;
+    }
+    if let (Some(l), Some(r)) = (
+        scalar_to_i128_for_filter_compare(left),
+        scalar_to_i128_for_filter_compare(right),
+    ) {
+        return l == r;
+    }
+
+    match (left, right) {
+        (ScalarValue::Utf8(Some(l)), ScalarValue::Utf8(Some(r)))
+        | (ScalarValue::LargeUtf8(Some(l)), ScalarValue::LargeUtf8(Some(r)))
+        | (ScalarValue::Utf8(Some(l)), ScalarValue::LargeUtf8(Some(r)))
+        | (ScalarValue::LargeUtf8(Some(l)), ScalarValue::Utf8(Some(r))) => l == r,
+        (ScalarValue::Boolean(Some(l)), ScalarValue::Boolean(Some(r))) => l == r,
+        _ => left == right,
+    }
+}
+
+fn scalar_to_i128_for_filter_compare(value: &ScalarValue) -> Option<i128> {
+    match value {
+        ScalarValue::Int8(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::Int16(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::Int32(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::Int64(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::UInt8(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::UInt16(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::UInt32(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::UInt64(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::TimestampNanosecond(Some(v), _) => Some(i128::from(*v)),
+        ScalarValue::TimestampMicrosecond(Some(v), _) => Some(i128::from(*v)),
+        ScalarValue::TimestampMillisecond(Some(v), _) => Some(i128::from(*v)),
+        ScalarValue::TimestampSecond(Some(v), _) => Some(i128::from(*v)),
+        _ => None,
+    }
+}
+
+fn scalar_is_nullish(value: &ScalarValue) -> bool {
+    matches!(
+        value,
+        ScalarValue::Null
+            | ScalarValue::Int8(None)
+            | ScalarValue::Int16(None)
+            | ScalarValue::Int32(None)
+            | ScalarValue::Int64(None)
+            | ScalarValue::UInt8(None)
+            | ScalarValue::UInt16(None)
+            | ScalarValue::UInt32(None)
+            | ScalarValue::UInt64(None)
+            | ScalarValue::Float32(None)
+            | ScalarValue::Float64(None)
+            | ScalarValue::Boolean(None)
+            | ScalarValue::Utf8(None)
+            | ScalarValue::LargeUtf8(None)
+            | ScalarValue::TimestampNanosecond(None, _)
+            | ScalarValue::TimestampMicrosecond(None, _)
+            | ScalarValue::TimestampMillisecond(None, _)
+            | ScalarValue::TimestampSecond(None, _)
+    )
+}
+
+fn aggregate_grouped_row(
+    groups: &mut BTreeMap<Vec<u8>, AggregateGroupState>,
+    columns: &[TableColumnRecord],
+    group_indexes: &[usize],
+    sum_column_index: usize,
+    row_values: &[ScalarValue],
+) -> Result<()> {
+    let mut group_values = Vec::<ScalarValue>::with_capacity(group_indexes.len());
+    let mut group_key = Vec::<u8>::new();
+    group_key.push(0x47);
+
+    for column_index in group_indexes {
+        let value = row_values
+            .get(*column_index)
+            .cloned()
+            .unwrap_or(ScalarValue::Null);
+        group_values.push(value.clone());
+        let payload = encode_scalar_payload(value, &columns[*column_index])?;
+        match payload {
+            Some(payload) => {
+                group_key.push(1);
+                group_key.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+                group_key.extend_from_slice(payload.as_slice());
+            }
+            None => {
+                group_key.push(0);
+            }
+        }
+    }
+
+    let Some(sum_value) = row_values.get(sum_column_index) else {
+        return Err(anyhow!(
+            "aggregate SUM column index {} out of bounds",
+            sum_column_index
+        ));
+    };
+    let row_sum = if scalar_is_nullish(sum_value) {
+        0i128
+    } else {
+        let parsed = scalar_to_i64(sum_value.clone()).ok_or_else(|| {
+            anyhow!(
+                "aggregate SUM column '{}' has non-numeric value",
+                columns[sum_column_index].name
+            )
+        })?;
+        i128::from(parsed)
+    };
+
+    let entry = groups
+        .entry(group_key)
+        .or_insert_with(|| AggregateGroupState {
+            group_values,
+            count: 0,
+            sum: 0,
+        });
+    entry.count = entry.count.saturating_add(1);
+    entry.sum = entry
+        .sum
+        .checked_add(row_sum)
+        .ok_or_else(|| anyhow!("aggregate SUM overflow while accumulating grouped results"))?;
+    Ok(())
+}
+
+fn merge_aggregate_group_maps(
+    global: &mut BTreeMap<Vec<u8>, AggregateGroupState>,
+    local: BTreeMap<Vec<u8>, AggregateGroupState>,
+) -> Result<()> {
+    for (key, local_state) in local {
+        let global_state = global.entry(key).or_insert_with(|| AggregateGroupState {
+            group_values: local_state.group_values.clone(),
+            count: 0,
+            sum: 0,
+        });
+        global_state.count = global_state.count.saturating_add(local_state.count);
+        global_state.sum = global_state
+            .sum
+            .checked_add(local_state.sum)
+            .ok_or_else(|| anyhow!("aggregate SUM overflow while merging shard partials"))?;
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -4192,6 +6809,30 @@ fn rows_to_batch_generic(schema: SchemaRef, rows: &[Vec<ScalarValue>]) -> Result
     RecordBatch::try_new(schema, arrays).map_err(Into::into)
 }
 
+/// Projects decoded generic rows onto a target schema column order.
+fn project_generic_rows(
+    rows: &[Vec<ScalarValue>],
+    projected_columns: &[usize],
+) -> Result<Vec<Vec<ScalarValue>>> {
+    let mut projected_rows = Vec::with_capacity(rows.len());
+    for (row_idx, row) in rows.iter().enumerate() {
+        let mut projected_row = Vec::with_capacity(projected_columns.len());
+        for projected_column in projected_columns {
+            let value = row.get(*projected_column).ok_or_else(|| {
+                anyhow!(
+                    "projection index {} out of bounds for row {} with {} columns",
+                    projected_column,
+                    row_idx,
+                    row.len()
+                )
+            })?;
+            projected_row.push(value.clone());
+        }
+        projected_rows.push(projected_row);
+    }
+    Ok(projected_rows)
+}
+
 /// Executes `decode orders rows` for this component.
 fn decode_orders_rows(batch: &RecordBatch) -> Result<Vec<OrdersSeedRow>> {
     // Decision: evaluate `batch.num_columns() != 5` to choose the correct SQL/storage control path.
@@ -4327,6 +6968,175 @@ fn now_timestamp_nanos() -> i64 {
             .try_into()
             .unwrap_or(i64::MAX),
         Err(_) => 0,
+    }
+}
+
+fn now_unix_millis() -> u64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis().min(u64::MAX as u128) as u64,
+        Err(_) => 0,
+    }
+}
+
+fn format_access_path(path: &AccessPath) -> String {
+    match path {
+        AccessPath::TableScan => "table_scan".to_string(),
+        AccessPath::Index {
+            index_name,
+            prefix,
+            index_only_table_covering,
+            ordered_limit_scan,
+            probe_count,
+        } => format!(
+            "index_scan[index={} prefix_columns={} probes={} covering={} ordered={}]",
+            index_name,
+            prefix.len(),
+            probe_count,
+            index_only_table_covering,
+            ordered_limit_scan
+        ),
+    }
+}
+
+fn format_optimizer_predicate_summary(predicates: &PredicateSummary) -> String {
+    let mut recognized_columns = predicates
+        .columns()
+        .filter_map(|(column, predicate)| format_column_predicate_summary(column, predicate))
+        .collect::<Vec<_>>();
+    recognized_columns.sort();
+    let columns = if recognized_columns.is_empty() {
+        "none".to_string()
+    } else {
+        recognized_columns.join(",")
+    };
+
+    format!(
+        "total_terms={} recognized_terms={} residual_terms={} recognized_columns={}",
+        predicates.total_terms, predicates.recognized_terms, predicates.residual_terms, columns
+    )
+}
+
+fn format_column_predicate_summary(column: &str, predicate: &ColumnPredicate) -> Option<String> {
+    if !predicate.has_any_constraint() {
+        return None;
+    }
+
+    let mut terms = Vec::<String>::new();
+    if !predicate.equals.is_empty() {
+        terms.push(format!("eq{}", predicate.equals.len()));
+    }
+    if let Some(lower) = predicate.lower.as_ref() {
+        terms.push(if lower.inclusive {
+            "ge".to_string()
+        } else {
+            "gt".to_string()
+        });
+    }
+    if let Some(upper) = predicate.upper.as_ref() {
+        terms.push(if upper.inclusive {
+            "le".to_string()
+        } else {
+            "lt".to_string()
+        });
+    }
+    if predicate.is_null {
+        terms.push("isnull".to_string());
+    }
+    if predicate.is_not_null {
+        terms.push("notnull".to_string());
+    }
+
+    Some(format!("{column}:{}", terms.join("+")))
+}
+
+fn optimizer_candidate_name_for_access_path(path: &AccessPath) -> String {
+    match path {
+        AccessPath::TableScan => "table_scan".to_string(),
+        AccessPath::Index {
+            index_name,
+            index_only_table_covering,
+            ordered_limit_scan,
+            ..
+        } => {
+            let prefix = if *index_only_table_covering {
+                "index_only"
+            } else if *ordered_limit_scan {
+                "ordered_index"
+            } else {
+                "index_lookup"
+            };
+            format!("{prefix}:{}", index_name.to_ascii_lowercase())
+        }
+    }
+}
+
+fn summary_supports_secondary_index_pushdown(
+    summary: &PredicateSummary,
+    indexes: &[&SecondaryIndexRecord],
+) -> bool {
+    if summary.recognized_terms == 0 {
+        return false;
+    }
+
+    indexes.iter().any(|index| {
+        index.key_columns.iter().any(|key_column| {
+            summary
+                .column(key_column.to_ascii_lowercase().as_str())
+                .is_some_and(column_predicate_supports_secondary_index_pushdown)
+        })
+    })
+}
+
+fn column_predicate_supports_secondary_index_pushdown(predicate: &ColumnPredicate) -> bool {
+    !predicate.equals.is_empty()
+        || predicate.lower.is_some()
+        || predicate.upper.is_some()
+        || predicate.is_null
+}
+
+fn index_covers_required_columns(
+    index: &SecondaryIndexRecord,
+    primary_key_column: &str,
+    required_columns: &BTreeSet<String>,
+) -> bool {
+    if required_columns.is_empty() {
+        return false;
+    }
+
+    let mut covered = BTreeSet::<String>::new();
+    covered.insert(primary_key_column.to_ascii_lowercase());
+    for column in &index.key_columns {
+        covered.insert(column.to_ascii_lowercase());
+    }
+    for column in &index.include_columns {
+        covered.insert(column.to_ascii_lowercase());
+    }
+    required_columns
+        .iter()
+        .all(|column| covered.contains(&column.to_ascii_lowercase()))
+}
+
+fn expand_scalar_combinations(
+    value_matrix: &[Vec<ScalarValue>],
+    depth: usize,
+    current: &mut Vec<ScalarValue>,
+    max_output: usize,
+    out: &mut Vec<Vec<ScalarValue>>,
+) {
+    if out.len() >= max_output {
+        return;
+    }
+    if depth >= value_matrix.len() {
+        out.push(current.clone());
+        return;
+    }
+    for value in &value_matrix[depth] {
+        if out.len() >= max_output {
+            break;
+        }
+        current.push(value.clone());
+        expand_scalar_combinations(value_matrix, depth + 1, current, max_output, out);
+        current.pop();
     }
 }
 
@@ -4569,6 +7379,29 @@ fn decode_generic_entry_with_version(
     }))
 }
 
+/// Decodes one storage entry and materializes only required columns.
+fn decode_generic_entry_with_version_projected(
+    expected_table_id: u64,
+    columns: &[TableColumnRecord],
+    primary_key_index: usize,
+    required_column_indexes: &BTreeSet<usize>,
+    entry: &LatestEntry,
+) -> Result<Option<VersionedGenericRow>> {
+    let primary_key = decode_primary_key(entry.key.as_slice(), expected_table_id)?;
+    let decoded = decode_generic_row_value_projected(
+        entry.value.as_slice(),
+        columns,
+        primary_key_index,
+        primary_key,
+        required_column_indexes,
+    )?;
+    Ok(decoded.map(|values| VersionedGenericRow {
+        primary_key,
+        values,
+        version: entry.version,
+    }))
+}
+
 /// Decodes generic row_v1 payload into typed scalar values.
 fn decode_generic_row_value(
     bytes: &[u8],
@@ -4622,6 +7455,65 @@ fn decode_generic_row_value(
         }
         values.push(payload_to_scalar(payloads[idx].as_deref(), column)?);
     }
+    Ok(Some(values))
+}
+
+/// Decodes generic row_v1 payload while only materializing required columns.
+fn decode_generic_row_value_projected(
+    bytes: &[u8],
+    columns: &[TableColumnRecord],
+    primary_key_index: usize,
+    primary_key: i64,
+    required_column_indexes: &BTreeSet<usize>,
+) -> Result<Option<Vec<ScalarValue>>> {
+    if bytes.len() < 2 {
+        return Err(anyhow!("row value too short"));
+    }
+
+    let format = bytes[0];
+    if format != ROW_FORMAT_VERSION_V2 {
+        return Err(anyhow!(
+            "unsupported row format version {format} for row_v1"
+        ));
+    }
+    let flags = bytes[1];
+    if flags & ROW_FLAG_TOMBSTONE != 0 {
+        return Ok(None);
+    }
+
+    let mut cursor = 2usize;
+    let column_count = read_u16(bytes, &mut cursor)? as usize;
+    if column_count != columns.len() {
+        return Err(anyhow!(
+            "row_v1 column count mismatch: payload={}, metadata={}",
+            column_count,
+            columns.len()
+        ));
+    }
+    let null_bitmap_len = read_u16(bytes, &mut cursor)? as usize;
+    let null_bitmap = read_bytes(bytes, &mut cursor, null_bitmap_len)?;
+
+    let mut values = vec![ScalarValue::Null; columns.len()];
+    values[primary_key_index] = primary_key_scalar(&columns[primary_key_index], primary_key)?;
+
+    let materialized =
+        |idx: usize| -> bool { idx == primary_key_index || required_column_indexes.contains(&idx) };
+
+    for column_idx in 0..column_count {
+        let is_null_value = is_null(null_bitmap, column_idx);
+        if is_null_value {
+            if materialized(column_idx) && column_idx != primary_key_index {
+                values[column_idx] = payload_to_scalar(None, &columns[column_idx])?;
+            }
+            continue;
+        }
+        let payload_len = read_u32(bytes, &mut cursor)? as usize;
+        let payload = read_bytes(bytes, &mut cursor, payload_len)?;
+        if materialized(column_idx) && column_idx != primary_key_index {
+            values[column_idx] = payload_to_scalar(Some(payload), &columns[column_idx])?;
+        }
+    }
+
     Ok(Some(values))
 }
 
@@ -5428,6 +8320,39 @@ mod tests {
     }
 
     #[test]
+    fn projected_generic_rows_avoid_omitted_non_nullable_null_validation() {
+        let full_schema = Arc::new(Schema::new(vec![
+            Field::new("order_id", DataType::Int64, false),
+            Field::new("customer_id", DataType::Int64, false),
+        ]));
+        let rows = vec![
+            vec![ScalarValue::Int64(Some(1)), ScalarValue::Null],
+            vec![ScalarValue::Int64(Some(2)), ScalarValue::Null],
+        ];
+
+        let full_err = rows_to_batch_generic(full_schema.clone(), rows.as_slice())
+            .expect_err("full-schema batch should reject NULL in non-nullable column");
+        assert!(
+            full_err
+                .to_string()
+                .contains("Column 'customer_id' is declared as non-nullable"),
+            "unexpected full-schema error: {full_err}"
+        );
+
+        let projected_rows =
+            project_generic_rows(rows.as_slice(), &[0]).expect("project rows to order_id");
+        let projected_schema = Arc::new(
+            full_schema
+                .project(&[0])
+                .expect("project schema to order_id column"),
+        );
+        let projected_batch = rows_to_batch_generic(projected_schema, projected_rows.as_slice())
+            .expect("projected schema should ignore omitted non-nullable column");
+        assert_eq!(projected_batch.num_columns(), 1);
+        assert_eq!(projected_batch.num_rows(), 2);
+    }
+
+    #[test]
     /// Executes `supported filter parser handles conjunction` for this component.
     fn supported_filter_parser_handles_conjunction() {
         use datafusion::logical_expr::col;
@@ -5522,6 +8447,77 @@ mod tests {
         ));
         assert!(!is_overload_error_message(
             "duplicate key value violates unique constraint"
+        ));
+    }
+
+    #[test]
+    fn summary_pushdown_support_accepts_second_key_constraints() {
+        use datafusion::logical_expr::{col, lit};
+
+        let index = SecondaryIndexRecord {
+            db_id: 1,
+            schema_id: 1,
+            table_id: 1,
+            index_id: 1,
+            table_name: "sales_facts".to_string(),
+            index_name: "idx_sales_status_day_merchant_cover".to_string(),
+            unique: false,
+            key_columns: vec![
+                "status".to_string(),
+                "event_day".to_string(),
+                "merchant_id".to_string(),
+            ],
+            include_columns: vec!["amount_cents".to_string()],
+            distribution: SecondaryIndexDistribution::Range,
+            hash_bucket_count: None,
+            state: SecondaryIndexState::Public,
+            created_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+        };
+        let summary = extract_predicate_summary(
+            vec![col("Use event_day@1").in_list(
+                vec![lit(20i64), lit(21i64), lit(22i64), lit(23i64)],
+                false,
+            )]
+            .as_slice(),
+        );
+
+        assert!(summary_supports_secondary_index_pushdown(
+            &summary,
+            &[&index]
+        ));
+    }
+
+    #[test]
+    fn summary_pushdown_support_rejects_non_indexed_constraints() {
+        use datafusion::logical_expr::{col, lit};
+
+        let index = SecondaryIndexRecord {
+            db_id: 1,
+            schema_id: 1,
+            table_id: 1,
+            index_id: 1,
+            table_name: "sales_facts".to_string(),
+            index_name: "idx_sales_status_day_merchant_cover".to_string(),
+            unique: false,
+            key_columns: vec![
+                "status".to_string(),
+                "event_day".to_string(),
+                "merchant_id".to_string(),
+            ],
+            include_columns: vec!["amount_cents".to_string()],
+            distribution: SecondaryIndexDistribution::Range,
+            hash_bucket_count: None,
+            state: SecondaryIndexState::Public,
+            created_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+        };
+        let summary =
+            extract_predicate_summary(vec![col("amount_cents").gt(lit(1000i64))].as_slice());
+
+        assert!(!summary_supports_secondary_index_pushdown(
+            &summary,
+            &[&index]
         ));
     }
 }

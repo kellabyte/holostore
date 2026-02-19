@@ -1,4 +1,4 @@
-# Data Fusion TODO
+# Holo Fusion TODO
 
 1. [x] Lock architecture details in `DATA_FUSION.md`.
 - Finalize embedded HoloStore + Ballista lifecycle.
@@ -156,3 +156,40 @@
 - [ ] Operational automation for pre-split/rebalance workflows (move from runbook-only to automated execution paths).
 - [ ] Planner/executor hardening for additional aggregate and boundary-scan patterns under topology churn.
 - [ ] Final go-live gate with repeated rollback drills and canary criteria validation in CI/perf environments.
+
+13. [ ] Complete Phase 11 query performance and SQL ergonomics.
+- [ ] Add global secondary indexes with planner support (`index scan`, `lookup join`, covering index plans).
+- [ ] Add online index backfill jobs with resumable progress and cancellation support.
+- [ ] Add optimizer statistics + cost-based planning (`ANALYZE`, NDV/histograms, index-vs-scan and join-order choice).
+- [ ] Add primary-key generation ergonomics (`SEQUENCE` and `GENERATED ... AS IDENTITY`) to remove reliance on `MAX(pk)` allocation patterns.
+- [ ] Complete Postgres-compatible `INSERT` / `ON CONFLICT` semantics and deterministic SQLSTATE behavior.
+- [ ] Add online schema-change framework for resumable add/drop index and backfill operations.
+
+14. [ ] Complete Phase 12 online shard split cutover (no client freeze).
+- [ ] Publish split design baseline in `ONLINE_SHARD_SPLIT_DESIGN.md`.
+  - Define split state machine: `Idle -> Preparing -> DualRoute -> Cutover -> Draining -> Complete`.
+  - Define metadata epoch/version rules so stale routers retry instead of blocking clients.
+  - Define parent/child range invariants (no key loss, no duplicate visible writes, monotonic ownership).
+- [ ] Phase A: metadata + routing protocol for non-blocking split.
+  - Add split-intent metadata persisted with split key, parent shard ID, child shard IDs, and split epoch.
+  - Add router behavior: if request epoch is stale, return deterministic retry/refresh signal with new epoch.
+  - Add cache refresh and bounded retry policy in SQL/provider path so client writes continue during cutover.
+- [ ] Phase B: dual-route write window and exactly-once apply semantics.
+  - Add temporary dual-route mode where parent leaseholder can forward writes to the correct child by split key.
+  - Add idempotent write tokens (`statement_id`, `chunk_id`, `row_seq`) so retries during cutover do not duplicate rows.
+  - Add bounded dual-route window with explicit close condition once all writers observe new epoch.
+- [ ] Phase C: split cutover transaction and background drain.
+  - Commit cutover atomically: parent becomes non-serving for user keys; children become serving owners.
+  - Keep parent as read-through/redirect stub during drain period for stale in-flight reads/writes.
+  - Background drain and GC parent shard metadata only after safe-point criteria are met.
+- [ ] Phase D: failure recovery + operability.
+  - Add resumable split coordinator state so node crash/restart continues or safely aborts split.
+  - Add metrics/tracing: split duration, dual-route retries, stale-epoch retries, cutover success/failure counts.
+  - Add `holoctl topology` and `EXPLAIN DIST` annotations for shard split state visibility.
+- [ ] Implementation checks for later execution.
+  - [ ] Correctness: no lost writes across split under concurrent ingest + retries + node restart.
+  - [ ] Correctness: no duplicate visible rows when retrying with idempotency tokens during cutover.
+  - [ ] Availability: p99 write latency increase during split remains within target SLO budget.
+  - [ ] Availability: no cluster-wide write freeze; only stale-route retries/redirects are observed.
+  - [ ] Recovery: injected failures in each split phase either auto-resume or roll back deterministically.
+  - [ ] Scale: sustained ingest test (>=1M rows) continues through repeated splits without rollback storms.

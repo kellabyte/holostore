@@ -546,6 +546,147 @@ async fn phase4_insert_select_duplicate_primary_key_returns_23505() -> Result<()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase11_create_unique_secondary_index_rejects_duplicate_inserts() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    client
+        .batch_execute(
+            "CREATE TABLE users_idx (
+                user_id BIGINT NOT NULL,
+                email TEXT,
+                country TEXT NOT NULL,
+                status TEXT NOT NULL,
+                PRIMARY KEY (user_id)
+            );",
+        )
+        .await
+        .context("create users_idx table")?;
+
+    client
+        .batch_execute(
+            "INSERT INTO users_idx (user_id, email, country, status) VALUES
+                (1, 'a@example.com', 'ca', 'active'),
+                (2, 'b@example.com', 'us', 'active');",
+        )
+        .await
+        .context("insert baseline users")?;
+
+    client
+        .batch_execute("CREATE UNIQUE INDEX users_idx_email_uq ON users_idx (email);")
+        .await
+        .context("create unique email index")?;
+
+    let duplicate_err = client
+        .execute(
+            "INSERT INTO users_idx (user_id, email, country, status)
+             VALUES (3, 'a@example.com', 'fr', 'active')",
+            &[],
+        )
+        .await
+        .expect_err("duplicate unique-index key should fail");
+    assert_sqlstate(&duplicate_err, "23505");
+    assert_error_contains(&duplicate_err, "users_idx_email_uq");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase11_create_unique_secondary_index_detects_backfill_duplicates() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    client
+        .batch_execute(
+            "CREATE TABLE users_dup_idx (
+                user_id BIGINT NOT NULL,
+                email TEXT,
+                region TEXT NOT NULL,
+                PRIMARY KEY (user_id)
+            );",
+        )
+        .await
+        .context("create users_dup_idx table")?;
+
+    client
+        .batch_execute(
+            "INSERT INTO users_dup_idx (user_id, email, region) VALUES
+                (1, 'dup@example.com', 'ca'),
+                (2, 'dup@example.com', 'us');",
+        )
+        .await
+        .context("insert duplicate email rows before unique index")?;
+
+    let err = client
+        .batch_execute("CREATE UNIQUE INDEX users_dup_idx_email_uq ON users_dup_idx (email);")
+        .await
+        .expect_err("unique-index backfill should fail on duplicates");
+    assert_sqlstate(&err, "23505");
+    assert_error_contains(&err, "users_dup_idx_email_uq");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase11_create_hash_secondary_index_and_drop() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    client
+        .batch_execute(
+            "CREATE TABLE sales_idx (
+                order_id BIGINT NOT NULL,
+                merchant_id BIGINT NOT NULL,
+                event_day BIGINT NOT NULL,
+                status TEXT NOT NULL,
+                amount_cents BIGINT NOT NULL,
+                PRIMARY KEY (order_id)
+            );",
+        )
+        .await
+        .context("create sales_idx table")?;
+
+    client
+        .batch_execute(
+            "INSERT INTO sales_idx (order_id, merchant_id, event_day, status, amount_cents)
+             SELECT
+               i,
+               1 + (i % 10),
+               1 + ((i - 1) / 100),
+               CASE WHEN i % 2 = 0 THEN 'paid' ELSE 'pending' END,
+               100 + i
+             FROM generate_series(1, 500) AS g(i);",
+        )
+        .await
+        .context("seed sales_idx rows")?;
+
+    client
+        .batch_execute(
+            "CREATE INDEX sales_idx_mday_hash
+             ON sales_idx USING HASH (merchant_id, event_day)
+             INCLUDE (status, amount_cents)
+             WITH (hash_buckets = 16);",
+        )
+        .await
+        .context("create hash secondary index with include columns")?;
+
+    client
+        .batch_execute("DROP INDEX sales_idx_mday_hash;")
+        .await
+        .context("drop hash secondary index")?;
+
+    client
+        .batch_execute(
+            "INSERT INTO sales_idx (order_id, merchant_id, event_day, status, amount_cents)
+             VALUES (1001, 3, 8, 'paid', 4242);",
+        )
+        .await
+        .context("insert row after index drop")?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn phase4_create_table_registers_metadata_and_supports_insert_select() -> Result<()> {
     let harness = TestHarness::start().await?;
     let (client, _guard) = harness.connect_pg().await?;
@@ -1679,6 +1820,12 @@ async fn phase7_metrics_expose_txn_distributed_and_guardrail_counters() -> Resul
         "scan_reroute_count=",
         "scan_chunk_count=",
         "scan_duplicate_rows_skipped=",
+        "optimizer_plan_table_scan=",
+        "optimizer_plan_index_scan=",
+        "optimizer_plan_index_only=",
+        "optimizer_bad_miss_count=",
+        "optimizer_estimated_rows_total=",
+        "optimizer_actual_rows_total=",
         "active_query_sessions=",
         "ingest_rows_ingested_total=",
         "ingest_jobs_started=",
@@ -1743,13 +1890,36 @@ async fn phase10_metrics_expose_circuit_and_ingest_status() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn phase9_explain_dist_reports_stage_placement() -> Result<()> {
+async fn phase9_explain_standard_returns_query_plan_column() -> Result<()> {
     let harness = TestHarness::start().await?;
     let (client, _guard) = harness.connect_pg().await?;
 
     let rows = client
         .query(
             "EXPLAIN SELECT order_id FROM orders WHERE order_id >= 1 ORDER BY order_id LIMIT 5",
+            &[],
+        )
+        .await
+        .context("run standard explain query")?;
+    assert!(!rows.is_empty(), "expected explain output rows");
+    let line: String = rows[0]
+        .try_get(0)
+        .context("read query plan column from explain output")?;
+    assert!(
+        !line.trim().is_empty(),
+        "expected non-empty query plan output"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase9_explain_dist_reports_stage_placement() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    let rows = client
+        .query(
+            "EXPLAIN (DIST) SELECT order_id FROM orders WHERE order_id >= 1 ORDER BY order_id LIMIT 5",
             &[],
         )
         .await
@@ -1778,6 +1948,371 @@ async fn phase9_explain_dist_reports_stage_placement() -> Result<()> {
         "expected query stage row in explain output"
     );
     assert!(has_scan_stage, "expected scan stage row in explain output");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase9_explain_dist_json_includes_distribution_sections() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    let rows = client
+        .query(
+            "EXPLAIN (ANALYZE, DIST, FORMAT JSON) SELECT order_id FROM orders WHERE order_id >= 1 ORDER BY order_id LIMIT 5",
+            &[],
+        )
+        .await
+        .context("run explain analyze dist json query")?;
+    assert!(
+        !rows.is_empty(),
+        "expected explain analyze dist json output rows"
+    );
+    let payload: String = rows[0].try_get(0).context("read json explain payload")?;
+    assert!(
+        payload.contains("\"distribution\""),
+        "expected distribution section in JSON explain output: {payload}"
+    );
+    assert!(
+        payload.contains("\"query_execution_id\""),
+        "expected query_execution_id in JSON explain output: {payload}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase12_optimizer_prefers_index_scan_for_selective_filter() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    client
+        .batch_execute(
+            "CREATE TABLE sales_optimizer (
+                order_id BIGINT NOT NULL,
+                merchant_id BIGINT NOT NULL,
+                event_day BIGINT NOT NULL,
+                status TEXT NOT NULL,
+                amount_cents BIGINT NOT NULL,
+                PRIMARY KEY (order_id)
+            );",
+        )
+        .await
+        .context("create sales_optimizer table")?;
+    client
+        .execute(
+            "INSERT INTO sales_optimizer (order_id, merchant_id, event_day, status, amount_cents)
+             SELECT
+               i,
+               1 + (i % 500),
+               1 + ((i - 1) / 1000),
+               CASE
+                   WHEN i % 10 < 6 THEN 'paid'
+                   WHEN i % 10 < 8 THEN 'shipped'
+                   ELSE 'pending'
+               END,
+               100 + (i % 2000)
+             FROM generate_series(1, 8000) AS g(i);",
+            &[],
+        )
+        .await
+        .context("seed sales_optimizer rows")?;
+    client
+        .batch_execute(
+            "CREATE INDEX sales_optimizer_status_day
+             ON sales_optimizer (status, event_day, merchant_id)
+             INCLUDE (amount_cents);",
+        )
+        .await
+        .context("create secondary index for optimizer test")?;
+
+    let count: i64 = client
+        .query_one(
+            "SELECT COUNT(*)::BIGINT
+             FROM sales_optimizer
+             WHERE status = 'shipped' AND event_day = 2;",
+            &[],
+        )
+        .await
+        .context("run selective filter query")?
+        .try_get(0)?;
+    assert!(count > 0, "expected selective query to return rows");
+
+    let metrics = harness.metrics_body().context("fetch metrics body")?;
+    let table_plans = metric_value(&metrics, "optimizer_plan_table_scan").unwrap_or(0);
+    let index_plans = metric_value(&metrics, "optimizer_plan_index_scan").unwrap_or(0);
+    let index_only_plans = metric_value(&metrics, "optimizer_plan_index_only").unwrap_or(0);
+    assert!(
+        index_plans + index_only_plans >= 1,
+        "expected at least one optimizer index-family plan; table_plans={table_plans} index_plans={index_plans} index_only_plans={index_only_plans} body={metrics}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase12_optimizer_prefers_table_scan_for_low_selectivity_non_covering_index() -> Result<()>
+{
+    let harness = TestHarness::start().await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    client
+        .batch_execute(
+            "CREATE TABLE sales_optimizer_low_sel (
+                order_id BIGINT NOT NULL,
+                merchant_id BIGINT NOT NULL,
+                event_day BIGINT NOT NULL,
+                status TEXT NOT NULL,
+                amount_cents BIGINT NOT NULL,
+                PRIMARY KEY (order_id)
+            );",
+        )
+        .await
+        .context("create sales_optimizer_low_sel table")?;
+    client
+        .execute(
+            "INSERT INTO sales_optimizer_low_sel (order_id, merchant_id, event_day, status, amount_cents)
+             SELECT
+               i,
+               1 + (i % 500),
+               1,
+               CASE
+                   WHEN i % 10 < 6 THEN 'paid'
+                   WHEN i % 10 < 8 THEN 'shipped'
+                   ELSE 'pending'
+               END,
+               100 + (i % 2000)
+             FROM generate_series(1, 20000) AS g(i);",
+            &[],
+        )
+        .await
+        .context("seed sales_optimizer_low_sel rows")?;
+    client
+        .batch_execute(
+            "CREATE INDEX sales_optimizer_low_sel_status_day
+             ON sales_optimizer_low_sel (status, event_day, merchant_id);",
+        )
+        .await
+        .context("create non-covering secondary index for low selectivity test")?;
+
+    let metrics_before = harness
+        .metrics_body()
+        .context("fetch metrics body before query")?;
+    let table_before = metric_value(&metrics_before, "optimizer_plan_table_scan").unwrap_or(0);
+    let index_before = metric_value(&metrics_before, "optimizer_plan_index_scan").unwrap_or(0);
+    let index_only_before = metric_value(&metrics_before, "optimizer_plan_index_only").unwrap_or(0);
+
+    let rows = client
+        .query(
+            "SELECT merchant_id, event_day, COUNT(*) AS orders, SUM(amount_cents) AS gross_cents
+             FROM sales_optimizer_low_sel
+             WHERE event_day = 1
+               AND status IN ('paid', 'shipped')
+             GROUP BY merchant_id, event_day
+             HAVING COUNT(*) >= 1
+             ORDER BY gross_cents DESC
+             LIMIT 200;",
+            &[],
+        )
+        .await
+        .context("run low-selectivity aggregate query")?;
+    assert!(!rows.is_empty(), "expected aggregate query rows");
+
+    let metrics_after = harness
+        .metrics_body()
+        .context("fetch metrics body after query")?;
+    let table_after = metric_value(&metrics_after, "optimizer_plan_table_scan").unwrap_or(0);
+    let index_after = metric_value(&metrics_after, "optimizer_plan_index_scan").unwrap_or(0);
+    let index_only_after = metric_value(&metrics_after, "optimizer_plan_index_only").unwrap_or(0);
+
+    let table_delta = table_after.saturating_sub(table_before);
+    let index_delta = index_after.saturating_sub(index_before);
+    let index_only_delta = index_only_after.saturating_sub(index_only_before);
+    assert!(
+        table_delta >= 1,
+        "expected table-scan preference for low-selectivity non-covering query; table_delta={table_delta} index_delta={index_delta} index_only_delta={index_only_delta} metrics={metrics_after}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase13_grouped_aggregate_topk_pushdown_returns_ranked_rows() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    client
+        .batch_execute(
+            "CREATE TABLE sales_pushdown (
+                order_id BIGINT NOT NULL,
+                customer_id BIGINT NOT NULL,
+                merchant_id BIGINT NOT NULL,
+                region_id BIGINT NOT NULL,
+                event_day BIGINT NOT NULL,
+                status TEXT NOT NULL,
+                amount_cents BIGINT NOT NULL,
+                PRIMARY KEY (order_id)
+            );",
+        )
+        .await
+        .context("create sales_pushdown table")?;
+
+    client
+        .batch_execute(
+            "INSERT INTO sales_pushdown (
+               order_id, customer_id, merchant_id, region_id, event_day, status, amount_cents
+             )
+             SELECT
+               i,
+               100000 + (i % 500000),
+               1 + (i % 20000),
+               1 + (i % 20),
+               1 + ((i - 1) / 86400),
+               CASE
+                 WHEN i % 10 < 6 THEN 'paid'
+                 WHEN i % 10 < 8 THEN 'shipped'
+                 WHEN i % 10 = 8 THEN 'pending'
+                 ELSE 'cancelled'
+               END,
+               100 + ((i * 37) % 20000)
+             FROM generate_series(1, 20000) AS g(i);",
+        )
+        .await
+        .context("seed sales_pushdown rows")?;
+
+    client
+        .batch_execute(
+            "CREATE INDEX sales_pushdown_status_day_merchant
+             ON sales_pushdown (status, event_day, merchant_id);",
+        )
+        .await
+        .context("create range secondary index for grouped aggregate pushdown test")?;
+
+    let rows = client
+        .query(
+            "SELECT merchant_id, event_day, COUNT(*) AS orders, SUM(amount_cents) AS gross_cents
+             FROM sales_pushdown
+             WHERE event_day = 1
+               AND status IN ('paid', 'shipped')
+             GROUP BY merchant_id, event_day
+             HAVING COUNT(*) >= 1
+             ORDER BY gross_cents DESC
+             LIMIT 200;",
+            &[],
+        )
+        .await
+        .context("run grouped aggregate top-k query")?;
+
+    assert_eq!(rows.len(), 200, "expected top-k result cardinality");
+    let mut prev_gross = i64::MAX;
+    for row in &rows {
+        let gross: i64 = row
+            .try_get("gross_cents")
+            .context("read gross_cents from grouped aggregate output")?;
+        assert!(
+            gross <= prev_gross,
+            "expected descending gross_cents order; prev={prev_gross} current={gross}"
+        );
+        prev_gross = gross;
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase13_projected_scan_omits_non_nullable_columns_without_null_violations() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    client
+        .batch_execute(
+            "CREATE TABLE sales_projection_guard (
+                order_id BIGINT NOT NULL,
+                customer_id BIGINT NOT NULL,
+                merchant_id BIGINT NOT NULL,
+                region_id BIGINT NOT NULL,
+                event_day BIGINT NOT NULL,
+                status TEXT NOT NULL,
+                amount_cents BIGINT NOT NULL,
+                PRIMARY KEY (order_id)
+            );",
+        )
+        .await
+        .context("create sales_projection_guard table")?;
+
+    client
+        .batch_execute(
+            "INSERT INTO sales_projection_guard (
+               order_id, customer_id, merchant_id, region_id, event_day, status, amount_cents
+             )
+             SELECT
+               i,
+               100000 + (i % 500000),
+               1 + (i % 20),
+               1 + ((i * 7) % 20),
+               1 + ((i - 1) % 120),
+               CASE
+                 WHEN i % 10 < 6 THEN 'paid'
+                 WHEN i % 10 < 8 THEN 'shipped'
+                 WHEN i % 10 = 8 THEN 'pending'
+                 ELSE 'cancelled'
+               END,
+               100 + ((i * 37) % 20000)
+             FROM generate_series(1, 30000) AS g(i);",
+        )
+        .await
+        .context("seed sales_projection_guard rows")?;
+
+    client
+        .batch_execute(
+            "CREATE INDEX sales_projection_guard_status_day_merchant
+             ON sales_projection_guard (status, event_day, merchant_id)
+             INCLUDE (amount_cents);",
+        )
+        .await
+        .context("create covering secondary index for projected scan regression")?;
+
+    let metrics_before = harness
+        .metrics_body()
+        .context("fetch metrics body before projected-scan query")?;
+    let index_before = metric_value(&metrics_before, "optimizer_plan_index_scan").unwrap_or(0);
+    let index_only_before = metric_value(&metrics_before, "optimizer_plan_index_only").unwrap_or(0);
+
+    let rows = client
+        .query(
+            "SELECT merchant_id, event_day, COUNT(*) AS orders, SUM(amount_cents) AS gross_cents
+             FROM sales_projection_guard
+             WHERE status = 'paid'
+               AND event_day IN (20, 21, 22, 23)
+             GROUP BY merchant_id, event_day
+             HAVING COUNT(*) >= 3
+             ORDER BY gross_cents DESC
+             LIMIT 200;",
+            &[],
+        )
+        .await
+        .context("run projected aggregate scan over non-nullable table")?;
+    assert!(
+        !rows.is_empty(),
+        "expected projected aggregate query to return rows"
+    );
+    for row in &rows {
+        let _merchant_id: i64 = row.try_get("merchant_id")?;
+        let _event_day: i64 = row.try_get("event_day")?;
+        let _orders: i64 = row.try_get("orders")?;
+        let _gross_cents: i64 = row.try_get("gross_cents")?;
+    }
+
+    let metrics_after = harness
+        .metrics_body()
+        .context("fetch metrics body after projected-scan query")?;
+    let index_after = metric_value(&metrics_after, "optimizer_plan_index_scan").unwrap_or(0);
+    let index_only_after = metric_value(&metrics_after, "optimizer_plan_index_only").unwrap_or(0);
+    assert!(
+        index_after.saturating_sub(index_before)
+            + index_only_after.saturating_sub(index_only_before)
+            >= 1,
+        "expected index-family path for projected scan regression; metrics={metrics_after}"
+    );
+
     Ok(())
 }
 
@@ -1820,6 +2355,13 @@ fn health_status(addr: SocketAddr, path: &str) -> Result<u16> {
         .parse::<u16>()
         .context("parse health status code")?;
     Ok(status)
+}
+
+fn metric_value(body: &str, key: &str) -> Option<u64> {
+    let prefix = format!("{key}=");
+    body.lines()
+        .find_map(|line| line.strip_prefix(prefix.as_str()))
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
 }
 
 fn health_body(addr: SocketAddr, path: &str) -> Result<String> {

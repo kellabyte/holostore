@@ -33,7 +33,10 @@ pub trait KvEngine: Send + Sync + 'static {
         }
     }
     /// Mark a previously written `(key, version)` as visible to readers.
-    fn mark_visible(&self, key: &[u8], version: Version);
+    ///
+    /// Returns `true` when this update created a new latest index entry for
+    /// the key (i.e. the key did not previously have a visible latest value).
+    fn mark_visible(&self, key: &[u8], version: Version) -> bool;
 }
 
 /// Routing policy for selecting a shard given a key.
@@ -123,16 +126,24 @@ impl KvEngine for KvStore {
     }
 
     /// Mark a version as visible so reads can observe it.
-    fn mark_visible(&self, key: &[u8], version: Version) {
+    fn mark_visible(&self, key: &[u8], version: Version) -> bool {
         if let Ok(mut guard) = self.inner.write() {
             let Some(entry) = guard.get_mut(key) else {
                 // Nothing to mark if the key does not exist yet.
-                return;
+                return false;
             };
+            let had_visible = entry.iter().any(|v| v.visible);
             // Only update visibility if the exact version is present.
             if let Ok(idx) = entry.binary_search_by(|v| v.version.cmp(&version)) {
+                if entry[idx].visible {
+                    return false;
+                }
                 entry[idx].visible = true;
+                return !had_visible;
             }
+            false
+        } else {
+            false
         }
     }
 }
@@ -261,29 +272,29 @@ impl KvEngine for FjallEngine {
     }
 
     /// Mark a version visible and update the latest index if needed.
-    fn mark_visible(&self, key: &[u8], version: Version) {
+    fn mark_visible(&self, key: &[u8], version: Version) -> bool {
         let _guard = match self.lock.write() {
             Ok(guard) => guard,
             // If the lock is poisoned, skip the update rather than panic.
-            Err(_) => return,
+            Err(_) => return false,
         };
         let entry_key = encode_version_key(key, version);
         let entry_value = match self.versions.get(&entry_key) {
             Ok(Some(bytes)) => bytes,
             // Nothing to mark if the version does not exist.
-            Ok(None) => return,
+            Ok(None) => return false,
             Err(err) => {
                 warn!(error = ?err, "fjall kv read failed");
-                return;
+                return false;
             }
         };
 
         let Ok((visible, value)) = decode_version_value(&entry_value) else {
-            return;
+            return false;
         };
         // Skip updates if the entry is already visible.
         if visible {
-            return;
+            return false;
         }
 
         let mut batch = self.keyspace.batch();
@@ -293,10 +304,15 @@ impl KvEngine for FjallEngine {
             encode_version_value(true, &value),
         );
 
-        let latest_update = match self.latest.get(key) {
+        let latest_current = match self.latest.get(key) {
             Ok(Some(bytes)) => decode_latest_value(&bytes).ok().map(|(cur, _)| cur),
-            _ => None,
+            Ok(None) => None,
+            Err(err) => {
+                warn!(error = ?err, "fjall kv latest read failed");
+                return false;
+            }
         };
+        let had_latest = latest_current.is_some();
         // Only update the latest index if this version should supersede the
         // current latest entry.
         //
@@ -307,14 +323,16 @@ impl KvEngine for FjallEngine {
         //
         // If group ids differ, treat the newly visible value as newer for the
         // purpose of the latest index.
-        let should_update_latest = latest_update.map_or(true, |cur| {
+        let should_update_latest = latest_current.map_or(true, |cur| {
             if txn_group_id(cur.txn_id) != txn_group_id(version.txn_id) {
                 true
             } else {
                 version >= cur
             }
         });
+        let mut inserted_latest = false;
         if should_update_latest {
+            inserted_latest = !had_latest;
             batch.insert(
                 &self.latest,
                 key.to_vec(),
@@ -324,7 +342,9 @@ impl KvEngine for FjallEngine {
 
         if let Err(err) = batch.commit() {
             warn!(error = ?err, "fjall kv mark visible failed");
+            return false;
         }
+        inserted_latest
     }
 }
 
@@ -415,9 +435,9 @@ impl KvEngine for RoutedKvEngine {
         }
     }
 
-    fn mark_visible(&self, key: &[u8], version: Version) {
+    fn mark_visible(&self, key: &[u8], version: Version) -> bool {
         let shard = self.shard_for_key(key);
-        self.shards[shard].mark_visible(key, version);
+        self.shards[shard].mark_visible(key, version)
     }
 }
 
@@ -515,9 +535,9 @@ impl KvEngine for ShardedKvEngine {
     }
 
     /// Delegate visibility updates to the chosen shard.
-    fn mark_visible(&self, key: &[u8], version: Version) {
+    fn mark_visible(&self, key: &[u8], version: Version) -> bool {
         let shard = self.shard_for_key(key);
-        self.shards[shard].mark_visible(key, version);
+        self.shards[shard].mark_visible(key, version)
     }
 }
 
@@ -745,6 +765,7 @@ pub struct KvStateMachine {
     kv: Arc<dyn KvEngine>,
     split_lock: Option<Arc<std::sync::RwLock<()>>>,
     membership_hook: Option<Arc<MembershipUpdateHook>>,
+    visibility_hook: Option<Arc<VisibilityDeltaHook>>,
 }
 
 /// Committed membership update payload replicated through a shard Accord log.
@@ -757,6 +778,8 @@ pub struct MembershipReconfig {
 /// Callback used by `KvStateMachine` to apply committed membership updates.
 pub type MembershipUpdateHook =
     dyn Fn(MembershipReconfig) -> anyhow::Result<()> + Send + Sync + 'static;
+/// Callback used by `KvStateMachine` to publish visible-row count deltas.
+pub type VisibilityDeltaHook = dyn Fn(i64) + Send + Sync + 'static;
 
 impl KvStateMachine {
     /// Create a new state machine wrapper around a KV engine.
@@ -765,6 +788,7 @@ impl KvStateMachine {
             kv,
             split_lock,
             membership_hook: None,
+            visibility_hook: None,
         }
     }
 
@@ -773,11 +797,13 @@ impl KvStateMachine {
         kv: Arc<dyn KvEngine>,
         split_lock: Option<Arc<std::sync::RwLock<()>>>,
         membership_hook: Option<Arc<MembershipUpdateHook>>,
+        visibility_hook: Option<Arc<VisibilityDeltaHook>>,
     ) -> Self {
         Self {
             kv,
             split_lock,
             membership_hook,
+            visibility_hook,
         }
     }
 }
@@ -956,8 +982,16 @@ impl StateMachine for KvStateMachine {
                 return;
             }
         };
+        let mut visibility_delta = 0i64;
         for key in keys.writes {
-            self.kv.mark_visible(&key, version);
+            if self.kv.mark_visible(&key, version) {
+                visibility_delta += 1;
+            }
+        }
+        if visibility_delta != 0 {
+            if let Some(hook) = &self.visibility_hook {
+                hook(visibility_delta);
+            }
         }
     }
 }
@@ -1275,7 +1309,8 @@ mod tests {
             guard.push(cfg);
             Ok(())
         });
-        let sm = KvStateMachine::with_membership_hook(Arc::new(KvStore::new()), None, Some(hook));
+        let sm =
+            KvStateMachine::with_membership_hook(Arc::new(KvStore::new()), None, Some(hook), None);
         let payload = encode_membership_reconfig(&[1, 2, 4], &[1, 2]);
         sm.apply(
             &payload,
