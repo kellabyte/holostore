@@ -2359,9 +2359,10 @@ impl NodeState {
             .collect::<Vec<_>>();
         self.ensure_keys_route_to_shard(shard_index, &keys)?;
 
+        let latest = self.kv_latest_batch(&keys);
         let mut conflicts = 0u64;
-        for entry in &in_range {
-            match self.kv_latest(entry.key.as_slice()) {
+        for (entry, latest_item) in in_range.iter().zip(latest.into_iter()) {
+            match latest_item {
                 Some((value, version)) => {
                     if entry.expected_version == kv::Version::zero()
                         && latest_value_is_sql_tombstone(value.as_slice())
@@ -2421,27 +2422,41 @@ impl NodeState {
             return Ok(Vec::new());
         }
 
-        let keys = items.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
+        // Track unresolved keys across polls so each retry only re-reads keys
+        // that are not yet visible with their expected values.
+        let mut pending_indices = (0..items.len()).collect::<Vec<_>>();
+        let mut pending_keys = items.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
+        let mut versions = vec![None; items.len()];
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            let latest = self.kv_latest_batch(&keys);
-            let mut versions = Vec::with_capacity(items.len());
-            let mut complete = true;
-
-            for ((_, expected_value), latest_item) in items.iter().zip(latest.into_iter()) {
+            let latest = self.kv_latest_batch(&pending_keys);
+            let mut next_pending_indices = Vec::with_capacity(pending_indices.len());
+            let mut next_pending_keys = Vec::with_capacity(pending_keys.len());
+            for ((idx, key), latest_item) in pending_indices
+                .into_iter()
+                .zip(pending_keys.into_iter())
+                .zip(latest.into_iter())
+            {
+                let expected_value = &items[idx].1;
                 match latest_item {
                     Some((value, version)) if value == *expected_value => {
-                        versions.push(version);
+                        versions[idx] = Some(version);
                     }
                     _ => {
-                        complete = false;
-                        break;
+                        next_pending_indices.push(idx);
+                        next_pending_keys.push(key);
                     }
                 }
             }
+            pending_indices = next_pending_indices;
+            pending_keys = next_pending_keys;
 
-            if complete {
-                return Ok(versions);
+            if pending_indices.is_empty() {
+                let mut out = Vec::with_capacity(versions.len());
+                for version in versions {
+                    out.push(version.context("missing latest version after visibility wait")?);
+                }
+                return Ok(out);
             }
 
             if tokio::time::Instant::now() >= deadline {
