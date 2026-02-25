@@ -227,6 +227,7 @@ Primary runtime knobs:
 | `HOLO_FUSION_DML_WRITE_MAX_INFLIGHT_ROWS` | `32768` | In-flight row budget guardrail. |
 | `HOLO_FUSION_DML_WRITE_MAX_INFLIGHT_BYTES` | `33554432` | In-flight byte budget guardrail. |
 | `HOLO_FUSION_DML_WRITE_MAX_INFLIGHT_RPCS` | `32` | In-flight RPC budget guardrail. |
+| `HOLO_FUSION_DML_WRITE_PIPELINE_DEPTH` | `4` | Max in-flight write batches per target before awaiting completions. |
 | `HOLO_FUSION_BULK_CHUNK_ROWS_INITIAL` | `1024` | Initial adaptive chunk target for bulk ingest. |
 | `HOLO_FUSION_BULK_CHUNK_ROWS_MIN` | `128` | Lower bound for adaptive bulk chunking. |
 | `HOLO_FUSION_BULK_CHUNK_ROWS_MAX` | `8192` | Upper bound for adaptive bulk chunking. |

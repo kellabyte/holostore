@@ -5,7 +5,7 @@
 
 use std::any::Any;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashSet, VecDeque};
 use std::fmt;
 use std::net::SocketAddr;
 use std::ops::Range;
@@ -34,7 +34,8 @@ use datafusion::physical_plan::display::{DisplayAs, DisplayFormatType};
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use futures_util::StreamExt;
 use holo_store::{
-    HoloStoreClient, LatestEntry, ReplicatedConditionalWriteEntry, ReplicatedWriteEntry, RpcVersion,
+    HoloStoreClient, LatestEntry, ReplicatedConditionalApplyResult,
+    ReplicatedConditionalWriteEntry, ReplicatedWriteEntry, RpcVersion,
 };
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, info_span, warn, Instrument};
@@ -87,6 +88,7 @@ const DEFAULT_DISTRIBUTED_CIRCUIT_BREAKER_OPEN_MS: u64 = 2_000;
 const DEFAULT_DISTRIBUTED_WRITE_MAX_INFLIGHT_ROWS: usize = 32_768;
 const DEFAULT_DISTRIBUTED_WRITE_MAX_INFLIGHT_BYTES: usize = 32 * 1_024 * 1_024;
 const DEFAULT_DISTRIBUTED_WRITE_MAX_INFLIGHT_RPCS: usize = 32;
+const DEFAULT_DISTRIBUTED_WRITE_PIPELINE_DEPTH: usize = 4;
 const DEFAULT_INDEX_BACKFILL_PAGE_SIZE: usize = 512;
 const DEFAULT_BULK_CHUNK_ROWS_INITIAL: usize = 1_024;
 const DEFAULT_BULK_CHUNK_ROWS_MIN: usize = 128;
@@ -254,6 +256,14 @@ fn configured_write_inflight_max_rpcs() -> usize {
         .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_DISTRIBUTED_WRITE_MAX_INFLIGHT_RPCS)
+}
+
+fn configured_write_pipeline_depth() -> usize {
+    std::env::var("HOLO_FUSION_DML_WRITE_PIPELINE_DEPTH")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_DISTRIBUTED_WRITE_PIPELINE_DEPTH)
 }
 
 fn configured_index_backfill_page_size() -> usize {
@@ -950,6 +960,7 @@ pub struct HoloStoreTableProvider {
     max_scan_rows: usize,
     distributed_write_max_batch_entries: usize,
     distributed_write_max_batch_bytes: usize,
+    distributed_write_pipeline_depth: usize,
     write_retry_policy: RetryPolicy,
     scan_retry_limit: usize,
     scan_retry_delay: Duration,
@@ -1165,6 +1176,7 @@ impl HoloStoreTableProvider {
             max_scan_rows: configured_max_scan_rows(),
             distributed_write_max_batch_entries: configured_write_max_batch_entries(),
             distributed_write_max_batch_bytes: configured_write_max_batch_bytes(),
+            distributed_write_pipeline_depth: configured_write_pipeline_depth(),
             write_retry_policy: RetryPolicy::from_env(),
             scan_retry_limit: configured_scan_retry_limit().max(1),
             scan_retry_delay: Duration::from_millis(configured_scan_retry_delay_ms()),
@@ -1220,6 +1232,7 @@ impl HoloStoreTableProvider {
             max_scan_rows: configured_max_scan_rows(),
             distributed_write_max_batch_entries: configured_write_max_batch_entries(),
             distributed_write_max_batch_bytes: configured_write_max_batch_bytes(),
+            distributed_write_pipeline_depth: configured_write_pipeline_depth(),
             write_retry_policy: RetryPolicy::from_env(),
             scan_retry_limit: configured_scan_retry_limit().max(1),
             scan_retry_delay: Duration::from_millis(configured_scan_retry_delay_ms()),
@@ -1291,6 +1304,7 @@ impl HoloStoreTableProvider {
             max_scan_rows: spec.max_scan_rows,
             distributed_write_max_batch_entries: configured_write_max_batch_entries(),
             distributed_write_max_batch_bytes: configured_write_max_batch_bytes(),
+            distributed_write_pipeline_depth: configured_write_pipeline_depth(),
             write_retry_policy: RetryPolicy::from_env(),
             scan_retry_limit: configured_scan_retry_limit().max(1),
             scan_retry_delay: Duration::from_millis(configured_scan_retry_delay_ms()),
@@ -2889,7 +2903,15 @@ impl HoloStoreTableProvider {
             self.enforce_inflight_budget(planned_rows, planned_bytes, planned_rpcs, "write_plan")?;
 
             let mut applied_targets = Vec::<(WriteTarget, Vec<PreparedConditionalEntry>)>::new();
+            let pipeline_depth = self.distributed_write_pipeline_depth.max(1);
             for (target, mut entries) in by_target {
+                #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+                enum TargetFailureKind {
+                    Conflict,
+                    Retryable,
+                    NonRetryable,
+                }
+
                 let expected = entries.len() as u64;
                 let write_client = self.client_for(target.grpc_addr);
                 let batch_ranges = conditional_chunk_ranges(
@@ -2898,10 +2920,34 @@ impl HoloStoreTableProvider {
                     self.distributed_write_max_batch_bytes,
                 );
                 let batch_count = batch_ranges.len();
+                let inflight_limit = pipeline_depth.min(batch_count.max(1));
+                let mut pending = batch_ranges
+                    .into_iter()
+                    .enumerate()
+                    .collect::<VecDeque<_>>();
+                let mut inflight = futures_util::stream::FuturesUnordered::<
+                    futures_util::future::BoxFuture<
+                        'static,
+                        (
+                            usize,
+                            usize,
+                            usize,
+                            u64,
+                            Instant,
+                            CircuitAcquireToken,
+                            anyhow::Result<ReplicatedConditionalApplyResult>,
+                        ),
+                    >,
+                >::new();
                 let mut applied_this_target = Vec::<PreparedConditionalEntry>::new();
                 let mut applied_total = 0u64;
+                let mut target_failure: Option<(TargetFailureKind, anyhow::Error)> = None;
+                let target_key = target.grpc_addr.to_string();
 
-                for (batch_idx, batch_range) in batch_ranges.into_iter().enumerate() {
+                while target_failure.is_none() && inflight.len() < inflight_limit {
+                    let Some((batch_idx, batch_range)) = pending.pop_front() else {
+                        break;
+                    };
                     let start = batch_range.start;
                     let end = batch_range.end;
                     let batch_bytes = entries[start..end]
@@ -2917,12 +2963,15 @@ impl HoloStoreTableProvider {
                         })
                         .collect::<Vec<_>>();
                     let batch_expected = request_entries.len() as u64;
-                    self.enforce_inflight_budget(
+                    if let Err(err) = self.enforce_inflight_budget(
                         batch_expected as usize,
                         batch_bytes,
                         1,
                         "conditional_apply_batch",
-                    )?;
+                    ) {
+                        target_failure = Some((TargetFailureKind::NonRetryable, err));
+                        break;
+                    }
                     let circuit_token = match self.circuit_acquire(target.grpc_addr) {
                         Ok(token) => token,
                         Err(err) => {
@@ -2937,45 +2986,18 @@ impl HoloStoreTableProvider {
                             let classification =
                                 classify_write_error_message(apply_error.to_string().as_str());
                             self.metrics.record_distributed_apply_failure(
-                                target.grpc_addr.to_string().as_str(),
+                                target_key.as_str(),
                                 classification.is_retryable(),
                             );
-                            if !applied_this_target.is_empty() {
-                                let rollback_scope =
-                                    vec![(target.clone(), applied_this_target.clone())];
-                                self.rollback_conditional_targets(rollback_scope.as_slice(), op)
-                                    .await
-                                    .with_context(|| {
-                                        format!(
-                                            "rollback conditional {op} writes for shard {} after circuit rejection",
-                                            target.shard_index
-                                        )
-                                    })?;
-                            }
-                            self.rollback_conditional_targets(applied_targets.as_slice(), op)
-                                .await
-                                .with_context(|| {
-                                    format!(
-                                        "rollback previously applied conditional {op} writes after circuit rejection"
-                                    )
-                                })?;
-
-                            if classification.is_retryable() && attempt + 1 < retry_limit {
-                                if let Some(deadline) = retry_deadline {
-                                    if Instant::now() >= deadline {
-                                        return Err(apply_error);
-                                    }
-                                }
-                                last_retryable_error = Some(apply_error);
-                                tokio::time::sleep(retry_backoff(
-                                    retry_policy,
-                                    attempt,
-                                    target.grpc_addr.port() as u64,
-                                ))
-                                .await;
-                                continue 'attempts;
-                            }
-                            return Err(apply_error);
+                            target_failure = Some((
+                                if classification.is_retryable() {
+                                    TargetFailureKind::Retryable
+                                } else {
+                                    TargetFailureKind::NonRetryable
+                                },
+                                apply_error,
+                            ));
+                            break;
                         }
                     };
                     let apply_span = info_span!(
@@ -2988,19 +3010,127 @@ impl HoloStoreTableProvider {
                         batch_count = batch_count
                     );
                     let apply_started = Instant::now();
-                    let result = match write_client
-                        .range_write_latest_conditional(
-                            target.shard_index,
-                            target.start_key.as_slice(),
-                            target.end_key.as_slice(),
-                            request_entries,
+                    let write_client = write_client.clone();
+                    let shard_index = target.shard_index;
+                    let start_key = target.start_key.clone();
+                    let end_key = target.end_key.clone();
+                    inflight.push(Box::pin(async move {
+                        let result = write_client
+                            .range_write_latest_conditional(
+                                shard_index,
+                                start_key.as_slice(),
+                                end_key.as_slice(),
+                                request_entries,
+                            )
+                            .instrument(apply_span)
+                            .await;
+                        (
+                            batch_idx,
+                            start,
+                            end,
+                            batch_expected,
+                            apply_started,
+                            circuit_token,
+                            result,
                         )
-                        .instrument(apply_span)
-                        .await
-                    {
+                    }));
+                }
+
+                while let Some((
+                    batch_idx,
+                    start,
+                    end,
+                    batch_expected,
+                    apply_started,
+                    circuit_token,
+                    result,
+                )) = inflight.next().await
+                {
+                    match result {
                         Ok(result) => {
                             self.circuit_on_success(target.grpc_addr, circuit_token);
-                            result
+                            self.metrics.record_distributed_apply(
+                                target.shard_index,
+                                batch_expected,
+                                apply_started.elapsed(),
+                            );
+
+                            if result.conflicts > 0 {
+                                self.metrics.record_distributed_conflict(target.shard_index);
+                                if target_failure.is_none() {
+                                    target_failure = Some((
+                                        TargetFailureKind::Conflict,
+                                        anyhow!(
+                                            "conditional {op} conflict on shard {} chunk {}/{}",
+                                            target.shard_index,
+                                            batch_idx + 1,
+                                            batch_count
+                                        ),
+                                    ));
+                                }
+                            } else if result.applied != batch_expected {
+                                if target_failure.is_none() {
+                                    target_failure = Some((
+                                        TargetFailureKind::NonRetryable,
+                                        anyhow!(
+                                            "partial conditional {op} apply on shard {} chunk {}/{}: expected {}, applied {}",
+                                            target.shard_index,
+                                            batch_idx + 1,
+                                            batch_count,
+                                            batch_expected,
+                                            result.applied
+                                        ),
+                                    ));
+                                }
+                            } else {
+                                let mut versions_by_key = BTreeMap::<Vec<u8>, RpcVersion>::new();
+                                for item in result.applied_versions {
+                                    versions_by_key.insert(item.key, item.version);
+                                }
+                                if versions_by_key.len() != batch_expected as usize {
+                                    if target_failure.is_none() {
+                                        target_failure = Some((
+                                            TargetFailureKind::NonRetryable,
+                                            anyhow!(
+                                                "conditional {op} response missing applied versions on shard {} chunk {}/{}: expected {}, got {}",
+                                                target.shard_index,
+                                                batch_idx + 1,
+                                                batch_count,
+                                                batch_expected,
+                                                versions_by_key.len()
+                                            ),
+                                        ));
+                                    }
+                                } else {
+                                    let mut missing_version = None::<anyhow::Error>;
+                                    for entry in &mut entries[start..end] {
+                                        let Some(applied_version) =
+                                            versions_by_key.get(entry.key.as_slice()).copied()
+                                        else {
+                                            missing_version = Some(anyhow!(
+                                                "conditional {op} response missing applied version for key={} on shard {} chunk {}/{}",
+                                                hex::encode(&entry.key),
+                                                target.shard_index,
+                                                batch_idx + 1,
+                                                batch_count
+                                            ));
+                                            break;
+                                        };
+                                        entry.applied_version = applied_version;
+                                    }
+                                    if let Some(err) = missing_version {
+                                        if target_failure.is_none() {
+                                            target_failure =
+                                                Some((TargetFailureKind::NonRetryable, err));
+                                        }
+                                    } else {
+                                        applied_this_target
+                                            .extend(entries[start..end].iter().cloned());
+                                        applied_total =
+                                            applied_total.saturating_add(result.applied);
+                                    }
+                                }
+                            }
                         }
                         Err(err) => {
                             self.circuit_on_failure(target.grpc_addr, circuit_token);
@@ -3015,36 +3145,149 @@ impl HoloStoreTableProvider {
                             let classification =
                                 classify_write_error_message(apply_error.to_string().as_str());
                             self.metrics.record_distributed_apply_failure(
-                                target.grpc_addr.to_string().as_str(),
+                                target_key.as_str(),
                                 classification.is_retryable(),
                             );
-                            if !applied_this_target.is_empty() {
-                                let rollback_scope =
-                                    vec![(target.clone(), applied_this_target.clone())];
-                                self.rollback_conditional_targets(rollback_scope.as_slice(), op)
-                                    .await
-                                    .with_context(|| {
-                                        format!(
-                                            "rollback conditional {op} writes for shard {} after apply failure",
-                                            target.shard_index
-                                        )
-                                    })?;
+                            if target_failure.is_none() {
+                                target_failure = Some((
+                                    if classification.is_retryable() {
+                                        TargetFailureKind::Retryable
+                                    } else {
+                                        TargetFailureKind::NonRetryable
+                                    },
+                                    apply_error,
+                                ));
                             }
-                            self.rollback_conditional_targets(applied_targets.as_slice(), op)
-                                .await
-                                .with_context(|| {
-                                    format!(
-                                        "rollback previously applied conditional {op} writes after apply failure"
-                                    )
-                                })?;
+                        }
+                    }
 
-                            if classification.is_retryable() && attempt + 1 < retry_limit {
+                    while target_failure.is_none() && inflight.len() < inflight_limit {
+                        let Some((batch_idx, batch_range)) = pending.pop_front() else {
+                            break;
+                        };
+                        let start = batch_range.start;
+                        let end = batch_range.end;
+                        let batch_bytes = entries[start..end]
+                            .iter()
+                            .map(prepared_conditional_entry_size)
+                            .fold(0usize, |acc, next| acc.saturating_add(next));
+                        let request_entries = entries[start..end]
+                            .iter()
+                            .map(|entry| ReplicatedConditionalWriteEntry {
+                                key: entry.key.clone(),
+                                value: entry.value.clone(),
+                                expected_version: entry.expected_version,
+                            })
+                            .collect::<Vec<_>>();
+                        let batch_expected = request_entries.len() as u64;
+                        if let Err(err) = self.enforce_inflight_budget(
+                            batch_expected as usize,
+                            batch_bytes,
+                            1,
+                            "conditional_apply_batch",
+                        ) {
+                            target_failure = Some((TargetFailureKind::NonRetryable, err));
+                            break;
+                        }
+                        let circuit_token = match self.circuit_acquire(target.grpc_addr) {
+                            Ok(token) => token,
+                            Err(err) => {
+                                let apply_error = anyhow!(
+                                    "apply conditional {op} batch table={} shard={} target={} chunk={}/{} failed: {err}",
+                                    self.table_name,
+                                    target.shard_index,
+                                    target.grpc_addr,
+                                    batch_idx + 1,
+                                    batch_count
+                                );
+                                let classification =
+                                    classify_write_error_message(apply_error.to_string().as_str());
+                                self.metrics.record_distributed_apply_failure(
+                                    target_key.as_str(),
+                                    classification.is_retryable(),
+                                );
+                                target_failure = Some((
+                                    if classification.is_retryable() {
+                                        TargetFailureKind::Retryable
+                                    } else {
+                                        TargetFailureKind::NonRetryable
+                                    },
+                                    apply_error,
+                                ));
+                                break;
+                            }
+                        };
+                        let apply_span = info_span!(
+                            "holo_fusion.distributed_write_apply",
+                            table = %self.table_name,
+                            op = op,
+                            shard_index = target.shard_index,
+                            target = %target.grpc_addr,
+                            batch_index = batch_idx + 1,
+                            batch_count = batch_count
+                        );
+                        let apply_started = Instant::now();
+                        let write_client = write_client.clone();
+                        let shard_index = target.shard_index;
+                        let start_key = target.start_key.clone();
+                        let end_key = target.end_key.clone();
+                        inflight.push(Box::pin(async move {
+                            let result = write_client
+                                .range_write_latest_conditional(
+                                    shard_index,
+                                    start_key.as_slice(),
+                                    end_key.as_slice(),
+                                    request_entries,
+                                )
+                                .instrument(apply_span)
+                                .await;
+                            (
+                                batch_idx,
+                                start,
+                                end,
+                                batch_expected,
+                                apply_started,
+                                circuit_token,
+                                result,
+                            )
+                        }));
+                    }
+                }
+
+                if let Some((failure_kind, failure_err)) = target_failure {
+                    if !applied_this_target.is_empty() {
+                        let rollback_scope = vec![(target.clone(), applied_this_target.clone())];
+                        self.rollback_conditional_targets(rollback_scope.as_slice(), op)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "rollback conditional {op} writes for shard {} after pipelined apply failure",
+                                    target.shard_index
+                                )
+                            })?;
+                    }
+                    if !applied_targets.is_empty() {
+                        self.rollback_conditional_targets(applied_targets.as_slice(), op)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "rollback previously applied conditional {op} writes after pipelined apply failure"
+                                )
+                            })?;
+                    }
+
+                    match failure_kind {
+                        TargetFailureKind::Conflict => {
+                            return Ok(ConditionalWriteDetailedOutcome::Conflict);
+                        }
+                        TargetFailureKind::Retryable => {
+                            if attempt + 1 < retry_limit {
                                 if let Some(deadline) = retry_deadline {
                                     if Instant::now() >= deadline {
-                                        return Err(apply_error);
+                                        return Err(failure_err);
                                     }
                                 }
-                                last_retryable_error = Some(apply_error);
+                                last_retryable_error = Some(failure_err);
                                 tokio::time::sleep(retry_backoff(
                                     retry_policy,
                                     attempt,
@@ -3053,90 +3296,12 @@ impl HoloStoreTableProvider {
                                 .await;
                                 continue 'attempts;
                             }
-                            return Err(apply_error);
+                            return Err(failure_err);
                         }
-                    };
-                    self.metrics.record_distributed_apply(
-                        target.shard_index,
-                        batch_expected,
-                        apply_started.elapsed(),
-                    );
-
-                    // Decision: evaluate `result.conflicts > 0` to choose the correct SQL/storage control path.
-                    if result.conflicts > 0 {
-                        self.metrics.record_distributed_conflict(target.shard_index);
-                        if !applied_this_target.is_empty() {
-                            let rollback_scope =
-                                vec![(target.clone(), applied_this_target.clone())];
-                            self.rollback_conditional_targets(rollback_scope.as_slice(), op)
-                                .await?;
+                        TargetFailureKind::NonRetryable => {
+                            return Err(failure_err);
                         }
-                        self.rollback_conditional_targets(applied_targets.as_slice(), op)
-                            .await?;
-                        return Ok(ConditionalWriteDetailedOutcome::Conflict);
                     }
-
-                    // Decision: evaluate `result.applied != batch_expected` to choose the correct SQL/storage control path.
-                    if result.applied != batch_expected {
-                        if !applied_this_target.is_empty() {
-                            let rollback_scope =
-                                vec![(target.clone(), applied_this_target.clone())];
-                            self.rollback_conditional_targets(rollback_scope.as_slice(), op)
-                                .await?;
-                        }
-                        self.rollback_conditional_targets(applied_targets.as_slice(), op)
-                            .await?;
-                        return Err(anyhow!(
-                            "partial conditional {op} apply on shard {} chunk {}/{}: expected {}, applied {}",
-                            target.shard_index,
-                            batch_idx + 1,
-                            batch_count,
-                            batch_expected,
-                            result.applied
-                        ));
-                    }
-
-                    let mut versions_by_key = BTreeMap::<Vec<u8>, RpcVersion>::new();
-                    for item in result.applied_versions {
-                        versions_by_key.insert(item.key, item.version);
-                    }
-                    // Decision: evaluate `versions_by_key.len() != batch_expected as usize` to choose the correct SQL/storage control path.
-                    if versions_by_key.len() != batch_expected as usize {
-                        if !applied_this_target.is_empty() {
-                            let rollback_scope =
-                                vec![(target.clone(), applied_this_target.clone())];
-                            self.rollback_conditional_targets(rollback_scope.as_slice(), op)
-                                .await?;
-                        }
-                        self.rollback_conditional_targets(applied_targets.as_slice(), op)
-                            .await?;
-                        return Err(anyhow!(
-                            "conditional {op} response missing applied versions on shard {} chunk {}/{}: expected {}, got {}",
-                            target.shard_index,
-                            batch_idx + 1,
-                            batch_count,
-                            batch_expected,
-                            versions_by_key.len()
-                        ));
-                    }
-
-                    for entry in &mut entries[start..end] {
-                        let applied_version = versions_by_key
-                            .get(entry.key.as_slice())
-                            .copied()
-                            .ok_or_else(|| {
-                                anyhow!(
-                                    "conditional {op} response missing applied version for key={} on shard {} chunk {}/{}",
-                                    hex::encode(&entry.key),
-                                    target.shard_index,
-                                    batch_idx + 1,
-                                    batch_count
-                                )
-                            })?;
-                        entry.applied_version = applied_version;
-                    }
-                    applied_this_target.extend(entries[start..end].iter().cloned());
-                    applied_total = applied_total.saturating_add(result.applied);
                 }
 
                 // Decision: evaluate `applied_total != expected` to choose the correct SQL/storage control path.
@@ -3146,8 +3311,10 @@ impl HoloStoreTableProvider {
                         self.rollback_conditional_targets(rollback_scope.as_slice(), op)
                             .await?;
                     }
-                    self.rollback_conditional_targets(applied_targets.as_slice(), op)
-                        .await?;
+                    if !applied_targets.is_empty() {
+                        self.rollback_conditional_targets(applied_targets.as_slice(), op)
+                            .await?;
+                    }
                     return Err(anyhow!(
                         "conditional {op} apply row count mismatch on shard {}: expected {}, applied {}",
                         target.shard_index,
@@ -5640,6 +5807,7 @@ impl HoloStoreTableProvider {
 
             let mut written = 0u64;
             let mut attempt_error: Option<anyhow::Error> = None;
+            let pipeline_depth = self.distributed_write_pipeline_depth.max(1);
             for (target, entries) in writes {
                 let write_client = self.client_for(target.grpc_addr);
                 let expected = entries.len() as u64;
@@ -5649,8 +5817,28 @@ impl HoloStoreTableProvider {
                     self.distributed_write_max_batch_bytes,
                 );
                 let batch_count = chunks.len();
+                let inflight_limit = pipeline_depth.min(batch_count.max(1));
+                let mut pending = chunks.into_iter().enumerate().collect::<VecDeque<_>>();
+                let mut inflight = futures_util::stream::FuturesUnordered::<
+                    futures_util::future::BoxFuture<
+                        'static,
+                        (
+                            usize,
+                            u64,
+                            Instant,
+                            CircuitAcquireToken,
+                            anyhow::Result<u64>,
+                        ),
+                    >,
+                >::new();
                 let mut target_written = 0u64;
-                for (batch_idx, batch_entries) in chunks.into_iter().enumerate() {
+                let mut stop_dispatch = false;
+                let target_key = target.grpc_addr.to_string();
+
+                while !stop_dispatch && inflight.len() < inflight_limit {
+                    let Some((batch_idx, batch_entries)) = pending.pop_front() else {
+                        break;
+                    };
                     let batch_expected = batch_entries.len() as u64;
                     let batch_bytes = batch_entries
                         .iter()
@@ -5663,12 +5851,14 @@ impl HoloStoreTableProvider {
                         "write_batch",
                     ) {
                         attempt_error = Some(err);
+                        stop_dispatch = true;
                         break;
                     }
                     let circuit_token = match self.circuit_acquire(target.grpc_addr) {
                         Ok(token) => token,
                         Err(err) => {
                             attempt_error = Some(err);
+                            stop_dispatch = true;
                             break;
                         }
                     };
@@ -5682,16 +5872,34 @@ impl HoloStoreTableProvider {
                         batch_count = batch_count
                     );
                     let apply_started = Instant::now();
-                    match write_client
-                        .range_write_latest(
-                            target.shard_index,
-                            target.start_key.as_slice(),
-                            target.end_key.as_slice(),
-                            batch_entries,
+                    let write_client = write_client.clone();
+                    let shard_index = target.shard_index;
+                    let start_key = target.start_key.clone();
+                    let end_key = target.end_key.clone();
+                    inflight.push(Box::pin(async move {
+                        let result = write_client
+                            .range_write_latest(
+                                shard_index,
+                                start_key.as_slice(),
+                                end_key.as_slice(),
+                                batch_entries,
+                            )
+                            .instrument(apply_span)
+                            .await;
+                        (
+                            batch_idx,
+                            batch_expected,
+                            apply_started,
+                            circuit_token,
+                            result,
                         )
-                        .instrument(apply_span)
-                        .await
-                    {
+                    }));
+                }
+
+                while let Some((batch_idx, batch_expected, apply_started, circuit_token, result)) =
+                    inflight.next().await
+                {
+                    match result {
                         Ok(applied) => {
                             self.circuit_on_success(target.grpc_addr, circuit_token);
                             self.metrics.record_distributed_apply(
@@ -5699,7 +5907,7 @@ impl HoloStoreTableProvider {
                                 batch_expected,
                                 apply_started.elapsed(),
                             );
-                            if applied != batch_expected {
+                            if applied != batch_expected && attempt_error.is_none() {
                                 attempt_error = Some(anyhow!(
                                     "partial {op} apply on shard {} chunk {}/{}: expected {}, applied {}",
                                     target.shard_index,
@@ -5708,10 +5916,11 @@ impl HoloStoreTableProvider {
                                     batch_expected,
                                     applied
                                 ));
-                                break;
+                                stop_dispatch = true;
+                            } else if applied == batch_expected {
+                                target_written = target_written.saturating_add(applied);
+                                written = written.saturating_add(applied);
                             }
-                            target_written = target_written.saturating_add(applied);
-                            written = written.saturating_add(applied);
                         }
                         Err(err) => {
                             self.circuit_on_failure(target.grpc_addr, circuit_token);
@@ -5726,14 +5935,78 @@ impl HoloStoreTableProvider {
                             let classification =
                                 classify_write_error_message(wrapped.to_string().as_str());
                             self.metrics.record_distributed_apply_failure(
-                                target.grpc_addr.to_string().as_str(),
+                                target_key.as_str(),
                                 classification.is_retryable(),
                             );
-                            attempt_error = Some(anyhow!("{}", wrapped));
-                            break;
+                            if attempt_error.is_none() {
+                                attempt_error = Some(anyhow!("{}", wrapped));
+                                stop_dispatch = true;
+                            }
                         }
                     }
+
+                    while !stop_dispatch && inflight.len() < inflight_limit {
+                        let Some((batch_idx, batch_entries)) = pending.pop_front() else {
+                            break;
+                        };
+                        let batch_expected = batch_entries.len() as u64;
+                        let batch_bytes = batch_entries
+                            .iter()
+                            .map(replicated_write_entry_size)
+                            .fold(0usize, |acc, next| acc.saturating_add(next));
+                        if let Err(err) = self.enforce_inflight_budget(
+                            batch_expected as usize,
+                            batch_bytes,
+                            1,
+                            "write_batch",
+                        ) {
+                            attempt_error = Some(err);
+                            stop_dispatch = true;
+                            break;
+                        }
+                        let circuit_token = match self.circuit_acquire(target.grpc_addr) {
+                            Ok(token) => token,
+                            Err(err) => {
+                                attempt_error = Some(err);
+                                stop_dispatch = true;
+                                break;
+                            }
+                        };
+                        let apply_span = info_span!(
+                            "holo_fusion.distributed_write_apply",
+                            table = %self.table_name,
+                            op = op,
+                            shard_index = target.shard_index,
+                            target = %target.grpc_addr,
+                            batch_index = batch_idx + 1,
+                            batch_count = batch_count
+                        );
+                        let apply_started = Instant::now();
+                        let write_client = write_client.clone();
+                        let shard_index = target.shard_index;
+                        let start_key = target.start_key.clone();
+                        let end_key = target.end_key.clone();
+                        inflight.push(Box::pin(async move {
+                            let result = write_client
+                                .range_write_latest(
+                                    shard_index,
+                                    start_key.as_slice(),
+                                    end_key.as_slice(),
+                                    batch_entries,
+                                )
+                                .instrument(apply_span)
+                                .await;
+                            (
+                                batch_idx,
+                                batch_expected,
+                                apply_started,
+                                circuit_token,
+                                result,
+                            )
+                        }));
+                    }
                 }
+
                 if attempt_error.is_some() {
                     break;
                 }
@@ -8475,10 +8748,8 @@ mod tests {
             updated_at_unix_ms: 0,
         };
         let summary = extract_predicate_summary(
-            vec![col("Use event_day@1").in_list(
-                vec![lit(20i64), lit(21i64), lit(22i64), lit(23i64)],
-                false,
-            )]
+            vec![col("Use event_day@1")
+                .in_list(vec![lit(20i64), lit(21i64), lit(22i64), lit(23i64)], false)]
             .as_slice(),
         );
 

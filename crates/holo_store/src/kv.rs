@@ -91,7 +91,21 @@ impl KvEngine for KvStore {
 
     /// Batch helper to read latest values for multiple keys.
     fn get_latest_batch(&self, keys: &[Vec<u8>]) -> Vec<Option<(Vec<u8>, Version)>> {
-        keys.iter().map(|k| self.get_latest(k)).collect()
+        let Ok(guard) = self.inner.read() else {
+            return vec![None; keys.len()];
+        };
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            let value = guard.get(key.as_slice()).and_then(|versions| {
+                versions
+                    .iter()
+                    .rev()
+                    .find(|versioned| versioned.visible)
+                    .map(|versioned| (versioned.value.clone(), versioned.version))
+            });
+            out.push(value);
+        }
+        out
     }
 
     /// Insert or update a versioned value (initially invisible).
@@ -272,7 +286,27 @@ impl KvEngine for FjallEngine {
 
     /// Batch helper to read latest values for multiple keys.
     fn get_latest_batch(&self, keys: &[Vec<u8>]) -> Vec<Option<(Vec<u8>, Version)>> {
-        keys.iter().map(|k| self.get_latest(k)).collect()
+        let _guard = match self.lock.read() {
+            Ok(guard) => guard,
+            // If the lock is poisoned, preserve ordering with missing entries.
+            Err(_) => return vec![None; keys.len()],
+        };
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            let value = match self.latest.get(key) {
+                Ok(Some(bytes)) => decode_latest_value(&bytes).ok().map(|(version, value)| {
+                    // Keep `(value, version)` ordering expected by the trait.
+                    (value, version)
+                }),
+                Ok(None) => None,
+                Err(err) => {
+                    warn!(error = ?err, "fjall kv latest batch read failed");
+                    None
+                }
+            };
+            out.push(value);
+        }
+        out
     }
 
     /// Insert a versioned value (initially invisible) into the versions partition.
