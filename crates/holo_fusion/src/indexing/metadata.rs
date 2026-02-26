@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use holo_store::{HoloStoreClient, ReplicatedConditionalWriteEntry, RpcVersion};
@@ -12,8 +12,10 @@ use crate::topology::{fetch_topology, require_non_empty_topology, route_key, sca
 const META_PREFIX_SECONDARY_INDEX: u8 = 0x04;
 const DEFAULT_INDEX_SCAN_PAGE_SIZE: usize = 1024;
 const INDEX_METADATA_VISIBILITY_TIMEOUT: Duration = Duration::from_secs(5);
-const INDEX_METADATA_RETRY_LIMIT: usize = 8;
+const INDEX_METADATA_RETRY_LIMIT: usize = 64;
 const INDEX_METADATA_RETRY_DELAY: Duration = Duration::from_millis(75);
+const INDEX_METADATA_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
+const INDEX_METADATA_RETRY_MAX_ELAPSED: Duration = Duration::from_secs(30);
 
 pub const DEFAULT_SECONDARY_INDEX_HASH_BUCKETS: usize = 32;
 pub const MAX_SECONDARY_INDEX_HASH_BUCKETS: usize = u16::MAX as usize;
@@ -274,10 +276,11 @@ pub async fn create_secondary_index_metadata(
     spec: &CreateSecondaryIndexMetadataSpec,
 ) -> Result<CreateSecondaryIndexMetadataOutcome> {
     spec.validate_against_table(table)?;
+    let retry_deadline = Instant::now() + INDEX_METADATA_RETRY_MAX_ELAPSED;
+    let normalized_name = spec.index_name.to_ascii_lowercase();
 
     for attempt in 0..INDEX_METADATA_RETRY_LIMIT {
         let mut existing = list_secondary_index_metadata_for_table(client, table.table_id).await?;
-        let normalized_name = spec.index_name.to_ascii_lowercase();
         if let Some(record) = existing.iter().find(|record| {
             record
                 .index_name
@@ -287,6 +290,17 @@ pub async fn create_secondary_index_metadata(
                 return Ok(CreateSecondaryIndexMetadataOutcome {
                     record: record.clone(),
                     created: false,
+                });
+            }
+            if attempt > 0 && secondary_index_record_matches_spec(record, spec) {
+                // Decision: the index was absent on attempt 0 and appeared during
+                // retries, which can happen when a prior conditional write was
+                // committed but the client observed a retryable transport error.
+                // Continue CREATE INDEX by treating write-only state as newly
+                // created so the caller performs backfill/state transition.
+                return Ok(CreateSecondaryIndexMetadataOutcome {
+                    record: record.clone(),
+                    created: record.state == SecondaryIndexState::WriteOnly,
                 });
             }
             return Err(anyhow!(
@@ -347,8 +361,8 @@ pub async fn create_secondary_index_metadata(
         let topology = fetch_topology(client).await?;
         require_non_empty_topology(&topology)?;
         let Some(route) = route_key(&topology, client.target(), key.as_slice(), &[]) else {
-            if attempt + 1 < INDEX_METADATA_RETRY_LIMIT {
-                tokio::time::sleep(INDEX_METADATA_RETRY_DELAY).await;
+            if should_retry_metadata_write(attempt, retry_deadline) {
+                tokio::time::sleep(metadata_retry_delay(attempt)).await;
                 continue;
             }
             return Err(anyhow!("failed to route secondary index metadata key"));
@@ -376,9 +390,9 @@ pub async fn create_secondary_index_metadata(
             Ok(result) => result,
             Err(err) => {
                 if is_retryable_metadata_write_error(&err)
-                    && attempt + 1 < INDEX_METADATA_RETRY_LIMIT
+                    && should_retry_metadata_write(attempt, retry_deadline)
                 {
-                    tokio::time::sleep(INDEX_METADATA_RETRY_DELAY).await;
+                    tokio::time::sleep(metadata_retry_delay(attempt)).await;
                     continue;
                 }
                 return Err(err);
@@ -406,7 +420,11 @@ pub async fn create_secondary_index_metadata(
             ));
         }
 
-        tokio::time::sleep(INDEX_METADATA_RETRY_DELAY).await;
+        if should_retry_metadata_write(attempt, retry_deadline) {
+            tokio::time::sleep(metadata_retry_delay(attempt)).await;
+            continue;
+        }
+        break;
     }
 
     Err(anyhow!(
@@ -422,6 +440,7 @@ pub async fn update_secondary_index_state(
     index_id: u64,
     state: SecondaryIndexState,
 ) -> Result<SecondaryIndexRecord> {
+    let retry_deadline = Instant::now() + INDEX_METADATA_RETRY_MAX_ELAPSED;
     for attempt in 0..INDEX_METADATA_RETRY_LIMIT {
         let Some(entry) = find_secondary_index_entry_by_id(client, table_id, index_id).await?
         else {
@@ -446,8 +465,8 @@ pub async fn update_secondary_index_state(
         let topology = fetch_topology(client).await?;
         require_non_empty_topology(&topology)?;
         let Some(route) = route_key(&topology, client.target(), entry.key.as_slice(), &[]) else {
-            if attempt + 1 < INDEX_METADATA_RETRY_LIMIT {
-                tokio::time::sleep(INDEX_METADATA_RETRY_DELAY).await;
+            if should_retry_metadata_write(attempt, retry_deadline) {
+                tokio::time::sleep(metadata_retry_delay(attempt)).await;
                 continue;
             }
             return Err(anyhow!("failed to route secondary index metadata key"));
@@ -474,9 +493,9 @@ pub async fn update_secondary_index_state(
             Ok(result) => result,
             Err(err) => {
                 if is_retryable_metadata_write_error(&err)
-                    && attempt + 1 < INDEX_METADATA_RETRY_LIMIT
+                    && should_retry_metadata_write(attempt, retry_deadline)
                 {
-                    tokio::time::sleep(INDEX_METADATA_RETRY_DELAY).await;
+                    tokio::time::sleep(metadata_retry_delay(attempt)).await;
                     continue;
                 }
                 return Err(err);
@@ -498,7 +517,11 @@ pub async fn update_secondary_index_state(
             }
         }
 
-        tokio::time::sleep(INDEX_METADATA_RETRY_DELAY).await;
+        if should_retry_metadata_write(attempt, retry_deadline) {
+            tokio::time::sleep(metadata_retry_delay(attempt)).await;
+            continue;
+        }
+        break;
     }
 
     Err(anyhow!(
@@ -517,6 +540,7 @@ pub async fn drop_secondary_index_metadata_by_name(
     if normalized.is_empty() {
         return Err(anyhow!("DROP INDEX has empty index name"));
     }
+    let retry_deadline = Instant::now() + INDEX_METADATA_RETRY_MAX_ELAPSED;
 
     for attempt in 0..INDEX_METADATA_RETRY_LIMIT {
         let entries = list_secondary_index_entries(client).await?;
@@ -543,8 +567,8 @@ pub async fn drop_secondary_index_metadata_by_name(
         let topology = fetch_topology(client).await?;
         require_non_empty_topology(&topology)?;
         let Some(route) = route_key(&topology, client.target(), entry.key.as_slice(), &[]) else {
-            if attempt + 1 < INDEX_METADATA_RETRY_LIMIT {
-                tokio::time::sleep(INDEX_METADATA_RETRY_DELAY).await;
+            if should_retry_metadata_write(attempt, retry_deadline) {
+                tokio::time::sleep(metadata_retry_delay(attempt)).await;
                 continue;
             }
             return Err(anyhow!(
@@ -573,9 +597,9 @@ pub async fn drop_secondary_index_metadata_by_name(
             Ok(result) => result,
             Err(err) => {
                 if is_retryable_metadata_write_error(&err)
-                    && attempt + 1 < INDEX_METADATA_RETRY_LIMIT
+                    && should_retry_metadata_write(attempt, retry_deadline)
                 {
-                    tokio::time::sleep(INDEX_METADATA_RETRY_DELAY).await;
+                    tokio::time::sleep(metadata_retry_delay(attempt)).await;
                     continue;
                 }
                 return Err(err);
@@ -586,7 +610,11 @@ pub async fn drop_secondary_index_metadata_by_name(
             return Ok(true);
         }
 
-        tokio::time::sleep(INDEX_METADATA_RETRY_DELAY).await;
+        if should_retry_metadata_write(attempt, retry_deadline) {
+            tokio::time::sleep(metadata_retry_delay(attempt)).await;
+            continue;
+        }
+        break;
     }
 
     Err(anyhow!(
@@ -778,6 +806,83 @@ fn now_unix_epoch_millis() -> u64 {
     }
 }
 
+/// Returns exponential retry delay for secondary-index metadata writes.
+///
+/// Design:
+/// - Metadata writes are routed and can observe transient route churn during
+///   split/rebalance windows, so backoff should stretch past sub-second bursts.
+/// - Keep delay bounded to avoid unbounded sleeps while still reducing retry
+///   pressure under prolonged control-plane instability.
+///
+/// Inputs:
+/// - `attempt`: zero-based metadata-write attempt index.
+///
+/// Outputs:
+/// - Backoff duration in `[INDEX_METADATA_RETRY_DELAY, INDEX_METADATA_RETRY_MAX_DELAY]`.
+fn metadata_retry_delay(attempt: usize) -> Duration {
+    let shift = (attempt as u32).min(5);
+    let factor = 1u128 << shift;
+    let base_ms = INDEX_METADATA_RETRY_DELAY.as_millis();
+    let capped_ms =
+        (base_ms.saturating_mul(factor)).min(INDEX_METADATA_RETRY_MAX_DELAY.as_millis());
+    Duration::from_millis(capped_ms as u64)
+}
+
+/// Returns `true` when metadata write path should schedule another retry.
+fn should_retry_metadata_write(attempt: usize, deadline: Instant) -> bool {
+    attempt + 1 < INDEX_METADATA_RETRY_LIMIT && Instant::now() < deadline
+}
+
+/// Returns whether an existing index metadata record matches CREATE INDEX spec.
+///
+/// Design:
+/// - Distinguish "same logical index appeared during retries" from true
+///   conflicting duplicates so CREATE INDEX can recover from ambiguous write
+///   acknowledgments without sacrificing correctness.
+///
+/// Inputs:
+/// - `record`: persisted metadata candidate with matching index name.
+/// - `spec`: requested CREATE INDEX metadata spec.
+///
+/// Outputs:
+/// - `true` when uniqueness/distribution/hash bucket and normalized key/include
+///   columns match exactly.
+fn secondary_index_record_matches_spec(
+    record: &SecondaryIndexRecord,
+    spec: &CreateSecondaryIndexMetadataSpec,
+) -> bool {
+    if record.unique != spec.unique || record.distribution != spec.distribution {
+        return false;
+    }
+    let expected_hash_buckets = if spec.distribution == SecondaryIndexDistribution::Hash {
+        Some(
+            spec.hash_bucket_count
+                .unwrap_or(DEFAULT_SECONDARY_INDEX_HASH_BUCKETS),
+        )
+    } else {
+        None
+    };
+    if record.hash_bucket_count != expected_hash_buckets {
+        return false;
+    }
+
+    let expected_keys = spec
+        .key_columns
+        .iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    if record.key_columns != expected_keys {
+        return false;
+    }
+
+    let expected_include = spec
+        .include_columns
+        .iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    record.include_columns == expected_include
+}
+
 fn is_retryable_metadata_write_error(err: &anyhow::Error) -> bool {
     let message = err.to_string();
     let lower = message.to_ascii_lowercase();
@@ -796,11 +901,25 @@ fn is_retryable_metadata_write_error(err: &anyhow::Error) -> bool {
         || lower.contains("connection refused")
         || lower.contains("broken pipe")
         || lower.contains("network")
+        || lower.contains("unknown group")
+        || lower.contains("meta handle not available")
+        || lower.contains("lost range controller lease")
+        || lower.contains("lease_lost")
+        || lower.contains("controller lease")
+        || lower.contains("failed precondition")
+        || lower.contains("failed_precondition")
+        || lower.contains("fence")
+        || lower.contains("retry after split")
+        || lower.contains("split in progress")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::is_retryable_metadata_write_error;
+    use super::{is_retryable_metadata_write_error, secondary_index_record_matches_spec};
+    use crate::indexing::metadata::{
+        CreateSecondaryIndexMetadataSpec, SecondaryIndexDistribution, SecondaryIndexRecord,
+        SecondaryIndexState,
+    };
 
     #[test]
     fn metadata_retry_classifier_matches_shard_route_mismatch() {
@@ -822,5 +941,81 @@ mod tests {
     fn metadata_retry_classifier_rejects_non_retryable_errors() {
         let err = anyhow::anyhow!("secondary index metadata write applied but not visible");
         assert!(!is_retryable_metadata_write_error(&err));
+    }
+
+    #[test]
+    fn metadata_retry_classifier_matches_split_lease_loss() {
+        let err = anyhow::anyhow!(
+            "persist secondary index metadata 'idx' on table 'sales_facts': range_write_latest_conditional rpc failed for 127.0.0.1:15051: rpc status: Internal: range conditional write failed: lost range controller lease during split operation"
+        );
+        assert!(is_retryable_metadata_write_error(&err));
+    }
+
+    #[test]
+    fn metadata_retry_classifier_matches_unknown_group() {
+        let err = anyhow::anyhow!(
+            "persist secondary index metadata 'idx' on table 'sales_facts': range_write_latest_conditional rpc failed for 127.0.0.1:15051: rpc status: NotFound: unknown group"
+        );
+        assert!(is_retryable_metadata_write_error(&err));
+    }
+
+    #[test]
+    fn secondary_index_record_matcher_detects_equal_spec() {
+        let spec = CreateSecondaryIndexMetadataSpec {
+            index_name: "idx_sales_status_day_merchant_cover".to_string(),
+            unique: false,
+            key_columns: vec!["status".to_string(), "event_day".to_string()],
+            include_columns: vec!["merchant_id".to_string(), "amount_cents".to_string()],
+            distribution: SecondaryIndexDistribution::Hash,
+            hash_bucket_count: Some(64),
+            if_not_exists: false,
+        };
+        let record = SecondaryIndexRecord {
+            db_id: 1,
+            schema_id: 1,
+            table_id: 1,
+            index_id: 1,
+            table_name: "sales_facts".to_string(),
+            index_name: "idx_sales_status_day_merchant_cover".to_string(),
+            unique: false,
+            key_columns: vec!["status".to_string(), "event_day".to_string()],
+            include_columns: vec!["merchant_id".to_string(), "amount_cents".to_string()],
+            distribution: SecondaryIndexDistribution::Hash,
+            hash_bucket_count: Some(64),
+            state: SecondaryIndexState::WriteOnly,
+            created_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+        };
+        assert!(secondary_index_record_matches_spec(&record, &spec));
+    }
+
+    #[test]
+    fn secondary_index_record_matcher_rejects_mismatched_distribution() {
+        let spec = CreateSecondaryIndexMetadataSpec {
+            index_name: "idx_sales_status_day_merchant_cover".to_string(),
+            unique: false,
+            key_columns: vec!["status".to_string(), "event_day".to_string()],
+            include_columns: vec!["merchant_id".to_string(), "amount_cents".to_string()],
+            distribution: SecondaryIndexDistribution::Range,
+            hash_bucket_count: None,
+            if_not_exists: false,
+        };
+        let record = SecondaryIndexRecord {
+            db_id: 1,
+            schema_id: 1,
+            table_id: 1,
+            index_id: 1,
+            table_name: "sales_facts".to_string(),
+            index_name: "idx_sales_status_day_merchant_cover".to_string(),
+            unique: false,
+            key_columns: vec!["status".to_string(), "event_day".to_string()],
+            include_columns: vec!["merchant_id".to_string(), "amount_cents".to_string()],
+            distribution: SecondaryIndexDistribution::Hash,
+            hash_bucket_count: Some(64),
+            state: SecondaryIndexState::WriteOnly,
+            created_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+        };
+        assert!(!secondary_index_record_matches_spec(&record, &spec));
     }
 }

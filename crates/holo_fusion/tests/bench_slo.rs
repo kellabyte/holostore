@@ -264,6 +264,10 @@ impl BenchHarness {
             dml_admission_wait_timeout: Duration::ZERO,
             dml_max_scan_rows: 100_000,
             dml_max_txn_staged_rows: 100_000,
+            catalog_sync_interval: Duration::from_millis(1_000),
+            catalog_sync_max_interval: Duration::from_millis(15_000),
+            catalog_sync_busy_apply_ops: 8,
+            catalog_sync_busy_apply_rows: 8_192,
             holostore: EmbeddedNodeConfig {
                 node_id: 1,
                 listen_redis: redis_addr,

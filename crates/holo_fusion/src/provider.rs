@@ -92,7 +92,10 @@ const DEFAULT_DISTRIBUTED_WRITE_PIPELINE_DEPTH: usize = 4;
 const DEFAULT_DISTRIBUTED_BULK_RPC_MAX_BATCH_ENTRIES: usize = 8_192;
 const DEFAULT_DISTRIBUTED_BULK_RPC_MAX_BATCH_BYTES: usize = 4 * 1_024 * 1_024;
 const DEFAULT_DISTRIBUTED_BULK_RPC_PIPELINE_DEPTH: usize = 8;
-const DEFAULT_INDEX_BACKFILL_PAGE_SIZE: usize = 512;
+const DEFAULT_INDEX_BACKFILL_PAGE_SIZE: usize = 32_768;
+const DEFAULT_INDEX_BACKFILL_WRITE_MAX_BATCH_ENTRIES: usize = 4_096;
+const DEFAULT_INDEX_BACKFILL_WRITE_MAX_BATCH_BYTES: usize = 4 * 1_024 * 1_024;
+const DEFAULT_INDEX_BACKFILL_WRITE_PIPELINE_DEPTH: usize = 8;
 const DEFAULT_BULK_CHUNK_ROWS_INITIAL: usize = 1_024;
 const DEFAULT_BULK_CHUNK_ROWS_MIN: usize = 128;
 const DEFAULT_BULK_CHUNK_ROWS_MAX: usize = 8_192;
@@ -299,6 +302,82 @@ fn configured_index_backfill_page_size() -> usize {
         .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_INDEX_BACKFILL_PAGE_SIZE)
+}
+
+/// Returns max conditional entries per RPC when applying index-backfill writes.
+///
+/// Design:
+/// - Keep backfill write pressure independently tunable from OLTP insert/update/delete paths.
+/// - Preserve safety defaults by bounding to positive values and falling back to a conservative default.
+///
+/// Inputs:
+/// - Environment variable `HOLO_FUSION_INDEX_BACKFILL_WRITE_MAX_BATCH_ENTRIES`.
+///
+/// Outputs:
+/// - Positive entry-count cap used for one conditional write RPC batch during index backfill.
+fn configured_index_backfill_write_max_batch_entries() -> usize {
+    std::env::var("HOLO_FUSION_INDEX_BACKFILL_WRITE_MAX_BATCH_ENTRIES")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_INDEX_BACKFILL_WRITE_MAX_BATCH_ENTRIES)
+}
+
+/// Returns byte budget per conditional RPC batch for index-backfill writes.
+///
+/// Design:
+/// - Allow backfill-specific payload sizing without changing foreground write behavior.
+/// - Enforce positive values; invalid settings degrade gracefully to defaults.
+///
+/// Inputs:
+/// - Environment variable `HOLO_FUSION_INDEX_BACKFILL_WRITE_MAX_BATCH_BYTES`.
+///
+/// Outputs:
+/// - Positive byte budget for one conditional write RPC batch used by backfill.
+fn configured_index_backfill_write_max_batch_bytes() -> usize {
+    std::env::var("HOLO_FUSION_INDEX_BACKFILL_WRITE_MAX_BATCH_BYTES")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_INDEX_BACKFILL_WRITE_MAX_BATCH_BYTES)
+}
+
+/// Returns per-target pipeline depth for conditional index-backfill write batches.
+///
+/// Design:
+/// - Keep backfill throughput knobs explicit and separate from OLTP write pipelining.
+/// - Bound to positive values and default to a moderate queue depth.
+///
+/// Inputs:
+/// - Environment variable `HOLO_FUSION_INDEX_BACKFILL_WRITE_PIPELINE_DEPTH`.
+///
+/// Outputs:
+/// - Positive pipeline depth used while applying conditional backfill batches to one shard target.
+fn configured_index_backfill_write_pipeline_depth() -> usize {
+    std::env::var("HOLO_FUSION_INDEX_BACKFILL_WRITE_PIPELINE_DEPTH")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_INDEX_BACKFILL_WRITE_PIPELINE_DEPTH)
+}
+
+/// Returns max concurrent shard-target apply workers for index backfill.
+///
+/// Design:
+/// - Restrict cross-target parallelism to an explicit cap so backfill cannot flood the cluster.
+/// - Default to scan parallelism with a bounded ceiling to remain predictable across hosts.
+///
+/// Inputs:
+/// - Environment variable `HOLO_FUSION_INDEX_BACKFILL_TARGET_PARALLELISM`.
+///
+/// Outputs:
+/// - Positive concurrency cap for parallel per-target conditional apply during index backfill.
+fn configured_index_backfill_target_parallelism() -> usize {
+    std::env::var("HOLO_FUSION_INDEX_BACKFILL_TARGET_PARALLELISM")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| configured_scan_parallelism().min(32).max(1))
 }
 
 fn configured_circuit_breaker_failure_threshold() -> u32 {
@@ -770,6 +849,68 @@ enum ConditionalWriteDetailedOutcome {
     Conflict,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Classifies one shard-target conditional apply failure for retry/rollback policy.
+///
+/// Design:
+/// - Keep failure policy explicit so the coordinator can preserve atomic behavior
+///   while deciding whether to retry, surface a conflict, or fail fast.
+///
+/// Inputs:
+/// - Internal classification from response conflicts, retryable transport errors,
+///   and deterministic validation checks.
+///
+/// Outputs:
+/// - `Conflict` for conditional version conflicts, `Retryable` for transient
+///   routing/transport/overload classes, and `NonRetryable` otherwise.
+enum TargetFailureKind {
+    Conflict,
+    Retryable,
+    NonRetryable,
+}
+
+#[derive(Debug)]
+/// Captures the full failure state for one shard-target conditional apply attempt.
+///
+/// Design:
+/// - Preserve enough detail to roll back partially applied entries and choose
+///   retry policy without losing original root-cause context.
+///
+/// Inputs:
+/// - Target metadata, classified failure kind, root error, and any entries that
+///   were already applied before the failure occurred.
+///
+/// Outputs:
+/// - Structured failure record consumed by the coordinator to roll back and
+///   select retry/conflict/fatal outcomes deterministically.
+struct TargetApplyFailure {
+    target: WriteTarget,
+    kind: TargetFailureKind,
+    error: anyhow::Error,
+    applied_entries: Vec<PreparedConditionalEntry>,
+}
+
+#[derive(Debug)]
+/// Result of one per-target conditional apply worker execution.
+///
+/// Design:
+/// - Separate success and failure payloads so coordinator logic can merge
+///   successful targets and roll back partial failures in one place.
+///
+/// Inputs:
+/// - Per-target conditional write entries and runtime apply responses.
+///
+/// Outputs:
+/// - `Applied` with fully versioned entries for rollback bookkeeping, or
+///   `Failed` with failure classification and partial applied entries.
+enum TargetApplyExecution {
+    Applied {
+        target: WriteTarget,
+        entries: Vec<PreparedConditionalEntry>,
+    },
+    Failed(TargetApplyFailure),
+}
+
 #[derive(Debug, Clone)]
 /// Structured duplicate-key violation used to preserve SQLSTATE mapping.
 pub struct DuplicateKeyViolation {
@@ -1005,6 +1146,14 @@ pub struct HoloStoreTableProvider {
     distributed_bulk_rpc_max_batch_entries: usize,
     distributed_bulk_rpc_max_batch_bytes: usize,
     distributed_bulk_rpc_pipeline_depth: usize,
+    /// Backfill-specific conditional batch entry cap.
+    index_backfill_write_max_batch_entries: usize,
+    /// Backfill-specific conditional batch payload cap.
+    index_backfill_write_max_batch_bytes: usize,
+    /// Backfill-specific per-target RPC pipeline depth.
+    index_backfill_write_pipeline_depth: usize,
+    /// Backfill-specific cap for concurrent shard targets.
+    index_backfill_target_parallelism: usize,
     write_retry_policy: RetryPolicy,
     scan_retry_limit: usize,
     scan_retry_delay: Duration,
@@ -1224,6 +1373,11 @@ impl HoloStoreTableProvider {
             distributed_bulk_rpc_max_batch_entries: configured_bulk_rpc_max_batch_entries(),
             distributed_bulk_rpc_max_batch_bytes: configured_bulk_rpc_max_batch_bytes(),
             distributed_bulk_rpc_pipeline_depth: configured_bulk_rpc_pipeline_depth(),
+            index_backfill_write_max_batch_entries:
+                configured_index_backfill_write_max_batch_entries(),
+            index_backfill_write_max_batch_bytes: configured_index_backfill_write_max_batch_bytes(),
+            index_backfill_write_pipeline_depth: configured_index_backfill_write_pipeline_depth(),
+            index_backfill_target_parallelism: configured_index_backfill_target_parallelism(),
             write_retry_policy: RetryPolicy::from_env(),
             scan_retry_limit: configured_scan_retry_limit().max(1),
             scan_retry_delay: Duration::from_millis(configured_scan_retry_delay_ms()),
@@ -1283,6 +1437,11 @@ impl HoloStoreTableProvider {
             distributed_bulk_rpc_max_batch_entries: configured_bulk_rpc_max_batch_entries(),
             distributed_bulk_rpc_max_batch_bytes: configured_bulk_rpc_max_batch_bytes(),
             distributed_bulk_rpc_pipeline_depth: configured_bulk_rpc_pipeline_depth(),
+            index_backfill_write_max_batch_entries:
+                configured_index_backfill_write_max_batch_entries(),
+            index_backfill_write_max_batch_bytes: configured_index_backfill_write_max_batch_bytes(),
+            index_backfill_write_pipeline_depth: configured_index_backfill_write_pipeline_depth(),
+            index_backfill_target_parallelism: configured_index_backfill_target_parallelism(),
             write_retry_policy: RetryPolicy::from_env(),
             scan_retry_limit: configured_scan_retry_limit().max(1),
             scan_retry_delay: Duration::from_millis(configured_scan_retry_delay_ms()),
@@ -1358,6 +1517,11 @@ impl HoloStoreTableProvider {
             distributed_bulk_rpc_max_batch_entries: configured_bulk_rpc_max_batch_entries(),
             distributed_bulk_rpc_max_batch_bytes: configured_bulk_rpc_max_batch_bytes(),
             distributed_bulk_rpc_pipeline_depth: configured_bulk_rpc_pipeline_depth(),
+            index_backfill_write_max_batch_entries:
+                configured_index_backfill_write_max_batch_entries(),
+            index_backfill_write_max_batch_bytes: configured_index_backfill_write_max_batch_bytes(),
+            index_backfill_write_pipeline_depth: configured_index_backfill_write_pipeline_depth(),
+            index_backfill_target_parallelism: configured_index_backfill_target_parallelism(),
             write_retry_policy: RetryPolicy::from_env(),
             scan_retry_limit: configured_scan_retry_limit().max(1),
             scan_retry_delay: Duration::from_millis(configured_scan_retry_delay_ms()),
@@ -1551,6 +1715,46 @@ impl HoloStoreTableProvider {
             }
         }
         out
+    }
+
+    /// Resolves minimal projected-column indexes required to encode one secondary index mutation.
+    ///
+    /// Design:
+    /// - Backfill scans should decode only columns used by index key/include payloads
+    ///   plus the primary key to reduce CPU and allocation pressure.
+    /// - Validate metadata references at runtime so corrupted index metadata fails fast.
+    ///
+    /// Inputs:
+    /// - `index`: secondary-index metadata describing key/include columns.
+    ///
+    /// Outputs:
+    /// - Set of column indexes safe for projected row decoding/encoding.
+    /// - Error when any referenced column is missing from table metadata.
+    fn required_column_indexes_for_secondary_index(
+        &self,
+        index: &SecondaryIndexRecord,
+    ) -> Result<BTreeSet<usize>> {
+        let by_name = self
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(idx, column)| (column.name.to_ascii_lowercase(), idx))
+            .collect::<BTreeMap<_, _>>();
+        let mut out = BTreeSet::<usize>::new();
+        out.insert(self.primary_key_index);
+
+        for column in index.key_columns.iter().chain(index.include_columns.iter()) {
+            let normalized = column.to_ascii_lowercase();
+            let idx = by_name.get(normalized.as_str()).copied().ok_or_else(|| {
+                anyhow!(
+                    "secondary index '{}' references missing column '{}'",
+                    index.index_name,
+                    column
+                )
+            })?;
+            out.insert(idx);
+        }
+        Ok(out)
     }
 
     fn optimizer_bootstrap_stats(&self, approx_row_count: u64) -> TableStats {
@@ -1964,6 +2168,62 @@ impl HoloStoreTableProvider {
         }
         self.scan_rows_with_bounds_with_versions_generic(bounds, limit, 1)
             .await
+    }
+
+    /// Scans row_v1 rows by primary-key bounds while decoding only selected columns.
+    ///
+    /// Design:
+    /// - Preserve scan semantics of the full-row API while reducing decode overhead
+    ///   for internal paths (for example index backfill) that only need a subset.
+    ///
+    /// Inputs:
+    /// - `lower`/`upper`: optional primary-key bounds with inclusive/exclusive flags.
+    /// - `limit`: optional maximum number of returned rows.
+    /// - `required_column_indexes`: projected column indexes to materialize.
+    ///
+    /// Outputs:
+    /// - Versioned rows with full row shape where non-projected columns remain
+    ///   unset (`NULL`) and projected columns are decoded from storage.
+    pub async fn scan_generic_rows_with_versions_by_primary_key_bounds_projected(
+        &self,
+        lower: Option<(i64, bool)>,
+        upper: Option<(i64, bool)>,
+        limit: Option<usize>,
+        required_column_indexes: &BTreeSet<usize>,
+    ) -> Result<Vec<VersionedGenericRow>> {
+        if self.row_codec_mode != RowCodecMode::RowV1 {
+            return Err(anyhow!(
+                "generic row scan is only available for row_v1 table model"
+            ));
+        }
+        let mut bounds = PkBounds::default();
+        if let Some((value, inclusive)) = lower {
+            bounds.apply(
+                if inclusive {
+                    Operator::GtEq
+                } else {
+                    Operator::Gt
+                },
+                value,
+            );
+        }
+        if let Some((value, inclusive)) = upper {
+            bounds.apply(
+                if inclusive {
+                    Operator::LtEq
+                } else {
+                    Operator::Lt
+                },
+                value,
+            );
+        }
+        self.scan_rows_with_bounds_with_versions_generic_projected(
+            bounds,
+            limit,
+            1,
+            required_column_indexes,
+        )
+        .await
     }
 
     /// Executes grouped `COUNT(*)/SUM(column)` aggregation with top-k ordering using provider pushdown.
@@ -2503,19 +2763,28 @@ impl HoloStoreTableProvider {
             ));
         }
 
-        // Keep index backfill batches smaller than generic scan pages to avoid
-        // long per-RPC conditional apply stalls under hot-shard pressure.
-        let page_size = self
-            .page_size
-            .min(configured_index_backfill_page_size())
-            .max(1);
+        let mut page_size = self.plan_index_backfill_page_size(index);
+        let required_column_indexes = self.required_column_indexes_for_secondary_index(index)?;
         let mut lower = None::<(i64, bool)>;
         let mut backfilled_rows = 0u64;
         let tombstone = index_tombstone_value();
+        info!(
+            table = %self.table_name,
+            index = %index.index_name,
+            page_size,
+            configured_page_cap = configured_index_backfill_page_size(),
+            scan_page_size = self.page_size,
+            "secondary index backfill page-size plan"
+        );
 
         loop {
             let rows = self
-                .scan_generic_rows_with_versions_by_primary_key_bounds(lower, None, Some(page_size))
+                .scan_generic_rows_with_versions_by_primary_key_bounds_projected(
+                    lower,
+                    None,
+                    Some(page_size),
+                    &required_column_indexes,
+                )
                 .await?;
             if rows.is_empty() {
                 break;
@@ -2546,10 +2815,29 @@ impl HoloStoreTableProvider {
                 }
             }
 
-            match self
+            let applied = match self
                 .apply_storage_writes_conditional_detailed(writes.as_slice(), "index_backfill")
-                .await?
+                .await
             {
+                Ok(applied) => applied,
+                Err(err) => {
+                    if Self::should_retry_backfill_with_smaller_page(&err) && page_size > 1 {
+                        let next_page_size = (page_size / 2).max(1);
+                        info!(
+                            table = %self.table_name,
+                            index = %index.index_name,
+                            page_size,
+                            next_page_size,
+                            "secondary index backfill shrinking page after inflight budget rejection"
+                        );
+                        page_size = next_page_size;
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
+
+            match applied {
                 ConditionalWriteDetailedOutcome::Applied(_) => {}
                 ConditionalWriteDetailedOutcome::Conflict => {
                     return Err(
@@ -2561,6 +2849,10 @@ impl HoloStoreTableProvider {
             backfilled_rows = backfilled_rows.saturating_add(rows.len() as u64);
             let last_pk = rows.last().map(|row| row.primary_key).unwrap_or(i64::MAX);
             lower = Some((last_pk, false));
+            let planned_page_size = self.plan_index_backfill_page_size(index);
+            if page_size < planned_page_size {
+                page_size = page_size.saturating_mul(2).min(planned_page_size);
+            }
         }
 
         Ok(backfilled_rows)
@@ -2782,11 +3074,82 @@ impl HoloStoreTableProvider {
                 pipeline_depth: self.distributed_bulk_rpc_pipeline_depth.max(1),
             };
         }
+        if op == "index_backfill" {
+            return WriteApplyLimits {
+                batch_entries: self.index_backfill_write_max_batch_entries.max(1),
+                batch_bytes: self.index_backfill_write_max_batch_bytes.max(1),
+                pipeline_depth: self.index_backfill_write_pipeline_depth.max(1),
+            };
+        }
         WriteApplyLimits {
             batch_entries: self.distributed_write_max_batch_entries.max(1),
             batch_bytes: self.distributed_write_max_batch_bytes.max(1),
             pipeline_depth: self.distributed_write_pipeline_depth.max(1),
         }
+    }
+
+    /// Plans one scan-iteration row cap for secondary-index backfill.
+    ///
+    /// Design:
+    /// - Keep enough source rows in each iteration to saturate conditional-write
+    ///   pipelines (`batch_entries * pipeline_depth`) under default settings.
+    /// - Preserve operational safety by honoring explicit operator cap
+    ///   (`HOLO_FUSION_INDEX_BACKFILL_PAGE_SIZE`) plus global in-flight row/RPC
+    ///   budgets before the write planner runs.
+    /// - Reserve write budget for unique indexes, which may emit both row-key and
+    ///   uniqueness-reservation writes for every source row.
+    ///
+    /// Inputs:
+    /// - `index`: secondary-index metadata driving per-row write fan-out.
+    ///
+    /// Outputs:
+    /// - Positive row-page size used as the scan limit for one backfill loop.
+    fn plan_index_backfill_page_size(&self, index: &SecondaryIndexRecord) -> usize {
+        let operator_cap = configured_index_backfill_page_size().max(1);
+        let write_limits = self.write_apply_limits_for_op("index_backfill");
+        let writes_per_row = if index.unique { 2usize } else { 1usize };
+
+        let pipeline_write_target = write_limits
+            .batch_entries
+            .saturating_mul(write_limits.pipeline_depth)
+            .max(write_limits.batch_entries)
+            .max(1);
+        let inflight_write_cap = self.inflight_budget.max_rows.max(1);
+        let inflight_rpc_write_cap = self
+            .inflight_budget
+            .max_rpcs
+            .saturating_mul(write_limits.batch_entries)
+            .max(1);
+        let write_budget = pipeline_write_target
+            .min(inflight_write_cap)
+            .min(inflight_rpc_write_cap)
+            .max(1);
+        let row_budget = write_budget.saturating_div(writes_per_row).max(1);
+
+        operator_cap.min(row_budget).max(1)
+    }
+
+    /// Classifies backfill apply failures that should trigger page-size shrink.
+    ///
+    /// Design:
+    /// - Treat in-flight budget rejections as a signal that the current scan page
+    ///   is too large for current payload shape; shrinking preserves correctness
+    ///   and retries deterministically from the same lower bound.
+    /// - Avoid shrinking on unrelated overload classes (for example circuit-open)
+    ///   where reducing page size would not resolve root cause.
+    ///
+    /// Inputs:
+    /// - `err`: apply failure emitted by distributed conditional-write path.
+    ///
+    /// Outputs:
+    /// - `true` when caller should reduce page size and retry same scan segment.
+    fn should_retry_backfill_with_smaller_page(err: &anyhow::Error) -> bool {
+        let message = err.to_string();
+        if !is_overload_error_message(message.as_str()) {
+            return false;
+        }
+        let lower = message.to_ascii_lowercase();
+        lower.contains("write inflight budget exceeded") && lower.contains("write_plan")
     }
 
     /// Applies conditional writes keyed by normalized primary key.
@@ -2972,432 +3335,118 @@ impl HoloStoreTableProvider {
             self.enforce_inflight_budget(planned_rows, planned_bytes, planned_rpcs, "write_plan")?;
 
             let mut applied_targets = Vec::<(WriteTarget, Vec<PreparedConditionalEntry>)>::new();
-            let pipeline_depth = write_limits.pipeline_depth;
-            for (target, mut entries) in by_target {
-                #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-                enum TargetFailureKind {
-                    Conflict,
-                    Retryable,
-                    NonRetryable,
-                }
-
-                let expected = entries.len() as u64;
-                let write_client = self.client_for(target.grpc_addr);
-                let batch_ranges = conditional_chunk_ranges(
-                    entries.as_slice(),
-                    write_limits.batch_entries,
-                    write_limits.batch_bytes,
-                );
-                let batch_count = batch_ranges.len();
-                let inflight_limit = pipeline_depth.min(batch_count.max(1));
-                let mut pending = batch_ranges
-                    .into_iter()
-                    .enumerate()
-                    .collect::<VecDeque<_>>();
-                let mut inflight = futures_util::stream::FuturesUnordered::<
-                    futures_util::future::BoxFuture<
-                        'static,
-                        (
-                            usize,
-                            usize,
-                            usize,
-                            u64,
-                            Instant,
-                            CircuitAcquireToken,
-                            anyhow::Result<ReplicatedConditionalApplyResult>,
-                        ),
-                    >,
-                >::new();
-                let mut applied_this_target = Vec::<PreparedConditionalEntry>::new();
-                let mut applied_total = 0u64;
-                let mut target_failure: Option<(TargetFailureKind, anyhow::Error)> = None;
-                let target_key = target.grpc_addr.to_string();
-
-                while target_failure.is_none() && inflight.len() < inflight_limit {
-                    let Some((batch_idx, batch_range)) = pending.pop_front() else {
-                        break;
-                    };
-                    let start = batch_range.start;
-                    let end = batch_range.end;
-                    let batch_bytes = entries[start..end]
-                        .iter()
-                        .map(prepared_conditional_entry_size)
-                        .fold(0usize, |acc, next| acc.saturating_add(next));
-                    let request_entries = entries[start..end]
-                        .iter()
-                        .map(|entry| ReplicatedConditionalWriteEntry {
-                            key: entry.key.clone(),
-                            value: entry.value.clone(),
-                            expected_version: entry.expected_version,
-                        })
-                        .collect::<Vec<_>>();
-                    let batch_expected = request_entries.len() as u64;
-                    if let Err(err) = self.enforce_inflight_budget(
-                        batch_expected as usize,
-                        batch_bytes,
-                        1,
-                        "conditional_apply_batch",
-                    ) {
-                        target_failure = Some((TargetFailureKind::NonRetryable, err));
-                        break;
-                    }
-                    let circuit_token = match self.circuit_acquire(target.grpc_addr) {
-                        Ok(token) => token,
-                        Err(err) => {
-                            let apply_error = anyhow!(
-                                "apply conditional {op} batch table={} shard={} target={} chunk={}/{} failed: {err}",
-                                self.table_name,
-                                target.shard_index,
-                                target.grpc_addr,
-                                batch_idx + 1,
-                                batch_count
-                            );
-                            let classification =
-                                classify_write_error_message(apply_error.to_string().as_str());
-                            self.metrics.record_distributed_apply_failure(
-                                target_key.as_str(),
-                                classification.is_retryable(),
-                            );
-                            target_failure = Some((
-                                if classification.is_retryable() {
-                                    TargetFailureKind::Retryable
-                                } else {
-                                    TargetFailureKind::NonRetryable
-                                },
-                                apply_error,
-                            ));
-                            break;
-                        }
-                    };
-                    let apply_span = info_span!(
-                        "holo_fusion.distributed_write_apply",
-                        table = %self.table_name,
-                        op = op,
-                        shard_index = target.shard_index,
-                        target = %target.grpc_addr,
-                        batch_index = batch_idx + 1,
-                        batch_count = batch_count
-                    );
-                    let apply_started = Instant::now();
-                    let write_client = write_client.clone();
-                    let shard_index = target.shard_index;
-                    let start_key = target.start_key.clone();
-                    let end_key = target.end_key.clone();
-                    inflight.push(Box::pin(async move {
-                        let result = write_client
-                            .range_write_latest_conditional(
-                                shard_index,
-                                start_key.as_slice(),
-                                end_key.as_slice(),
-                                request_entries,
-                            )
-                            .instrument(apply_span)
-                            .await;
-                        (
-                            batch_idx,
-                            start,
-                            end,
-                            batch_expected,
-                            apply_started,
-                            circuit_token,
-                            result,
-                        )
-                    }));
-                }
-
-                while let Some((
-                    batch_idx,
-                    start,
-                    end,
-                    batch_expected,
-                    apply_started,
-                    circuit_token,
-                    result,
-                )) = inflight.next().await
-                {
-                    match result {
-                        Ok(result) => {
-                            self.circuit_on_success(target.grpc_addr, circuit_token);
-                            self.metrics.record_distributed_apply(
-                                target.shard_index,
-                                batch_expected,
-                                apply_started.elapsed(),
-                            );
-
-                            if result.conflicts > 0 {
-                                self.metrics.record_distributed_conflict(target.shard_index);
-                                if target_failure.is_none() {
-                                    target_failure = Some((
-                                        TargetFailureKind::Conflict,
-                                        anyhow!(
-                                            "conditional {op} conflict on shard {} chunk {}/{}",
-                                            target.shard_index,
-                                            batch_idx + 1,
-                                            batch_count
-                                        ),
-                                    ));
-                                }
-                            } else if result.applied != batch_expected {
-                                if target_failure.is_none() {
-                                    target_failure = Some((
-                                        TargetFailureKind::NonRetryable,
-                                        anyhow!(
-                                            "partial conditional {op} apply on shard {} chunk {}/{}: expected {}, applied {}",
-                                            target.shard_index,
-                                            batch_idx + 1,
-                                            batch_count,
-                                            batch_expected,
-                                            result.applied
-                                        ),
-                                    ));
-                                }
-                            } else {
-                                let mut versions_by_key = BTreeMap::<Vec<u8>, RpcVersion>::new();
-                                for item in result.applied_versions {
-                                    versions_by_key.insert(item.key, item.version);
-                                }
-                                if versions_by_key.len() != batch_expected as usize {
-                                    if target_failure.is_none() {
-                                        target_failure = Some((
-                                            TargetFailureKind::NonRetryable,
-                                            anyhow!(
-                                                "conditional {op} response missing applied versions on shard {} chunk {}/{}: expected {}, got {}",
-                                                target.shard_index,
-                                                batch_idx + 1,
-                                                batch_count,
-                                                batch_expected,
-                                                versions_by_key.len()
-                                            ),
-                                        ));
-                                    }
-                                } else {
-                                    let mut missing_version = None::<anyhow::Error>;
-                                    for entry in &mut entries[start..end] {
-                                        let Some(applied_version) =
-                                            versions_by_key.get(entry.key.as_slice()).copied()
-                                        else {
-                                            missing_version = Some(anyhow!(
-                                                "conditional {op} response missing applied version for key={} on shard {} chunk {}/{}",
-                                                hex::encode(&entry.key),
-                                                target.shard_index,
-                                                batch_idx + 1,
-                                                batch_count
-                                            ));
-                                            break;
-                                        };
-                                        entry.applied_version = applied_version;
-                                    }
-                                    if let Some(err) = missing_version {
-                                        if target_failure.is_none() {
-                                            target_failure =
-                                                Some((TargetFailureKind::NonRetryable, err));
-                                        }
-                                    } else {
-                                        applied_this_target
-                                            .extend(entries[start..end].iter().cloned());
-                                        applied_total =
-                                            applied_total.saturating_add(result.applied);
-                                    }
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            let apply_error = anyhow!(
-                                "apply conditional {op} batch table={} shard={} target={} chunk={}/{} failed: {err}",
-                                self.table_name,
-                                target.shard_index,
-                                target.grpc_addr,
-                                batch_idx + 1,
-                                batch_count
-                            );
-                            let classification =
-                                classify_write_error_message(apply_error.to_string().as_str());
-                            self.circuit_on_classified_failure(
-                                target.grpc_addr,
-                                circuit_token,
-                                classification,
-                            );
-                            self.metrics.record_distributed_apply_failure(
-                                target_key.as_str(),
-                                classification.is_retryable(),
-                            );
-                            if target_failure.is_none() {
-                                target_failure = Some((
-                                    if classification.is_retryable() {
-                                        TargetFailureKind::Retryable
-                                    } else {
-                                        TargetFailureKind::NonRetryable
-                                    },
-                                    apply_error,
-                                ));
-                            }
-                        }
-                    }
-
-                    while target_failure.is_none() && inflight.len() < inflight_limit {
-                        let Some((batch_idx, batch_range)) = pending.pop_front() else {
-                            break;
-                        };
-                        let start = batch_range.start;
-                        let end = batch_range.end;
-                        let batch_bytes = entries[start..end]
-                            .iter()
-                            .map(prepared_conditional_entry_size)
-                            .fold(0usize, |acc, next| acc.saturating_add(next));
-                        let request_entries = entries[start..end]
-                            .iter()
-                            .map(|entry| ReplicatedConditionalWriteEntry {
-                                key: entry.key.clone(),
-                                value: entry.value.clone(),
-                                expected_version: entry.expected_version,
-                            })
-                            .collect::<Vec<_>>();
-                        let batch_expected = request_entries.len() as u64;
-                        if let Err(err) = self.enforce_inflight_budget(
-                            batch_expected as usize,
-                            batch_bytes,
-                            1,
-                            "conditional_apply_batch",
-                        ) {
-                            target_failure = Some((TargetFailureKind::NonRetryable, err));
-                            break;
-                        }
-                        let circuit_token = match self.circuit_acquire(target.grpc_addr) {
-                            Ok(token) => token,
-                            Err(err) => {
-                                let apply_error = anyhow!(
-                                    "apply conditional {op} batch table={} shard={} target={} chunk={}/{} failed: {err}",
-                                    self.table_name,
-                                    target.shard_index,
-                                    target.grpc_addr,
-                                    batch_idx + 1,
-                                    batch_count
-                                );
-                                let classification =
-                                    classify_write_error_message(apply_error.to_string().as_str());
-                                self.metrics.record_distributed_apply_failure(
-                                    target_key.as_str(),
-                                    classification.is_retryable(),
-                                );
-                                target_failure = Some((
-                                    if classification.is_retryable() {
-                                        TargetFailureKind::Retryable
-                                    } else {
-                                        TargetFailureKind::NonRetryable
-                                    },
-                                    apply_error,
-                                ));
-                                break;
-                            }
-                        };
-                        let apply_span = info_span!(
-                            "holo_fusion.distributed_write_apply",
-                            table = %self.table_name,
-                            op = op,
-                            shard_index = target.shard_index,
-                            target = %target.grpc_addr,
-                            batch_index = batch_idx + 1,
-                            batch_count = batch_count
-                        );
-                        let apply_started = Instant::now();
-                        let write_client = write_client.clone();
-                        let shard_index = target.shard_index;
-                        let start_key = target.start_key.clone();
-                        let end_key = target.end_key.clone();
-                        inflight.push(Box::pin(async move {
-                            let result = write_client
-                                .range_write_latest_conditional(
-                                    shard_index,
-                                    start_key.as_slice(),
-                                    end_key.as_slice(),
-                                    request_entries,
-                                )
-                                .instrument(apply_span)
-                                .await;
-                            (
-                                batch_idx,
-                                start,
-                                end,
-                                batch_expected,
-                                apply_started,
-                                circuit_token,
-                                result,
-                            )
-                        }));
-                    }
-                }
-
-                if let Some((failure_kind, failure_err)) = target_failure {
-                    if !applied_this_target.is_empty() {
-                        let rollback_scope = vec![(target.clone(), applied_this_target.clone())];
-                        self.rollback_conditional_targets(rollback_scope.as_slice(), op)
+            let mut failures = Vec::<TargetApplyFailure>::new();
+            let target_entries = by_target.into_iter().collect::<Vec<_>>();
+            let backfill_parallel_targets = op == "index_backfill" && target_entries.len() > 1;
+            if backfill_parallel_targets {
+                let concurrency = self
+                    .index_backfill_target_parallelism
+                    .max(1)
+                    .min(target_entries.len());
+                let executions = futures_util::stream::iter(target_entries.into_iter().map(
+                    |(target, entries)| async move {
+                        self.apply_conditional_entries_for_target(target, entries, op, write_limits)
                             .await
-                            .with_context(|| {
-                                format!(
-                                    "rollback conditional {op} writes for shard {} after pipelined apply failure",
-                                    target.shard_index
-                                )
-                            })?;
+                    },
+                ))
+                .buffer_unordered(concurrency)
+                .collect::<Vec<_>>()
+                .await;
+                for execution in executions {
+                    match execution {
+                        TargetApplyExecution::Applied { target, entries } => {
+                            applied_targets.push((target, entries));
+                        }
+                        TargetApplyExecution::Failed(failure) => {
+                            failures.push(failure);
+                        }
                     }
-                    if !applied_targets.is_empty() {
-                        self.rollback_conditional_targets(applied_targets.as_slice(), op)
-                            .await
-                            .with_context(|| {
-                                format!(
-                                    "rollback previously applied conditional {op} writes after pipelined apply failure"
-                                )
-                            })?;
+                }
+            } else {
+                for (target, entries) in target_entries {
+                    match self
+                        .apply_conditional_entries_for_target(target, entries, op, write_limits)
+                        .await
+                    {
+                        TargetApplyExecution::Applied { target, entries } => {
+                            applied_targets.push((target, entries));
+                        }
+                        TargetApplyExecution::Failed(failure) => {
+                            failures.push(failure);
+                            break;
+                        }
                     }
+                }
+            }
 
-                    match failure_kind {
+            if !failures.is_empty() {
+                let mut rollback_scope = applied_targets
+                    .iter()
+                    .map(|(target, entries)| (target.clone(), entries.clone()))
+                    .collect::<Vec<_>>();
+                for failure in &failures {
+                    if !failure.applied_entries.is_empty() {
+                        rollback_scope
+                            .push((failure.target.clone(), failure.applied_entries.clone()));
+                    }
+                }
+                if !rollback_scope.is_empty() {
+                    self.rollback_conditional_targets(rollback_scope.as_slice(), op)
+                        .await
+                        .with_context(|| {
+                            format!("rollback conditional {op} writes after apply failure")
+                        })?;
+                }
+
+                let mut first_conflict = None::<TargetApplyFailure>;
+                let mut first_retryable = None::<TargetApplyFailure>;
+                let mut first_non_retryable = None::<TargetApplyFailure>;
+                for failure in failures {
+                    match failure.kind {
                         TargetFailureKind::Conflict => {
-                            return Ok(ConditionalWriteDetailedOutcome::Conflict);
+                            if first_conflict.is_none() {
+                                first_conflict = Some(failure);
+                            }
                         }
                         TargetFailureKind::Retryable => {
-                            if attempt + 1 < retry_limit {
-                                if let Some(deadline) = retry_deadline {
-                                    if Instant::now() >= deadline {
-                                        return Err(failure_err);
-                                    }
-                                }
-                                last_retryable_error = Some(failure_err);
-                                tokio::time::sleep(retry_backoff(
-                                    retry_policy,
-                                    attempt,
-                                    target.grpc_addr.port() as u64,
-                                ))
-                                .await;
-                                continue 'attempts;
+                            if first_retryable.is_none() {
+                                first_retryable = Some(failure);
                             }
-                            return Err(failure_err);
                         }
                         TargetFailureKind::NonRetryable => {
-                            return Err(failure_err);
+                            if first_non_retryable.is_none() {
+                                first_non_retryable = Some(failure);
+                            }
                         }
                     }
                 }
 
-                // Decision: evaluate `applied_total != expected` to choose the correct SQL/storage control path.
-                if applied_total != expected {
-                    if !applied_this_target.is_empty() {
-                        let rollback_scope = vec![(target.clone(), applied_this_target)];
-                        self.rollback_conditional_targets(rollback_scope.as_slice(), op)
-                            .await?;
-                    }
-                    if !applied_targets.is_empty() {
-                        self.rollback_conditional_targets(applied_targets.as_slice(), op)
-                            .await?;
-                    }
-                    return Err(anyhow!(
-                        "conditional {op} apply row count mismatch on shard {}: expected {}, applied {}",
-                        target.shard_index,
-                        expected,
-                        applied_total
-                    ));
+                if let Some(failure) = first_non_retryable {
+                    return Err(failure.error);
                 }
-
-                applied_targets.push((target, entries));
+                if first_conflict.is_some() {
+                    return Ok(ConditionalWriteDetailedOutcome::Conflict);
+                }
+                if let Some(failure) = first_retryable {
+                    if attempt + 1 < retry_limit {
+                        if let Some(deadline) = retry_deadline {
+                            if Instant::now() >= deadline {
+                                return Err(failure.error);
+                            }
+                        }
+                        let jitter_seed = failure.target.grpc_addr.port() as u64;
+                        last_retryable_error = Some(failure.error);
+                        tokio::time::sleep(retry_backoff(retry_policy, attempt, jitter_seed)).await;
+                        continue 'attempts;
+                    }
+                    return Err(failure.error);
+                }
+                return Err(anyhow!(
+                    "conditional {op} apply failed without classified failure detail"
+                ));
             }
+
+            applied_targets.sort_by(|left, right| left.0.cmp(&right.0));
 
             return Ok(ConditionalWriteDetailedOutcome::Applied(
                 ConditionalWriteAppliedBatch {
@@ -3409,6 +3458,401 @@ impl HoloStoreTableProvider {
 
         Err(last_retryable_error
             .unwrap_or_else(|| anyhow!("conditional {op} write retries exhausted")))
+    }
+
+    /// Applies conditional writes for one routed target with pipelined RPC batches.
+    ///
+    /// Design:
+    /// - Keep per-target apply execution isolated so the coordinator can run targets
+    ///   sequentially or in bounded parallel mode while preserving rollback metadata.
+    /// - Preserve existing conditional semantics: every batch must apply fully with
+    ///   complete version echoes, otherwise this target is marked failed.
+    ///
+    /// Inputs:
+    /// - `target`: routed shard endpoint and key-range metadata.
+    /// - `entries`: prepared conditional writes for this target.
+    /// - `op`: operation label used in metrics/error context.
+    /// - `write_limits`: batch-size and pipeline controls for this operation class.
+    ///
+    /// Outputs:
+    /// - `TargetApplyExecution::Applied` with versioned entries when all writes apply.
+    /// - `TargetApplyExecution::Failed` with failure classification and partial applied
+    ///   entries (if any) for coordinator rollback.
+    async fn apply_conditional_entries_for_target(
+        &self,
+        target: WriteTarget,
+        mut entries: Vec<PreparedConditionalEntry>,
+        op: &'static str,
+        write_limits: WriteApplyLimits,
+    ) -> TargetApplyExecution {
+        let expected = entries.len() as u64;
+        let write_client = self.client_for(target.grpc_addr);
+        let batch_ranges = conditional_chunk_ranges(
+            entries.as_slice(),
+            write_limits.batch_entries,
+            write_limits.batch_bytes,
+        );
+        let batch_count = batch_ranges.len();
+        let inflight_limit = write_limits.pipeline_depth.min(batch_count.max(1));
+        let mut pending = batch_ranges
+            .into_iter()
+            .enumerate()
+            .collect::<VecDeque<_>>();
+        let mut inflight = futures_util::stream::FuturesUnordered::<
+            futures_util::future::BoxFuture<
+                'static,
+                (
+                    usize,
+                    usize,
+                    usize,
+                    u64,
+                    Instant,
+                    CircuitAcquireToken,
+                    anyhow::Result<ReplicatedConditionalApplyResult>,
+                ),
+            >,
+        >::new();
+        let mut applied_this_target = Vec::<PreparedConditionalEntry>::new();
+        let mut applied_total = 0u64;
+        let mut target_failure: Option<(TargetFailureKind, anyhow::Error)> = None;
+        let target_key = target.grpc_addr.to_string();
+
+        while target_failure.is_none() && inflight.len() < inflight_limit {
+            let Some((batch_idx, batch_range)) = pending.pop_front() else {
+                break;
+            };
+            let start = batch_range.start;
+            let end = batch_range.end;
+            let batch_bytes = entries[start..end]
+                .iter()
+                .map(prepared_conditional_entry_size)
+                .fold(0usize, |acc, next| acc.saturating_add(next));
+            let request_entries = entries[start..end]
+                .iter()
+                .map(|entry| ReplicatedConditionalWriteEntry {
+                    key: entry.key.clone(),
+                    value: entry.value.clone(),
+                    expected_version: entry.expected_version,
+                })
+                .collect::<Vec<_>>();
+            let batch_expected = request_entries.len() as u64;
+            if let Err(err) = self.enforce_inflight_budget(
+                batch_expected as usize,
+                batch_bytes,
+                1,
+                "conditional_apply_batch",
+            ) {
+                target_failure = Some((TargetFailureKind::NonRetryable, err));
+                break;
+            }
+            let circuit_token = match self.circuit_acquire(target.grpc_addr) {
+                Ok(token) => token,
+                Err(err) => {
+                    let apply_error = anyhow!(
+                        "apply conditional {op} batch table={} shard={} target={} chunk={}/{} failed: {err}",
+                        self.table_name,
+                        target.shard_index,
+                        target.grpc_addr,
+                        batch_idx + 1,
+                        batch_count
+                    );
+                    let classification =
+                        classify_write_error_message(apply_error.to_string().as_str());
+                    self.metrics.record_distributed_apply_failure(
+                        target_key.as_str(),
+                        classification.is_retryable(),
+                    );
+                    target_failure = Some((
+                        if classification.is_retryable() {
+                            TargetFailureKind::Retryable
+                        } else {
+                            TargetFailureKind::NonRetryable
+                        },
+                        apply_error,
+                    ));
+                    break;
+                }
+            };
+            let apply_span = info_span!(
+                "holo_fusion.distributed_write_apply",
+                table = %self.table_name,
+                op = op,
+                shard_index = target.shard_index,
+                target = %target.grpc_addr,
+                batch_index = batch_idx + 1,
+                batch_count = batch_count
+            );
+            let apply_started = Instant::now();
+            let write_client = write_client.clone();
+            let shard_index = target.shard_index;
+            let start_key = target.start_key.clone();
+            let end_key = target.end_key.clone();
+            inflight.push(Box::pin(async move {
+                let result = write_client
+                    .range_write_latest_conditional(
+                        shard_index,
+                        start_key.as_slice(),
+                        end_key.as_slice(),
+                        request_entries,
+                    )
+                    .instrument(apply_span)
+                    .await;
+                (
+                    batch_idx,
+                    start,
+                    end,
+                    batch_expected,
+                    apply_started,
+                    circuit_token,
+                    result,
+                )
+            }));
+        }
+
+        while let Some((
+            batch_idx,
+            start,
+            end,
+            batch_expected,
+            apply_started,
+            circuit_token,
+            result,
+        )) = inflight.next().await
+        {
+            match result {
+                Ok(result) => {
+                    self.circuit_on_success(target.grpc_addr, circuit_token);
+                    self.metrics.record_distributed_apply(
+                        target.shard_index,
+                        batch_expected,
+                        apply_started.elapsed(),
+                    );
+
+                    if result.conflicts > 0 {
+                        self.metrics.record_distributed_conflict(target.shard_index);
+                        if target_failure.is_none() {
+                            target_failure = Some((
+                                TargetFailureKind::Conflict,
+                                anyhow!(
+                                    "conditional {op} conflict on shard {} chunk {}/{}",
+                                    target.shard_index,
+                                    batch_idx + 1,
+                                    batch_count
+                                ),
+                            ));
+                        }
+                    } else if result.applied != batch_expected {
+                        if target_failure.is_none() {
+                            target_failure = Some((
+                                TargetFailureKind::NonRetryable,
+                                anyhow!(
+                                    "partial conditional {op} apply on shard {} chunk {}/{}: expected {}, applied {}",
+                                    target.shard_index,
+                                    batch_idx + 1,
+                                    batch_count,
+                                    batch_expected,
+                                    result.applied
+                                ),
+                            ));
+                        }
+                    } else {
+                        let mut versions_by_key = BTreeMap::<Vec<u8>, RpcVersion>::new();
+                        for item in result.applied_versions {
+                            versions_by_key.insert(item.key, item.version);
+                        }
+                        if versions_by_key.len() != batch_expected as usize {
+                            if target_failure.is_none() {
+                                target_failure = Some((
+                                    TargetFailureKind::NonRetryable,
+                                    anyhow!(
+                                        "conditional {op} response missing applied versions on shard {} chunk {}/{}: expected {}, got {}",
+                                        target.shard_index,
+                                        batch_idx + 1,
+                                        batch_count,
+                                        batch_expected,
+                                        versions_by_key.len()
+                                    ),
+                                ));
+                            }
+                        } else {
+                            let mut missing_version = None::<anyhow::Error>;
+                            for entry in &mut entries[start..end] {
+                                let Some(applied_version) =
+                                    versions_by_key.get(entry.key.as_slice()).copied()
+                                else {
+                                    missing_version = Some(anyhow!(
+                                        "conditional {op} response missing applied version for key={} on shard {} chunk {}/{}",
+                                        hex::encode(&entry.key),
+                                        target.shard_index,
+                                        batch_idx + 1,
+                                        batch_count
+                                    ));
+                                    break;
+                                };
+                                entry.applied_version = applied_version;
+                            }
+                            if let Some(err) = missing_version {
+                                if target_failure.is_none() {
+                                    target_failure = Some((TargetFailureKind::NonRetryable, err));
+                                }
+                            } else {
+                                applied_this_target.extend(entries[start..end].iter().cloned());
+                                applied_total = applied_total.saturating_add(result.applied);
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    let apply_error = anyhow!(
+                        "apply conditional {op} batch table={} shard={} target={} chunk={}/{} failed: {err}",
+                        self.table_name,
+                        target.shard_index,
+                        target.grpc_addr,
+                        batch_idx + 1,
+                        batch_count
+                    );
+                    let classification =
+                        classify_write_error_message(apply_error.to_string().as_str());
+                    self.circuit_on_classified_failure(
+                        target.grpc_addr,
+                        circuit_token,
+                        classification,
+                    );
+                    self.metrics.record_distributed_apply_failure(
+                        target_key.as_str(),
+                        classification.is_retryable(),
+                    );
+                    if target_failure.is_none() {
+                        target_failure = Some((
+                            if classification.is_retryable() {
+                                TargetFailureKind::Retryable
+                            } else {
+                                TargetFailureKind::NonRetryable
+                            },
+                            apply_error,
+                        ));
+                    }
+                }
+            }
+
+            while target_failure.is_none() && inflight.len() < inflight_limit {
+                let Some((batch_idx, batch_range)) = pending.pop_front() else {
+                    break;
+                };
+                let start = batch_range.start;
+                let end = batch_range.end;
+                let batch_bytes = entries[start..end]
+                    .iter()
+                    .map(prepared_conditional_entry_size)
+                    .fold(0usize, |acc, next| acc.saturating_add(next));
+                let request_entries = entries[start..end]
+                    .iter()
+                    .map(|entry| ReplicatedConditionalWriteEntry {
+                        key: entry.key.clone(),
+                        value: entry.value.clone(),
+                        expected_version: entry.expected_version,
+                    })
+                    .collect::<Vec<_>>();
+                let batch_expected = request_entries.len() as u64;
+                if let Err(err) = self.enforce_inflight_budget(
+                    batch_expected as usize,
+                    batch_bytes,
+                    1,
+                    "conditional_apply_batch",
+                ) {
+                    target_failure = Some((TargetFailureKind::NonRetryable, err));
+                    break;
+                }
+                let circuit_token = match self.circuit_acquire(target.grpc_addr) {
+                    Ok(token) => token,
+                    Err(err) => {
+                        let apply_error = anyhow!(
+                            "apply conditional {op} batch table={} shard={} target={} chunk={}/{} failed: {err}",
+                            self.table_name,
+                            target.shard_index,
+                            target.grpc_addr,
+                            batch_idx + 1,
+                            batch_count
+                        );
+                        let classification =
+                            classify_write_error_message(apply_error.to_string().as_str());
+                        self.metrics.record_distributed_apply_failure(
+                            target_key.as_str(),
+                            classification.is_retryable(),
+                        );
+                        target_failure = Some((
+                            if classification.is_retryable() {
+                                TargetFailureKind::Retryable
+                            } else {
+                                TargetFailureKind::NonRetryable
+                            },
+                            apply_error,
+                        ));
+                        break;
+                    }
+                };
+                let apply_span = info_span!(
+                    "holo_fusion.distributed_write_apply",
+                    table = %self.table_name,
+                    op = op,
+                    shard_index = target.shard_index,
+                    target = %target.grpc_addr,
+                    batch_index = batch_idx + 1,
+                    batch_count = batch_count
+                );
+                let apply_started = Instant::now();
+                let write_client = write_client.clone();
+                let shard_index = target.shard_index;
+                let start_key = target.start_key.clone();
+                let end_key = target.end_key.clone();
+                inflight.push(Box::pin(async move {
+                    let result = write_client
+                        .range_write_latest_conditional(
+                            shard_index,
+                            start_key.as_slice(),
+                            end_key.as_slice(),
+                            request_entries,
+                        )
+                        .instrument(apply_span)
+                        .await;
+                    (
+                        batch_idx,
+                        start,
+                        end,
+                        batch_expected,
+                        apply_started,
+                        circuit_token,
+                        result,
+                    )
+                }));
+            }
+        }
+
+        if let Some((kind, error)) = target_failure {
+            return TargetApplyExecution::Failed(TargetApplyFailure {
+                target,
+                kind,
+                error,
+                applied_entries: applied_this_target,
+            });
+        }
+
+        if applied_total != expected {
+            let shard_index = target.shard_index;
+            return TargetApplyExecution::Failed(TargetApplyFailure {
+                target,
+                kind: TargetFailureKind::NonRetryable,
+                error: anyhow!(
+                    "conditional {op} apply row count mismatch on shard {}: expected {}, applied {}",
+                    shard_index,
+                    expected,
+                    applied_total
+                ),
+                applied_entries: applied_this_target,
+            });
+        }
+
+        TargetApplyExecution::Applied { target, entries }
     }
 
     /// Scans orders rows with explicit query/stage context.
@@ -3632,6 +4076,7 @@ impl HoloStoreTableProvider {
                 limit,
                 pushed_filters.len(),
                 predicate.clone(),
+                None,
             )
             .await
         };
@@ -3806,6 +4251,44 @@ impl HoloStoreTableProvider {
             limit,
             pushed_filter_count,
             None,
+            None,
+        )
+        .await
+    }
+
+    /// Scans generic rows while decoding only required projected columns.
+    ///
+    /// Design:
+    /// - Reuse the generic scan pipeline and metrics path while allowing targeted
+    ///   decode projection for internal maintenance jobs.
+    ///
+    /// Inputs:
+    /// - `bounds`: primary-key scan bounds.
+    /// - `limit`: optional row cap.
+    /// - `pushed_filter_count`: scan diagnostics metadata.
+    /// - `required_column_indexes`: exact columns to materialize from payload.
+    ///
+    /// Outputs:
+    /// - Versioned generic rows constrained to projected decode requirements.
+    async fn scan_rows_with_bounds_with_versions_generic_projected(
+        &self,
+        bounds: PkBounds,
+        limit: Option<usize>,
+        pushed_filter_count: usize,
+        required_column_indexes: &BTreeSet<usize>,
+    ) -> Result<Vec<VersionedGenericRow>> {
+        let query_execution_id = self
+            .metrics
+            .ensure_query_execution_for_session("internal_scan_generic_projected", "INTERNAL_SCAN");
+        let stage_id = self.metrics.next_stage_execution_id();
+        self.scan_rows_with_bounds_with_versions_generic_ctx(
+            query_execution_id.as_str(),
+            stage_id,
+            bounds,
+            limit,
+            pushed_filter_count,
+            None,
+            Some(required_column_indexes),
         )
         .await
     }
@@ -3819,17 +4302,23 @@ impl HoloStoreTableProvider {
         limit: Option<usize>,
         pushed_filter_count: usize,
         predicate: Option<ScanPredicateExpr>,
+        required_column_indexes: Option<&BTreeSet<usize>>,
     ) -> Result<Vec<VersionedGenericRow>> {
         if bounds.is_empty() {
             return Ok(Vec::new());
         }
 
+        let projected_columns = if let Some(required) = required_column_indexes {
+            required.iter().copied().collect::<Vec<_>>()
+        } else {
+            (0..self.schema.fields().len()).collect::<Vec<_>>()
+        };
         let spec = ScanSpec {
             query_execution_id: query_execution_id.to_string(),
             stage_id,
             table_id: self.table_id,
             table_name: self.table_name.clone(),
-            projected_columns: (0..self.schema.fields().len()).collect(),
+            projected_columns,
             predicate,
             limit,
             bounds,
@@ -3837,12 +4326,22 @@ impl HoloStoreTableProvider {
         let execution = self.execute_scan_spec(&spec).await?;
         let mut rows = Vec::new();
         for entry in execution.entries {
-            let row = decode_generic_entry_with_version(
-                self.table_id,
-                self.columns.as_slice(),
-                self.primary_key_index,
-                &entry,
-            )?;
+            let row = if let Some(required) = required_column_indexes {
+                decode_generic_entry_with_version_projected(
+                    self.table_id,
+                    self.columns.as_slice(),
+                    self.primary_key_index,
+                    required,
+                    &entry,
+                )?
+            } else {
+                decode_generic_entry_with_version(
+                    self.table_id,
+                    self.columns.as_slice(),
+                    self.primary_key_index,
+                    &entry,
+                )?
+            };
             if let Some(row) = row {
                 if spec.bounds.matches(row.primary_key) {
                     rows.push(row);
@@ -4446,6 +4945,44 @@ impl HoloStoreTableProvider {
         limit: Option<usize>,
         stage_label: &str,
     ) -> Result<ScanExecutionResult> {
+        let tasks = self.build_scan_range_tasks(ranges).await;
+        self.execute_scan_tasks_ctx(
+            query_execution_id,
+            stage_id,
+            ranges.len(),
+            tasks,
+            limit,
+            stage_label,
+        )
+        .await
+    }
+
+    /// Executes a storage scan over preplanned range tasks and aggregates output/statistics.
+    ///
+    /// Design:
+    /// - Decouple scan-task planning from execution so callers that already resolved
+    ///   targets (for example `execute_scan_spec`) can avoid duplicate topology work.
+    /// - Preserve existing limit semantics: bounded scans execute tasks in order,
+    ///   while unbounded scans can fan out in parallel.
+    ///
+    /// Inputs:
+    /// - `query_execution_id`/`stage_id`: tracing and metrics identity.
+    /// - `range_count`: number of logical scan ranges before task expansion.
+    /// - `tasks`: prebuilt scan tasks (range+target pairs).
+    /// - `limit`: optional output row cap.
+    /// - `stage_label`: metrics stage label.
+    ///
+    /// Outputs:
+    /// - Raw latest entries plus aggregated scan statistics.
+    async fn execute_scan_tasks_ctx(
+        &self,
+        query_execution_id: &str,
+        stage_id: u64,
+        range_count: usize,
+        tasks: Vec<ScanRangeTask>,
+        limit: Option<usize>,
+        stage_label: &str,
+    ) -> Result<ScanExecutionResult> {
         let mut result = ScanExecutionResult::default();
         let mut seen_keys = BTreeSet::<Vec<u8>>::new();
 
@@ -4455,21 +4992,20 @@ impl HoloStoreTableProvider {
             stage_label,
             format!(
                 "ranges={} limit={}",
-                ranges.len(),
+                range_count,
                 limit
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "none".to_string())
             ),
         );
 
-        let tasks = self.build_scan_range_tasks(ranges).await;
         self.metrics.record_stage_event(
             query_execution_id,
             stage_id,
             "scan_partition_plan",
             format!(
                 "ranges={} tasks={} parallelism={} limit={}",
-                ranges.len(),
+                range_count,
                 tasks.len(),
                 self.scan_parallelism.max(1),
                 limit
@@ -5119,13 +5655,7 @@ impl HoloStoreTableProvider {
             return Ok(ScanExecutionResult::default());
         }
 
-        let mut all_targets = Vec::<LocalScanTarget>::new();
-        for (start_key, end_key) in &scan_ranges {
-            let mut targets = self
-                .scan_targets_for_range(start_key.as_slice(), end_key.as_slice())
-                .await;
-            all_targets.append(&mut targets);
-        }
+        let tasks = self.build_scan_range_tasks(scan_ranges.as_slice()).await;
         self.metrics.record_stage_event(
             spec.query_execution_id.as_str(),
             spec.stage_id,
@@ -5133,7 +5663,7 @@ impl HoloStoreTableProvider {
             format!(
                 "table={} targets={} projection_columns={} limit={}",
                 spec.table_name,
-                all_targets.len(),
+                tasks.len(),
                 spec.projected_columns.len(),
                 spec.limit
                     .map(|value| value.to_string())
@@ -5150,10 +5680,11 @@ impl HoloStoreTableProvider {
         }
 
         let result = self
-            .execute_scan_ranges_ctx(
+            .execute_scan_tasks_ctx(
                 spec.query_execution_id.as_str(),
                 spec.stage_id,
-                scan_ranges.as_slice(),
+                scan_ranges.len(),
+                tasks,
                 spec.limit,
                 "scan_stage_plan",
             )
@@ -8768,6 +9299,9 @@ mod tests {
         provider.distributed_bulk_rpc_max_batch_entries = 4_444;
         provider.distributed_bulk_rpc_max_batch_bytes = 5_555;
         provider.distributed_bulk_rpc_pipeline_depth = 8;
+        provider.index_backfill_write_max_batch_entries = 6_666;
+        provider.index_backfill_write_max_batch_bytes = 7_777;
+        provider.index_backfill_write_pipeline_depth = 9;
 
         assert_eq!(
             provider.write_apply_limits_for_op("insert"),
@@ -8785,6 +9319,131 @@ mod tests {
                 pipeline_depth: 8,
             }
         );
+        assert_eq!(
+            provider.write_apply_limits_for_op("index_backfill"),
+            WriteApplyLimits {
+                batch_entries: 6_666,
+                batch_bytes: 7_777,
+                pipeline_depth: 9,
+            }
+        );
+    }
+
+    #[test]
+    fn index_backfill_page_plan_targets_pipeline_for_non_unique_indexes() {
+        let client =
+            HoloStoreClient::new("127.0.0.1:15051".parse().expect("parse loopback grpc addr"));
+        let mut provider =
+            HoloStoreTableProvider::orders(client, Arc::new(PushdownMetrics::default()));
+        provider.index_backfill_write_max_batch_entries = 4_096;
+        provider.index_backfill_write_pipeline_depth = 8;
+        provider.inflight_budget = InflightBudgetConfig {
+            max_rows: 32_768,
+            max_bytes: 32 * 1024 * 1024,
+            max_rpcs: 32,
+        };
+
+        let index = SecondaryIndexRecord {
+            db_id: 1,
+            schema_id: 1,
+            table_id: provider.table_id,
+            index_id: 7,
+            table_name: provider.table_name.clone(),
+            index_name: "idx_non_unique".to_string(),
+            unique: false,
+            key_columns: vec!["order_id".to_string()],
+            include_columns: Vec::new(),
+            distribution: SecondaryIndexDistribution::Range,
+            hash_bucket_count: None,
+            state: SecondaryIndexState::WriteOnly,
+            created_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+        };
+
+        let page_size = provider.plan_index_backfill_page_size(&index);
+        assert_eq!(page_size, configured_index_backfill_page_size().min(32_768));
+    }
+
+    #[test]
+    fn index_backfill_page_plan_reserves_budget_for_unique_indexes() {
+        let client =
+            HoloStoreClient::new("127.0.0.1:15051".parse().expect("parse loopback grpc addr"));
+        let mut provider =
+            HoloStoreTableProvider::orders(client, Arc::new(PushdownMetrics::default()));
+        provider.index_backfill_write_max_batch_entries = 4_096;
+        provider.index_backfill_write_pipeline_depth = 8;
+        provider.inflight_budget = InflightBudgetConfig {
+            max_rows: 32_768,
+            max_bytes: 32 * 1024 * 1024,
+            max_rpcs: 32,
+        };
+
+        let index = SecondaryIndexRecord {
+            db_id: 1,
+            schema_id: 1,
+            table_id: provider.table_id,
+            index_id: 8,
+            table_name: provider.table_name.clone(),
+            index_name: "idx_unique".to_string(),
+            unique: true,
+            key_columns: vec!["order_id".to_string()],
+            include_columns: Vec::new(),
+            distribution: SecondaryIndexDistribution::Range,
+            hash_bucket_count: None,
+            state: SecondaryIndexState::WriteOnly,
+            created_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+        };
+
+        let page_size = provider.plan_index_backfill_page_size(&index);
+        assert_eq!(page_size, configured_index_backfill_page_size().min(16_384));
+    }
+
+    #[test]
+    fn index_backfill_page_plan_honors_inflight_rpc_budget() {
+        let client =
+            HoloStoreClient::new("127.0.0.1:15051".parse().expect("parse loopback grpc addr"));
+        let mut provider =
+            HoloStoreTableProvider::orders(client, Arc::new(PushdownMetrics::default()));
+        provider.index_backfill_write_max_batch_entries = 4_096;
+        provider.index_backfill_write_pipeline_depth = 8;
+        provider.inflight_budget = InflightBudgetConfig {
+            max_rows: 64_000,
+            max_bytes: 64 * 1024 * 1024,
+            max_rpcs: 2,
+        };
+
+        let index = SecondaryIndexRecord {
+            db_id: 1,
+            schema_id: 1,
+            table_id: provider.table_id,
+            index_id: 9,
+            table_name: provider.table_name.clone(),
+            index_name: "idx_rpc_cap".to_string(),
+            unique: false,
+            key_columns: vec!["order_id".to_string()],
+            include_columns: Vec::new(),
+            distribution: SecondaryIndexDistribution::Range,
+            hash_bucket_count: None,
+            state: SecondaryIndexState::WriteOnly,
+            created_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+        };
+
+        let page_size = provider.plan_index_backfill_page_size(&index);
+        assert_eq!(page_size, configured_index_backfill_page_size().min(8_192));
+    }
+
+    #[test]
+    fn backfill_page_shrink_classifier_matches_only_budget_rejections() {
+        let budget_err = anyhow::anyhow!(
+            "server is overloaded: write inflight budget exceeded in write_plan: rows=65536 (max 32768)"
+        );
+        assert!(HoloStoreTableProvider::should_retry_backfill_with_smaller_page(&budget_err));
+
+        let circuit_err =
+            anyhow::anyhow!("server is overloaded: circuit breaker open for 127.0.0.1:15051");
+        assert!(!HoloStoreTableProvider::should_retry_backfill_with_smaller_page(&circuit_err));
     }
 
     #[test]

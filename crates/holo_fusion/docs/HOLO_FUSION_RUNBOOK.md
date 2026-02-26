@@ -230,6 +230,12 @@ Primary runtime knobs:
 | `HOLO_FUSION_DML_WRITE_MAX_INFLIGHT_BYTES` | `33554432` | In-flight byte budget guardrail. |
 | `HOLO_FUSION_DML_WRITE_MAX_INFLIGHT_RPCS` | `32` | In-flight RPC budget guardrail. |
 | `HOLO_FUSION_DML_WRITE_PIPELINE_DEPTH` | `4` | Max in-flight write batches per target before awaiting completions. |
+| `HOLO_FUSION_SCAN_PARALLELISM` | host CPU count (clamped to `1..64`) | Max concurrent scan tasks for unbounded scans and maintenance jobs. |
+| `HOLO_FUSION_INDEX_BACKFILL_PAGE_SIZE` | `32768` | Row-page cap per backfill scan iteration (runtime planner may choose smaller pages to honor in-flight budgets). |
+| `HOLO_FUSION_INDEX_BACKFILL_WRITE_MAX_BATCH_ENTRIES` | `4096` | Max conditional entries per backfill write RPC chunk. |
+| `HOLO_FUSION_INDEX_BACKFILL_WRITE_MAX_BATCH_BYTES` | `4194304` | Approximate payload budget per backfill write RPC chunk. |
+| `HOLO_FUSION_INDEX_BACKFILL_WRITE_PIPELINE_DEPTH` | `8` | Max in-flight backfill write batches per target. |
+| `HOLO_FUSION_INDEX_BACKFILL_TARGET_PARALLELISM` | min(`HOLO_FUSION_SCAN_PARALLELISM`, `32`) | Max concurrent shard targets during one backfill apply attempt. |
 | `HOLO_FUSION_BULK_CHUNK_ROWS_INITIAL` | `1024` | Initial adaptive chunk target for bulk ingest. |
 | `HOLO_FUSION_BULK_CHUNK_ROWS_MIN` | `128` | Lower bound for adaptive bulk chunking. |
 | `HOLO_FUSION_BULK_CHUNK_ROWS_MAX` | `8192` | Upper bound for adaptive bulk chunking. |
