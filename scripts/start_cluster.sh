@@ -161,6 +161,8 @@ export HOLO_WAL_PERSIST_MODE="${HOLO_WAL_PERSIST_MODE:-sync_data}"
 export HOLO_WAL_PERSIST_EVERY="${HOLO_WAL_PERSIST_EVERY:-1024}"
 export HOLO_WAL_PERSIST_INTERVAL_US="${HOLO_WAL_PERSIST_INTERVAL_US:-10000}"
 export HOLO_WAL_PERSIST_ASYNC="${HOLO_WAL_PERSIST_ASYNC:-false}"
+# Commit ACK durability semantics (`async_commit` or `sync_commit`).
+export HOLO_COMMIT_DURABILITY_MODE="${HOLO_COMMIT_DURABILITY_MODE:-sync_commit}"
 
 check_port_free() {
   local port="$1"

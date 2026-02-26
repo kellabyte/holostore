@@ -21,10 +21,11 @@ use super::state::{
     is_monotonic_update, status_to_txn_status, ExecutedLogEntry, Record, State, Status,
 };
 use super::types::{
-    txn_group_id, AcceptRequest, AcceptResponse, Ballot, CommandKeys, CommitLog, CommitLogEntry,
-    CommitRequest, CommitResponse, Config, ExecMeta, ExecutedPrefix, Member, NodeId,
-    PreAcceptRequest, PreAcceptResponse, RecoverRequest, RecoverResponse, ReportExecutedRequest,
-    ReportExecutedResponse, StateMachine, Transport, TxnId, TxnStatus, TXN_COUNTER_SHARD_SHIFT,
+    txn_group_id, AcceptRequest, AcceptResponse, Ballot, CommandKeys, CommitLog,
+    CommitLogAppendOptions, CommitLogEntry, CommitRequest, CommitResponse, Config, ExecMeta,
+    ExecutedPrefix, Member, NodeId, PreAcceptRequest, PreAcceptResponse, RecoverRequest,
+    RecoverResponse, ReportExecutedRequest, ReportExecutedResponse, StateMachine, Transport, TxnId,
+    TxnStatus, TXN_COUNTER_SHARD_SHIFT,
 };
 
 const COMPACT_EVERY_APPLIED: u64 = 1024;
@@ -175,7 +176,7 @@ pub struct Group {
     transport: Arc<dyn Transport>,
     sm: Arc<dyn StateMachine>,
     commit_log: Option<Arc<dyn CommitLog>>,
-    commit_log_tx: Option<std_mpsc::Sender<CommitLogEntry>>,
+    commit_log_tx: Option<std_mpsc::Sender<CommitLogWork>>,
     apply_tx: Option<std_mpsc::Sender<ApplyWork>>,
     state: Mutex<State>,
     execute_lock: Mutex<()>,
@@ -200,6 +201,22 @@ struct ApplyItem {
 struct ApplyWork {
     batch: Vec<(Vec<u8>, ExecMeta)>,
     tx: oneshot::Sender<ApplyResult>,
+}
+
+/// Work item sent to the commit-log batcher.
+///
+/// Inputs:
+/// - `entry`: commit record to append to the WAL.
+/// - `require_durable`: whether this caller requires fsync-on-ack semantics.
+/// - `done_tx`: completion channel that receives the final append result.
+///
+/// Design:
+/// - Multiple items can be batched together; if any item requires durable
+///   persistence, the whole batch is appended with `require_durable=true`.
+struct CommitLogWork {
+    entry: CommitLogEntry,
+    require_durable: bool,
+    done_tx: std_mpsc::Sender<anyhow::Result<()>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -416,6 +433,21 @@ impl GroupMetrics {
 }
 
 impl Group {
+    /// Construct one Accord group instance with worker threads and runtime state.
+    ///
+    /// Inputs:
+    /// - `config`: quorum, timeout, batching, and durability behavior.
+    /// - `transport`: RPC transport used for peer protocol messages.
+    /// - `sm`: storage state machine used for key extraction and apply.
+    /// - `commit_log`: optional WAL backend for commit persistence.
+    ///
+    /// Output:
+    /// - A fully initialized `Group` with commit-log/apply worker channels wired.
+    ///
+    /// Design:
+    /// - Commit-log requests are batched on a dedicated thread so we can coalesce
+    ///   append + fsync cost across multiple transactions.
+    /// - Apply work is offloaded to a blocking thread to avoid stalling the async runtime.
     pub fn new(
         config: Config,
         transport: Arc<dyn Transport>,
@@ -423,7 +455,7 @@ impl Group {
         commit_log: Option<Arc<dyn CommitLog>>,
     ) -> Self {
         let commit_log_tx = commit_log.as_ref().map(|log| {
-            let (tx, rx) = std_mpsc::channel::<CommitLogEntry>();
+            let (tx, rx) = std_mpsc::channel::<CommitLogWork>();
             let log = log.clone();
             let batch_max = config.commit_log_batch_max.max(1);
             let batch_wait = config.commit_log_batch_wait;
@@ -435,7 +467,7 @@ impl Group {
                     let mut disconnected = false;
                     while !disconnected {
                         let first = match rx.recv() {
-                            Ok(entry) => entry,
+                            Ok(work) => work,
                             Err(_) => break,
                         };
                         let mut batch = Vec::with_capacity(batch_max);
@@ -449,8 +481,8 @@ impl Group {
 
                         while batch.len() < batch_max {
                             match rx.try_recv() {
-                                Ok(entry) => {
-                                    batch.push(entry);
+                                Ok(work) => {
+                                    batch.push(work);
                                     continue;
                                 }
                                 Err(std_mpsc::TryRecvError::Disconnected) => {
@@ -469,7 +501,7 @@ impl Group {
                             }
                             let remaining = deadline.saturating_duration_since(now);
                             match rx.recv_timeout(remaining) {
-                                Ok(entry) => batch.push(entry),
+                                Ok(work) => batch.push(work),
                                 Err(std_mpsc::RecvTimeoutError::Timeout) => break,
                                 Err(std_mpsc::RecvTimeoutError::Disconnected) => {
                                     disconnected = true;
@@ -478,8 +510,30 @@ impl Group {
                             }
                         }
 
-                        if let Err(err) = log.append_commits(batch) {
+                        // If any request in this batch requires fsync-on-ack, run the whole
+                        // batch as durable so every caller in this batch sees correct semantics.
+                        let require_durable = batch.iter().any(|work| work.require_durable);
+                        let mut entries = Vec::with_capacity(batch.len());
+                        let mut done_txs = Vec::with_capacity(batch.len());
+                        for work in batch {
+                            entries.push(work.entry);
+                            done_txs.push(work.done_tx);
+                        }
+
+                        let append_result = log.append_commits_with_options(
+                            entries,
+                            CommitLogAppendOptions { require_durable },
+                        );
+                        if let Err(err) = &append_result {
                             tracing::warn!(error = ?err, "commit log batch append failed");
+                        }
+                        let err_msg = append_result.err().map(|err| err.to_string());
+                        for done_tx in done_txs {
+                            let result = match &err_msg {
+                                None => Ok(()),
+                                Some(msg) => Err(anyhow::anyhow!(msg.clone())),
+                            };
+                            let _ = done_tx.send(result);
                         }
                     }
                 })
@@ -669,6 +723,57 @@ impl Group {
             .map(|id| Member { id })
             .collect();
         cfg
+    }
+
+    /// Queue one commit-log append request and return a receiver for completion.
+    ///
+    /// Inputs:
+    /// - `entry`: WAL record to append.
+    /// - `require_durable`: whether this append must include synchronous fsync.
+    ///
+    /// Output:
+    /// - A `Receiver` that yields the append result once the commit-log batcher
+    ///   has finished processing the request.
+    fn enqueue_commit_log_append(
+        &self,
+        entry: CommitLogEntry,
+        require_durable: bool,
+    ) -> anyhow::Result<std_mpsc::Receiver<anyhow::Result<()>>> {
+        let Some(tx) = &self.commit_log_tx else {
+            anyhow::bail!("commit log unavailable");
+        };
+        let (done_tx, done_rx) = std_mpsc::channel();
+        tx.send(CommitLogWork {
+            entry,
+            require_durable,
+            done_tx,
+        })
+        .map_err(|_| anyhow::anyhow!("commit log batcher closed"))?;
+        Ok(done_rx)
+    }
+
+    /// Block until the commit-log batcher completes an append request.
+    ///
+    /// Inputs:
+    /// - `done_rx`: completion channel returned by `enqueue_commit_log_append`.
+    /// - `timeout`: maximum wait to prevent unbounded request stalls.
+    ///
+    /// Output:
+    /// - `Ok(())` when append finished successfully.
+    /// - `Err(...)` on timeout, channel closure, or WAL append failure.
+    fn wait_commit_log_append(
+        done_rx: std_mpsc::Receiver<anyhow::Result<()>>,
+        timeout: Duration,
+    ) -> anyhow::Result<()> {
+        match tokio::task::block_in_place(|| done_rx.recv_timeout(timeout)) {
+            Ok(res) => res,
+            Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                Err(anyhow::anyhow!("commit log append timed out"))
+            }
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                Err(anyhow::anyhow!("commit log append response channel closed"))
+            }
+        }
     }
 
     pub fn handle(self: &Arc<Self>) -> Handle {
@@ -1441,6 +1546,21 @@ impl Group {
         }
     }
 
+    /// Handle incoming commit RPC and transition transaction state toward execution.
+    ///
+    /// Input:
+    /// - `req`: commit metadata (txn id, ballot, command/digest, seq, deps).
+    ///
+    /// Output:
+    /// - `CommitResponse { ok: true }` when this node accepts/records the commit.
+    /// - `CommitResponse { ok: false }` when validation, durability, or command
+    ///   recovery fails.
+    ///
+    /// Design:
+    /// - In `SyncCommit` mode we durably append to WAL *before* moving status to
+    ///   `Committed` and ACKing, so ACK implies local fsync durability.
+    /// - In `AsyncCommit` mode we preserve historical behavior: update state and
+    ///   ACK, then enqueue WAL append asynchronously.
     pub async fn rpc_commit(&self, req: CommitRequest) -> CommitResponse {
         if !self.local_is_member() {
             return CommitResponse { ok: false };
@@ -1485,7 +1605,7 @@ impl Group {
                 rec.updated_at = now;
             }
 
-            let (prev_status, prev_seq, committed_fast_path) = state
+            let (observed_status, committed_fast_path) = state
                 .records
                 .get(&txn_id)
                 .map(|r| {
@@ -1496,15 +1616,11 @@ impl Group {
                         .unwrap_or(false);
                     let req_deps = deps_vec.iter().copied().collect::<BTreeSet<_>>();
                     let same_commit = r.seq == seq && r.deps == req_deps && cmd_matches;
-                    (
-                        r.status,
-                        r.seq,
-                        r.status >= Status::Committed && same_commit,
-                    )
+                    (r.status, r.status >= Status::Committed && same_commit)
                 })
                 .expect("record must exist");
 
-            if prev_status >= Status::Executing {
+            if observed_status >= Status::Executing {
                 // Already being applied (or done). A late commit must not downgrade the record or
                 // re-insert it into the committed queue.
                 return CommitResponse { ok: true };
@@ -1564,7 +1680,77 @@ impl Group {
                 }
             }
 
+            let require_durable_ack = self.config.commit_durability_mode.requires_durable_ack();
             let req_deps = deps_vec.iter().copied().collect::<BTreeSet<_>>();
+            let seq = seq.max(1);
+            let req_deps_vec = req_deps.iter().copied().collect::<Vec<_>>();
+            let command_for_log = state
+                .records
+                .get(&txn_id)
+                .and_then(|r| r.command.clone())
+                .unwrap_or_default();
+
+            if require_durable_ack {
+                // Strict durability mode: force WAL append + sync before any
+                // committed-state transition that could be ACKed to coordinator.
+                let done_rx = match self.enqueue_commit_log_append(
+                    CommitLogEntry {
+                        txn_id,
+                        seq,
+                        deps: req_deps_vec.clone(),
+                        command: command_for_log.clone(),
+                    },
+                    true,
+                ) {
+                    Ok(done_rx) => done_rx,
+                    Err(err) => {
+                        tracing::warn!(
+                            error = ?err,
+                            txn_id = ?txn_id,
+                            "failed to enqueue durable commit-log append"
+                        );
+                        return CommitResponse { ok: false };
+                    }
+                };
+                drop(state);
+                if let Err(err) = Self::wait_commit_log_append(done_rx, self.config.propose_timeout)
+                {
+                    tracing::warn!(
+                        error = ?err,
+                        txn_id = ?txn_id,
+                        "durable commit-log append failed"
+                    );
+                    return CommitResponse { ok: false };
+                }
+                state = self.state.lock().await;
+                // Another task may have advanced this txn while we were waiting
+                // on WAL I/O; re-check terminal/committed status before mutating.
+                if state.is_executed(&txn_id) {
+                    return CommitResponse { ok: true };
+                }
+                let committed_after_wait = state
+                    .records
+                    .get(&txn_id)
+                    .map(|r| {
+                        let cmd_matches = r
+                            .command
+                            .as_ref()
+                            .map(|cmd| command_digest(cmd) == expected_digest)
+                            .unwrap_or(false);
+                        let same_commit = r.seq == seq && r.deps == req_deps && cmd_matches;
+                        (r.status, r.status >= Status::Committed && same_commit)
+                    })
+                    .unwrap_or((Status::None, false));
+                if committed_after_wait.0 >= Status::Executing || committed_after_wait.1 {
+                    return CommitResponse { ok: true };
+                }
+            }
+
+            let (prev_status, prev_seq) = state
+                .records
+                .get(&txn_id)
+                .map(|r| (r.status, r.seq))
+                .unwrap_or((Status::None, 0));
             let keys = state
                 .records
                 .get(&txn_id)
@@ -1585,8 +1771,6 @@ impl Group {
             }
             state.update_frontier(txn_id, &keys, &req_deps);
 
-            let seq = seq.max(1);
-            let req_deps_vec = req_deps.iter().copied().collect::<Vec<_>>();
             {
                 let rec = state.records.get_mut(&txn_id).expect("record must exist");
                 rec.seq = seq;
@@ -1600,25 +1784,28 @@ impl Group {
             }
             let should_notify = state.committed_queue.is_empty();
             state.insert_committed(txn_id, seq);
-
-            let command_for_log = state
-                .records
-                .get(&txn_id)
-                .and_then(|r| r.command.clone())
-                .unwrap_or_default();
             drop(state);
             if should_notify {
                 self.executor_notify.notify_one();
             }
-            if let Some(tx) = &self.commit_log_tx {
-                let entry = CommitLogEntry {
-                    txn_id,
-                    seq,
-                    deps: req_deps_vec,
-                    command: command_for_log,
-                };
-                if tx.send(entry).is_err() {
-                    tracing::warn!("commit log batcher closed");
+            if !require_durable_ack && self.commit_log_tx.is_some() {
+                // Async mode preserves original ACK semantics: enqueue WAL append
+                // after state transition and return without waiting for fsync.
+                let enqueue_res = self.enqueue_commit_log_append(
+                    CommitLogEntry {
+                        txn_id,
+                        seq,
+                        deps: req_deps_vec,
+                        command: command_for_log,
+                    },
+                    false,
+                );
+                if let Err(err) = enqueue_res {
+                    tracing::warn!(
+                        error = ?err,
+                        txn_id = ?txn_id,
+                        "failed to enqueue commit-log append"
+                    );
                 }
             }
             // Avoid per-commit wakeups; executor polls on a short interval already.
@@ -4138,4 +4325,327 @@ fn kosaraju_scc_from_deps(nodes: &[TxnId], deps: &HashMap<TxnId, Vec<TxnId>>) ->
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::accord::{CommitDurabilityMode, GroupId};
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{mpsc as std_mpsc, Arc, Mutex};
+    use std::time::Duration as StdDuration;
+
+    /// No-op transport for unit tests that invoke local RPC handlers directly.
+    ///
+    /// Design:
+    /// - `rpc_commit` tests do not use remote transport paths.
+    /// - All RPC methods return an error so accidental usage fails loudly.
+    struct NoopTransport;
+
+    #[async_trait]
+    impl Transport for NoopTransport {
+        async fn pre_accept(
+            &self,
+            _target: NodeId,
+            _req: PreAcceptRequest,
+        ) -> anyhow::Result<PreAcceptResponse> {
+            Err(anyhow::anyhow!("transport not used in this test"))
+        }
+
+        async fn accept(
+            &self,
+            _target: NodeId,
+            _req: AcceptRequest,
+        ) -> anyhow::Result<AcceptResponse> {
+            Err(anyhow::anyhow!("transport not used in this test"))
+        }
+
+        async fn commit(
+            &self,
+            _target: NodeId,
+            _req: CommitRequest,
+        ) -> anyhow::Result<CommitResponse> {
+            Err(anyhow::anyhow!("transport not used in this test"))
+        }
+
+        async fn recover(
+            &self,
+            _target: NodeId,
+            _req: RecoverRequest,
+        ) -> anyhow::Result<RecoverResponse> {
+            Err(anyhow::anyhow!("transport not used in this test"))
+        }
+
+        async fn fetch_command(
+            &self,
+            _target: NodeId,
+            _group_id: GroupId,
+            _txn_id: TxnId,
+        ) -> anyhow::Result<Option<Vec<u8>>> {
+            Err(anyhow::anyhow!("transport not used in this test"))
+        }
+
+        async fn report_executed(
+            &self,
+            _target: NodeId,
+            _req: ReportExecutedRequest,
+        ) -> anyhow::Result<ReportExecutedResponse> {
+            Err(anyhow::anyhow!("transport not used in this test"))
+        }
+
+        async fn last_executed_prefix(
+            &self,
+            _target: NodeId,
+            _group_id: GroupId,
+        ) -> anyhow::Result<Vec<ExecutedPrefix>> {
+            Err(anyhow::anyhow!("transport not used in this test"))
+        }
+
+        async fn executed(
+            &self,
+            _target: NodeId,
+            _group_id: GroupId,
+            _txn_id: TxnId,
+        ) -> anyhow::Result<bool> {
+            Err(anyhow::anyhow!("transport not used in this test"))
+        }
+
+        async fn mark_visible(
+            &self,
+            _target: NodeId,
+            _group_id: GroupId,
+            _txn_id: TxnId,
+        ) -> anyhow::Result<bool> {
+            Err(anyhow::anyhow!("transport not used in this test"))
+        }
+    }
+
+    /// Minimal state machine that classifies every non-empty command as a write.
+    ///
+    /// Inputs:
+    /// - `data`: opaque command bytes from Accord.
+    ///
+    /// Output:
+    /// - One synthetic write key for non-empty commands, enabling write commit
+    ///   bookkeeping in `rpc_commit` during unit tests.
+    struct TestStateMachine;
+
+    impl StateMachine for TestStateMachine {
+        fn command_keys(&self, data: &[u8]) -> anyhow::Result<CommandKeys> {
+            if data.is_empty() {
+                return Ok(CommandKeys::default());
+            }
+            Ok(CommandKeys {
+                reads: Vec::new(),
+                writes: vec![b"unit-test-key".to_vec()],
+            })
+        }
+
+        fn apply(&self, _data: &[u8], _meta: ExecMeta) {}
+    }
+
+    /// Commit log that blocks durable appends until the test releases it.
+    ///
+    /// Design:
+    /// - Sends a one-time start signal when the durable append begins.
+    /// - Waits on `release_rx` before returning success.
+    struct BlockingDurableCommitLog {
+        started_tx: Mutex<Option<std_mpsc::Sender<()>>>,
+        release_rx: Mutex<std_mpsc::Receiver<()>>,
+        append_calls: AtomicU64,
+    }
+
+    impl BlockingDurableCommitLog {
+        /// Construct a blocking commit log with external start/release channels.
+        ///
+        /// Inputs:
+        /// - `started_tx`: signaled once the first durable append starts.
+        /// - `release_rx`: gate that must be released before append returns.
+        ///
+        /// Output:
+        /// - Commit-log test double that lets tests control durable-append timing.
+        fn new(started_tx: std_mpsc::Sender<()>, release_rx: std_mpsc::Receiver<()>) -> Self {
+            Self {
+                started_tx: Mutex::new(Some(started_tx)),
+                release_rx: Mutex::new(release_rx),
+                append_calls: AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl CommitLog for BlockingDurableCommitLog {
+        fn append_commits_with_options(
+            &self,
+            _entries: Vec<CommitLogEntry>,
+            options: CommitLogAppendOptions,
+        ) -> anyhow::Result<()> {
+            self.append_calls.fetch_add(1, Ordering::Relaxed);
+            if options.require_durable {
+                if let Some(tx) = self.started_tx.lock().expect("started tx lock").take() {
+                    let _ = tx.send(());
+                }
+                self.release_rx
+                    .lock()
+                    .expect("release rx lock")
+                    .recv()
+                    .map_err(|_| anyhow::anyhow!("release signal dropped"))?;
+            }
+            Ok(())
+        }
+
+        fn mark_executed(&self, _txn_id: TxnId) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn load(&self) -> anyhow::Result<Vec<CommitLogEntry>> {
+            Ok(Vec::new())
+        }
+
+        fn compact(&self, _max_delete: usize) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    /// Commit log that injects an error whenever durable append is requested.
+    ///
+    /// Design:
+    /// - Used to verify sync-commit failure propagation from WAL to RPC caller.
+    struct FailingDurableCommitLog;
+
+    impl CommitLog for FailingDurableCommitLog {
+        fn append_commits_with_options(
+            &self,
+            _entries: Vec<CommitLogEntry>,
+            options: CommitLogAppendOptions,
+        ) -> anyhow::Result<()> {
+            if options.require_durable {
+                anyhow::bail!("injected durable append failure");
+            }
+            Ok(())
+        }
+
+        fn mark_executed(&self, _txn_id: TxnId) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn load(&self) -> anyhow::Result<Vec<CommitLogEntry>> {
+            Ok(Vec::new())
+        }
+
+        fn compact(&self, _max_delete: usize) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    /// Build a compact, single-node group config for commit-path unit tests.
+    ///
+    /// Input:
+    /// - `mode`: commit durability mode under test.
+    ///
+    /// Output:
+    /// - Deterministic config with short timeouts and enabled commit-log batching.
+    fn test_config(mode: CommitDurabilityMode) -> Config {
+        Config {
+            group_id: 1,
+            node_id: 1,
+            members: vec![Member { id: 1 }],
+            rpc_timeout: StdDuration::from_millis(200),
+            propose_timeout: StdDuration::from_secs(2),
+            recovery_min_delay: StdDuration::from_millis(10),
+            stall_recover_interval: StdDuration::from_millis(10),
+            preaccept_stall_hits: 1,
+            execute_batch_max: 16,
+            inline_command_in_accept_commit: true,
+            commit_log_batch_max: 16,
+            commit_log_batch_wait: StdDuration::from_micros(50),
+            commit_durability_mode: mode,
+        }
+    }
+
+    /// Build a deterministic commit request for local `rpc_commit` tests.
+    ///
+    /// Input:
+    /// - `counter`: transaction counter to make test txn IDs unique.
+    ///
+    /// Output:
+    /// - Valid commit request with fixed command payload and digest.
+    fn test_commit_request(counter: u64) -> CommitRequest {
+        let command = b"set unit-test-key value".to_vec();
+        CommitRequest {
+            group_id: 1,
+            txn_id: TxnId {
+                node_id: 1,
+                counter,
+            },
+            ballot: Ballot::initial(1),
+            command: command.clone(),
+            command_digest: command_digest(&command),
+            has_command: true,
+            seq: 1,
+            deps: Vec::new(),
+        }
+    }
+
+    /// Ensure sync-commit mode never ACKs before the durable append completes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sync_commit_waits_for_durable_append_before_ack() {
+        let (started_tx, started_rx) = std_mpsc::channel();
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let commit_log = Arc::new(BlockingDurableCommitLog::new(started_tx, release_rx));
+        let group = Arc::new(Group::new(
+            test_config(CommitDurabilityMode::SyncCommit),
+            Arc::new(NoopTransport),
+            Arc::new(TestStateMachine),
+            Some(commit_log),
+        ));
+
+        let req = test_commit_request(10);
+        let group_task = group.clone();
+        let join = tokio::spawn(async move { group_task.rpc_commit(req).await });
+
+        tokio::task::block_in_place(|| {
+            started_rx
+                .recv_timeout(StdDuration::from_secs(1))
+                .expect("durable append should start")
+        });
+        assert!(
+            !join.is_finished(),
+            "sync commit returned before durable append completed"
+        );
+
+        release_tx.send(()).expect("release durable append");
+        let resp = tokio::time::timeout(StdDuration::from_secs(1), join)
+            .await
+            .expect("commit should finish after release")
+            .expect("join should succeed");
+        assert!(
+            resp.ok,
+            "commit should succeed after durable append completion"
+        );
+    }
+
+    /// Ensure sync-commit mode surfaces durable append failures to callers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sync_commit_fails_when_durable_append_fails() {
+        let group = Arc::new(Group::new(
+            test_config(CommitDurabilityMode::SyncCommit),
+            Arc::new(NoopTransport),
+            Arc::new(TestStateMachine),
+            Some(Arc::new(FailingDurableCommitLog)),
+        ));
+
+        let resp = group.rpc_commit(test_commit_request(11)).await;
+        assert!(!resp.ok, "sync commit must fail when durable append fails");
+
+        let stats = group.debug_stats().await;
+        assert_eq!(
+            stats.records_status_committed_len, 0,
+            "failed durable commit must not transition record to committed"
+        );
+        assert_eq!(
+            stats.committed_queue_len, 0,
+            "failed durable commit must not enqueue execution"
+        );
+    }
 }
