@@ -71,6 +71,34 @@ pub struct Member {
     pub id: NodeId,
 }
 
+/// Commit ACK durability policy for one consensus group.
+///
+/// Design:
+/// - `AsyncCommit` preserves historical behavior where commit ACK does not wait
+///   for an fsync barrier.
+/// - `SyncCommit` upgrades ACK semantics so commit completion implies durable
+///   WAL persistence on that node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommitDurabilityMode {
+    /// Preserve existing behavior: commit ACK does not require synchronous fsync.
+    AsyncCommit,
+    /// Strict behavior: commit ACK requires durable WAL persistence for this commit.
+    SyncCommit,
+}
+
+impl CommitDurabilityMode {
+    /// Return whether commit processing must block on a durable WAL append.
+    ///
+    /// Input:
+    /// - `self`: active durability mode for the group.
+    ///
+    /// Output:
+    /// - `true` only for `SyncCommit`; `false` for `AsyncCommit`.
+    pub fn requires_durable_ack(self) -> bool {
+        matches!(self, Self::SyncCommit)
+    }
+}
+
 /// Per-group configuration and operational tuning.
 ///
 /// The `*timeout` values guard against slow/failed peers. Batch settings are
@@ -99,6 +127,8 @@ pub struct Config {
     pub inline_command_in_accept_commit: bool,
     pub commit_log_batch_max: usize,
     pub commit_log_batch_wait: Duration,
+    /// Commit ACK durability policy for this group (`async` vs `sync` ACK).
+    pub commit_durability_mode: CommitDurabilityMode,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,6 +201,16 @@ pub struct CommitLogEntry {
     pub command: Vec<u8>,
 }
 
+/// Commit-log append options controlling durability semantics for this request.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CommitLogAppendOptions {
+    /// If `true`, the append must include a synchronous durability barrier.
+    ///
+    /// Implementations should return an error when strict durability is
+    /// requested but the active persistence mode cannot satisfy fsync-on-ack.
+    pub require_durable: bool,
+}
+
 /// WAL floor snapshot used for checkpoint/compaction observability.
 #[derive(Clone, Debug, Default)]
 pub struct CommitLogCheckpointStatus {
@@ -187,10 +227,33 @@ pub struct CommitLogCheckpointStatus {
 /// Implementations are responsible for persisting committed entries and
 /// returning them on startup for replay.
 pub trait CommitLog: Send + Sync + 'static {
-    fn append_commit(&self, entry: CommitLogEntry) -> anyhow::Result<()>;
+    /// Append one committed entry using default options.
+    fn append_commit(&self, entry: CommitLogEntry) -> anyhow::Result<()> {
+        self.append_commit_with_options(entry, CommitLogAppendOptions::default())
+    }
+
+    /// Append one committed entry with explicit append options.
+    fn append_commit_with_options(
+        &self,
+        entry: CommitLogEntry,
+        options: CommitLogAppendOptions,
+    ) -> anyhow::Result<()> {
+        self.append_commits_with_options(vec![entry], options)
+    }
+
+    /// Append multiple committed entries using default options.
     fn append_commits(&self, entries: Vec<CommitLogEntry>) -> anyhow::Result<()> {
+        self.append_commits_with_options(entries, CommitLogAppendOptions::default())
+    }
+
+    /// Append multiple committed entries with explicit append options.
+    fn append_commits_with_options(
+        &self,
+        entries: Vec<CommitLogEntry>,
+        options: CommitLogAppendOptions,
+    ) -> anyhow::Result<()> {
         for entry in entries {
-            self.append_commit(entry)?;
+            self.append_commit_with_options(entry, options)?;
         }
         Ok(())
     }

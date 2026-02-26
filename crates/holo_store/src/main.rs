@@ -577,6 +577,17 @@ pub struct NodeArgs {
     #[arg(long, env = "HOLO_PROPOSE_TIMEOUT_MS", default_value_t = 10000)]
     propose_timeout_ms: u64,
 
+    /// Commit durability policy for commit ACK semantics.
+    ///
+    /// - `async_commit`: return commit OK after WAL enqueue/append path.
+    /// - `sync_commit`: return commit OK only after durable fsync for this commit.
+    #[arg(
+        long,
+        env = "HOLO_COMMIT_DURABILITY_MODE",
+        default_value = "sync-commit"
+    )]
+    commit_durability_mode: CommitDurabilityModeArg,
+
     /// Minimum delay before retrying stalled transaction recovery (milliseconds).
     #[arg(long, env = "HOLO_RECOVERY_MIN_DELAY_MS", default_value_t = 200)]
     recovery_min_delay_ms: u64,
@@ -1442,6 +1453,35 @@ impl RecoveryCheckpointPersistMode {
         match self {
             RecoveryCheckpointPersistMode::SyncData => PersistMode::SyncData,
             RecoveryCheckpointPersistMode::SyncAll => PersistMode::SyncAll,
+        }
+    }
+}
+
+/// Commit durability policy exposed on CLI/env for node startup.
+///
+/// Design:
+/// - Parsed by clap from `HOLO_COMMIT_DURABILITY_MODE`.
+/// - Translated into Accord runtime behavior when group configs are built.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum CommitDurabilityModeArg {
+    #[value(alias = "async_commit")]
+    AsyncCommit,
+    #[value(alias = "sync_commit")]
+    SyncCommit,
+}
+
+impl CommitDurabilityModeArg {
+    /// Convert CLI durability mode to Accord runtime mode.
+    ///
+    /// Input:
+    /// - `self`: parsed CLI/env durability policy.
+    ///
+    /// Output:
+    /// - Equivalent `accord::CommitDurabilityMode` for commit-path logic.
+    fn to_accord(self) -> accord::CommitDurabilityMode {
+        match self {
+            CommitDurabilityModeArg::AsyncCommit => accord::CommitDurabilityMode::AsyncCommit,
+            CommitDurabilityModeArg::SyncCommit => accord::CommitDurabilityMode::SyncCommit,
         }
     }
 }
@@ -5289,6 +5329,7 @@ where
         inline_command_in_accept_commit: args.accord_inline_command_in_accept_commit,
         commit_log_batch_max: args.commit_log_batch_max.max(1),
         commit_log_batch_wait: Duration::from_micros(args.commit_log_batch_wait_us),
+        commit_durability_mode: args.commit_durability_mode.to_accord(),
     };
 
     let meta_wal_root = match args.wal_engine {
@@ -5729,6 +5770,7 @@ where
         node_id = args.node_id,
         redis = %redis_addr,
         grpc = %grpc_addr,
+        commit_durability_mode = ?args.commit_durability_mode,
         "node started"
     );
 
