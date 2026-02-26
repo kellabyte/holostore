@@ -238,6 +238,8 @@ struct SplitHealthView {
     #[serde(default)]
     failures: u64,
     #[serde(default)]
+    transient_aborts: u64,
+    #[serde(default)]
     backoff_active: u64,
     #[serde(default)]
     last_attempt_ms: u64,
@@ -407,6 +409,15 @@ async fn main() -> anyhow::Result<()> {
                 .into_inner();
             let state: ClusterStateView =
                 serde_json::from_str(&resp.json).context("parse cluster state json")?;
+            let split_health = match fetch_split_health_for_range_controller(&state).await {
+                Ok(view) => view,
+                Err(err) => {
+                    eprintln!(
+                        "warning: failed to read split health from range-controller holder: {err}"
+                    );
+                    state.split_health.clone()
+                }
+            };
             let mut members = state.members.values().cloned().collect::<Vec<_>>();
             members.sort_by_key(|m| m.node_id);
             let mut member_state_counts = BTreeMap::<String, usize>::new();
@@ -565,25 +576,17 @@ async fn main() -> anyhow::Result<()> {
             ]];
             footer_lines.push(vec![
                 "SPLIT".to_string(),
+                format!("attempts: {}", format_count_u64(split_health.attempts)),
+                format!("success: {}", format_count_u64(split_health.successes)),
                 format!(
-                    "attempts: {}",
-                    format_count_u64(state.split_health.attempts)
+                    "failures: {} (transient: {})",
+                    format_count_u64(split_health.failures),
+                    format_count_u64(split_health.transient_aborts)
                 ),
-                format!(
-                    "success: {}",
-                    format_count_u64(state.split_health.successes)
-                ),
-                format!(
-                    "failures: {}",
-                    format_count_u64(state.split_health.failures)
-                ),
-                format!(
-                    "backoff: {}",
-                    format_count_u64(state.split_health.backoff_active)
-                ),
+                format!("backoff: {}", format_count_u64(split_health.backoff_active)),
                 format!(
                     "attempts_by: {}",
-                    format_top_reasons(&state.split_health.attempt_reasons),
+                    format_top_reasons(&split_health.attempt_reasons),
                 ),
                 String::new(),
             ]);
@@ -968,6 +971,37 @@ async fn fetch_range_stats(target: &str) -> anyhow::Result<HashMap<u64, u64>> {
         out.insert(range.shard_id, range.record_count);
     }
     Ok(out)
+}
+
+async fn fetch_cluster_state(target: &str) -> anyhow::Result<ClusterStateView> {
+    let addr: SocketAddr = target
+        .parse()
+        .with_context(|| format!("invalid grpc address: {target}"))?;
+    let client = rpc::HoloRpcClientBuilder::new("holo_store.rpc.HoloRpc")
+        .address(volo::net::Address::from(addr))
+        .build();
+    let resp = client
+        .cluster_state(rpc::ClusterStateRequest {})
+        .await?
+        .into_inner();
+    serde_json::from_str(&resp.json).context("parse cluster state json")
+}
+
+async fn fetch_split_health_for_range_controller(
+    state: &ClusterStateView,
+) -> anyhow::Result<SplitHealthView> {
+    let Some(lease) = state.controller_leases.get("range") else {
+        return Ok(state.split_health.clone());
+    };
+    let Some(holder) = state
+        .members
+        .values()
+        .find(|member| member.node_id == lease.holder && member.state != "Removed")
+    else {
+        return Ok(state.split_health.clone());
+    };
+    let holder_state = fetch_cluster_state(holder.grpc_addr.as_str()).await?;
+    Ok(holder_state.split_health)
 }
 
 fn format_range(start: &[u8], end: &[u8]) -> String {

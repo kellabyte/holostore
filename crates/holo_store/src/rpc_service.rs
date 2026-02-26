@@ -1118,6 +1118,9 @@ impl rpc::HoloRpc for RpcService {
         let cmd = crate::cluster::ClusterCommand::SplitRange {
             split_key: split_key.clone(),
             target_shard_index,
+            target_replicas: None,
+            target_leaseholder: None,
+            skip_migration: false,
         };
         self.state
             .propose_meta_command(cmd)
@@ -1318,7 +1321,8 @@ impl rpc::HoloRpc for RpcService {
     ) -> Result<volo_grpc::Response<rpc::RangeStatsResponse>, volo_grpc::Status> {
         let local = self
             .state
-            .local_range_stats()
+            .local_range_stats_detailed()
+            .await
             .map_err(|e| volo_grpc::Status::internal(format!("range stats failed: {e}")))?;
         let ranges = local
             .into_iter()
@@ -1327,6 +1331,14 @@ impl rpc::HoloRpc for RpcService {
                 shard_index: item.shard_index as u64,
                 record_count: item.record_count,
                 is_leaseholder: item.is_leaseholder,
+                write_ops_total: item.write_ops_total,
+                read_ops_total: item.read_ops_total,
+                write_bytes_total: item.write_bytes_total,
+                queue_depth: item.queue_depth,
+                write_tail_latency_ms: item.write_tail_latency_ms,
+                hot_key_concentration_bps: item.hot_key_concentration_bps,
+                write_hot_buckets: item.write_hot_buckets,
+                read_hot_buckets: item.read_hot_buckets,
             })
             .collect();
         Ok(volo_grpc::Response::new(rpc::RangeStatsResponse {

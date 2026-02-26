@@ -62,6 +62,23 @@ pub struct RangeLatestEntry {
     pub version: Version,
 }
 
+/// Per-range telemetry sampled from one node.
+#[derive(Clone, Debug, Default)]
+pub struct RangeTelemetryStat {
+    pub shard_id: u64,
+    pub shard_index: usize,
+    pub record_count: u64,
+    pub is_leaseholder: bool,
+    pub write_ops_total: u64,
+    pub read_ops_total: u64,
+    pub write_bytes_total: u64,
+    pub queue_depth: u64,
+    pub write_tail_latency_ms: f64,
+    pub hot_key_concentration_bps: u32,
+    pub write_hot_buckets: Vec<u64>,
+    pub read_hot_buckets: Vec<u64>,
+}
+
 /// Collect a batch of items from a channel with a size/time bound.
 async fn collect_batch<T>(
     first: T,
@@ -845,8 +862,11 @@ impl GrpcTransport {
         }
     }
 
-    /// Fetch local range record counts from a peer keyed by shard id.
-    pub async fn range_stats(&self, target: NodeId) -> anyhow::Result<HashMap<u64, u64>> {
+    /// Fetch per-range telemetry from a peer.
+    pub async fn range_stats_detailed(
+        &self,
+        target: NodeId,
+    ) -> anyhow::Result<Vec<RangeTelemetryStat>> {
         let peer = self.peer(target)?;
         let resp = time::timeout(
             self.rpc_timeout,
@@ -855,15 +875,38 @@ impl GrpcTransport {
         .await;
         match resp {
             Ok(Ok(resp)) => {
-                let mut out = HashMap::new();
+                let mut out = Vec::new();
                 for range in resp.into_inner().ranges {
-                    out.insert(range.shard_id, range.record_count);
+                    out.push(RangeTelemetryStat {
+                        shard_id: range.shard_id,
+                        shard_index: range.shard_index as usize,
+                        record_count: range.record_count,
+                        is_leaseholder: range.is_leaseholder,
+                        write_ops_total: range.write_ops_total,
+                        read_ops_total: range.read_ops_total,
+                        write_bytes_total: range.write_bytes_total,
+                        queue_depth: range.queue_depth,
+                        write_tail_latency_ms: range.write_tail_latency_ms,
+                        hot_key_concentration_bps: range.hot_key_concentration_bps,
+                        write_hot_buckets: range.write_hot_buckets,
+                        read_hot_buckets: range.read_hot_buckets,
+                    });
                 }
                 Ok(out)
             }
             Ok(Err(err)) => Err(anyhow::anyhow!("range_stats rpc failed: {err}")),
             Err(_) => Err(anyhow::anyhow!("range_stats rpc timed out")),
         }
+    }
+
+    /// Fetch local range record counts from a peer keyed by shard id.
+    pub async fn range_stats(&self, target: NodeId) -> anyhow::Result<HashMap<u64, u64>> {
+        let detailed = self.range_stats_detailed(target).await?;
+        let mut out = HashMap::new();
+        for stat in detailed {
+            out.insert(stat.shard_id, stat.record_count);
+        }
+        Ok(out)
     }
 
     /// Fetch one page of latest-visible rows from a peer for `[start, end)`.
