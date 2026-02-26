@@ -81,8 +81,19 @@ pub struct Config {
     pub node_id: NodeId,
     pub members: Vec<Member>,
 
+    /// Upper bound for point-to-point RPC waits used by protocol steps.
     pub rpc_timeout: Duration,
+    /// End-to-end timeout for one propose attempt (pre-accept/accept/commit path).
     pub propose_timeout: Duration,
+    /// Lower bound before triggering recovery for a blocked transaction.
+    ///
+    /// Design: avoids aggressive recovery churn on short-lived dependency waits.
+    pub recovery_min_delay: Duration,
+    /// Minimum spacing between executor-driven stall recovery probes.
+    ///
+    /// Design: keeps recovery bounded under heavy contention so execution work
+    /// is not starved by repeated probe attempts.
+    pub stall_recover_interval: Duration,
     pub preaccept_stall_hits: u32,
     pub execute_batch_max: usize,
     pub inline_command_in_accept_commit: bool,

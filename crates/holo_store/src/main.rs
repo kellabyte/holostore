@@ -4,7 +4,7 @@
 // transport, and Redis protocol server. It also hosts the CLI and runtime
 // configuration, as well as performance/statistics logging.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{BufWriter, IsTerminal, Write};
 use std::net::SocketAddr;
@@ -16,6 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
 use fjall::{Keyspace, PartitionCreateOptions, PersistMode};
+use futures_util::future::BoxFuture;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use holo_accord::accord::{self, GroupId, NodeId, TxnId};
 use serde::{Deserialize, Serialize};
@@ -457,6 +458,14 @@ pub struct NodeArgs {
     #[arg(long, env = "HOLO_PROPOSE_TIMEOUT_MS", default_value_t = 10000)]
     propose_timeout_ms: u64,
 
+    /// Minimum delay before retrying stalled transaction recovery (milliseconds).
+    #[arg(long, env = "HOLO_RECOVERY_MIN_DELAY_MS", default_value_t = 200)]
+    recovery_min_delay_ms: u64,
+
+    /// Minimum interval between executor stall-recovery probes (milliseconds).
+    #[arg(long, env = "HOLO_STALL_RECOVER_INTERVAL_MS", default_value_t = 100)]
+    stall_recover_interval_ms: u64,
+
     /// Read mode: accord (default), quorum, or local.
     #[arg(long, env = "HOLO_READ_MODE", default_value = "accord")]
     read_mode: ReadMode,
@@ -549,6 +558,14 @@ pub struct NodeArgs {
     #[arg(long, env = "HOLO_CLIENT_SET_BATCH_TARGET", default_value_t = 128)]
     client_set_batch_target: usize,
 
+    /// Max in-flight proposals per shard for direct SET batch execution.
+    #[arg(
+        long,
+        env = "HOLO_CLIENT_SET_PROPOSAL_PIPELINE_DEPTH",
+        default_value_t = 8
+    )]
+    client_set_proposal_pipeline_depth: usize,
+
     /// Target max range-write operations per replicated proposal.
     ///
     /// This is intentionally decoupled from `HOLO_CLIENT_SET_BATCH_TARGET` so
@@ -571,6 +588,14 @@ pub struct NodeArgs {
         default_value_t = 1_048_576
     )]
     range_write_batch_max_bytes: usize,
+
+    /// Max in-flight proposals per shard for replicated range-write execution.
+    #[arg(
+        long,
+        env = "HOLO_RANGE_WRITE_PROPOSAL_PIPELINE_DEPTH",
+        default_value_t = 8
+    )]
+    range_write_proposal_pipeline_depth: usize,
 
     /// Force single-key proposals for SET (debug perf mode).
     #[arg(long, env = "HOLO_CLIENT_SINGLE_KEY_TXN", default_value_t = false)]
@@ -651,8 +676,16 @@ struct NodeState {
     client_get_tx: mpsc::Sender<BatchGetWork>,
     client_batch_stats: Arc<ClientBatchStats>,
     client_set_batch_target: usize,
+    /// Per-shard max in-flight proposals for direct client SET execution.
+    ///
+    /// Design: bounded pipelining keeps throughput high without unbounded queue growth.
+    client_set_proposal_pipeline_depth: usize,
+    /// Entry target for range-write proposal chunking (SQL write path).
     range_write_batch_target: usize,
+    /// Byte cap for range-write proposal chunking.
     range_write_batch_max_bytes: usize,
+    /// Per-shard max in-flight proposals for range-write execution.
+    range_write_proposal_pipeline_depth: usize,
     client_inflight_ops: Arc<AtomicU64>,
     cluster_store: ClusterStateStore,
     meta_handles: BTreeMap<usize, accord::Handle>,
@@ -2652,6 +2685,7 @@ impl NodeState {
             items,
             self.client_set_batch_target.max(1),
             usize::MAX,
+            self.client_set_proposal_pipeline_depth.max(1),
         )
         .await
     }
@@ -2665,15 +2699,95 @@ impl NodeState {
             items,
             self.range_write_batch_target.max(1),
             self.range_write_batch_max_bytes.max(1),
+            self.range_write_proposal_pipeline_depth.max(1),
         )
         .await
     }
 
+    /// Applies one shard's chunked SET workload with bounded in-flight proposals.
+    ///
+    /// Input:
+    /// - `handle`: shard/group handle to propose on.
+    /// - `chunks`: pre-chunked key/value batches in submit order.
+    /// - `pipeline_depth`: max number of concurrent proposals for this shard.
+    ///
+    /// Output:
+    /// - `Ok(())` when all chunks are committed.
+    /// - First proposal error encountered, preserving fail-fast semantics.
+    ///
+    /// Design: keep multiple proposals in flight to overlap network/consensus
+    /// latency, while preserving bounded memory and natural backpressure.
+    async fn execute_batch_set_chunks_on_shard(
+        &self,
+        handle: accord::Handle,
+        chunks: Vec<Vec<(Vec<u8>, Vec<u8>)>>,
+        pipeline_depth: usize,
+    ) -> anyhow::Result<()> {
+        if chunks.is_empty() {
+            return Ok(());
+        }
+        let state = self.clone();
+        let inflight_limit = pipeline_depth.max(1).min(chunks.len().max(1));
+        let mut pending = chunks.into_iter().enumerate().collect::<VecDeque<_>>();
+        let mut inflight =
+            FuturesUnordered::<BoxFuture<'static, anyhow::Result<accord::ProposalResult>>>::new();
+
+        // Prime pipeline up to the configured in-flight bound.
+        while inflight.len() < inflight_limit {
+            let Some((_chunk_idx, chunk)) = pending.pop_front() else {
+                break;
+            };
+            let handle = handle.clone();
+            let state = state.clone();
+            inflight.push(Box::pin(async move {
+                let cmd = kv::encode_batch_set(chunk.as_slice());
+                state
+                    .propose_timed_on(handle, ProposalKind::BatchSet, cmd)
+                    .await
+            }));
+        }
+
+        // As each proposal completes, refill pipeline until all chunks are drained.
+        while let Some(res) = inflight.next().await {
+            res?;
+            while inflight.len() < inflight_limit {
+                let Some((_chunk_idx, chunk)) = pending.pop_front() else {
+                    break;
+                };
+                let handle = handle.clone();
+                let state = state.clone();
+                inflight.push(Box::pin(async move {
+                    let cmd = kv::encode_batch_set(chunk.as_slice());
+                    state
+                        .propose_timed_on(handle, ProposalKind::BatchSet, cmd)
+                        .await
+                }));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Directly routes and proposes a multi-key SET workload with explicit limits.
+    ///
+    /// Input:
+    /// - `items`: key/value writes to apply.
+    /// - `max_ops_per_proposal`: entry cap per proposal chunk.
+    /// - `max_bytes_per_proposal`: byte cap per proposal chunk.
+    /// - `proposal_pipeline_depth`: in-flight proposal bound per shard.
+    ///
+    /// Output:
+    /// - `Ok(())` after all shard workloads are committed.
+    /// - Error if any shard proposal fails.
+    ///
+    /// Design: route once, chunk once, then pipeline per shard. This keeps small
+    /// writes low-latency while letting large writes amortize proposal overhead.
     async fn execute_batch_set_direct_with_limits(
         &self,
         items: Vec<(Vec<u8>, Vec<u8>)>,
         max_ops_per_proposal: usize,
         max_bytes_per_proposal: usize,
+        proposal_pipeline_depth: usize,
     ) -> anyhow::Result<()> {
         if items.is_empty() {
             // Nothing to do.
@@ -2700,7 +2814,8 @@ impl NodeState {
 
         let target = max_ops_per_proposal.max(1);
         let max_bytes = max_bytes_per_proposal.max(1);
-        let mut futs = FuturesUnordered::new();
+        let pipeline_depth = proposal_pipeline_depth.max(1);
+        let mut shard_futs = FuturesUnordered::new();
         for (shard, batch) in by_shard.into_iter().enumerate() {
             if batch.is_empty() {
                 // Skip shards with no work.
@@ -2709,14 +2824,18 @@ impl NodeState {
             // Track client-visible write load per shard (best-effort).
             self.shard_load.record_set_ops(shard, batch.len() as u64);
             let handle = self.handle_for_shard(shard);
-            for chunk in chunk_batch_set_items_by_limits(batch, target, max_bytes) {
-                // Split large batches by entry and byte budgets for bounded proposal size.
-                let cmd = kv::encode_batch_set(chunk.as_slice());
-                futs.push(self.propose_timed_on(handle.clone(), ProposalKind::BatchSet, cmd));
-            }
+            // Chunk by entry/byte budgets once, then let per-shard pipelining
+            // overlap proposal round-trips behind a bounded concurrency gate.
+            let chunks = chunk_batch_set_items_by_limits(batch, target, max_bytes);
+            let state = self.clone();
+            shard_futs.push(async move {
+                state
+                    .execute_batch_set_chunks_on_shard(handle, chunks, pipeline_depth)
+                    .await
+            });
         }
 
-        while let Some(res) = futs.next().await {
+        while let Some(res) = shard_futs.next().await {
             res?;
         }
         Ok(())
@@ -4855,6 +4974,8 @@ where
         members: accord_members.clone(),
         rpc_timeout,
         propose_timeout,
+        recovery_min_delay: Duration::from_millis(args.recovery_min_delay_ms.max(1)),
+        stall_recover_interval: Duration::from_millis(args.stall_recover_interval_ms.max(1)),
         preaccept_stall_hits: args.preaccept_stall_hits.max(1),
         execute_batch_max: args.accord_execute_batch_max.max(1),
         inline_command_in_accept_commit: args.accord_inline_command_in_accept_commit,
@@ -5080,8 +5201,10 @@ where
         } else {
             args.client_set_batch_target.max(1)
         },
+        client_set_proposal_pipeline_depth: args.client_set_proposal_pipeline_depth.max(1),
         range_write_batch_target,
         range_write_batch_max_bytes,
+        range_write_proposal_pipeline_depth: args.range_write_proposal_pipeline_depth.max(1),
         client_inflight_ops: Arc::new(AtomicU64::new(0)),
         cluster_store,
         meta_handles,
