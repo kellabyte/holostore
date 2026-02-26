@@ -218,6 +218,8 @@ Primary runtime knobs:
 | `HOLO_FUSION_DML_MAX_TXN_STAGED_ROWS` | `100000` | Caps staged writes in explicit tx. |
 | `HOLO_FUSION_DML_WRITE_MAX_BATCH_ENTRIES` | `1024` | Max rows per distributed write RPC chunk. |
 | `HOLO_FUSION_DML_WRITE_MAX_BATCH_BYTES` | `1048576` | Approximate payload budget per write RPC chunk. |
+| `HOLO_RANGE_WRITE_BATCH_TARGET` | `1024` | Embedded HoloStore range-write proposal target (decoupled from Redis `SET` batching). |
+| `HOLO_RANGE_WRITE_BATCH_MAX_BYTES` | `1048576` | Embedded HoloStore range-write proposal byte cap (decoupled from Redis `SET` batching). |
 | `HOLO_FUSION_DML_RETRY_MAX_ATTEMPTS` | `5` | Max attempts for retry-governed distributed writes. |
 | `HOLO_FUSION_DML_RETRY_BASE_DELAY_MS` | `50` | Base backoff for jittered retry policy. |
 | `HOLO_FUSION_DML_RETRY_MAX_DELAY_MS` | `1000` | Ceiling for retry backoff delay. |

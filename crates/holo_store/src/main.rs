@@ -112,6 +112,43 @@ fn resolve_data_shards(max_shards: usize) -> usize {
     }
 }
 
+fn parse_positive_env_usize(var_name: &str) -> Option<usize> {
+    std::env::var(var_name)
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+}
+
+fn resolve_range_write_batch_target(configured: usize) -> usize {
+    if std::env::var_os("HOLO_RANGE_WRITE_BATCH_TARGET").is_some() {
+        return configured.max(1);
+    }
+    if let Some(legacy) = parse_positive_env_usize("HOLO_SQL_WRITE_BATCH_TARGET") {
+        tracing::warn!(
+            legacy_env = "HOLO_SQL_WRITE_BATCH_TARGET",
+            replacement_env = "HOLO_RANGE_WRITE_BATCH_TARGET",
+            "legacy range-write batch target env is deprecated; use replacement env"
+        );
+        return legacy;
+    }
+    configured.max(1)
+}
+
+fn resolve_range_write_batch_max_bytes(configured: usize) -> usize {
+    if std::env::var_os("HOLO_RANGE_WRITE_BATCH_MAX_BYTES").is_some() {
+        return configured.max(1);
+    }
+    if let Some(legacy) = parse_positive_env_usize("HOLO_SQL_WRITE_BATCH_MAX_BYTES") {
+        tracing::warn!(
+            legacy_env = "HOLO_SQL_WRITE_BATCH_MAX_BYTES",
+            replacement_env = "HOLO_RANGE_WRITE_BATCH_MAX_BYTES",
+            "legacy range-write batch byte-cap env is deprecated; use replacement env"
+        );
+        return legacy;
+    }
+    configured.max(1)
+}
+
 fn meta_group_id_for_index(meta_index: usize) -> GroupId {
     if meta_index == 0 {
         GROUP_MEMBERSHIP
@@ -512,6 +549,29 @@ pub struct NodeArgs {
     #[arg(long, env = "HOLO_CLIENT_SET_BATCH_TARGET", default_value_t = 128)]
     client_set_batch_target: usize,
 
+    /// Target max range-write operations per replicated proposal.
+    ///
+    /// This is intentionally decoupled from `HOLO_CLIENT_SET_BATCH_TARGET` so
+    /// Redis/SET latency tuning does not throttle range-write throughput.
+    #[arg(
+        long,
+        env = "HOLO_RANGE_WRITE_BATCH_TARGET",
+        visible_alias = "sql-write-batch-target",
+        default_value_t = 1_024
+    )]
+    range_write_batch_target: usize,
+
+    /// Approximate byte cap for range-write operations per proposal.
+    ///
+    /// A value of `0` is treated as `1` internally to preserve bounded chunks.
+    #[arg(
+        long,
+        env = "HOLO_RANGE_WRITE_BATCH_MAX_BYTES",
+        visible_alias = "sql-write-batch-max-bytes",
+        default_value_t = 1_048_576
+    )]
+    range_write_batch_max_bytes: usize,
+
     /// Force single-key proposals for SET (debug perf mode).
     #[arg(long, env = "HOLO_CLIENT_SINGLE_KEY_TXN", default_value_t = false)]
     client_single_key_txn: bool,
@@ -591,6 +651,8 @@ struct NodeState {
     client_get_tx: mpsc::Sender<BatchGetWork>,
     client_batch_stats: Arc<ClientBatchStats>,
     client_set_batch_target: usize,
+    range_write_batch_target: usize,
+    range_write_batch_max_bytes: usize,
     client_inflight_ops: Arc<AtomicU64>,
     cluster_store: ClusterStateStore,
     meta_handles: BTreeMap<usize, accord::Handle>,
@@ -2366,7 +2428,7 @@ impl NodeState {
             .iter()
             .map(|entry| (entry.key.clone(), entry.value.clone()))
             .collect::<Vec<_>>();
-        self.execute_batch_set_direct(items).await?;
+        self.execute_range_write_batch_set_direct(items).await?;
         let committed = in_range
             .iter()
             .map(|entry| (entry.key.clone(), entry.value.clone()))
@@ -2438,7 +2500,7 @@ impl NodeState {
             .iter()
             .map(|entry| (entry.key.clone(), entry.value.clone()))
             .collect::<Vec<_>>();
-        self.execute_batch_set_direct(items).await?;
+        self.execute_range_write_batch_set_direct(items).await?;
         let committed = in_range
             .iter()
             .map(|entry| (entry.key.clone(), entry.value.clone()))
@@ -2586,6 +2648,33 @@ impl NodeState {
 
     /// Execute a batch SET directly against Accord without client batching.
     async fn execute_batch_set_direct(&self, items: Vec<(Vec<u8>, Vec<u8>)>) -> anyhow::Result<()> {
+        self.execute_batch_set_direct_with_limits(
+            items,
+            self.client_set_batch_target.max(1),
+            usize::MAX,
+        )
+        .await
+    }
+
+    /// Execute a range-write batch directly with range-write-specific batching limits.
+    async fn execute_range_write_batch_set_direct(
+        &self,
+        items: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> anyhow::Result<()> {
+        self.execute_batch_set_direct_with_limits(
+            items,
+            self.range_write_batch_target.max(1),
+            self.range_write_batch_max_bytes.max(1),
+        )
+        .await
+    }
+
+    async fn execute_batch_set_direct_with_limits(
+        &self,
+        items: Vec<(Vec<u8>, Vec<u8>)>,
+        max_ops_per_proposal: usize,
+        max_bytes_per_proposal: usize,
+    ) -> anyhow::Result<()> {
         if items.is_empty() {
             // Nothing to do.
             return Ok(());
@@ -2609,7 +2698,8 @@ impl NodeState {
             }
         }
 
-        let target = self.client_set_batch_target.max(1);
+        let target = max_ops_per_proposal.max(1);
+        let max_bytes = max_bytes_per_proposal.max(1);
         let mut futs = FuturesUnordered::new();
         for (shard, batch) in by_shard.into_iter().enumerate() {
             if batch.is_empty() {
@@ -2619,11 +2709,10 @@ impl NodeState {
             // Track client-visible write load per shard (best-effort).
             self.shard_load.record_set_ops(shard, batch.len() as u64);
             let handle = self.handle_for_shard(shard);
-            for chunk in batch.chunks(target) {
-                // Split large batches into target-sized chunks for bounded proposal size.
-                let cmd = kv::encode_batch_set(chunk);
-                let handle = handle.clone();
-                futs.push(self.propose_timed_on(handle, ProposalKind::BatchSet, cmd));
+            for chunk in chunk_batch_set_items_by_limits(batch, target, max_bytes) {
+                // Split large batches by entry and byte budgets for bounded proposal size.
+                let cmd = kv::encode_batch_set(chunk.as_slice());
+                futs.push(self.propose_timed_on(handle.clone(), ProposalKind::BatchSet, cmd));
             }
         }
 
@@ -3269,6 +3358,37 @@ async fn collect_set_batch(
     }
 
     batch
+}
+
+fn chunk_batch_set_items_by_limits(
+    batch: Vec<(Vec<u8>, Vec<u8>)>,
+    max_ops_per_proposal: usize,
+    max_bytes_per_proposal: usize,
+) -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
+    let target = max_ops_per_proposal.max(1);
+    let byte_cap = max_bytes_per_proposal.max(1);
+    let mut chunks = Vec::new();
+    let mut current = Vec::with_capacity(target);
+    let mut current_bytes = 0usize;
+
+    for (key, value) in batch {
+        let item_bytes = key.len().saturating_add(value.len());
+        let exceeds_ops = current.len() >= target;
+        let exceeds_bytes =
+            !current.is_empty() && current_bytes.saturating_add(item_bytes) > byte_cap;
+        if exceeds_ops || exceeds_bytes {
+            chunks.push(std::mem::take(&mut current));
+            current_bytes = 0;
+            current.reserve(target);
+        }
+        current_bytes = current_bytes.saturating_add(item_bytes);
+        current.push((key, value));
+    }
+
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 /// Collect a batch of GET work items up to size/time limits.
@@ -4928,6 +5048,9 @@ where
         wait: Duration::from_micros(args.client_batch_wait_us),
         inflight: args.client_batch_inflight.max(1),
     };
+    let range_write_batch_target = resolve_range_write_batch_target(args.range_write_batch_target);
+    let range_write_batch_max_bytes =
+        resolve_range_write_batch_max_bytes(args.range_write_batch_max_bytes);
 
     let state = Arc::new(NodeState {
         initial_members: cluster_store.members_string(),
@@ -4957,6 +5080,8 @@ where
         } else {
             args.client_set_batch_target.max(1)
         },
+        range_write_batch_target,
+        range_write_batch_max_bytes,
         client_inflight_ops: Arc::new(AtomicU64::new(0)),
         cluster_store,
         meta_handles,
@@ -5422,6 +5547,39 @@ mod tests {
             ControllerDomain::Range,
             42
         ));
+    }
+
+    #[test]
+    fn chunk_batch_set_items_respects_op_limit() {
+        let items = (0..5)
+            .map(|idx| (format!("k{idx}").into_bytes(), vec![idx as u8]))
+            .collect::<Vec<_>>();
+        let chunks = chunk_batch_set_items_by_limits(items, 2, usize::MAX);
+        let sizes = chunks.iter().map(Vec::len).collect::<Vec<_>>();
+        assert_eq!(sizes, vec![2, 2, 1]);
+    }
+
+    #[test]
+    fn chunk_batch_set_items_respects_byte_limit() {
+        let items = vec![
+            (b"k1".to_vec(), vec![0; 7]), // 9 bytes
+            (b"k2".to_vec(), vec![1; 7]), // 9 bytes (would exceed 16 if grouped)
+            (b"k3".to_vec(), vec![2; 2]), // 4 bytes (fits with k2)
+        ];
+        let chunks = chunk_batch_set_items_by_limits(items, 100, 16);
+        let sizes = chunks.iter().map(Vec::len).collect::<Vec<_>>();
+        assert_eq!(sizes, vec![1, 2]);
+    }
+
+    #[test]
+    fn chunk_batch_set_items_keeps_oversize_item_in_single_chunk() {
+        let items = vec![
+            (b"k1".to_vec(), vec![0; 20]), // 22 bytes, larger than cap
+            (b"k2".to_vec(), vec![1; 2]),
+        ];
+        let chunks = chunk_batch_set_items_by_limits(items, 100, 16);
+        let sizes = chunks.iter().map(Vec::len).collect::<Vec<_>>();
+        assert_eq!(sizes, vec![1, 1]);
     }
 }
 

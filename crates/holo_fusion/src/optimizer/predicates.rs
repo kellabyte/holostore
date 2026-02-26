@@ -401,12 +401,10 @@ mod tests {
 
     #[test]
     fn extracts_predicates_from_slot_qualified_use_columns() {
-        let filters = vec![col("status@2")
-            .eq(lit("paid"))
-            .and(col("Use event_day@1").in_list(
-                vec![lit(20i64), lit(21i64), lit(22i64), lit(23i64)],
-                false,
-            ))];
+        let filters = vec![col("status@2").eq(lit("paid")).and(
+            col("Use event_day@1")
+                .in_list(vec![lit(20i64), lit(21i64), lit(22i64), lit(23i64)], false),
+        )];
         let summary = extract_predicate_summary(filters.as_slice());
         let status = summary.column("status").expect("status predicate");
         assert_eq!(status.equals.len(), 1);
