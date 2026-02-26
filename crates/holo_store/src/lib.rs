@@ -243,12 +243,20 @@ pub struct ReplicatedConditionalApplyResult {
     pub applied_versions: Vec<ConditionalAppliedVersion>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RangeStat {
     pub shard_id: u64,
     pub shard_index: usize,
     pub record_count: u64,
     pub is_leaseholder: bool,
+    pub write_ops_total: u64,
+    pub read_ops_total: u64,
+    pub write_bytes_total: u64,
+    pub queue_depth: u64,
+    pub write_tail_latency_ms: f64,
+    pub hot_key_concentration_bps: u32,
+    pub write_hot_buckets: Vec<u64>,
+    pub read_hot_buckets: Vec<u64>,
 }
 
 #[derive(Clone)]
@@ -331,6 +339,14 @@ impl HoloStoreClient {
                         shard_index: item.shard_index,
                         record_count: item.record_count,
                         is_leaseholder: item.is_leaseholder,
+                        write_ops_total: item.write_ops_total,
+                        read_ops_total: item.read_ops_total,
+                        write_bytes_total: item.write_bytes_total,
+                        queue_depth: item.queue_depth,
+                        write_tail_latency_ms: item.write_tail_latency_ms,
+                        hot_key_concentration_bps: item.hot_key_concentration_bps,
+                        write_hot_buckets: item.write_hot_buckets,
+                        read_hot_buckets: item.read_hot_buckets,
                     });
                 }
                 Ok(out)
@@ -352,6 +368,14 @@ impl HoloStoreClient {
                         shard_index: item.shard_index as usize,
                         record_count: item.record_count,
                         is_leaseholder: item.is_leaseholder,
+                        write_ops_total: item.write_ops_total,
+                        read_ops_total: item.read_ops_total,
+                        write_bytes_total: item.write_bytes_total,
+                        queue_depth: item.queue_depth,
+                        write_tail_latency_ms: item.write_tail_latency_ms,
+                        hot_key_concentration_bps: item.hot_key_concentration_bps,
+                        write_hot_buckets: item.write_hot_buckets,
+                        read_hot_buckets: item.read_hot_buckets,
                     });
                 }
                 Ok(out)
@@ -746,6 +770,9 @@ impl HoloStoreClient {
                     let cmd = crate::cluster::ClusterCommand::SplitRange {
                         split_key: split_key.clone(),
                         target_shard_index,
+                        target_replicas: None,
+                        target_leaseholder: None,
+                        skip_migration: false,
                     };
                     state.propose_meta_command(cmd).await?;
                     let snapshot = state.cluster_store.state();

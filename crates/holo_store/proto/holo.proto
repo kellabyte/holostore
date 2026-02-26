@@ -351,6 +351,14 @@ message RangeStat {
   uint64 shard_index = 2;
   uint64 record_count = 3;
   bool is_leaseholder = 4;
+  uint64 write_ops_total = 5;
+  uint64 read_ops_total = 6;
+  uint64 write_bytes_total = 7;
+  uint64 queue_depth = 8;
+  double write_tail_latency_ms = 9;
+  uint32 hot_key_concentration_bps = 10;
+  repeated uint64 write_hot_buckets = 11;
+  repeated uint64 read_hot_buckets = 12;
 }
 
 message RangeStatsResponse {

@@ -316,6 +316,125 @@ pub struct NodeArgs {
     #[arg(long, env = "HOLO_RANGE_SPLIT_COOLDOWN_MS", default_value_t = 10_000)]
     range_split_cooldown_ms: u64,
 
+    /// Split-strategy planner used by the range manager.
+    ///
+    /// - `loadops`: existing load-first/size-second strategy.
+    /// - `adaptive`: cluster-aware score-based strategy with staged split workflow.
+    #[arg(long, env = "HOLO_RANGE_SPLIT_STRATEGY", default_value = "adaptive")]
+    range_split_strategy: RangeSplitStrategy,
+
+    /// Adaptive split manager: minimum stress score required to split.
+    #[arg(
+        long,
+        env = "HOLO_RANGE_ADAPTIVE_SCORE_THRESHOLD",
+        default_value_t = 1.0
+    )]
+    range_adaptive_score_threshold: f64,
+
+    /// Adaptive split manager: clear sustained score when below
+    /// `score_threshold * (1 - hysteresis_pct/100)`.
+    #[arg(long, env = "HOLO_RANGE_ADAPTIVE_HYSTERESIS_PCT", default_value_t = 15)]
+    range_adaptive_hysteresis_pct: u8,
+
+    /// Adaptive split manager: sustained intervals above score threshold.
+    #[arg(long, env = "HOLO_RANGE_ADAPTIVE_SUSTAIN", default_value_t = 3)]
+    range_adaptive_sustain: u8,
+
+    /// Adaptive split manager: skip range split when sampled hot-key
+    /// concentration exceeds this many basis points.
+    #[arg(long, env = "HOLO_RANGE_ADAPTIVE_HOT_KEY_BPS", default_value_t = 7000)]
+    range_adaptive_hot_key_bps: u32,
+
+    /// Adaptive split manager: target logical bytes per range used by stress scoring.
+    #[arg(
+        long,
+        env = "HOLO_RANGE_ADAPTIVE_TARGET_BYTES",
+        default_value_t = 64 * 1024 * 1024
+    )]
+    range_adaptive_target_bytes: u64,
+
+    /// Adaptive split manager: target write QPS used by stress scoring.
+    #[arg(
+        long,
+        env = "HOLO_RANGE_ADAPTIVE_TARGET_WRITE_QPS",
+        default_value_t = 50_000
+    )]
+    range_adaptive_target_write_qps: u64,
+
+    /// Adaptive split manager: target read QPS used by stress scoring.
+    #[arg(
+        long,
+        env = "HOLO_RANGE_ADAPTIVE_TARGET_READ_QPS",
+        default_value_t = 100_000
+    )]
+    range_adaptive_target_read_qps: u64,
+
+    /// Adaptive split manager: target write throughput (bytes/s) used by stress scoring.
+    #[arg(
+        long,
+        env = "HOLO_RANGE_ADAPTIVE_TARGET_WRITE_BPS",
+        default_value_t = 64 * 1024 * 1024
+    )]
+    range_adaptive_target_write_bps: u64,
+
+    /// Adaptive split manager: target queue-depth used by stress scoring.
+    #[arg(
+        long,
+        env = "HOLO_RANGE_ADAPTIVE_TARGET_QUEUE_DEPTH",
+        default_value_t = 128
+    )]
+    range_adaptive_target_queue_depth: u64,
+
+    /// Adaptive split manager: target p99 latency in milliseconds used by stress scoring.
+    #[arg(
+        long,
+        env = "HOLO_RANGE_ADAPTIVE_TARGET_P99_MS",
+        default_value_t = 10.0
+    )]
+    range_adaptive_target_p99_ms: f64,
+
+    /// Adaptive split manager: maximum bytes/sec for staged backfill copy.
+    ///
+    /// Set to 0 to disable throttling.
+    #[arg(
+        long,
+        env = "HOLO_RANGE_ADAPTIVE_BACKFILL_MAX_BPS",
+        default_value_t = 128 * 1024 * 1024
+    )]
+    range_adaptive_backfill_max_bps: u64,
+
+    /// Adaptive split manager: page size for staged split backfill.
+    #[arg(
+        long,
+        env = "HOLO_RANGE_ADAPTIVE_BACKFILL_PAGE_LIMIT",
+        default_value_t = 2000
+    )]
+    range_adaptive_backfill_page_limit: usize,
+
+    /// Adaptive split manager: maximum pages copied during one staged pass.
+    #[arg(
+        long,
+        env = "HOLO_RANGE_ADAPTIVE_BACKFILL_MAX_PAGES",
+        default_value_t = 1_000_000
+    )]
+    range_adaptive_backfill_max_pages: usize,
+
+    /// Adaptive split manager: minimum interval between cluster telemetry refreshes.
+    #[arg(
+        long,
+        env = "HOLO_RANGE_ADAPTIVE_STATS_REFRESH_MS",
+        default_value_t = 1000
+    )]
+    range_adaptive_stats_refresh_ms: u64,
+
+    /// Adaptive split manager split budget: max concurrent split workflows.
+    #[arg(
+        long,
+        env = "HOLO_RANGE_ADAPTIVE_MAX_CONCURRENT_SPLITS",
+        default_value_t = 1
+    )]
+    range_adaptive_max_concurrent_splits: usize,
+
     /// Merge adjacent ranges when their combined key count is below this threshold.
     ///
     /// Set to 0 to disable automatic merge proposals.
@@ -707,6 +826,14 @@ struct LocalRangeStat {
     shard_index: usize,
     record_count: u64,
     is_leaseholder: bool,
+    write_ops_total: u64,
+    read_ops_total: u64,
+    write_bytes_total: u64,
+    queue_depth: u64,
+    write_tail_latency_ms: f64,
+    hot_key_concentration_bps: u32,
+    write_hot_buckets: Vec<u64>,
+    read_hot_buckets: Vec<u64>,
 }
 
 /// One latest-visible KV entry used for replica backfill.
@@ -856,13 +983,24 @@ impl LocalRangeStats {
         self.adjust_record_count(shard_index, inserted_keys);
     }
 
-    fn on_range_migration(&self, from_shard: usize, to_shard: usize, moved_keys: u64) {
-        if moved_keys == 0 || from_shard == to_shard {
+    fn on_range_migration(
+        &self,
+        from_shard: usize,
+        to_shard: usize,
+        removed_from_source: u64,
+        inserted_into_target: u64,
+    ) {
+        if from_shard == to_shard {
             return;
         }
-        let moved = moved_keys.min(i64::MAX as u64) as i64;
-        self.adjust_record_count(from_shard, -moved);
-        self.adjust_record_count(to_shard, moved);
+        if removed_from_source > 0 {
+            let removed = removed_from_source.min(i64::MAX as u64) as i64;
+            self.adjust_record_count(from_shard, -removed);
+        }
+        if inserted_into_target > 0 {
+            let inserted = inserted_into_target.min(i64::MAX as u64) as i64;
+            self.adjust_record_count(to_shard, inserted);
+        }
     }
 
     /// Read one paged snapshot of latest-visible rows for `[start_key, end_key)`.
@@ -1268,6 +1406,21 @@ enum RoutingMode {
     Range,
 }
 
+/// Range split strategy options.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum RangeSplitStrategy {
+    /// Baseline load-first/ops-since-baseline strategy.
+    ///
+    /// Output:
+    /// - Preserves historical behavior for comparison and controlled rollouts.
+    Loadops,
+    /// Hybrid adaptive strategy driven by cluster telemetry + staged split workflow.
+    ///
+    /// Output:
+    /// - Produces cost-scored split plans with split budgeting and weighted keys.
+    Adaptive,
+}
+
 /// WAL engine options.
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum WalEngine {
@@ -1649,6 +1802,7 @@ struct SplitHealthStats {
     attempts: AtomicU64,
     successes: AtomicU64,
     failures: AtomicU64,
+    transient_aborts: AtomicU64,
     backoff_active: AtomicU64,
     last_attempt_ms: AtomicU64,
     last_success_ms: AtomicU64,
@@ -1663,6 +1817,7 @@ pub(crate) struct SplitHealthSnapshot {
     attempts: u64,
     successes: u64,
     failures: u64,
+    transient_aborts: u64,
     backoff_active: u64,
     last_attempt_ms: u64,
     last_success_ms: u64,
@@ -1710,6 +1865,24 @@ impl SplitHealthStats {
         }
     }
 
+    fn record_transient_abort(&self, reason: &str, detail: &str) {
+        self.transient_aborts.fetch_add(1, Ordering::Relaxed);
+        let mut reasons = self.failure_reasons.write().unwrap();
+        reasons
+            .entry(format!("abort:{reason}"))
+            .and_modify(|v| *v = v.saturating_add(1))
+            .or_insert(1);
+        drop(reasons);
+
+        let detail_trimmed = detail.trim();
+        let mut last = self.last_failure_reason.write().unwrap();
+        if detail_trimmed.is_empty() {
+            *last = format!("abort:{reason}");
+        } else {
+            *last = format!("abort:{reason}: {}", detail_trimmed);
+        }
+    }
+
     fn set_backoff_active(&self, count: u64) {
         self.backoff_active.store(count, Ordering::Relaxed);
     }
@@ -1719,6 +1892,7 @@ impl SplitHealthStats {
             attempts: self.attempts.load(Ordering::Relaxed),
             successes: self.successes.load(Ordering::Relaxed),
             failures: self.failures.load(Ordering::Relaxed),
+            transient_aborts: self.transient_aborts.load(Ordering::Relaxed),
             backoff_active: self.backoff_active.load(Ordering::Relaxed),
             last_attempt_ms: self.last_attempt_ms.load(Ordering::Relaxed),
             last_success_ms: self.last_success_ms.load(Ordering::Relaxed),
@@ -1932,6 +2106,10 @@ impl NodeState {
 
     pub(crate) fn record_split_failure(&self, reason: &str, detail: &str) {
         self.split_health.record_failure(reason, detail);
+    }
+
+    pub(crate) fn record_split_transient_abort(&self, reason: &str, detail: &str) {
+        self.split_health.record_transient_abort(reason, detail);
     }
 
     pub(crate) fn set_split_backoff_active(&self, count: u64) {
@@ -2323,18 +2501,68 @@ impl NodeState {
     /// Collect local per-range record counts for ranges this node serves.
     pub(crate) fn local_range_stats(&self) -> anyhow::Result<Vec<LocalRangeStat>> {
         let shards = self.cluster_store.shards_snapshot();
+        let load = self.shard_load.snapshot();
         let mut out = Vec::new();
         for shard in shards {
             if !shard.replicas.contains(&self.node_id) {
                 continue;
             }
+            let write_hot_buckets = load
+                .write_hot_buckets
+                .get(shard.shard_index)
+                .cloned()
+                .unwrap_or_else(|| vec![0; crate::load::HOT_KEY_BUCKETS]);
+            let read_hot_buckets = load
+                .read_hot_buckets
+                .get(shard.shard_index)
+                .cloned()
+                .unwrap_or_else(|| vec![0; crate::load::HOT_KEY_BUCKETS]);
             let record_count = self.range_stats.record_count(shard.shard_index);
             out.push(LocalRangeStat {
                 shard_id: shard.shard_id,
                 shard_index: shard.shard_index,
                 record_count,
                 is_leaseholder: shard.leaseholder == self.node_id,
+                write_ops_total: load.set_ops.get(shard.shard_index).copied().unwrap_or(0),
+                read_ops_total: load.get_ops.get(shard.shard_index).copied().unwrap_or(0),
+                write_bytes_total: load
+                    .write_bytes
+                    .get(shard.shard_index)
+                    .copied()
+                    .unwrap_or(0),
+                queue_depth: 0,
+                write_tail_latency_ms: load
+                    .write_tail_latency_ms
+                    .get(shard.shard_index)
+                    .copied()
+                    .unwrap_or(0.0),
+                hot_key_concentration_bps: load
+                    .hot_key_concentration_bps
+                    .get(shard.shard_index)
+                    .copied()
+                    .unwrap_or(0),
+                write_hot_buckets,
+                read_hot_buckets,
             });
+        }
+        Ok(out)
+    }
+
+    /// Collect local per-range stats with runtime queue-depth sampling.
+    pub(crate) async fn local_range_stats_detailed(&self) -> anyhow::Result<Vec<LocalRangeStat>> {
+        let mut out = self.local_range_stats()?;
+        for stat in &mut out {
+            let group_id = GROUP_DATA_BASE + stat.shard_index as u64;
+            let Some(group) = self.group(group_id) else {
+                continue;
+            };
+            let debug = group.debug_stats().await;
+            stat.queue_depth = (debug.records_status_preaccepted_len
+                + debug.records_status_accepted_len
+                + debug.records_status_committed_len
+                + debug.records_status_executing_len
+                + debug.committed_queue_len
+                + debug.read_waiters_len) as u64;
         }
         Ok(out)
     }
@@ -2350,8 +2578,66 @@ impl NodeState {
         Ok(out)
     }
 
+    /// Collect per-node range telemetry for active members.
+    pub(crate) async fn cluster_range_telemetry(
+        &self,
+    ) -> BTreeMap<NodeId, Vec<transport::RangeTelemetryStat>> {
+        let snapshot = self.cluster_store.state();
+        let mut targets = snapshot
+            .members
+            .iter()
+            .filter_map(|(node_id, member)| {
+                (member.state != MemberState::Removed).then_some(*node_id)
+            })
+            .collect::<Vec<_>>();
+        targets.sort_unstable();
+
+        let mut futs = FuturesUnordered::<
+            BoxFuture<'static, (NodeId, Option<Vec<transport::RangeTelemetryStat>>)>,
+        >::new();
+        for node_id in targets {
+            if node_id == self.node_id {
+                let local = self
+                    .local_range_stats_detailed()
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|item| transport::RangeTelemetryStat {
+                        shard_id: item.shard_id,
+                        shard_index: item.shard_index,
+                        record_count: item.record_count,
+                        is_leaseholder: item.is_leaseholder,
+                        write_ops_total: item.write_ops_total,
+                        read_ops_total: item.read_ops_total,
+                        write_bytes_total: item.write_bytes_total,
+                        queue_depth: item.queue_depth,
+                        write_tail_latency_ms: item.write_tail_latency_ms,
+                        hot_key_concentration_bps: item.hot_key_concentration_bps,
+                        write_hot_buckets: item.write_hot_buckets,
+                        read_hot_buckets: item.read_hot_buckets,
+                    })
+                    .collect::<Vec<_>>();
+                futs.push(Box::pin(async move { (node_id, Some(local)) }));
+                continue;
+            }
+            let transport = self.transport.clone();
+            futs.push(Box::pin(async move {
+                let stats = transport.range_stats_detailed(node_id).await.ok();
+                (node_id, stats)
+            }));
+        }
+
+        let mut out = BTreeMap::new();
+        while let Some((node_id, stats)) = futs.next().await {
+            if let Some(stats) = stats {
+                out.insert(node_id, stats);
+            }
+        }
+        out
+    }
+
     /// Read one paged snapshot of latest rows for a shard range.
-    fn snapshot_range_latest_page(
+    pub(crate) fn snapshot_range_latest_page(
         &self,
         shard_index: usize,
         start_key: &[u8],
@@ -2371,7 +2657,7 @@ impl NodeState {
     }
 
     /// Apply one page of latest rows into a local shard range.
-    fn apply_range_latest_page(
+    pub(crate) fn apply_range_latest_page(
         &self,
         shard_index: usize,
         start_key: &[u8],
@@ -2383,7 +2669,7 @@ impl NodeState {
     }
 
     /// Apply one page of latest rows conditionally into a local shard range.
-    fn apply_range_latest_page_conditional(
+    pub(crate) fn apply_range_latest_page_conditional(
         &self,
         shard_index: usize,
         start_key: &[u8],
@@ -2719,6 +3005,7 @@ impl NodeState {
     /// latency, while preserving bounded memory and natural backpressure.
     async fn execute_batch_set_chunks_on_shard(
         &self,
+        shard_index: usize,
         handle: accord::Handle,
         chunks: Vec<Vec<(Vec<u8>, Vec<u8>)>>,
         pipeline_depth: usize,
@@ -2739,11 +3026,18 @@ impl NodeState {
             };
             let handle = handle.clone();
             let state = state.clone();
+            let shard_index_local = shard_index;
             inflight.push(Box::pin(async move {
+                let started = Instant::now();
                 let cmd = kv::encode_batch_set(chunk.as_slice());
-                state
+                let res = state
                     .propose_timed_on(handle, ProposalKind::BatchSet, cmd)
-                    .await
+                    .await;
+                let dur_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                state
+                    .shard_load
+                    .record_write_latency_us(shard_index_local, dur_us);
+                res
             }));
         }
 
@@ -2756,11 +3050,18 @@ impl NodeState {
                 };
                 let handle = handle.clone();
                 let state = state.clone();
+                let shard_index_local = shard_index;
                 inflight.push(Box::pin(async move {
+                    let started = Instant::now();
                     let cmd = kv::encode_batch_set(chunk.as_slice());
-                    state
+                    let res = state
                         .propose_timed_on(handle, ProposalKind::BatchSet, cmd)
-                        .await
+                        .await;
+                    let dur_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                    state
+                        .shard_load
+                        .record_write_latency_us(shard_index_local, dur_us);
+                    res
                 }));
             }
         }
@@ -2823,6 +3124,12 @@ impl NodeState {
             }
             // Track client-visible write load per shard (best-effort).
             self.shard_load.record_set_ops(shard, batch.len() as u64);
+            let mut write_bytes = 0u64;
+            for (key, value) in &batch {
+                self.shard_load.record_write_key_sample(shard, key);
+                write_bytes = write_bytes.saturating_add((key.len() + value.len()) as u64);
+            }
+            self.shard_load.record_set_bytes(shard, write_bytes);
             let handle = self.handle_for_shard(shard);
             // Chunk by entry/byte budgets once, then let per-shard pipelining
             // overlap proposal round-trips behind a bounded concurrency gate.
@@ -2830,7 +3137,7 @@ impl NodeState {
             let state = self.clone();
             shard_futs.push(async move {
                 state
-                    .execute_batch_set_chunks_on_shard(handle, chunks, pipeline_depth)
+                    .execute_batch_set_chunks_on_shard(shard, handle, chunks, pipeline_depth)
                     .await
             });
         }
@@ -2902,6 +3209,7 @@ impl NodeState {
             let mut shard_keys = Vec::with_capacity(entries.len());
             let mut shard_indices = Vec::with_capacity(entries.len());
             for (idx, key) in entries {
+                self.shard_load.record_read_key_sample(shard, &key);
                 shard_indices.push(idx);
                 shard_keys.push(key);
             }
@@ -5010,9 +5318,16 @@ where
     let range_stats = Arc::new(LocalRangeStats::new(keyspace.clone(), data_shards)?);
     let migration_stats_hook: Arc<cluster::MigrationStatsHook> = {
         let range_stats = range_stats.clone();
-        Arc::new(move |from_shard, to_shard, moved_keys| {
-            range_stats.on_range_migration(from_shard, to_shard, moved_keys);
-        })
+        Arc::new(
+            move |from_shard, to_shard, removed_from_source, inserted_into_target| {
+                range_stats.on_range_migration(
+                    from_shard,
+                    to_shard,
+                    removed_from_source,
+                    inserted_into_target,
+                );
+            },
+        )
     };
     let cluster_sm = Arc::new(ClusterStateMachine::new(
         cluster_store.clone(),
@@ -5317,11 +5632,29 @@ where
         state.clone(),
         keyspace.clone(),
         RangeManagerConfig {
+            split_strategy: args.range_split_strategy,
             interval: Duration::from_millis(args.range_mgr_interval_ms.max(50)),
             split_min_keys: args.range_split_min_keys,
             split_min_qps: args.range_split_min_qps,
             split_qps_sustain: args.range_split_qps_sustain.max(1),
             split_cooldown: Duration::from_millis(args.range_split_cooldown_ms.max(1)),
+            adaptive_sustain: args.range_adaptive_sustain.max(1),
+            adaptive_score_threshold: args.range_adaptive_score_threshold.max(0.01),
+            adaptive_hysteresis_pct: args.range_adaptive_hysteresis_pct.clamp(1, 90),
+            adaptive_hot_key_bps: args.range_adaptive_hot_key_bps.clamp(1, 10_000),
+            adaptive_target_bytes: args.range_adaptive_target_bytes.max(1),
+            adaptive_target_write_qps: args.range_adaptive_target_write_qps.max(1),
+            adaptive_target_read_qps: args.range_adaptive_target_read_qps.max(1),
+            adaptive_target_write_bps: args.range_adaptive_target_write_bps.max(1),
+            adaptive_target_queue_depth: args.range_adaptive_target_queue_depth.max(1),
+            adaptive_target_p99_ms: args.range_adaptive_target_p99_ms.max(0.1),
+            adaptive_backfill_max_bps: args.range_adaptive_backfill_max_bps,
+            adaptive_backfill_page_limit: args.range_adaptive_backfill_page_limit.clamp(64, 10_000),
+            adaptive_backfill_max_pages: args.range_adaptive_backfill_max_pages.max(1),
+            adaptive_stats_refresh: Duration::from_millis(
+                args.range_adaptive_stats_refresh_ms.max(100),
+            ),
+            adaptive_max_concurrent_splits: args.range_adaptive_max_concurrent_splits.max(1),
             merge_max_keys: args.range_merge_max_keys,
             merge_cooldown: Duration::from_millis(args.range_merge_cooldown_ms.max(1)),
             merge_max_qps: args.range_merge_max_qps,

@@ -286,6 +286,12 @@ pub enum ClusterCommand {
     SplitRange {
         split_key: Vec<u8>,
         target_shard_index: usize,
+        #[serde(default)]
+        target_replicas: Option<Vec<NodeId>>,
+        #[serde(default)]
+        target_leaseholder: Option<NodeId>,
+        #[serde(default)]
+        skip_migration: bool,
     },
     MergeRange {
         left_shard_id: u64,
@@ -342,8 +348,14 @@ pub trait RangeMigrator: Send + Sync + 'static {
     ) -> anyhow::Result<()>;
 }
 
-/// Callback used by range migration to publish moved-key deltas.
-pub type MigrationStatsHook = dyn Fn(usize, usize, u64) + Send + Sync + 'static;
+/// Callback used by range migration to publish key-count deltas.
+///
+/// Arguments:
+/// - `from_shard`: source shard index
+/// - `to_shard`: target shard index
+/// - `removed_from_source`: keys removed from source latest index
+/// - `inserted_into_target`: keys newly inserted into target latest index
+pub type MigrationStatsHook = dyn Fn(usize, usize, u64, u64) + Send + Sync + 'static;
 
 /// Fjall-backed range migrator that moves keys between shard partitions.
 pub struct FjallRangeMigrator {
@@ -415,7 +427,8 @@ impl RangeMigrator for FjallRangeMigrator {
             let (key, latest_val) = item?;
             latest_entries.push((key.to_vec(), latest_val.to_vec()));
         }
-        let moved_count = latest_entries.len() as u64;
+        let removed_from_source = latest_entries.len() as u64;
+        let mut inserted_into_target = 0u64;
 
         // Commit in chunks to keep batch sizes bounded.
         const CHUNK_ITEMS: usize = 10_000;
@@ -432,10 +445,14 @@ impl RangeMigrator for FjallRangeMigrator {
                 version_entries.push((ver_key.to_vec(), ver_val.to_vec()));
             }
 
+            let existed_in_target = to_latest.get(key_bytes.as_slice())?.is_some();
             // Copy latest index entry.
             batch.insert(&to_latest, key_bytes.clone(), latest_val);
             batch.remove(&from_latest, key_bytes.clone());
             queued += 2;
+            if !existed_in_target {
+                inserted_into_target = inserted_into_target.saturating_add(1);
+            }
 
             // Copy all version entries for this key.
             for (ver_key, ver_val) in version_entries {
@@ -461,7 +478,12 @@ impl RangeMigrator for FjallRangeMigrator {
         }
 
         if let Some(hook) = &self.migration_hook {
-            hook(from_shard, to_shard, moved_count);
+            hook(
+                from_shard,
+                to_shard,
+                removed_from_source,
+                inserted_into_target,
+            );
         }
 
         Ok(())
@@ -1004,6 +1026,9 @@ impl ClusterStateStore {
         &self,
         split_key: Vec<u8>,
         target_shard_index: usize,
+        target_replicas: Option<Vec<NodeId>>,
+        target_leaseholder: Option<NodeId>,
+        skip_migration: bool,
         migrator: Option<&dyn RangeMigrator>,
         shard_limit: usize,
     ) -> anyhow::Result<()> {
@@ -1058,8 +1083,69 @@ impl ClusterStateStore {
         let end = shard_snapshot.end_key.clone();
 
         // Move keys for the right-hand side before changing routing.
-        if let Some(migrator) = migrator {
-            migrator.migrate(from_shard, target_shard_index, &start, &end)?;
+        if !skip_migration {
+            if let Some(migrator) = migrator {
+                migrator.migrate(from_shard, target_shard_index, &start, &end)?;
+            }
+        }
+
+        let mut right_replicas = if let Some(explicit) = target_replicas.clone() {
+            let active_members = active_member_ids_from_state(&state);
+            let expected_replicas = state.replication_factor.min(active_members.len()).max(1);
+            let mut replicas = explicit;
+            dedupe_nodes_in_place(&mut replicas);
+            if replicas.is_empty() {
+                anyhow::bail!("split target replicas cannot be empty");
+            }
+            if replicas.len() != expected_replicas {
+                anyhow::bail!(
+                    "invalid target replica count for split: got {}, expected {} (rf={}, active={})",
+                    replicas.len(),
+                    expected_replicas,
+                    state.replication_factor,
+                    active_members.len()
+                );
+            }
+            for id in &replicas {
+                let Some(member) = state.members.get(id) else {
+                    anyhow::bail!("split target replica node {id} does not exist");
+                };
+                if member.state != MemberState::Active {
+                    anyhow::bail!("split target replica node {id} is not Active");
+                }
+            }
+            replicas
+        } else {
+            shard_snapshot.replicas.clone()
+        };
+        dedupe_nodes_in_place(&mut right_replicas);
+        if right_replicas.is_empty() {
+            anyhow::bail!("split target replicas cannot be empty");
+        }
+        let mut right_leaseholder = target_leaseholder.unwrap_or(shard_snapshot.leaseholder);
+        if target_replicas.is_some() && !right_replicas.contains(&right_leaseholder) {
+            right_leaseholder = right_replicas.first().copied().unwrap_or(right_leaseholder);
+        }
+        if !right_replicas.contains(&right_leaseholder) {
+            anyhow::bail!(
+                "split target leaseholder {} must be part of target replicas {:?}",
+                right_leaseholder,
+                right_replicas
+            );
+        }
+
+        let left_roles = state
+            .shard_replica_roles
+            .entry(shard_snapshot.shard_id)
+            .or_insert_with(|| default_roles_for_replicas(&shard_snapshot.replicas))
+            .clone();
+        let mut right_roles = default_roles_for_replicas(&right_replicas);
+        if !left_roles.is_empty() {
+            for node_id in &right_replicas {
+                if let Some(role) = left_roles.get(node_id) {
+                    right_roles.insert(*node_id, *role);
+                }
+            }
         }
 
         let right_id = next_shard_id(&state.shards);
@@ -1070,18 +1156,12 @@ impl ClusterStateStore {
             end_hash: 0,
             start_key: start,
             end_key: end.clone(),
-            replicas: shard_snapshot.replicas.clone(),
-            leaseholder: shard_snapshot.leaseholder,
+            replicas: right_replicas,
+            leaseholder: right_leaseholder,
         };
         state.shards[idx].end_key = right.start_key.clone();
         state.shards.insert(idx + 1, right);
-        let left_id = shard_snapshot.shard_id;
-        let left_roles = state
-            .shard_replica_roles
-            .entry(left_id)
-            .or_insert_with(|| default_roles_for_replicas(&shard_snapshot.replicas))
-            .clone();
-        state.shard_replica_roles.insert(right_id, left_roles);
+        state.shard_replica_roles.insert(right_id, right_roles);
         state.shard_rebalances.remove(&right_id);
         state.epoch = state.epoch.saturating_add(1);
 
@@ -2727,12 +2807,12 @@ mod tests {
         let split_key = b"key:050000".to_vec();
 
         store
-            .apply_split_range(split_key.clone(), 1, None, 8)
+            .apply_split_range(split_key.clone(), 1, None, None, false, None, 8)
             .expect("first split should apply");
         let epoch_after_first = store.state().epoch;
 
         store
-            .apply_split_range(split_key.clone(), 1, None, 8)
+            .apply_split_range(split_key.clone(), 1, None, None, false, None, 8)
             .expect("replayed split should be a no-op");
         let state = store.state();
         assert_eq!(
@@ -2746,6 +2826,51 @@ mod tests {
         );
         assert_eq!(state.shards[1].shard_index, 1);
         assert_eq!(state.shards[1].start_key, split_key);
+    }
+
+    #[test]
+    fn split_range_without_explicit_target_replicas_keeps_source_replicas() {
+        let mut state = base_state();
+        state
+            .members
+            .get_mut(&3)
+            .expect("member should exist")
+            .state = MemberState::Decommissioning;
+        let store = test_store(state);
+        let split_key = b"key:050000".to_vec();
+
+        store
+            .apply_split_range(split_key.clone(), 1, None, None, false, None, 8)
+            .expect("split without explicit placement should succeed");
+
+        let state = store.state();
+        assert_eq!(state.shards.len(), 2);
+        assert_eq!(state.shards[0].replicas, vec![1, 2, 3]);
+        assert_eq!(state.shards[1].replicas, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn split_range_with_explicit_target_replicas_requires_active_members() {
+        let mut state = base_state();
+        state
+            .members
+            .get_mut(&4)
+            .expect("member should exist")
+            .state = MemberState::Decommissioning;
+        let store = test_store(state);
+
+        let err = store
+            .apply_split_range(
+                b"key:050000".to_vec(),
+                1,
+                Some(vec![1, 2, 4]),
+                Some(1),
+                true,
+                None,
+                8,
+            )
+            .expect_err("explicit placement with non-active member should fail");
+        assert!(err.to_string().contains("is not Active"));
     }
 
     #[test]
@@ -3067,6 +3192,102 @@ mod tests {
         drop(keyspace);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn migrator_hook_counts_only_new_target_latest_keys() {
+        fn temp_dir(name: &str) -> PathBuf {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            std::env::temp_dir().join(format!(
+                "holo_store_{name}_{}_{}",
+                std::process::id(),
+                nanos
+            ))
+        }
+
+        let dir = temp_dir("migrator_hook_counts");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let keyspace = Arc::new(
+            fjall::Config::new(&dir)
+                .open()
+                .expect("open temporary keyspace"),
+        );
+        let from_latest = keyspace
+            .open_partition("kv_latest_0", PartitionCreateOptions::default())
+            .expect("open from latest");
+        let from_versions = keyspace
+            .open_partition("kv_versions_0", PartitionCreateOptions::default())
+            .expect("open from versions");
+        let to_latest = keyspace
+            .open_partition("kv_latest_1", PartitionCreateOptions::default())
+            .expect("open to latest");
+
+        for key in ["k0001", "k0002", "k0003"] {
+            let value = format!("src-{key}").into_bytes();
+            from_latest
+                .insert(key.as_bytes(), value.clone())
+                .expect("insert source latest");
+            let mut version_key = Vec::with_capacity(4 + key.len() + 8 + 8 + 8);
+            version_key.extend_from_slice(&(key.len() as u32).to_be_bytes());
+            version_key.extend_from_slice(key.as_bytes());
+            version_key.extend_from_slice(&1u64.to_be_bytes());
+            version_key.extend_from_slice(&1u64.to_be_bytes());
+            version_key.extend_from_slice(&1u64.to_be_bytes());
+            from_versions
+                .insert(version_key, value)
+                .expect("insert source version");
+        }
+        to_latest
+            .insert("k0002".as_bytes(), b"seed-k0002".as_slice())
+            .expect("seed existing target key");
+
+        let observed = Arc::new(Mutex::new(None::<(u64, u64)>));
+        let hook: Arc<MigrationStatsHook> = {
+            let observed = observed.clone();
+            Arc::new(move |_, _, removed, inserted| {
+                *observed.lock().expect("lock observed") = Some((removed, inserted));
+            })
+        };
+        let migrator = FjallRangeMigrator::with_migration_hook(keyspace.clone(), Some(hook));
+        migrator
+            .migrate(0, 1, b"k0000", b"k9999")
+            .expect("migrate range");
+
+        let metrics = observed
+            .lock()
+            .expect("lock observed")
+            .expect("hook should fire");
+        assert_eq!(
+            metrics,
+            (3, 2),
+            "one key already existed on target, so inserted count must exclude it"
+        );
+
+        for key in ["k0001", "k0002", "k0003"] {
+            assert!(
+                from_latest
+                    .get(key.as_bytes())
+                    .expect("read source latest")
+                    .is_none(),
+                "source latest should be cleared after migration"
+            );
+            assert!(
+                to_latest
+                    .get(key.as_bytes())
+                    .expect("read target latest")
+                    .is_some(),
+                "target latest should contain migrated key"
+            );
+        }
+
+        drop(to_latest);
+        drop(from_versions);
+        drop(from_latest);
+        drop(keyspace);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 fn hash_key(bytes: &[u8]) -> u64 {
@@ -3140,9 +3361,15 @@ impl StateMachine for ClusterStateMachine {
                 ClusterCommand::SplitRange {
                     split_key,
                     target_shard_index,
+                    target_replicas,
+                    target_leaseholder,
+                    skip_migration,
                 } => self.store.apply_split_range(
                     split_key,
                     target_shard_index,
+                    target_replicas,
+                    target_leaseholder,
+                    skip_migration,
                     self.migrator.as_deref(),
                     self.shard_limit,
                 ),
