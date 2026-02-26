@@ -499,6 +499,13 @@ fn classify_write_error_message(message: &str) -> RetryableErrorClass {
     RetryableErrorClass::NonRetryable
 }
 
+fn class_counts_toward_circuit_failure(classification: RetryableErrorClass) -> bool {
+    matches!(
+        classification,
+        RetryableErrorClass::TransientRpc | RetryableErrorClass::Overload
+    )
+}
+
 /// Estimates one replicated write entry payload size for batch sizing.
 fn replicated_write_entry_size(entry: &ReplicatedWriteEntry) -> usize {
     entry
@@ -3133,7 +3140,6 @@ impl HoloStoreTableProvider {
                             }
                         }
                         Err(err) => {
-                            self.circuit_on_failure(target.grpc_addr, circuit_token);
                             let apply_error = anyhow!(
                                 "apply conditional {op} batch table={} shard={} target={} chunk={}/{} failed: {err}",
                                 self.table_name,
@@ -3144,6 +3150,11 @@ impl HoloStoreTableProvider {
                             );
                             let classification =
                                 classify_write_error_message(apply_error.to_string().as_str());
+                            self.circuit_on_classified_failure(
+                                target.grpc_addr,
+                                circuit_token,
+                                classification,
+                            );
                             self.metrics.record_distributed_apply_failure(
                                 target_key.as_str(),
                                 classification.is_retryable(),
@@ -5220,43 +5231,6 @@ impl HoloStoreTableProvider {
                         break;
                     }
 
-                    let circuit_token = match self.circuit_acquire(target.grpc_addr) {
-                        Ok(token) => token,
-                        Err(err) => {
-                            let wrapped = anyhow!(
-                                "rollback for {op} circuit rejection on shard {} chunk {}/{} target={}: {err}",
-                                target.shard_index,
-                                batch_idx + 1,
-                                batch_count,
-                                target.grpc_addr
-                            );
-                            let class = classify_write_error_message(wrapped.to_string().as_str());
-                            warn!(
-                                error = %wrapped,
-                                attempt = attempt + 1,
-                                retry_limit = retry_limit,
-                                retryable = class.is_retryable(),
-                                "rollback circuit rejection"
-                            );
-                            batch_err = Some(wrapped);
-                            if class.is_retryable() && attempt + 1 < retry_limit {
-                                if let Some(deadline) = retry_deadline {
-                                    if Instant::now() >= deadline {
-                                        break;
-                                    }
-                                }
-                                tokio::time::sleep(retry_backoff(
-                                    retry_policy,
-                                    attempt,
-                                    target.grpc_addr.port() as u64,
-                                ))
-                                .await;
-                                continue;
-                            }
-                            break;
-                        }
-                    };
-
                     let rollback_span = info_span!(
                         "holo_fusion.distributed_write_rollback",
                         table = %self.table_name,
@@ -5279,7 +5253,6 @@ impl HoloStoreTableProvider {
                         .await
                     {
                         Ok(result) => {
-                            self.circuit_on_success(target.grpc_addr, circuit_token);
                             self.metrics.record_distributed_rollback(
                                 target.shard_index,
                                 expected,
@@ -5316,11 +5289,11 @@ impl HoloStoreTableProvider {
                             break;
                         }
                         Err(err) => {
-                            self.circuit_on_failure(target.grpc_addr, circuit_token);
+                            let classification =
+                                classify_write_error_message(err.to_string().as_str());
                             self.metrics.record_distributed_apply_failure(
                                 target.grpc_addr.to_string().as_str(),
-                                classify_write_error_message(err.to_string().as_str())
-                                    .is_retryable(),
+                                classification.is_retryable(),
                             );
                             self.metrics.record_distributed_rollback(
                                 target.shard_index,
@@ -5923,7 +5896,6 @@ impl HoloStoreTableProvider {
                             }
                         }
                         Err(err) => {
-                            self.circuit_on_failure(target.grpc_addr, circuit_token);
                             let wrapped = anyhow!(
                                 "apply {op} batch table={} shard={} target={} chunk {}/{} failed: {err}",
                                 self.table_name,
@@ -5934,6 +5906,11 @@ impl HoloStoreTableProvider {
                             );
                             let classification =
                                 classify_write_error_message(wrapped.to_string().as_str());
+                            self.circuit_on_classified_failure(
+                                target.grpc_addr,
+                                circuit_token,
+                                classification,
+                            );
                             self.metrics.record_distributed_apply_failure(
                                 target_key.as_str(),
                                 classification.is_retryable(),
@@ -6197,6 +6174,21 @@ impl HoloStoreTableProvider {
             state.consecutive_failures = 0;
             state.half_open_probe_inflight = false;
             self.metrics.record_circuit_open(target_key.as_str());
+        }
+    }
+
+    fn circuit_on_classified_failure(
+        &self,
+        target: SocketAddr,
+        token: CircuitAcquireToken,
+        classification: RetryableErrorClass,
+    ) {
+        if class_counts_toward_circuit_failure(classification) {
+            self.circuit_on_failure(target, token);
+        } else {
+            // Topology churn and logical/non-retryable errors should not poison
+            // target health. Close the probe/half-open token without opening.
+            self.circuit_on_success(target, token);
         }
     }
 }
@@ -8720,6 +8712,22 @@ mod tests {
         ));
         assert!(!is_overload_error_message(
             "duplicate key value violates unique constraint"
+        ));
+    }
+
+    #[test]
+    fn circuit_failure_counting_ignores_topology_and_non_retryable_errors() {
+        assert!(class_counts_toward_circuit_failure(
+            RetryableErrorClass::TransientRpc
+        ));
+        assert!(class_counts_toward_circuit_failure(
+            RetryableErrorClass::Overload
+        ));
+        assert!(!class_counts_toward_circuit_failure(
+            RetryableErrorClass::Topology
+        ));
+        assert!(!class_counts_toward_circuit_failure(
+            RetryableErrorClass::NonRetryable
         ));
     }
 

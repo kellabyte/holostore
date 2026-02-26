@@ -149,6 +149,8 @@ cargo run -p holo_fusion --bin holo-fusion
 - `HOLO_FUSION_DML_MAX_TXN_STAGED_ROWS`
 - `HOLO_FUSION_DML_WRITE_MAX_BATCH_ENTRIES`
 - `HOLO_FUSION_DML_WRITE_MAX_BATCH_BYTES`
+- `HOLO_RANGE_WRITE_BATCH_TARGET` (embedded HoloStore range-write proposal chunk target; default `1024`)
+- `HOLO_RANGE_WRITE_BATCH_MAX_BYTES` (embedded HoloStore range-write proposal byte cap; default `1048576`)
 - `HOLO_FUSION_SCAN_MAX_ROWS` (`0` disables scan-row rejection; default `0`)
 - `HOLO_FUSION_SQL_TARGET_PARTITIONS`
 - `HOLO_FUSION_SQL_SORT_SPILL_RESERVATION_BYTES`
