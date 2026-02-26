@@ -89,6 +89,9 @@ const DEFAULT_DISTRIBUTED_WRITE_MAX_INFLIGHT_ROWS: usize = 32_768;
 const DEFAULT_DISTRIBUTED_WRITE_MAX_INFLIGHT_BYTES: usize = 32 * 1_024 * 1_024;
 const DEFAULT_DISTRIBUTED_WRITE_MAX_INFLIGHT_RPCS: usize = 32;
 const DEFAULT_DISTRIBUTED_WRITE_PIPELINE_DEPTH: usize = 4;
+const DEFAULT_DISTRIBUTED_BULK_RPC_MAX_BATCH_ENTRIES: usize = 8_192;
+const DEFAULT_DISTRIBUTED_BULK_RPC_MAX_BATCH_BYTES: usize = 4 * 1_024 * 1_024;
+const DEFAULT_DISTRIBUTED_BULK_RPC_PIPELINE_DEPTH: usize = 8;
 const DEFAULT_INDEX_BACKFILL_PAGE_SIZE: usize = 512;
 const DEFAULT_BULK_CHUNK_ROWS_INITIAL: usize = 1_024;
 const DEFAULT_BULK_CHUNK_ROWS_MIN: usize = 128;
@@ -264,6 +267,30 @@ fn configured_write_pipeline_depth() -> usize {
         .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_DISTRIBUTED_WRITE_PIPELINE_DEPTH)
+}
+
+fn configured_bulk_rpc_max_batch_entries() -> usize {
+    std::env::var("HOLO_FUSION_DML_BULK_RPC_MAX_BATCH_ENTRIES")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_DISTRIBUTED_BULK_RPC_MAX_BATCH_ENTRIES)
+}
+
+fn configured_bulk_rpc_max_batch_bytes() -> usize {
+    std::env::var("HOLO_FUSION_DML_BULK_RPC_MAX_BATCH_BYTES")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_DISTRIBUTED_BULK_RPC_MAX_BATCH_BYTES)
+}
+
+fn configured_bulk_rpc_pipeline_depth() -> usize {
+    std::env::var("HOLO_FUSION_DML_BULK_RPC_PIPELINE_DEPTH")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_DISTRIBUTED_BULK_RPC_PIPELINE_DEPTH)
 }
 
 fn configured_index_backfill_page_size() -> usize {
@@ -947,6 +974,13 @@ fn encode_generic_tombstone_value() -> Vec<u8> {
     vec![ROW_FORMAT_VERSION_V2, ROW_FLAG_TOMBSTONE]
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WriteApplyLimits {
+    batch_entries: usize,
+    batch_bytes: usize,
+    pipeline_depth: usize,
+}
+
 #[derive(Debug, Clone)]
 /// Represents the `HoloStoreTableProvider` component used by the holo_fusion runtime.
 pub struct HoloStoreTableProvider {
@@ -968,6 +1002,9 @@ pub struct HoloStoreTableProvider {
     distributed_write_max_batch_entries: usize,
     distributed_write_max_batch_bytes: usize,
     distributed_write_pipeline_depth: usize,
+    distributed_bulk_rpc_max_batch_entries: usize,
+    distributed_bulk_rpc_max_batch_bytes: usize,
+    distributed_bulk_rpc_pipeline_depth: usize,
     write_retry_policy: RetryPolicy,
     scan_retry_limit: usize,
     scan_retry_delay: Duration,
@@ -1184,6 +1221,9 @@ impl HoloStoreTableProvider {
             distributed_write_max_batch_entries: configured_write_max_batch_entries(),
             distributed_write_max_batch_bytes: configured_write_max_batch_bytes(),
             distributed_write_pipeline_depth: configured_write_pipeline_depth(),
+            distributed_bulk_rpc_max_batch_entries: configured_bulk_rpc_max_batch_entries(),
+            distributed_bulk_rpc_max_batch_bytes: configured_bulk_rpc_max_batch_bytes(),
+            distributed_bulk_rpc_pipeline_depth: configured_bulk_rpc_pipeline_depth(),
             write_retry_policy: RetryPolicy::from_env(),
             scan_retry_limit: configured_scan_retry_limit().max(1),
             scan_retry_delay: Duration::from_millis(configured_scan_retry_delay_ms()),
@@ -1240,6 +1280,9 @@ impl HoloStoreTableProvider {
             distributed_write_max_batch_entries: configured_write_max_batch_entries(),
             distributed_write_max_batch_bytes: configured_write_max_batch_bytes(),
             distributed_write_pipeline_depth: configured_write_pipeline_depth(),
+            distributed_bulk_rpc_max_batch_entries: configured_bulk_rpc_max_batch_entries(),
+            distributed_bulk_rpc_max_batch_bytes: configured_bulk_rpc_max_batch_bytes(),
+            distributed_bulk_rpc_pipeline_depth: configured_bulk_rpc_pipeline_depth(),
             write_retry_policy: RetryPolicy::from_env(),
             scan_retry_limit: configured_scan_retry_limit().max(1),
             scan_retry_delay: Duration::from_millis(configured_scan_retry_delay_ms()),
@@ -1312,6 +1355,9 @@ impl HoloStoreTableProvider {
             distributed_write_max_batch_entries: configured_write_max_batch_entries(),
             distributed_write_max_batch_bytes: configured_write_max_batch_bytes(),
             distributed_write_pipeline_depth: configured_write_pipeline_depth(),
+            distributed_bulk_rpc_max_batch_entries: configured_bulk_rpc_max_batch_entries(),
+            distributed_bulk_rpc_max_batch_bytes: configured_bulk_rpc_max_batch_bytes(),
+            distributed_bulk_rpc_pipeline_depth: configured_bulk_rpc_pipeline_depth(),
             write_retry_policy: RetryPolicy::from_env(),
             scan_retry_limit: configured_scan_retry_limit().max(1),
             scan_retry_delay: Duration::from_millis(configured_scan_retry_delay_ms()),
@@ -2728,6 +2774,21 @@ impl HoloStoreTableProvider {
         }
     }
 
+    fn write_apply_limits_for_op(&self, op: &'static str) -> WriteApplyLimits {
+        if op == "bulk_insert" {
+            return WriteApplyLimits {
+                batch_entries: self.distributed_bulk_rpc_max_batch_entries.max(1),
+                batch_bytes: self.distributed_bulk_rpc_max_batch_bytes.max(1),
+                pipeline_depth: self.distributed_bulk_rpc_pipeline_depth.max(1),
+            };
+        }
+        WriteApplyLimits {
+            batch_entries: self.distributed_write_max_batch_entries.max(1),
+            batch_bytes: self.distributed_write_max_batch_bytes.max(1),
+            pipeline_depth: self.distributed_write_pipeline_depth.max(1),
+        }
+    }
+
     /// Applies conditional writes keyed by normalized primary key.
     async fn apply_primary_writes_conditional(
         &self,
@@ -2888,6 +2949,7 @@ impl HoloStoreTableProvider {
                         rollback_value: write.rollback_value.clone(),
                     });
             }
+            let write_limits = self.write_apply_limits_for_op(op);
             let planned_rows = writes.len();
             let mut planned_bytes = 0usize;
             let mut planned_rpcs = 0usize;
@@ -2901,8 +2963,8 @@ impl HoloStoreTableProvider {
                 planned_rpcs = planned_rpcs.saturating_add(
                     conditional_chunk_ranges(
                         entries.as_slice(),
-                        self.distributed_write_max_batch_entries,
-                        self.distributed_write_max_batch_bytes,
+                        write_limits.batch_entries,
+                        write_limits.batch_bytes,
                     )
                     .len(),
                 );
@@ -2910,7 +2972,7 @@ impl HoloStoreTableProvider {
             self.enforce_inflight_budget(planned_rows, planned_bytes, planned_rpcs, "write_plan")?;
 
             let mut applied_targets = Vec::<(WriteTarget, Vec<PreparedConditionalEntry>)>::new();
-            let pipeline_depth = self.distributed_write_pipeline_depth.max(1);
+            let pipeline_depth = write_limits.pipeline_depth;
             for (target, mut entries) in by_target {
                 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
                 enum TargetFailureKind {
@@ -2923,8 +2985,8 @@ impl HoloStoreTableProvider {
                 let write_client = self.client_for(target.grpc_addr);
                 let batch_ranges = conditional_chunk_ranges(
                     entries.as_slice(),
-                    self.distributed_write_max_batch_entries,
-                    self.distributed_write_max_batch_bytes,
+                    write_limits.batch_entries,
+                    write_limits.batch_bytes,
                 );
                 let batch_count = batch_ranges.len();
                 let inflight_limit = pipeline_depth.min(batch_count.max(1));
@@ -5179,13 +5241,14 @@ impl HoloStoreTableProvider {
         } else {
             None
         };
+        let write_limits = self.write_apply_limits_for_op(op);
         let mut first_err: Option<anyhow::Error> = None;
         for (target, entries) in rollback_targets {
             let client = self.client_for(target.grpc_addr);
             let batch_ranges = conditional_chunk_ranges(
                 entries.as_slice(),
-                self.distributed_write_max_batch_entries,
-                self.distributed_write_max_batch_bytes,
+                write_limits.batch_entries,
+                write_limits.batch_bytes,
             );
             let batch_count = batch_ranges.len();
             for (batch_idx, batch_range) in batch_ranges.into_iter().enumerate() {
@@ -5505,6 +5568,7 @@ impl HoloStoreTableProvider {
             let low_latency = Duration::from_millis(configured_bulk_chunk_low_latency_ms());
             let high_latency = Duration::from_millis(configured_bulk_chunk_high_latency_ms());
             let mut chunk_seq = 0u64;
+            let bulk_write_limits = self.write_apply_limits_for_op("bulk_insert");
 
             while let Some(batch) = data.next().await.transpose()? {
                 self.schema
@@ -5528,7 +5592,7 @@ impl HoloStoreTableProvider {
                     pending.push((primary_key, value));
 
                     if pending.len() >= chunk_target
-                        || pending_bytes >= self.distributed_write_max_batch_bytes
+                        || pending_bytes >= bulk_write_limits.batch_bytes
                     {
                         chunk_seq = chunk_seq.saturating_add(1);
                         let chunk_id = format!("{statement_id}:{chunk_seq}");
@@ -5758,6 +5822,7 @@ impl HoloStoreTableProvider {
                         value: value.clone(),
                     });
             }
+            let write_limits = self.write_apply_limits_for_op(op);
             let mut planned_bytes = 0usize;
             let mut planned_rpcs = 0usize;
             for entries in writes.values() {
@@ -5770,8 +5835,8 @@ impl HoloStoreTableProvider {
                 planned_rpcs = planned_rpcs.saturating_add(
                     chunk_replicated_writes(
                         entries.clone(),
-                        self.distributed_write_max_batch_entries,
-                        self.distributed_write_max_batch_bytes,
+                        write_limits.batch_entries,
+                        write_limits.batch_bytes,
                     )
                     .len(),
                 );
@@ -5780,14 +5845,14 @@ impl HoloStoreTableProvider {
 
             let mut written = 0u64;
             let mut attempt_error: Option<anyhow::Error> = None;
-            let pipeline_depth = self.distributed_write_pipeline_depth.max(1);
+            let pipeline_depth = write_limits.pipeline_depth;
             for (target, entries) in writes {
                 let write_client = self.client_for(target.grpc_addr);
                 let expected = entries.len() as u64;
                 let chunks = chunk_replicated_writes(
                     entries,
-                    self.distributed_write_max_batch_entries,
-                    self.distributed_write_max_batch_bytes,
+                    write_limits.batch_entries,
+                    write_limits.batch_bytes,
                 );
                 let batch_count = chunks.len();
                 let inflight_limit = pipeline_depth.min(batch_count.max(1));
@@ -8689,6 +8754,37 @@ mod tests {
             one_entry_bytes.saturating_add(1),
         );
         assert_eq!(by_bytes, vec![0..1, 1..2, 2..3, 3..4]);
+    }
+
+    #[test]
+    fn write_apply_limits_keep_small_write_defaults_and_use_bulk_overrides() {
+        let client =
+            HoloStoreClient::new("127.0.0.1:15051".parse().expect("parse loopback grpc addr"));
+        let mut provider =
+            HoloStoreTableProvider::orders(client, Arc::new(PushdownMetrics::default()));
+        provider.distributed_write_max_batch_entries = 111;
+        provider.distributed_write_max_batch_bytes = 2_222;
+        provider.distributed_write_pipeline_depth = 3;
+        provider.distributed_bulk_rpc_max_batch_entries = 4_444;
+        provider.distributed_bulk_rpc_max_batch_bytes = 5_555;
+        provider.distributed_bulk_rpc_pipeline_depth = 8;
+
+        assert_eq!(
+            provider.write_apply_limits_for_op("insert"),
+            WriteApplyLimits {
+                batch_entries: 111,
+                batch_bytes: 2_222,
+                pipeline_depth: 3,
+            }
+        );
+        assert_eq!(
+            provider.write_apply_limits_for_op("bulk_insert"),
+            WriteApplyLimits {
+                batch_entries: 4_444,
+                batch_bytes: 5_555,
+                pipeline_depth: 8,
+            }
+        );
     }
 
     #[test]
