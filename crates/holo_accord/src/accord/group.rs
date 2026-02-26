@@ -2862,14 +2862,18 @@ impl Group {
         }
     }
 
+    /// Returns `true` when dependency waiting has exceeded configured recovery delay.
+    ///
+    /// Input:
+    /// - `txn_id`: blocked transaction candidate.
+    /// - `waiting_since`: when this executor wait cycle began.
+    ///
+    /// Output:
+    /// - `true` when recovery should be attempted now.
+    /// - `false` when transaction is already executed or still within grace window.
     async fn should_recover(&self, txn_id: TxnId, waiting_since: time::Instant) -> bool {
         let now = time::Instant::now();
-        const MIN_RECOVERY_DELAY: Duration = Duration::from_secs(1);
-        let recovery_delay = self
-            .config
-            .rpc_timeout
-            .min(Duration::from_millis(200))
-            .max(MIN_RECOVERY_DELAY);
+        let recovery_delay = self.recovery_delay();
         if now.duration_since(waiting_since) < recovery_delay {
             return false;
         }
@@ -2959,14 +2963,25 @@ impl Group {
         true
     }
 
+    /// Rate-limits executor stall recovery probes.
+    ///
+    /// Design: use a monotonic timestamp gate so only one recovery probe is
+    /// attempted within the configured window, preventing feedback loops when
+    /// many workers detect the same stall.
     fn should_attempt_stall_recover(&self) -> bool {
-        const STALL_RECOVER_INTERVAL_US: u64 = 200_000;
+        let recover_interval_us = self
+            .config
+            .stall_recover_interval
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
+        // Guard against zero/too-small configured durations.
+        let recover_interval_us = recover_interval_us.max(1_000);
         let now_us = self.start_at.elapsed().as_micros() as u64;
         let last = self
             .metrics
             .exec_stall_recover_at_us
             .load(Ordering::Relaxed);
-        if now_us.saturating_sub(last) < STALL_RECOVER_INTERVAL_US {
+        if now_us.saturating_sub(last) < recover_interval_us {
             return false;
         }
         self.metrics
@@ -2984,14 +2999,16 @@ impl Group {
         pick_recovery_from_chain(&chain)
     }
 
+    /// Returns `true` when an executor-detected stall is old enough to recover.
+    ///
+    /// Input:
+    /// - `txn_id`: recovery target picked from dependency-chain analysis.
+    ///
+    /// Output:
+    /// - `true` when transaction has not advanced recently and recovery should run.
     async fn should_recover_due_to_stall(&self, txn_id: TxnId) -> bool {
         let now = time::Instant::now();
-        const MIN_RECOVERY_DELAY: Duration = Duration::from_secs(1);
-        let recovery_delay = self
-            .config
-            .rpc_timeout
-            .min(Duration::from_millis(200))
-            .max(MIN_RECOVERY_DELAY);
+        let recovery_delay = self.recovery_delay();
         let mut state = self.state.lock().await;
 
         if state.is_executed(&txn_id) {
@@ -3007,6 +3024,17 @@ impl Group {
         }
 
         self.record_recovery_attempt(&mut state, txn_id, now)
+    }
+
+    /// Computes the effective recovery delay used by both recovery triggers.
+    ///
+    /// Design: clamp to a floor so tiny RPC timeouts do not cause recovery
+    /// thrash, while still honoring explicit operator tuning.
+    fn recovery_delay(&self) -> Duration {
+        self.config
+            .rpc_timeout
+            .min(Duration::from_millis(200))
+            .max(self.config.recovery_min_delay)
     }
 
     async fn execute_progress(&self) -> anyhow::Result<bool> {

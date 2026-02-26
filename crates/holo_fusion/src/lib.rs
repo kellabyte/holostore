@@ -49,8 +49,10 @@ use mutation::{DmlHook, DmlRuntimeConfig};
 use pg_catalog_ext::install_pg_locks_table;
 use pg_compat::{current_unix_timestamp_ns, register_pg_compat_udfs};
 
-/// Interval used by the background metadata-to-catalog synchronization loop.
-const CATALOG_SYNC_INTERVAL: Duration = Duration::from_secs(1);
+/// Default catalog-sync loop interval in milliseconds.
+const DEFAULT_CATALOG_SYNC_INTERVAL_MS: u64 = 1_000;
+/// Default upper bound for catalog-sync backoff under write load.
+const DEFAULT_CATALOG_SYNC_MAX_INTERVAL_MS: u64 = 15_000;
 
 /// Coarse runtime health states surfaced by the health HTTP endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,6 +150,14 @@ pub struct HoloFusionConfig {
     pub dml_max_scan_rows: usize,
     /// Maximum number of staged rows allowed in one explicit transaction.
     pub dml_max_txn_staged_rows: usize,
+    /// Baseline catalog-sync interval for metadata registration.
+    pub catalog_sync_interval: Duration,
+    /// Upper bound for catalog-sync backoff interval.
+    pub catalog_sync_max_interval: Duration,
+    /// Busy-threshold for write-apply operation deltas between catalog ticks (`0` disables).
+    pub catalog_sync_busy_apply_ops: u64,
+    /// Busy-threshold for write-apply row deltas between catalog ticks (`0` disables).
+    pub catalog_sync_busy_apply_rows: u64,
     /// Embedded HoloStore node configuration.
     pub holostore: EmbeddedNodeConfig,
 }
@@ -213,6 +223,26 @@ impl HoloFusionConfig {
             100_000,
         )?
         .max(1);
+        // Catalog sync defaults are intentionally conservative:
+        // start at a short cadence for freshness, then back off under ingest load.
+        let catalog_sync_interval_ms = parse_u64(
+            std::env::var("HOLO_FUSION_CATALOG_SYNC_INTERVAL_MS").ok(),
+            DEFAULT_CATALOG_SYNC_INTERVAL_MS,
+        )?
+        .max(1);
+        let catalog_sync_max_interval_ms = parse_u64(
+            std::env::var("HOLO_FUSION_CATALOG_SYNC_MAX_INTERVAL_MS").ok(),
+            DEFAULT_CATALOG_SYNC_MAX_INTERVAL_MS,
+        )?
+        .max(catalog_sync_interval_ms);
+        let catalog_sync_busy_apply_ops = parse_u64(
+            std::env::var("HOLO_FUSION_CATALOG_SYNC_BUSY_APPLY_OPS").ok(),
+            8,
+        )?;
+        let catalog_sync_busy_apply_rows = parse_u64(
+            std::env::var("HOLO_FUSION_CATALOG_SYNC_BUSY_APPLY_ROWS").ok(),
+            8_192,
+        )?;
 
         let node_id = std::env::var("HOLO_FUSION_NODE_ID")
             .ok()
@@ -228,7 +258,10 @@ impl HoloFusionConfig {
         )?;
         let data_dir = std::env::var("HOLO_FUSION_HOLOSTORE_DATA_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(format!(".holo_fusion/node-{node_id}")));
+            .unwrap_or_else(|_| {
+                // Keep default node state under tmp/cluster to avoid polluting repo root.
+                PathBuf::from(format!("./tmp/cluster/holo_fusion/node-{node_id}"))
+            });
         let bootstrap = std::env::var("HOLO_FUSION_BOOTSTRAP")
             .ok()
             .and_then(|v| v.parse::<bool>().ok())
@@ -271,6 +304,10 @@ impl HoloFusionConfig {
             dml_admission_wait_timeout: Duration::from_millis(dml_admission_wait_timeout_ms),
             dml_max_scan_rows,
             dml_max_txn_staged_rows,
+            catalog_sync_interval: Duration::from_millis(catalog_sync_interval_ms),
+            catalog_sync_max_interval: Duration::from_millis(catalog_sync_max_interval_ms),
+            catalog_sync_busy_apply_ops,
+            catalog_sync_busy_apply_rows,
             holostore: EmbeddedNodeConfig {
                 node_id,
                 listen_redis: redis_addr,
@@ -298,6 +335,17 @@ pub async fn run_with_shutdown<F>(config: HoloFusionConfig, shutdown: F) -> Resu
 where
     F: std::future::Future<Output = Result<(), std::io::Error>> + Send,
 {
+    info!(
+        node_id = config.holostore.node_id,
+        pg_host = %config.pg_host,
+        pg_port = config.pg_port,
+        health_addr = %config.health_addr,
+        holostore_redis_addr = %config.holostore.listen_redis,
+        holostore_grpc_addr = %config.holostore.listen_grpc,
+        bootstrap = config.holostore.bootstrap,
+        join_addr = ?config.holostore.join,
+        "holo_fusion node starting"
+    );
     let default_target_partitions = std::thread::available_parallelism()
         .map(|parallelism| parallelism.get())
         .unwrap_or(4)
@@ -455,10 +503,19 @@ where
     )
     .await
     .context("bootstrap holo_fusion catalog")?;
+    // Catalog sync pacing is decoupled from DML write batching so ingest-heavy
+    // periods can reduce metadata-read pressure without disabling sync entirely.
+    let catalog_sync_config = CatalogSyncLoopConfig {
+        interval: config.catalog_sync_interval,
+        max_interval: config.catalog_sync_max_interval,
+        busy_apply_ops_threshold: config.catalog_sync_busy_apply_ops,
+        busy_apply_rows_threshold: config.catalog_sync_busy_apply_rows,
+    };
     let catalog_sync_task = tokio::spawn(run_catalog_sync_loop(
         session_context.clone(),
         holostore_client.clone(),
         pushdown_metrics.clone(),
+        catalog_sync_config,
         health_shutdown_tx.subscribe(),
     ));
     let server_opts = ServerOptions::new()
@@ -483,6 +540,13 @@ where
     // Decision: evaluate `match ballista_mode {` to choose the correct SQL/storage control path.
     match ballista_mode {
         BallistaMode::Standalone => {
+            info!(
+                node_id = config.holostore.node_id,
+                pg_host = %config.pg_host,
+                pg_port = config.pg_port,
+                table_count = bootstrap.registered_tables.len(),
+                "holo_fusion node ready (ballista standalone)"
+            );
             health
                 .set(
                     HealthState::Ready,
@@ -494,6 +558,13 @@ where
                 .await;
         }
         BallistaMode::LocalFallback => {
+            info!(
+                node_id = config.holostore.node_id,
+                pg_host = %config.pg_host,
+                pg_port = config.pg_port,
+                table_count = bootstrap.registered_tables.len(),
+                "holo_fusion node ready (local datafusion fallback)"
+            );
             health
                 .set(
                     HealthState::Degraded,
@@ -505,6 +576,13 @@ where
                 .await;
         }
         BallistaMode::Disabled => {
+            info!(
+                node_id = config.holostore.node_id,
+                pg_host = %config.pg_host,
+                pg_port = config.pg_port,
+                table_count = bootstrap.registered_tables.len(),
+                "holo_fusion node ready (ballista disabled)"
+            );
             health
                 .set(
                     HealthState::Ready,
@@ -599,6 +677,19 @@ enum BallistaMode {
     Disabled,
 }
 
+/// Adaptive timing policy for background catalog synchronization.
+#[derive(Clone, Copy, Debug)]
+struct CatalogSyncLoopConfig {
+    /// Baseline sleep interval between sync attempts.
+    interval: Duration,
+    /// Maximum sleep interval after exponential backoff.
+    max_interval: Duration,
+    /// Busy threshold based on apply operation deltas (`0` disables this signal).
+    busy_apply_ops_threshold: u64,
+    /// Busy threshold based on apply row deltas (`0` disables this signal).
+    busy_apply_rows_threshold: u64,
+}
+
 /// Runs a minimal HTTP health server and exits when shutdown is signaled.
 async fn run_health_server(
     addr: SocketAddr,
@@ -631,12 +722,35 @@ async fn run_health_server(
 }
 
 /// Periodically syncs DataFusion catalog entries from persisted table metadata.
+///
+/// Input:
+/// - `session_context`: SQL catalog target to register newly discovered tables.
+/// - `holostore_client`: metadata source for table definitions.
+/// - `pushdown_metrics`: activity signal used to detect ingest-heavy periods.
+/// - `config`: backoff policy and busy thresholds.
+/// - `shutdown_rx`: cooperative shutdown signal.
+///
+/// Output:
+/// - `Ok(())` when shutdown is requested.
+/// - Error if loop setup or sync path returns a fatal error.
+///
+/// Design:
+/// - Stay responsive at low load using `interval`.
+/// - Reduce read/write conflict pressure during ingest by backing off when apply
+///   deltas exceed thresholds.
+/// - Never starve sync: even when busy, sync runs at `max_interval`.
 async fn run_catalog_sync_loop(
     session_context: Arc<SessionContext>,
     holostore_client: HoloStoreClient,
     pushdown_metrics: Arc<PushdownMetrics>,
+    config: CatalogSyncLoopConfig,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
+    let base_interval = config.interval.max(Duration::from_millis(1));
+    let max_interval = config.max_interval.max(base_interval);
+    let mut current_interval = base_interval;
+    let mut previous_metrics = pushdown_metrics.snapshot();
+
     loop {
         tokio::select! {
             changed = shutdown_rx.changed() => {
@@ -645,7 +759,31 @@ async fn run_catalog_sync_loop(
                     return Ok(());
                 }
             }
-            _ = tokio::time::sleep(CATALOG_SYNC_INTERVAL) => {
+            _ = tokio::time::sleep(current_interval) => {
+                // Use counter deltas so "busy" reflects recent write pressure, not
+                // lifetime totals.
+                let current_metrics = pushdown_metrics.snapshot();
+                let apply_ops_delta = current_metrics
+                    .distributed_write_apply_ops
+                    .saturating_sub(previous_metrics.distributed_write_apply_ops);
+                let apply_rows_delta = current_metrics
+                    .distributed_write_apply_rows
+                    .saturating_sub(previous_metrics.distributed_write_apply_rows);
+                previous_metrics = current_metrics;
+
+                let busy_by_ops = config.busy_apply_ops_threshold > 0
+                    && apply_ops_delta >= config.busy_apply_ops_threshold;
+                let busy_by_rows = config.busy_apply_rows_threshold > 0
+                    && apply_rows_delta >= config.busy_apply_rows_threshold;
+                let ingest_active = current_metrics.ingest_jobs_tracked > 0;
+                let busy = busy_by_ops || busy_by_rows || ingest_active;
+                // During sustained ingest, back off aggressively before issuing
+                // metadata reads to reduce avoidable contention.
+                if busy && current_interval < max_interval {
+                    current_interval = next_catalog_sync_interval(current_interval, max_interval);
+                    continue;
+                }
+
                 // Decision: evaluate `match sync_catalog_from_metadata(` to choose the correct SQL/storage control path.
                 match sync_catalog_from_metadata(
                     session_context.as_ref(),
@@ -653,6 +791,9 @@ async fn run_catalog_sync_loop(
                     pushdown_metrics.clone(),
                 ).await {
                     Ok(new_tables) => {
+                        // Under load, pin at max interval; when load subsides,
+                        // immediately reset to baseline for freshness.
+                        current_interval = if busy { max_interval } else { base_interval };
                         // Decision: log only non-empty registration sets to
                         // keep background logs high-signal.
                         // Decision: evaluate `if !new_tables.is_empty() {` to choose the correct SQL/storage control path.
@@ -664,12 +805,27 @@ async fn run_catalog_sync_loop(
                         }
                     }
                     Err(err) => {
+                        current_interval = next_catalog_sync_interval(current_interval, max_interval);
                         warn!(error = %err, "catalog sync failed");
                     }
                 }
             }
         }
     }
+}
+
+/// Returns the next catalog-sync interval using bounded exponential backoff.
+///
+/// Input:
+/// - `current`: current interval.
+/// - `max_interval`: hard upper bound.
+///
+/// Output:
+/// - `min(current * 2, max_interval)` with a 1ms floor.
+fn next_catalog_sync_interval(current: Duration, max_interval: Duration) -> Duration {
+    let current_ms = current.as_millis().min(u128::from(u64::MAX)) as u64;
+    let max_ms = max_interval.as_millis().min(u128::from(u64::MAX)) as u64;
+    Duration::from_millis(current_ms.saturating_mul(2).min(max_ms).max(1))
 }
 
 /// Handles one HTTP health connection and writes a text/plain response.
