@@ -10,7 +10,7 @@ use std::io::{BufWriter, IsTerminal, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context};
@@ -58,6 +58,51 @@ const GROUP_DATA_BASE: GroupId = 1;
 /// The current runtime pre-creates shard groups at startup, so this is a
 /// practical upper bound for automatic splitting rather than true infinity.
 const AUTO_MAX_SHARDS: usize = 64;
+
+type LocalNodeStateRegistry = HashMap<SocketAddr, Weak<NodeState>>;
+static LOCAL_NODE_STATE_REGISTRY: OnceLock<RwLock<LocalNodeStateRegistry>> = OnceLock::new();
+
+fn local_node_state_registry() -> &'static RwLock<LocalNodeStateRegistry> {
+    LOCAL_NODE_STATE_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+pub(crate) fn register_local_node_state(grpc_addr: SocketAddr, state: &Arc<NodeState>) {
+    if let Ok(mut registry) = local_node_state_registry().write() {
+        registry.insert(grpc_addr, Arc::downgrade(state));
+    }
+}
+
+pub(crate) fn unregister_local_node_state(grpc_addr: SocketAddr) {
+    if let Ok(mut registry) = local_node_state_registry().write() {
+        registry.remove(&grpc_addr);
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn lookup_local_node_state(grpc_addr: SocketAddr) -> Option<Arc<NodeState>> {
+    if let Ok(registry) = local_node_state_registry().read() {
+        let Some(entry) = registry.get(&grpc_addr) else {
+            return None;
+        };
+        if let Some(state) = entry.upgrade() {
+            return Some(state);
+        }
+    } else {
+        return None;
+    }
+
+    // Clean up stale entries when embedded nodes have already shut down.
+    if let Ok(mut registry) = local_node_state_registry().write() {
+        let stale = registry
+            .get(&grpc_addr)
+            .and_then(std::sync::Weak::upgrade)
+            .is_none();
+        if stale {
+            registry.remove(&grpc_addr);
+        }
+    }
+    None
+}
 
 fn resolve_data_shards(max_shards: usize) -> usize {
     if max_shards == 0 {
@@ -4933,6 +4978,20 @@ where
         recovery_checkpoint_controller,
     });
 
+    struct LocalNodeStateRegistration {
+        grpc_addr: SocketAddr,
+    }
+
+    impl Drop for LocalNodeStateRegistration {
+        fn drop(&mut self) {
+            unregister_local_node_state(self.grpc_addr);
+        }
+    }
+
+    let grpc_addr = args.listen_grpc;
+    register_local_node_state(grpc_addr, &state);
+    let _local_state_registration = LocalNodeStateRegistration { grpc_addr };
+
     let refresh_state = state.clone();
     tokio::spawn(async move {
         // Force one refresh on startup, then apply on each metadata epoch bump.
@@ -5053,7 +5112,6 @@ where
         },
     );
 
-    let grpc_addr = args.listen_grpc;
     tokio::spawn({
         let service = RpcService {
             state: state.clone(),

@@ -252,22 +252,35 @@ pub struct RangeStat {
 }
 
 #[derive(Clone)]
+enum HoloStoreClientBackend {
+    Rpc(volo_gen::holo_store::rpc::HoloRpcClient),
+    Local(Arc<NodeState>),
+}
+
+#[derive(Clone)]
 pub struct HoloStoreClient {
     target: EmbedSocketAddr,
     timeout: EmbedDuration,
-    client: volo_gen::holo_store::rpc::HoloRpcClient,
+    backend: HoloStoreClientBackend,
 }
 
 impl HoloStoreClient {
     pub fn with_timeout(target: EmbedSocketAddr, timeout: EmbedDuration) -> Self {
-        let client = volo_gen::holo_store::rpc::HoloRpcClientBuilder::new("holo_store.rpc.HoloRpc")
-            .address(volo::net::Address::from(target))
-            .build();
+        let timeout = timeout.max(EmbedDuration::from_millis(1));
+        let backend = if let Some(state) = lookup_local_node_state(target) {
+            HoloStoreClientBackend::Local(state)
+        } else {
+            let client =
+                volo_gen::holo_store::rpc::HoloRpcClientBuilder::new("holo_store.rpc.HoloRpc")
+                    .address(volo::net::Address::from(target))
+                    .build();
+            HoloStoreClientBackend::Rpc(client)
+        };
 
         Self {
             target,
-            timeout: timeout.max(EmbedDuration::from_millis(1)),
-            client,
+            timeout,
+            backend,
         }
     }
 
@@ -284,34 +297,66 @@ impl HoloStoreClient {
     }
 
     pub async fn cluster_state_json(&self) -> anyhow::Result<String> {
-        let request = volo_gen::holo_store::rpc::ClusterStateRequest {};
-        let response = tokio::time::timeout(self.timeout, self.client.cluster_state(request))
-            .await
-            .map_err(|_| anyhow::anyhow!("cluster_state rpc timed out for {}", self.target))?
-            .map_err(|err| {
-                anyhow::anyhow!("cluster_state rpc failed for {}: {err}", self.target)
-            })?;
-        Ok(response.into_inner().json.to_string())
+        match &self.backend {
+            HoloStoreClientBackend::Local(state) => {
+                tokio::time::timeout(self.timeout, cluster_state_json_local(state))
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("cluster_state local call timed out for {}", self.target)
+                    })?
+            }
+            HoloStoreClientBackend::Rpc(client) => {
+                let request = volo_gen::holo_store::rpc::ClusterStateRequest {};
+                let response = tokio::time::timeout(self.timeout, client.cluster_state(request))
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("cluster_state rpc timed out for {}", self.target)
+                    })?
+                    .map_err(|err| {
+                        anyhow::anyhow!("cluster_state rpc failed for {}: {err}", self.target)
+                    })?;
+                Ok(response.into_inner().json.to_string())
+            }
+        }
     }
 
     pub async fn range_stats(&self) -> anyhow::Result<Vec<RangeStat>> {
-        let request = volo_gen::holo_store::rpc::RangeStatsRequest {};
-        let response = tokio::time::timeout(self.timeout, self.client.range_stats(request))
-            .await
-            .map_err(|_| anyhow::anyhow!("range_stats rpc timed out for {}", self.target))?
-            .map_err(|err| anyhow::anyhow!("range_stats rpc failed for {}: {err}", self.target))?
-            .into_inner();
+        match &self.backend {
+            HoloStoreClientBackend::Local(state) => {
+                let ranges = state.local_range_stats()?;
+                let mut out = Vec::with_capacity(ranges.len());
+                for item in ranges {
+                    out.push(RangeStat {
+                        shard_id: item.shard_id,
+                        shard_index: item.shard_index,
+                        record_count: item.record_count,
+                        is_leaseholder: item.is_leaseholder,
+                    });
+                }
+                Ok(out)
+            }
+            HoloStoreClientBackend::Rpc(client) => {
+                let request = volo_gen::holo_store::rpc::RangeStatsRequest {};
+                let response = tokio::time::timeout(self.timeout, client.range_stats(request))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("range_stats rpc timed out for {}", self.target))?
+                    .map_err(|err| {
+                        anyhow::anyhow!("range_stats rpc failed for {}: {err}", self.target)
+                    })?
+                    .into_inner();
 
-        let mut out = Vec::with_capacity(response.ranges.len());
-        for item in response.ranges {
-            out.push(RangeStat {
-                shard_id: item.shard_id,
-                shard_index: item.shard_index as usize,
-                record_count: item.record_count,
-                is_leaseholder: item.is_leaseholder,
-            });
+                let mut out = Vec::with_capacity(response.ranges.len());
+                for item in response.ranges {
+                    out.push(RangeStat {
+                        shard_id: item.shard_id,
+                        shard_index: item.shard_index as usize,
+                        record_count: item.record_count,
+                        is_leaseholder: item.is_leaseholder,
+                    });
+                }
+                Ok(out)
+            }
         }
-        Ok(out)
     }
 
     pub async fn range_snapshot_latest(
@@ -323,39 +368,65 @@ impl HoloStoreClient {
         limit: usize,
         reverse: bool,
     ) -> anyhow::Result<(Vec<LatestEntry>, Vec<u8>, bool)> {
-        let request = volo_gen::holo_store::rpc::RangeSnapshotLatestRequest {
-            shard_index: shard_index as u64,
-            start_key: start_key.to_vec().into(),
-            end_key: end_key.to_vec().into(),
-            cursor: cursor.to_vec().into(),
-            limit: limit.clamp(1, u32::MAX as usize) as u32,
-            reverse,
-        };
+        match &self.backend {
+            HoloStoreClientBackend::Local(state) => {
+                let (latest, next_cursor, done) = state.snapshot_range_latest_page(
+                    shard_index,
+                    start_key,
+                    end_key,
+                    cursor,
+                    limit.clamp(1, u32::MAX as usize),
+                    reverse,
+                )?;
+                let mut entries = Vec::with_capacity(latest.len());
+                for entry in latest {
+                    entries.push(LatestEntry {
+                        key: entry.key,
+                        value: entry.value,
+                        version: from_kv_version(entry.version),
+                    });
+                }
+                Ok((entries, next_cursor, done))
+            }
+            HoloStoreClientBackend::Rpc(client) => {
+                let request = volo_gen::holo_store::rpc::RangeSnapshotLatestRequest {
+                    shard_index: shard_index as u64,
+                    start_key: start_key.to_vec().into(),
+                    end_key: end_key.to_vec().into(),
+                    cursor: cursor.to_vec().into(),
+                    limit: limit.clamp(1, u32::MAX as usize) as u32,
+                    reverse,
+                };
 
-        let response =
-            tokio::time::timeout(self.timeout, self.client.range_snapshot_latest(request))
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!("range_snapshot_latest rpc timed out for {}", self.target)
-                })?
-                .map_err(|err| {
-                    anyhow::anyhow!(
-                        "range_snapshot_latest rpc failed for {}: {err}",
-                        self.target
-                    )
-                })?
-                .into_inner();
+                let response =
+                    tokio::time::timeout(self.timeout, client.range_snapshot_latest(request))
+                        .await
+                        .map_err(|_| {
+                            anyhow::anyhow!(
+                                "range_snapshot_latest rpc timed out for {}",
+                                self.target
+                            )
+                        })?
+                        .map_err(|err| {
+                            anyhow::anyhow!(
+                                "range_snapshot_latest rpc failed for {}: {err}",
+                                self.target
+                            )
+                        })?
+                        .into_inner();
 
-        let mut entries = Vec::with_capacity(response.entries.len());
-        for entry in response.entries {
-            entries.push(LatestEntry {
-                key: entry.key.to_vec(),
-                value: entry.value.to_vec(),
-                version: from_rpc_version_required(entry.version)?,
-            });
+                let mut entries = Vec::with_capacity(response.entries.len());
+                for entry in response.entries {
+                    entries.push(LatestEntry {
+                        key: entry.key.to_vec(),
+                        value: entry.value.to_vec(),
+                        version: from_rpc_version_required(entry.version)?,
+                    });
+                }
+
+                Ok((entries, response.next_cursor.to_vec(), response.done))
+            }
         }
-
-        Ok((entries, response.next_cursor.to_vec(), response.done))
     }
 
     pub async fn range_apply_latest(
@@ -365,33 +436,54 @@ impl HoloStoreClient {
         end_key: &[u8],
         entries: Vec<LatestEntry>,
     ) -> anyhow::Result<u64> {
-        let rpc_entries = entries
-            .into_iter()
-            .map(
-                |entry| volo_gen::holo_store::rpc::RangeSnapshotLatestEntry {
-                    key: entry.key.into(),
-                    value: entry.value.into(),
-                    version: Some(to_rpc_version(entry.version)),
-                },
-            )
-            .collect();
+        match &self.backend {
+            HoloStoreClientBackend::Local(state) => {
+                let latest = entries
+                    .into_iter()
+                    .map(|entry| RangeSnapshotLatestEntry {
+                        key: entry.key,
+                        value: entry.value,
+                        version: to_kv_version(entry.version),
+                    })
+                    .collect::<Vec<_>>();
+                state.apply_range_latest_page(shard_index, start_key, end_key, latest.as_slice())
+            }
+            HoloStoreClientBackend::Rpc(client) => {
+                let rpc_entries = entries
+                    .into_iter()
+                    .map(
+                        |entry| volo_gen::holo_store::rpc::RangeSnapshotLatestEntry {
+                            key: entry.key.into(),
+                            value: entry.value.into(),
+                            version: Some(to_rpc_version(entry.version)),
+                        },
+                    )
+                    .collect();
 
-        let request = volo_gen::holo_store::rpc::RangeApplyLatestRequest {
-            shard_index: shard_index as u64,
-            start_key: start_key.to_vec().into(),
-            end_key: end_key.to_vec().into(),
-            entries: rpc_entries,
-            admin: true,
-        };
+                let request = volo_gen::holo_store::rpc::RangeApplyLatestRequest {
+                    shard_index: shard_index as u64,
+                    start_key: start_key.to_vec().into(),
+                    end_key: end_key.to_vec().into(),
+                    entries: rpc_entries,
+                    admin: true,
+                };
 
-        let response = tokio::time::timeout(self.timeout, self.client.range_apply_latest(request))
-            .await
-            .map_err(|_| anyhow::anyhow!("range_apply_latest rpc timed out for {}", self.target))?
-            .map_err(|err| {
-                anyhow::anyhow!("range_apply_latest rpc failed for {}: {err}", self.target)
-            })?;
+                let response =
+                    tokio::time::timeout(self.timeout, client.range_apply_latest(request))
+                        .await
+                        .map_err(|_| {
+                            anyhow::anyhow!("range_apply_latest rpc timed out for {}", self.target)
+                        })?
+                        .map_err(|err| {
+                            anyhow::anyhow!(
+                                "range_apply_latest rpc failed for {}: {err}",
+                                self.target
+                            )
+                        })?;
 
-        Ok(response.into_inner().applied)
+                Ok(response.into_inner().applied)
+            }
+        }
     }
 
     pub async fn range_apply_latest_conditional(
@@ -401,49 +493,74 @@ impl HoloStoreClient {
         end_key: &[u8],
         entries: Vec<ConditionalLatestEntry>,
     ) -> anyhow::Result<ConditionalApplyResult> {
-        let rpc_entries = entries
-            .into_iter()
-            .map(
-                |entry| volo_gen::holo_store::rpc::RangeApplyLatestConditionalEntry {
-                    key: entry.key.into(),
-                    value: entry.value.into(),
-                    version: Some(to_rpc_version(entry.version)),
-                    expected_version: Some(to_rpc_version(entry.expected_version)),
-                },
-            )
-            .collect();
+        match &self.backend {
+            HoloStoreClientBackend::Local(state) => {
+                let latest = entries
+                    .into_iter()
+                    .map(|entry| RangeConditionalLatestEntry {
+                        key: entry.key,
+                        value: entry.value,
+                        version: to_kv_version(entry.version),
+                        expected_version: to_kv_version(entry.expected_version),
+                    })
+                    .collect::<Vec<_>>();
+                let result = state.apply_range_latest_page_conditional(
+                    shard_index,
+                    start_key,
+                    end_key,
+                    latest.as_slice(),
+                )?;
+                Ok(ConditionalApplyResult {
+                    applied: result.applied,
+                    conflicts: result.conflicts,
+                })
+            }
+            HoloStoreClientBackend::Rpc(client) => {
+                let rpc_entries = entries
+                    .into_iter()
+                    .map(
+                        |entry| volo_gen::holo_store::rpc::RangeApplyLatestConditionalEntry {
+                            key: entry.key.into(),
+                            value: entry.value.into(),
+                            version: Some(to_rpc_version(entry.version)),
+                            expected_version: Some(to_rpc_version(entry.expected_version)),
+                        },
+                    )
+                    .collect();
 
-        let request = volo_gen::holo_store::rpc::RangeApplyLatestConditionalRequest {
-            shard_index: shard_index as u64,
-            start_key: start_key.to_vec().into(),
-            end_key: end_key.to_vec().into(),
-            entries: rpc_entries,
-            admin: true,
-        };
+                let request = volo_gen::holo_store::rpc::RangeApplyLatestConditionalRequest {
+                    shard_index: shard_index as u64,
+                    start_key: start_key.to_vec().into(),
+                    end_key: end_key.to_vec().into(),
+                    entries: rpc_entries,
+                    admin: true,
+                };
 
-        let response = tokio::time::timeout(
-            self.timeout,
-            self.client.range_apply_latest_conditional(request),
-        )
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "range_apply_latest_conditional rpc timed out for {}",
-                self.target
-            )
-        })?
-        .map_err(|err| {
-            anyhow::anyhow!(
-                "range_apply_latest_conditional rpc failed for {}: {err}",
-                self.target
-            )
-        })?
-        .into_inner();
+                let response = tokio::time::timeout(
+                    self.timeout,
+                    client.range_apply_latest_conditional(request),
+                )
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "range_apply_latest_conditional rpc timed out for {}",
+                        self.target
+                    )
+                })?
+                .map_err(|err| {
+                    anyhow::anyhow!(
+                        "range_apply_latest_conditional rpc failed for {}: {err}",
+                        self.target
+                    )
+                })?
+                .into_inner();
 
-        Ok(ConditionalApplyResult {
-            applied: response.applied,
-            conflicts: response.conflicts,
-        })
+                Ok(ConditionalApplyResult {
+                    applied: response.applied,
+                    conflicts: response.conflicts,
+                })
+            }
+        }
     }
 
     pub async fn range_write_latest(
@@ -453,30 +570,65 @@ impl HoloStoreClient {
         end_key: &[u8],
         entries: Vec<ReplicatedWriteEntry>,
     ) -> anyhow::Result<u64> {
-        let rpc_entries = entries
-            .into_iter()
-            .map(|entry| volo_gen::holo_store::rpc::RangeWriteLatestEntry {
-                key: entry.key.into(),
-                value: entry.value.into(),
-            })
-            .collect();
+        match &self.backend {
+            HoloStoreClientBackend::Local(state) => {
+                let writes = entries
+                    .into_iter()
+                    .map(|entry| RangeWriteEntry {
+                        key: entry.key,
+                        value: entry.value,
+                    })
+                    .collect::<Vec<_>>();
+                tokio::time::timeout(
+                    self.timeout,
+                    state.write_range_latest_replicated(
+                        shard_index,
+                        start_key,
+                        end_key,
+                        writes.as_slice(),
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "range_write_latest local call timed out for {}",
+                        self.target
+                    )
+                })?
+            }
+            HoloStoreClientBackend::Rpc(client) => {
+                let rpc_entries = entries
+                    .into_iter()
+                    .map(|entry| volo_gen::holo_store::rpc::RangeWriteLatestEntry {
+                        key: entry.key.into(),
+                        value: entry.value.into(),
+                    })
+                    .collect();
 
-        let request = volo_gen::holo_store::rpc::RangeWriteLatestRequest {
-            shard_index: shard_index as u64,
-            start_key: start_key.to_vec().into(),
-            end_key: end_key.to_vec().into(),
-            entries: rpc_entries,
-        };
+                let request = volo_gen::holo_store::rpc::RangeWriteLatestRequest {
+                    shard_index: shard_index as u64,
+                    start_key: start_key.to_vec().into(),
+                    end_key: end_key.to_vec().into(),
+                    entries: rpc_entries,
+                };
 
-        let response = tokio::time::timeout(self.timeout, self.client.range_write_latest(request))
-            .await
-            .map_err(|_| anyhow::anyhow!("range_write_latest rpc timed out for {}", self.target))?
-            .map_err(|err| {
-                anyhow::anyhow!("range_write_latest rpc failed for {}: {err}", self.target)
-            })?
-            .into_inner();
+                let response =
+                    tokio::time::timeout(self.timeout, client.range_write_latest(request))
+                        .await
+                        .map_err(|_| {
+                            anyhow::anyhow!("range_write_latest rpc timed out for {}", self.target)
+                        })?
+                        .map_err(|err| {
+                            anyhow::anyhow!(
+                                "range_write_latest rpc failed for {}: {err}",
+                                self.target
+                            )
+                        })?
+                        .into_inner();
 
-        Ok(response.applied)
+                Ok(response.applied)
+            }
+        }
     }
 
     pub async fn range_write_latest_conditional(
@@ -486,70 +638,146 @@ impl HoloStoreClient {
         end_key: &[u8],
         entries: Vec<ReplicatedConditionalWriteEntry>,
     ) -> anyhow::Result<ReplicatedConditionalApplyResult> {
-        let rpc_entries = entries
-            .into_iter()
-            .map(
-                |entry| volo_gen::holo_store::rpc::RangeWriteLatestConditionalEntry {
-                    key: entry.key.into(),
-                    value: entry.value.into(),
-                    expected_version: Some(to_rpc_version(entry.expected_version)),
-                },
-            )
-            .collect();
+        match &self.backend {
+            HoloStoreClientBackend::Local(state) => {
+                let writes = entries
+                    .into_iter()
+                    .map(|entry| RangeConditionalWriteEntry {
+                        key: entry.key,
+                        value: entry.value,
+                        expected_version: to_kv_version(entry.expected_version),
+                    })
+                    .collect::<Vec<_>>();
+                let result = tokio::time::timeout(
+                    self.timeout,
+                    state.write_range_latest_conditional_replicated(
+                        shard_index,
+                        start_key,
+                        end_key,
+                        writes.as_slice(),
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "range_write_latest_conditional local call timed out for {}",
+                        self.target
+                    )
+                })??;
+                let mut applied_versions = Vec::with_capacity(result.applied_versions.len());
+                for item in result.applied_versions {
+                    applied_versions.push(ConditionalAppliedVersion {
+                        key: item.key,
+                        version: from_kv_version(item.version),
+                    });
+                }
+                Ok(ReplicatedConditionalApplyResult {
+                    applied: result.applied,
+                    conflicts: result.conflicts,
+                    applied_versions,
+                })
+            }
+            HoloStoreClientBackend::Rpc(client) => {
+                let rpc_entries = entries
+                    .into_iter()
+                    .map(
+                        |entry| volo_gen::holo_store::rpc::RangeWriteLatestConditionalEntry {
+                            key: entry.key.into(),
+                            value: entry.value.into(),
+                            expected_version: Some(to_rpc_version(entry.expected_version)),
+                        },
+                    )
+                    .collect();
 
-        let request = volo_gen::holo_store::rpc::RangeWriteLatestConditionalRequest {
-            shard_index: shard_index as u64,
-            start_key: start_key.to_vec().into(),
-            end_key: end_key.to_vec().into(),
-            entries: rpc_entries,
-        };
+                let request = volo_gen::holo_store::rpc::RangeWriteLatestConditionalRequest {
+                    shard_index: shard_index as u64,
+                    start_key: start_key.to_vec().into(),
+                    end_key: end_key.to_vec().into(),
+                    entries: rpc_entries,
+                };
 
-        let response = tokio::time::timeout(
-            self.timeout,
-            self.client.range_write_latest_conditional(request),
-        )
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "range_write_latest_conditional rpc timed out for {}",
-                self.target
-            )
-        })?
-        .map_err(|err| {
-            anyhow::anyhow!(
-                "range_write_latest_conditional rpc failed for {}: {err}",
-                self.target
-            )
-        })?
-        .into_inner();
+                let response = tokio::time::timeout(
+                    self.timeout,
+                    client.range_write_latest_conditional(request),
+                )
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "range_write_latest_conditional rpc timed out for {}",
+                        self.target
+                    )
+                })?
+                .map_err(|err| {
+                    anyhow::anyhow!(
+                        "range_write_latest_conditional rpc failed for {}: {err}",
+                        self.target
+                    )
+                })?
+                .into_inner();
 
-        let mut applied_versions = Vec::with_capacity(response.applied_versions.len());
-        for item in response.applied_versions {
-            applied_versions.push(ConditionalAppliedVersion {
-                key: item.key.to_vec(),
-                version: from_rpc_version_required(item.version)?,
-            });
+                let mut applied_versions = Vec::with_capacity(response.applied_versions.len());
+                for item in response.applied_versions {
+                    applied_versions.push(ConditionalAppliedVersion {
+                        key: item.key.to_vec(),
+                        version: from_rpc_version_required(item.version)?,
+                    });
+                }
+
+                Ok(ReplicatedConditionalApplyResult {
+                    applied: response.applied,
+                    conflicts: response.conflicts,
+                    applied_versions,
+                })
+            }
         }
-
-        Ok(ReplicatedConditionalApplyResult {
-            applied: response.applied,
-            conflicts: response.conflicts,
-            applied_versions,
-        })
     }
 
     pub async fn range_split(&self, split_key: &[u8]) -> anyhow::Result<(u64, u64)> {
-        let request = volo_gen::holo_store::rpc::RangeSplitRequest {
-            split_key: split_key.to_vec().into(),
-        };
+        match &self.backend {
+            HoloStoreClientBackend::Local(state) => {
+                let split_key = split_key.to_vec();
+                tokio::time::timeout(self.timeout, async move {
+                    let Some(target_shard_index) = state
+                        .cluster_store
+                        .first_free_shard_index(state.data_shards.max(1))
+                    else {
+                        anyhow::bail!("no free data shard available for split");
+                    };
+                    let cmd = crate::cluster::ClusterCommand::SplitRange {
+                        split_key: split_key.clone(),
+                        target_shard_index,
+                    };
+                    state.propose_meta_command(cmd).await?;
+                    let snapshot = state.cluster_store.state();
+                    let (left, right) = snapshot
+                        .shards
+                        .windows(2)
+                        .find(|pair| pair[0].end_key == split_key)
+                        .map(|pair| (pair[0].shard_id, pair[1].shard_id))
+                        .unwrap_or((0, 0));
+                    Ok((left, right))
+                })
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("range_split local call timed out for {}", self.target)
+                })?
+            }
+            HoloStoreClientBackend::Rpc(client) => {
+                let request = volo_gen::holo_store::rpc::RangeSplitRequest {
+                    split_key: split_key.to_vec().into(),
+                };
 
-        let response = tokio::time::timeout(self.timeout, self.client.range_split(request))
-            .await
-            .map_err(|_| anyhow::anyhow!("range_split rpc timed out for {}", self.target))?
-            .map_err(|err| anyhow::anyhow!("range_split rpc failed for {}: {err}", self.target))?
-            .into_inner();
+                let response = tokio::time::timeout(self.timeout, client.range_split(request))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("range_split rpc timed out for {}", self.target))?
+                    .map_err(|err| {
+                        anyhow::anyhow!("range_split rpc failed for {}: {err}", self.target)
+                    })?
+                    .into_inner();
 
-        Ok((response.left_shard_id, response.right_shard_id))
+                Ok((response.left_shard_id, response.right_shard_id))
+            }
+        }
     }
 
     pub async fn range_rebalance(
@@ -561,21 +789,43 @@ impl HoloStoreClient {
         if replicas.is_empty() {
             anyhow::bail!("range_rebalance requires at least one replica");
         }
+        match &self.backend {
+            HoloStoreClientBackend::Local(state) => {
+                tokio::time::timeout(self.timeout, async move {
+                    let planned = state.cluster_store.plan_rebalance_command(
+                        shard_id,
+                        replicas.to_vec(),
+                        leaseholder,
+                    )?;
+                    if let Some(cmd) = planned {
+                        state.propose_meta_command(cmd).await?;
+                    }
+                    Ok(())
+                })
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("range_rebalance local call timed out for {}", self.target)
+                })?
+            }
+            HoloStoreClientBackend::Rpc(client) => {
+                let request = volo_gen::holo_store::rpc::RangeRebalanceRequest {
+                    shard_id,
+                    replicas: replicas.to_vec(),
+                    leaseholder: leaseholder.unwrap_or(0),
+                };
 
-        let request = volo_gen::holo_store::rpc::RangeRebalanceRequest {
-            shard_id,
-            replicas: replicas.to_vec(),
-            leaseholder: leaseholder.unwrap_or(0),
-        };
+                tokio::time::timeout(self.timeout, client.range_rebalance(request))
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("range_rebalance rpc timed out for {}", self.target)
+                    })?
+                    .map_err(|err| {
+                        anyhow::anyhow!("range_rebalance rpc failed for {}: {err}", self.target)
+                    })?;
 
-        tokio::time::timeout(self.timeout, self.client.range_rebalance(request))
-            .await
-            .map_err(|_| anyhow::anyhow!("range_rebalance rpc timed out for {}", self.target))?
-            .map_err(|err| {
-                anyhow::anyhow!("range_rebalance rpc failed for {}: {err}", self.target)
-            })?;
-
-        Ok(())
+                Ok(())
+            }
+        }
     }
 }
 
@@ -584,8 +834,97 @@ impl std::fmt::Debug for HoloStoreClient {
         f.debug_struct("HoloStoreClient")
             .field("target", &self.target)
             .field("timeout", &self.timeout)
+            .field(
+                "backend",
+                &match &self.backend {
+                    HoloStoreClientBackend::Local(_) => "local",
+                    HoloStoreClientBackend::Rpc(_) => "rpc",
+                },
+            )
             .finish()
     }
+}
+
+async fn cluster_state_json_local(state: &NodeState) -> anyhow::Result<String> {
+    let snapshot = state.cluster_store.state();
+    let ops_by_index = state.cluster_store.meta_ops_total_by_index();
+    let lag_by_index = state.meta_group_lag_by_index().await;
+    let recovery = state.recovery_checkpoint_snapshot();
+    let proposal = state.meta_proposal_stats_peek();
+    let split_health = state.split_health_snapshot();
+    let proposal_total_avg_us = if proposal.total.count == 0 {
+        0.0
+    } else {
+        proposal.total.total_us as f64 / proposal.total.count as f64
+    };
+    let proposal_by_index = proposal
+        .by_index
+        .iter()
+        .map(|(idx, snap)| {
+            let avg_us = if snap.count == 0 {
+                0.0
+            } else {
+                snap.total_us as f64 / snap.count as f64
+            };
+            (
+                *idx,
+                serde_json::json!({
+                    "count": snap.count,
+                    "errors": snap.errors,
+                    "avg_us": avg_us,
+                    "max_us": snap.max_us,
+                }),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    let now_ms = unix_time_ms();
+    let stuck_threshold_ms = state.meta_move_stuck_warn_ms();
+    let rebalances_stuck = snapshot
+        .meta_rebalances
+        .values()
+        .filter(|mv| {
+            let last = mv.last_progress_unix_ms.max(mv.started_unix_ms);
+            last > 0 && now_ms.saturating_sub(last) >= stuck_threshold_ms
+        })
+        .count();
+
+    let mut root = serde_json::to_value(&snapshot).context("serialize state failed")?;
+    root["meta_health"] = serde_json::json!({
+        "ops_by_index": ops_by_index,
+        "lag_by_index": lag_by_index,
+        "proposal_total": {
+            "count": proposal.total.count,
+            "errors": proposal.total.errors,
+            "avg_us": proposal_total_avg_us,
+            "max_us": proposal.total.max_us,
+        },
+        "proposal_by_index": proposal_by_index,
+        "rebalances_inflight": snapshot.meta_rebalances.len(),
+        "rebalances_stuck": rebalances_stuck,
+        "stuck_threshold_ms": stuck_threshold_ms,
+    });
+    root["recovery_health"] = serde_json::json!({
+        "checkpoint_successes": recovery.success_count,
+        "checkpoint_failures": recovery.failure_count,
+        "checkpoint_manual_triggers": recovery.manual_trigger_count,
+        "checkpoint_manual_trigger_failures": recovery.manual_trigger_failure_count,
+        "checkpoint_pressure_skips": recovery.pressure_skip_count,
+        "checkpoint_manifest_parse_errors": recovery.manifest_parse_error_count,
+        "last_attempt_ms": recovery.last_attempt_ms,
+        "last_success_ms": recovery.last_success_ms,
+        "max_lag_entries": recovery.max_lag_entries,
+        "blocked_groups": recovery.blocked_groups,
+        "paused": recovery.paused,
+        "last_run_reason": recovery.last_run_reason,
+        "last_free_bytes": recovery.last_free_bytes,
+        "last_free_pct": recovery.last_free_pct,
+        "last_error": recovery.last_error,
+    });
+    root["split_health"] =
+        serde_json::to_value(&split_health).context("serialize split health failed")?;
+
+    serde_json::to_string_pretty(&root).context("serialize state failed")
 }
 
 fn to_rpc_version(version: RpcVersion) -> volo_gen::holo_store::rpc::Version {
@@ -611,4 +950,67 @@ fn from_rpc_version_required(
         txn_node_id: txn_id.node_id,
         txn_counter: txn_id.counter,
     })
+}
+
+fn to_kv_version(version: RpcVersion) -> kv::Version {
+    kv::Version {
+        seq: version.seq,
+        txn_id: TxnId {
+            node_id: version.txn_node_id,
+            counter: version.txn_counter,
+        },
+    }
+}
+
+fn from_kv_version(version: kv::Version) -> RpcVersion {
+    RpcVersion {
+        seq: version.seq,
+        txn_node_id: version.txn_id.node_id,
+        txn_counter: version.txn_id.counter,
+    }
+}
+
+#[cfg(test)]
+mod lib_client_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn embedded_client_uses_local_backend() -> anyhow::Result<()> {
+        let grpc_listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let redis_listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let grpc_addr = grpc_listener.local_addr()?;
+        let redis_addr = redis_listener.local_addr()?;
+        drop(grpc_listener);
+        drop(redis_listener);
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "holo_store_embedded_local_client_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+
+        let node = start_embedded_node(EmbeddedNodeConfig::single_node(
+            1,
+            redis_addr,
+            grpc_addr,
+            data_dir.clone(),
+        ))
+        .await?;
+
+        let client = HoloStoreClient::new(grpc_addr);
+        let debug = format!("{client:?}");
+        assert!(
+            debug.contains("backend: \"local\""),
+            "expected local backend, got {debug}"
+        );
+
+        // Smoke one API call to ensure the direct path is operational.
+        let _ = client.cluster_state_json().await?;
+
+        node.shutdown().await?;
+        let _ = std::fs::remove_dir_all(data_dir);
+        Ok(())
+    }
 }
