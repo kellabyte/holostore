@@ -1,7 +1,22 @@
 //! gRPC transport layer used by the Accord consensus engine.
 //!
-//! This module builds per-peer RPC batching pipelines, exposes a `Transport`
-//! implementation for Accord, and surfaces rich per-peer latency/queue stats.
+//! Purpose:
+//! - Provide low-latency, backpressure-aware RPC transport for Accord quorum
+//!   rounds and read paths.
+//!
+//! Design:
+//! - Build per-peer batching workers with bounded in-flight RPC concurrency.
+//! - Keep worker loops single-task and cancellation-friendly by polling
+//!   in-flight futures directly instead of spawning per-batch helper tasks.
+//! - Surface detailed queue, wait, and latency counters for tuning.
+//!
+//! Inputs:
+//! - Local transport method calls (`pre_accept`, `accept`, `commit`, `recover`,
+//!   and read RPCs), membership updates, and environment-derived batching knobs.
+//!
+//! Outputs:
+//! - Timed/batched gRPC requests to peers, fan-out responses to callers, and
+//!   per-peer and global transport telemetry snapshots.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -13,6 +28,7 @@ use ahash::RandomState;
 use anyhow::Context;
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use hashbrown::HashMap as FastHashMap;
 use holo_accord::accord::{
     AcceptRequest, AcceptResponse, Ballot, CommitRequest, CommitResponse, ExecutedPrefix, GroupId,
@@ -27,6 +43,12 @@ use crate::volo_gen::holo_store::rpc;
 
 /// Capacity for each per-peer RPC queue.
 const RPC_QUEUE_CAPACITY: usize = 4096;
+
+/// Maximum number of reusable vectors cached per worker lane.
+const REUSE_POOL_MAX_CACHED: usize = 64;
+
+/// Upper bound multiplier for retained reusable vector capacities.
+const REUSE_POOL_CAPACITY_MULTIPLIER: usize = 4;
 
 /// Histogram bucket boundaries for latency metrics (microseconds).
 const LATENCY_BUCKETS_US: [u64; 12] = [
@@ -84,14 +106,41 @@ pub struct RangeTelemetryStat {
     pub read_hot_buckets: Vec<u64>,
 }
 
-/// Collect a batch of items from a channel with a size/time bound.
-async fn collect_batch<T>(
+/// Collect a batch of items from a channel with a size/time bound, reusing
+/// caller-provided vector storage.
+///
+/// Purpose:
+/// - Build one bounded batch while minimizing allocator churn on hot lanes.
+///
+/// Design:
+/// - Clear and reuse the supplied `items` buffer.
+/// - Include a required first item.
+/// - Fill additional items via `try_recv` fast path.
+/// - If temporarily empty, wait for either next item or batching deadline.
+///
+/// Inputs:
+/// - `items`: caller-owned reusable vector buffer.
+/// - `first`: first already-dequeued item.
+/// - `rx`: lane receiver.
+/// - `batch_max`: maximum batch size.
+/// - `batch_wait`: soft wait window for coalescing.
+///
+/// Outputs:
+/// - Batch vector with `1..=batch_max` items unless channel disconnects.
+async fn collect_batch_reuse<T>(
+    mut items: Vec<T>,
     first: T,
     rx: &mut mpsc::Receiver<T>,
     batch_max: usize,
     batch_wait: Duration,
 ) -> Vec<T> {
-    let mut items = Vec::with_capacity(batch_max.max(1));
+    items.clear();
+    let target_capacity = batch_max.max(1);
+    if items.capacity() < target_capacity {
+        // Grow once up to the configured batch target; we intentionally avoid
+        // shrinking so callers can keep reusing this allocation.
+        items.reserve(target_capacity - items.capacity());
+    }
     items.push(first);
     if batch_max <= 1 {
         return items;
@@ -142,6 +191,247 @@ async fn collect_batch<T>(
     }
 
     items
+}
+
+/// Collect a batch while still polling already in-flight RPC futures.
+///
+/// Purpose:
+/// - Preserve batch coalescing while preventing active RPCs from stalling during
+///   the batching wait window.
+///
+/// Design:
+/// - Reuse caller-provided vector storage to avoid per-batch allocation churn.
+/// - Start from a required first item.
+/// - Fill up to `batch_max` using immediate `try_recv`.
+/// - When queue is briefly empty, wait on either: next item, batching deadline,
+///   or one in-flight RPC completion.
+/// - Forward each completed in-flight output to `on_in_flight` so caller-owned
+///   buffer pools can reclaim memory immediately.
+///
+/// Inputs:
+/// - `items`: reusable vector buffer supplied by caller.
+/// - `first`: first work item already dequeued by caller.
+/// - `rx`: work queue for the same peer+RPC lane.
+/// - `batch_max`: hard cap on items in one batch.
+/// - `batch_wait`: soft batching window.
+/// - `in_flight`: currently running batch RPC futures.
+/// - `on_in_flight`: callback for each completed in-flight output.
+///
+/// Outputs:
+/// - A batch vector sized in `[1, batch_max]` unless channel is disconnected.
+async fn collect_batch_with_progress<T, Fut, F>(
+    mut items: Vec<T>,
+    first: T,
+    rx: &mut mpsc::Receiver<T>,
+    batch_max: usize,
+    batch_wait: Duration,
+    in_flight: &mut FuturesUnordered<Fut>,
+    mut on_in_flight: F,
+) -> Vec<T>
+where
+    Fut: std::future::Future,
+    F: FnMut(Fut::Output),
+{
+    items.clear();
+    let target_capacity = batch_max.max(1);
+    if items.capacity() < target_capacity {
+        // Grow once up to the configured batch target; we intentionally avoid
+        // shrinking here so the caller can reuse this allocation on later batches.
+        items.reserve(target_capacity - items.capacity());
+    }
+    items.push(first);
+    if batch_max <= 1 {
+        return items;
+    }
+
+    let deadline = if batch_wait.is_zero() {
+        None
+    } else {
+        Some(time::Instant::now() + batch_wait)
+    };
+
+    // Keep filling until size/deadline/channel constraints stop us.
+    'outer: loop {
+        if items.len() >= batch_max {
+            break;
+        }
+        match rx.try_recv() {
+            Ok(item) => {
+                items.push(item);
+                continue;
+            }
+            Err(mpsc::error::TryRecvError::Empty) => {}
+            Err(mpsc::error::TryRecvError::Disconnected) => break,
+        }
+
+        let Some(deadline) = deadline else {
+            break;
+        };
+        if time::Instant::now() >= deadline {
+            break;
+        }
+
+        // While waiting for another queue item, we also poll in-flight RPCs so
+        // they can make forward progress and release limiter permits.
+        tokio::select! {
+            maybe = rx.recv() => {
+                match maybe {
+                    Some(item) => items.push(item),
+                    None => break 'outer,
+                }
+            }
+            _ = time::sleep_until(deadline) => {
+                break;
+            }
+            done = in_flight.next(), if !in_flight.is_empty() => {
+                // Reclaim completion outputs immediately. This branch exists to
+                // keep in-flight futures progressing; it does not dequeue extra
+                // queue work beyond the current batch window.
+                if let Some(output) = done {
+                    on_in_flight(output);
+                }
+            }
+        }
+    }
+
+    items
+}
+
+/// Bounded pool of reusable vectors.
+///
+/// Purpose:
+/// - Reuse vector allocations across hot-path batch completions.
+///
+/// Design:
+/// - Stores cleared vectors up to `max_cached`.
+/// - Rejects oversized vectors (capacity above `max_capacity`) so one spike does
+///   not pin excessive memory.
+/// - Serves vectors by minimum required capacity, otherwise allocates.
+///
+/// Inputs:
+/// - Capacity bounds and candidate vectors to cache/reuse.
+///
+/// Outputs:
+/// - Reusable vectors with amortized allocation cost and bounded retained memory.
+struct ReuseVecPool<T> {
+    free: Vec<Vec<T>>,
+    max_cached: usize,
+    max_capacity: usize,
+}
+
+impl<T> ReuseVecPool<T> {
+    /// Create a new reusable-vector pool.
+    ///
+    /// Purpose:
+    /// - Configure bounded vector reuse for one worker lane.
+    ///
+    /// Design:
+    /// - Clamps cache-size and capacity bounds to at least 1.
+    ///
+    /// Inputs:
+    /// - `max_cached`: max vectors retained in the pool.
+    /// - `max_capacity`: largest vector capacity allowed to remain cached.
+    ///
+    /// Outputs:
+    /// - Empty pool ready for `take`/`put`.
+    fn new(max_cached: usize, max_capacity: usize) -> Self {
+        Self {
+            free: Vec::new(),
+            max_cached: max_cached.max(1),
+            max_capacity: max_capacity.max(1),
+        }
+    }
+
+    /// Take a vector with at least `min_capacity`, reusing one if possible.
+    ///
+    /// Purpose:
+    /// - Avoid allocating for common batch sizes.
+    ///
+    /// Design:
+    /// - Finds any cached vector with enough capacity and clears it.
+    /// - Falls back to allocating exactly `min_capacity`.
+    ///
+    /// Inputs:
+    /// - `min_capacity`: lower bound on returned vector capacity.
+    ///
+    /// Outputs:
+    /// - Empty vector ready for caller writes.
+    fn take(&mut self, min_capacity: usize) -> Vec<T> {
+        let min_capacity = min_capacity.max(1);
+        if let Some(idx) = self
+            .free
+            .iter()
+            .position(|candidate| candidate.capacity() >= min_capacity)
+        {
+            let mut reused = self.free.swap_remove(idx);
+            reused.clear();
+            return reused;
+        }
+        Vec::with_capacity(min_capacity)
+    }
+
+    /// Return a vector to the pool if it is safe and useful to retain.
+    ///
+    /// Purpose:
+    /// - Bound memory usage while still reusing typical batch allocations.
+    ///
+    /// Design:
+    /// - Clears vector contents.
+    /// - Drops vectors that are too large or when cache is already full.
+    ///
+    /// Inputs:
+    /// - `vec`: candidate vector to recycle.
+    ///
+    /// Outputs:
+    /// - Vector is cached for future `take` or dropped.
+    fn put(&mut self, mut vec: Vec<T>) {
+        vec.clear();
+        if vec.capacity() == 0 {
+            return;
+        }
+        // Do not cache pathological one-off spikes.
+        if vec.capacity() > self.max_capacity {
+            return;
+        }
+        if self.free.len() >= self.max_cached {
+            return;
+        }
+        self.free.push(vec);
+    }
+}
+
+/// Recycled waiter vector for one completed quorum RPC batch.
+///
+/// Purpose:
+/// - Return oneshot sender vector capacity to the worker pool after completion.
+///
+/// Design:
+/// - Holds drained sender storage only; sender values are consumed before return.
+///
+/// Inputs:
+/// - Drained sender vector from one in-flight batch.
+///
+/// Outputs:
+/// - Reusable sender vector capacity for subsequent batches.
+struct WaiterBatchRecycle<T> {
+    txs: Vec<oneshot::Sender<anyhow::Result<T>>>,
+}
+
+/// Recycled transaction-id vector for one completed recover batch.
+///
+/// Purpose:
+/// - Return txn-id vector capacity to the worker pool after completion.
+///
+/// Design:
+/// - Holds drained txn id storage only; ids are consumed before return.
+///
+/// Inputs:
+/// - Drained txn-id vector from one in-flight recover batch.
+///
+/// Outputs:
+/// - Reusable txn-id vector capacity for subsequent recover batches.
+struct RecoverBatchRecycle {
+    txn_ids: Vec<TxnId>,
 }
 
 /// Per-peer RPC state and queues.
@@ -198,10 +488,13 @@ fn epoch_micros() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
+type KvGetResult = anyhow::Result<Option<(Vec<u8>, Version)>>;
+type KvGetReplyTx = oneshot::Sender<KvGetResult>;
+
 /// Work item for per-key GET RPCs.
 struct KvGetWork {
     key: Vec<u8>,
-    tx: oneshot::Sender<anyhow::Result<Option<(Vec<u8>, Version)>>>,
+    tx: KvGetReplyTx,
     enqueued_at: std::time::Instant,
 }
 
@@ -268,6 +561,41 @@ impl InflightLimiter {
         }
     }
 
+    /// Attempt to acquire a permit without waiting.
+    ///
+    /// Purpose:
+    /// - Let batching workers avoid blocking on limiter saturation while they
+    ///   continue polling already in-flight RPC futures.
+    ///
+    /// Design:
+    /// - Single compare-exchange against current in-flight count.
+    /// - No retries or waits; caller decides whether to fall back to blocking.
+    ///
+    /// Inputs:
+    /// - None.
+    ///
+    /// Outputs:
+    /// - `Some(InflightPermit)` when capacity is available.
+    /// - `None` when current in-flight count is at/above limit.
+    fn try_acquire(self: &Arc<Self>) -> Option<InflightPermit> {
+        let limit = self.limit.load(Ordering::Relaxed).max(1);
+        let current = self.in_flight.load(Ordering::Relaxed);
+        if current >= limit {
+            return None;
+        }
+        if self
+            .in_flight
+            .compare_exchange(current, current + 1, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            Some(InflightPermit {
+                limiter: self.clone(),
+            })
+        } else {
+            None
+        }
+    }
+
     /// Release a permit and wake one waiter.
     fn release(&self) {
         self.in_flight.fetch_sub(1, Ordering::Relaxed);
@@ -289,6 +617,44 @@ impl InflightLimiter {
             true
         } else {
             false
+        }
+    }
+}
+
+/// Acquire an in-flight permit while keeping active RPC futures progressing.
+///
+/// Purpose:
+/// - Avoid head-of-line stalls when limiter capacity is exhausted.
+///
+/// Design:
+/// - Try fast-path non-blocking acquire.
+/// - If saturated, wait for one in-flight future to finish, then retry.
+/// - Fall back to blocking acquire only when no futures are registered.
+///
+/// Inputs:
+/// - `limiter`: adaptive concurrency limiter for one RPC lane.
+/// - `in_flight`: futures currently executing for that lane.
+///
+/// Outputs:
+/// - One acquired permit.
+async fn acquire_with_progress<Fut>(
+    limiter: &Arc<InflightLimiter>,
+    in_flight: &mut FuturesUnordered<Fut>,
+) -> InflightPermit
+where
+    Fut: std::future::Future,
+{
+    loop {
+        if let Some(permit) = limiter.try_acquire() {
+            return permit;
+        }
+
+        // When saturated, wait for one completion before retrying. This does
+        // not dequeue more work while the lane is fully utilized.
+        if in_flight.next().await.is_none() {
+            // Defensive fallback: if no tracked futures remain, use blocking
+            // acquire to preserve correctness under transient races.
+            return limiter.acquire().await;
         }
     }
 }
@@ -1069,6 +1435,23 @@ impl GrpcTransport {
 }
 
 /// Spawn a task that batches KV GET requests per peer.
+///
+/// Purpose:
+/// - Coalesce per-key reads into one RPC while preserving request order and
+///   per-request completion fan-out.
+///
+/// Design:
+/// - One long-lived worker owns dequeue, batch build, and RPC execution.
+/// - Reuses hot-path vectors (`KvGetWork` item buffers and waiter senders) via
+///   bounded pools to reduce allocator churn on read-heavy workloads.
+/// - Keeps response fan-out linear and deterministic by preserving original
+///   queue order within each batch.
+///
+/// Inputs:
+/// - Peer client, queue receiver, timeout/batching knobs, shared stats.
+///
+/// Outputs:
+/// - Batched `kv_batch_get` RPC calls and per-request response completion.
 fn spawn_kv_get_batcher(
     client: rpc::HoloRpcClient,
     mut rx: mpsc::Receiver<KvGetWork>,
@@ -1079,23 +1462,32 @@ fn spawn_kv_get_batcher(
     peer_stats: Arc<PeerStats>,
 ) {
     tokio::spawn(async move {
+        let reuse_max_capacity = batch_max
+            .saturating_mul(REUSE_POOL_CAPACITY_MULTIPLIER)
+            .max(1);
+        let mut item_pool = ReuseVecPool::<KvGetWork>::new(4, reuse_max_capacity);
+        let mut tx_pool = ReuseVecPool::<KvGetReplyTx>::new(4, reuse_max_capacity);
         while let Some(first) = rx.recv().await {
-            let items = collect_batch(first, &mut rx, batch_max, batch_wait).await;
+            let items_buf = item_pool.take(batch_max.max(1));
+            let mut items =
+                collect_batch_reuse(items_buf, first, &mut rx, batch_max, batch_wait).await;
 
             let batch_len = items.len() as u64;
             peer_stats
                 .kv_get_queue
                 .fetch_sub(batch_len, Ordering::Relaxed);
-            let mut txs = Vec::with_capacity(items.len());
+            let mut txs = tx_pool.take(items.len());
             let mut keys = Vec::with_capacity(items.len());
             let batch_start = std::time::Instant::now();
             let mut wait_us_total = 0u64;
             let mut wait_us_max = 0u64;
+            // Build one batch request in dequeue order so response fan-out maps
+            // 1:1 to queued waiters. We intentionally do not re-order keys.
             for KvGetWork {
                 key,
                 tx,
                 enqueued_at,
-            } in items
+            } in items.drain(..)
             {
                 // Track queue wait time for each request in the batch.
                 let wait_us = batch_start
@@ -1107,9 +1499,14 @@ fn spawn_kv_get_batcher(
                 txs.push(tx);
                 keys.push(key.into());
             }
+            // Recycle the now-drained item buffer immediately.
+            item_pool.put(items);
 
             peer_stats.kv_get_inflight.fetch_add(1, Ordering::Relaxed);
             let rpc_start = std::time::Instant::now();
+            // `volo` unary calls consume the request message by value; this keys
+            // vector is intentionally one-per-batch until the transport API can
+            // support reclaimable request buffers.
             let result = time::timeout(
                 timeout,
                 client.kv_batch_get(rpc::KvBatchGetRequest { keys }),
@@ -1131,13 +1528,14 @@ fn spawn_kv_get_batcher(
                             resp.responses.len()
                         );
                         peer_stats.kv_get_errors.fetch_add(1, Ordering::Relaxed);
-                        for tx in txs {
+                        for tx in txs.drain(..) {
                             let _ = tx.send(Err(anyhow::anyhow!("{err}")));
                         }
+                        tx_pool.put(txs);
                         continue;
                     }
 
-                    for (tx, item) in txs.into_iter().zip(resp.responses) {
+                    for (tx, item) in txs.drain(..).zip(resp.responses) {
                         if !item.has_value {
                             let _ = tx.send(Ok(None));
                         } else {
@@ -1145,31 +1543,51 @@ fn spawn_kv_get_batcher(
                             let _ = tx.send(Ok(Some((item.value.to_vec(), version))));
                         }
                     }
+                    tx_pool.put(txs);
                 }
                 Ok(Err(err)) => {
                     // RPC error: notify all waiters.
                     stats.record_kv_get_error();
                     peer_stats.kv_get_errors.fetch_add(1, Ordering::Relaxed);
                     let err = anyhow::anyhow!("kv_batch_get rpc failed: {err}");
-                    for tx in txs {
+                    for tx in txs.drain(..) {
                         let _ = tx.send(Err(anyhow::anyhow!("{err}")));
                     }
+                    tx_pool.put(txs);
                 }
                 Err(_) => {
                     // Timeout: notify all waiters.
                     stats.record_kv_get_error();
                     peer_stats.kv_get_errors.fetch_add(1, Ordering::Relaxed);
                     let err = anyhow::anyhow!("kv_batch_get rpc timed out");
-                    for tx in txs {
+                    for tx in txs.drain(..) {
                         let _ = tx.send(Err(anyhow::anyhow!("{err}")));
                     }
+                    tx_pool.put(txs);
                 }
             }
         }
     });
 }
 
-/// Spawn a task that batches pre-accept RPCs per peer.
+/// Spawn a pre-accept batching worker for one peer.
+///
+/// Purpose:
+/// - Amortize per-request RPC overhead while keeping tail latency low under
+///   bursty load.
+///
+/// Design:
+/// - One long-lived worker task owns queue dequeue and in-flight RPC polling.
+/// - Uses `FuturesUnordered` for bounded parallel batch RPCs without spawning a
+///   second task per batch.
+/// - Enforces concurrency via `InflightLimiter`.
+///
+/// Inputs:
+/// - Peer client, queue receiver, timeout/batching knobs, shared stats, and
+///   one limiter for this RPC lane.
+///
+/// Outputs:
+/// - Batched pre-accept RPC calls with per-request response fan-out.
 fn spawn_pre_accept_batcher(
     client: rpc::HoloRpcClient,
     mut rx: mpsc::Receiver<PreAcceptWork>,
@@ -1181,119 +1599,183 @@ fn spawn_pre_accept_batcher(
     limiter: Arc<InflightLimiter>,
 ) {
     tokio::spawn(async move {
-        while let Some(first) = rx.recv().await {
-            let items = collect_batch(first, &mut rx, batch_max, batch_wait).await;
-
-            let batch_len = items.len() as u64;
-            peer_stats
-                .pre_accept_queue
-                .fetch_sub(batch_len, Ordering::Relaxed);
-            let mut txs = Vec::with_capacity(items.len());
-            let mut requests = Vec::with_capacity(items.len());
-            let batch_start = std::time::Instant::now();
-            let mut wait_us_total = 0u64;
-            let mut wait_us_max = 0u64;
-            for PreAcceptWork {
-                req,
-                tx,
-                enqueued_at,
-            } in items
-            {
-                // Track queue wait time for each request in the batch.
-                let wait_us = batch_start
-                    .duration_since(enqueued_at)
-                    .as_micros()
-                    .min(u128::from(u64::MAX)) as u64;
-                wait_us_total = wait_us_total.saturating_add(wait_us);
-                wait_us_max = wait_us_max.max(wait_us);
-                txs.push(tx);
-                requests.push(to_rpc_pre_accept(req));
+        let reuse_max_capacity = batch_max
+            .saturating_mul(REUSE_POOL_CAPACITY_MULTIPLIER)
+            .max(1);
+        let reuse_max_cached = limiter.current().clamp(1, REUSE_POOL_MAX_CACHED);
+        let mut item_pool =
+            ReuseVecPool::<PreAcceptWork>::new(reuse_max_cached, reuse_max_capacity);
+        let mut tx_pool = ReuseVecPool::<oneshot::Sender<anyhow::Result<PreAcceptResponse>>>::new(
+            reuse_max_cached,
+            reuse_max_capacity,
+        );
+        let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+        let mut rx_closed = false;
+        loop {
+            // Exit only after queue shutdown and all in-flight RPCs complete.
+            if rx_closed && in_flight.is_empty() {
+                break;
             }
+            tokio::select! {
+                maybe = rx.recv(), if !rx_closed => {
+                    match maybe {
+                        Some(first) => {
+                            let items_buf = item_pool.take(batch_max.max(1));
+                            let mut items = collect_batch_with_progress(
+                                items_buf,
+                                first,
+                                &mut rx,
+                                batch_max,
+                                batch_wait,
+                                &mut in_flight,
+                                |recycle: WaiterBatchRecycle<PreAcceptResponse>| {
+                                    tx_pool.put(recycle.txs);
+                                },
+                            ).await;
 
-            peer_stats
-                .pre_accept_last_dequeue_us
-                .store(epoch_micros(), Ordering::Relaxed);
-            peer_stats
-                .pre_accept_wait_total_us
-                .fetch_add(wait_us_total, Ordering::Relaxed);
-            peer_stats
-                .pre_accept_wait_max_us
-                .fetch_max(wait_us_max, Ordering::Relaxed);
-            peer_stats
-                .pre_accept_wait_count
-                .fetch_add(batch_len, Ordering::Relaxed);
-
-            let client = client.clone();
-            let stats = stats.clone();
-            let peer_stats = peer_stats.clone();
-            let permit = limiter.acquire().await;
-            tokio::spawn(async move {
-                let _permit = permit;
-                peer_stats
-                    .pre_accept_inflight
-                    .fetch_add(1, Ordering::Relaxed);
-                let rpc_start = std::time::Instant::now();
-                let result = time::timeout(
-                    timeout,
-                    client.pre_accept_batch(rpc::PreAcceptBatchRequest { requests }),
-                )
-                .await;
-                let rpc_us = rpc_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-                peer_stats
-                    .pre_accept_inflight
-                    .fetch_sub(1, Ordering::Relaxed);
-                stats.record_pre_accept_batch(batch_len, wait_us_total, wait_us_max, rpc_us);
-                peer_stats.pre_accept_latency.record(rpc_us);
-
-                match result {
-                    Ok(Ok(resp)) => {
-                        let resp = resp.into_inner();
-                        if resp.responses.len() != txs.len() {
-                            // Reject if server returned a mismatched response count.
-                            let err = anyhow::anyhow!(
-                                "pre_accept_batch response count mismatch (expected {}, got {})",
-                                txs.len(),
-                                resp.responses.len()
-                            );
-                            peer_stats.pre_accept_errors.fetch_add(1, Ordering::Relaxed);
-                            for tx in txs {
-                                let _ = tx.send(Err(anyhow::anyhow!("{err}")));
+                            let batch_len = items.len() as u64;
+                            peer_stats
+                                .pre_accept_queue
+                                .fetch_sub(batch_len, Ordering::Relaxed);
+                            let mut txs = tx_pool.take(items.len());
+                            let mut requests = Vec::with_capacity(items.len());
+                            let batch_start = std::time::Instant::now();
+                            let mut wait_us_total = 0u64;
+                            let mut wait_us_max = 0u64;
+                            // Build one RPC payload for the current dequeued batch.
+                            for PreAcceptWork {
+                                req,
+                                tx,
+                                enqueued_at,
+                            } in items.drain(..)
+                            {
+                                // Track queue wait time for each request in the batch.
+                                let wait_us = batch_start
+                                    .duration_since(enqueued_at)
+                                    .as_micros()
+                                    .min(u128::from(u64::MAX)) as u64;
+                                wait_us_total = wait_us_total.saturating_add(wait_us);
+                                wait_us_max = wait_us_max.max(wait_us);
+                                txs.push(tx);
+                                requests.push(to_rpc_pre_accept(req));
                             }
-                            return;
-                        }
+                            // Recycle item vector now that all items were drained.
+                            item_pool.put(items);
 
-                        for (tx, r) in txs.into_iter().zip(resp.responses) {
-                            let _ = tx.send(Ok(from_rpc_pre_accept(r)));
+                            peer_stats
+                                .pre_accept_last_dequeue_us
+                                .store(epoch_micros(), Ordering::Relaxed);
+                            peer_stats
+                                .pre_accept_wait_total_us
+                                .fetch_add(wait_us_total, Ordering::Relaxed);
+                            peer_stats
+                                .pre_accept_wait_max_us
+                                .fetch_max(wait_us_max, Ordering::Relaxed);
+                            peer_stats
+                                .pre_accept_wait_count
+                                .fetch_add(batch_len, Ordering::Relaxed);
+
+                            // Saturated lanes wait for one completion before dispatching more.
+                            let permit = acquire_with_progress(&limiter, &mut in_flight).await;
+                            let client = client.clone();
+                            let stats = stats.clone();
+                            let peer_stats = peer_stats.clone();
+                            in_flight.push(async move {
+                                let _permit = permit;
+                                peer_stats
+                                    .pre_accept_inflight
+                                    .fetch_add(1, Ordering::Relaxed);
+                                let rpc_start = std::time::Instant::now();
+                                let result = time::timeout(
+                                    timeout,
+                                    client.pre_accept_batch(rpc::PreAcceptBatchRequest { requests }),
+                                )
+                                .await;
+                                let rpc_us = rpc_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                                peer_stats
+                                    .pre_accept_inflight
+                                    .fetch_sub(1, Ordering::Relaxed);
+                                stats.record_pre_accept_batch(batch_len, wait_us_total, wait_us_max, rpc_us);
+                                peer_stats.pre_accept_latency.record(rpc_us);
+
+                                match result {
+                                    Ok(Ok(resp)) => {
+                                        let resp = resp.into_inner();
+                                        if resp.responses.len() != txs.len() {
+                                            // Reject if server returned a mismatched response count.
+                                            let err = anyhow::anyhow!(
+                                                "pre_accept_batch response count mismatch (expected {}, got {})",
+                                                txs.len(),
+                                                resp.responses.len()
+                                            );
+                                            peer_stats.pre_accept_errors.fetch_add(1, Ordering::Relaxed);
+                                            for tx in txs.drain(..) {
+                                                let _ = tx.send(Err(anyhow::anyhow!("{err}")));
+                                            }
+                                            return WaiterBatchRecycle { txs };
+                                        }
+
+                                        for (tx, r) in txs.drain(..).zip(resp.responses) {
+                                            let _ = tx.send(Ok(from_rpc_pre_accept(r)));
+                                        }
+                                    }
+                                    Ok(Err(err)) => {
+                                        // RPC error: notify all waiters.
+                                        stats.record_pre_accept_error();
+                                        peer_stats.pre_accept_errors.fetch_add(1, Ordering::Relaxed);
+                                        let err = anyhow::anyhow!("pre_accept_batch rpc failed: {err}");
+                                        for tx in txs.drain(..) {
+                                            let _ = tx.send(Err(anyhow::anyhow!("{err}")));
+                                        }
+                                    }
+                                    Err(_) => {
+                                        // Timeout: notify all waiters.
+                                        stats.record_pre_accept_error();
+                                        peer_stats
+                                            .pre_accept_timeouts
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        peer_stats.pre_accept_errors.fetch_add(1, Ordering::Relaxed);
+                                        let err = anyhow::anyhow!("pre_accept_batch rpc timed out");
+                                        for tx in txs.drain(..) {
+                                            let _ = tx.send(Err(anyhow::anyhow!("{err}")));
+                                        }
+                                    }
+                                }
+                                WaiterBatchRecycle { txs }
+                            });
                         }
-                    }
-                    Ok(Err(err)) => {
-                        // RPC error: notify all waiters.
-                        stats.record_pre_accept_error();
-                        peer_stats.pre_accept_errors.fetch_add(1, Ordering::Relaxed);
-                        let err = anyhow::anyhow!("pre_accept_batch rpc failed: {err}");
-                        for tx in txs {
-                            let _ = tx.send(Err(anyhow::anyhow!("{err}")));
-                        }
-                    }
-                    Err(_) => {
-                        // Timeout: notify all waiters.
-                        stats.record_pre_accept_error();
-                        peer_stats
-                            .pre_accept_timeouts
-                            .fetch_add(1, Ordering::Relaxed);
-                        peer_stats.pre_accept_errors.fetch_add(1, Ordering::Relaxed);
-                        let err = anyhow::anyhow!("pre_accept_batch rpc timed out");
-                        for tx in txs {
-                            let _ = tx.send(Err(anyhow::anyhow!("{err}")));
+                        None => {
+                            rx_closed = true;
                         }
                     }
                 }
-            });
+                done = in_flight.next(), if !in_flight.is_empty() => {
+                    // Keep driving in-flight futures even when queue load is low.
+                    if let Some(recycle) = done {
+                        tx_pool.put(recycle.txs);
+                    }
+                }
+            }
         }
     });
 }
 
-/// Spawn a task that batches accept RPCs per peer.
+/// Spawn an accept batching worker for one peer.
+///
+/// Purpose:
+/// - Batch accept RPC calls while maintaining bounded concurrency.
+///
+/// Design:
+/// - Single worker task owns queue dequeue and in-flight batch polling.
+/// - Uses `FuturesUnordered` to avoid per-batch spawned tasks.
+/// - Applies limiter permits before launching each in-flight batch future.
+///
+/// Inputs:
+/// - Peer client, queue receiver, timeout/batching knobs, shared stats, and
+///   one limiter for this RPC lane.
+///
+/// Outputs:
+/// - Batched accept RPC calls with response fan-out to original waiters.
 fn spawn_accept_batcher(
     client: rpc::HoloRpcClient,
     mut rx: mpsc::Receiver<AcceptWork>,
@@ -1305,113 +1787,177 @@ fn spawn_accept_batcher(
     limiter: Arc<InflightLimiter>,
 ) {
     tokio::spawn(async move {
-        while let Some(first) = rx.recv().await {
-            let items = collect_batch(first, &mut rx, batch_max, batch_wait).await;
-
-            let batch_len = items.len() as u64;
-            peer_stats
-                .accept_queue
-                .fetch_sub(batch_len, Ordering::Relaxed);
-            let mut txs = Vec::with_capacity(items.len());
-            let mut requests = Vec::with_capacity(items.len());
-            let batch_start = std::time::Instant::now();
-            let mut wait_us_total = 0u64;
-            let mut wait_us_max = 0u64;
-            for AcceptWork {
-                req,
-                tx,
-                enqueued_at,
-            } in items
-            {
-                // Track queue wait time for each request in the batch.
-                let wait_us = batch_start
-                    .duration_since(enqueued_at)
-                    .as_micros()
-                    .min(u128::from(u64::MAX)) as u64;
-                wait_us_total = wait_us_total.saturating_add(wait_us);
-                wait_us_max = wait_us_max.max(wait_us);
-                txs.push(tx);
-                requests.push(to_rpc_accept(req));
+        let reuse_max_capacity = batch_max
+            .saturating_mul(REUSE_POOL_CAPACITY_MULTIPLIER)
+            .max(1);
+        let reuse_max_cached = limiter.current().clamp(1, REUSE_POOL_MAX_CACHED);
+        let mut item_pool = ReuseVecPool::<AcceptWork>::new(reuse_max_cached, reuse_max_capacity);
+        let mut tx_pool = ReuseVecPool::<oneshot::Sender<anyhow::Result<AcceptResponse>>>::new(
+            reuse_max_cached,
+            reuse_max_capacity,
+        );
+        let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+        let mut rx_closed = false;
+        loop {
+            // Exit only after queue shutdown and all in-flight RPCs complete.
+            if rx_closed && in_flight.is_empty() {
+                break;
             }
+            tokio::select! {
+                maybe = rx.recv(), if !rx_closed => {
+                    match maybe {
+                        Some(first) => {
+                            let items_buf = item_pool.take(batch_max.max(1));
+                            let mut items = collect_batch_with_progress(
+                                items_buf,
+                                first,
+                                &mut rx,
+                                batch_max,
+                                batch_wait,
+                                &mut in_flight,
+                                |recycle: WaiterBatchRecycle<AcceptResponse>| {
+                                    tx_pool.put(recycle.txs);
+                                },
+                            ).await;
 
-            peer_stats
-                .accept_last_dequeue_us
-                .store(epoch_micros(), Ordering::Relaxed);
-            peer_stats
-                .accept_wait_total_us
-                .fetch_add(wait_us_total, Ordering::Relaxed);
-            peer_stats
-                .accept_wait_max_us
-                .fetch_max(wait_us_max, Ordering::Relaxed);
-            peer_stats
-                .accept_wait_count
-                .fetch_add(batch_len, Ordering::Relaxed);
-
-            let client = client.clone();
-            let stats = stats.clone();
-            let peer_stats = peer_stats.clone();
-            let permit = limiter.acquire().await;
-            tokio::spawn(async move {
-                let _permit = permit;
-                peer_stats.accept_inflight.fetch_add(1, Ordering::Relaxed);
-                let rpc_start = std::time::Instant::now();
-                let result = time::timeout(
-                    timeout,
-                    client.accept_batch(rpc::AcceptBatchRequest { requests }),
-                )
-                .await;
-                let rpc_us = rpc_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-                peer_stats.accept_inflight.fetch_sub(1, Ordering::Relaxed);
-                stats.record_accept_batch(batch_len, wait_us_total, wait_us_max, rpc_us);
-                peer_stats.accept_latency.record(rpc_us);
-
-                match result {
-                    Ok(Ok(resp)) => {
-                        let resp = resp.into_inner();
-                        if resp.responses.len() != txs.len() {
-                            // Reject if server returned a mismatched response count.
-                            let err = anyhow::anyhow!(
-                                "accept_batch response count mismatch (expected {}, got {})",
-                                txs.len(),
-                                resp.responses.len()
-                            );
-                            peer_stats.accept_errors.fetch_add(1, Ordering::Relaxed);
-                            for tx in txs {
-                                let _ = tx.send(Err(anyhow::anyhow!("{err}")));
+                            let batch_len = items.len() as u64;
+                            peer_stats
+                                .accept_queue
+                                .fetch_sub(batch_len, Ordering::Relaxed);
+                            let mut txs = tx_pool.take(items.len());
+                            let mut requests = Vec::with_capacity(items.len());
+                            let batch_start = std::time::Instant::now();
+                            let mut wait_us_total = 0u64;
+                            let mut wait_us_max = 0u64;
+                            // Build one RPC payload for the current dequeued batch.
+                            for AcceptWork {
+                                req,
+                                tx,
+                                enqueued_at,
+                            } in items.drain(..)
+                            {
+                                // Track queue wait time for each request in the batch.
+                                let wait_us = batch_start
+                                    .duration_since(enqueued_at)
+                                    .as_micros()
+                                    .min(u128::from(u64::MAX)) as u64;
+                                wait_us_total = wait_us_total.saturating_add(wait_us);
+                                wait_us_max = wait_us_max.max(wait_us);
+                                txs.push(tx);
+                                requests.push(to_rpc_accept(req));
                             }
-                            return;
-                        }
+                            // Recycle item vector now that all items were drained.
+                            item_pool.put(items);
 
-                        for (tx, r) in txs.into_iter().zip(resp.responses) {
-                            let _ = tx.send(Ok(from_rpc_accept(r)));
+                            peer_stats
+                                .accept_last_dequeue_us
+                                .store(epoch_micros(), Ordering::Relaxed);
+                            peer_stats
+                                .accept_wait_total_us
+                                .fetch_add(wait_us_total, Ordering::Relaxed);
+                            peer_stats
+                                .accept_wait_max_us
+                                .fetch_max(wait_us_max, Ordering::Relaxed);
+                            peer_stats
+                                .accept_wait_count
+                                .fetch_add(batch_len, Ordering::Relaxed);
+
+                            // Saturated lanes wait for one completion before dispatching more.
+                            let permit = acquire_with_progress(&limiter, &mut in_flight).await;
+                            let client = client.clone();
+                            let stats = stats.clone();
+                            let peer_stats = peer_stats.clone();
+                            in_flight.push(async move {
+                                let _permit = permit;
+                                peer_stats.accept_inflight.fetch_add(1, Ordering::Relaxed);
+                                let rpc_start = std::time::Instant::now();
+                                let result = time::timeout(
+                                    timeout,
+                                    client.accept_batch(rpc::AcceptBatchRequest { requests }),
+                                )
+                                .await;
+                                let rpc_us = rpc_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                                peer_stats.accept_inflight.fetch_sub(1, Ordering::Relaxed);
+                                stats.record_accept_batch(batch_len, wait_us_total, wait_us_max, rpc_us);
+                                peer_stats.accept_latency.record(rpc_us);
+
+                                match result {
+                                    Ok(Ok(resp)) => {
+                                        let resp = resp.into_inner();
+                                        if resp.responses.len() != txs.len() {
+                                            // Reject if server returned a mismatched response count.
+                                            let err = anyhow::anyhow!(
+                                                "accept_batch response count mismatch (expected {}, got {})",
+                                                txs.len(),
+                                                resp.responses.len()
+                                            );
+                                            peer_stats.accept_errors.fetch_add(1, Ordering::Relaxed);
+                                            for tx in txs.drain(..) {
+                                                let _ = tx.send(Err(anyhow::anyhow!("{err}")));
+                                            }
+                                            return WaiterBatchRecycle { txs };
+                                        }
+
+                                        for (tx, r) in txs.drain(..).zip(resp.responses) {
+                                            let _ = tx.send(Ok(from_rpc_accept(r)));
+                                        }
+                                    }
+                                    Ok(Err(err)) => {
+                                        // RPC error: notify all waiters.
+                                        stats.record_accept_error();
+                                        peer_stats.accept_errors.fetch_add(1, Ordering::Relaxed);
+                                        let err = anyhow::anyhow!("accept_batch rpc failed: {err}");
+                                        for tx in txs.drain(..) {
+                                            let _ = tx.send(Err(anyhow::anyhow!("{err}")));
+                                        }
+                                    }
+                                    Err(_) => {
+                                        // Timeout: notify all waiters.
+                                        stats.record_accept_error();
+                                        peer_stats.accept_timeouts.fetch_add(1, Ordering::Relaxed);
+                                        peer_stats.accept_errors.fetch_add(1, Ordering::Relaxed);
+                                        let err = anyhow::anyhow!("accept_batch rpc timed out");
+                                        for tx in txs.drain(..) {
+                                            let _ = tx.send(Err(anyhow::anyhow!("{err}")));
+                                        }
+                                    }
+                                }
+                                WaiterBatchRecycle { txs }
+                            });
                         }
-                    }
-                    Ok(Err(err)) => {
-                        // RPC error: notify all waiters.
-                        stats.record_accept_error();
-                        peer_stats.accept_errors.fetch_add(1, Ordering::Relaxed);
-                        let err = anyhow::anyhow!("accept_batch rpc failed: {err}");
-                        for tx in txs {
-                            let _ = tx.send(Err(anyhow::anyhow!("{err}")));
-                        }
-                    }
-                    Err(_) => {
-                        // Timeout: notify all waiters.
-                        stats.record_accept_error();
-                        peer_stats.accept_timeouts.fetch_add(1, Ordering::Relaxed);
-                        peer_stats.accept_errors.fetch_add(1, Ordering::Relaxed);
-                        let err = anyhow::anyhow!("accept_batch rpc timed out");
-                        for tx in txs {
-                            let _ = tx.send(Err(anyhow::anyhow!("{err}")));
+                        None => {
+                            rx_closed = true;
                         }
                     }
                 }
-            });
+                done = in_flight.next(), if !in_flight.is_empty() => {
+                    // Keep driving in-flight futures even when queue load is low.
+                    if let Some(recycle) = done {
+                        tx_pool.put(recycle.txs);
+                    }
+                }
+            }
         }
     });
 }
 
-/// Spawn a task that batches commit RPCs per peer.
+/// Spawn a commit batching worker for one peer.
+///
+/// Purpose:
+/// - Batch commit RPC calls with bounded concurrency and predictable queue
+///   behavior.
+///
+/// Design:
+/// - One worker task handles dequeue + in-flight polling in one loop.
+/// - Uses `FuturesUnordered` rather than per-batch spawned helper tasks.
+/// - Enforces concurrency with `InflightLimiter`.
+///
+/// Inputs:
+/// - Peer client, queue receiver, timeout/batching knobs, shared stats, and
+///   one limiter for this RPC lane.
+///
+/// Outputs:
+/// - Batched commit RPC calls with response fan-out.
 fn spawn_commit_batcher(
     client: rpc::HoloRpcClient,
     mut rx: mpsc::Receiver<CommitWork>,
@@ -1423,113 +1969,176 @@ fn spawn_commit_batcher(
     limiter: Arc<InflightLimiter>,
 ) {
     tokio::spawn(async move {
-        while let Some(first) = rx.recv().await {
-            let items = collect_batch(first, &mut rx, batch_max, batch_wait).await;
-
-            let batch_len = items.len() as u64;
-            peer_stats
-                .commit_queue
-                .fetch_sub(batch_len, Ordering::Relaxed);
-            let mut txs = Vec::with_capacity(items.len());
-            let mut requests = Vec::with_capacity(items.len());
-            let batch_start = std::time::Instant::now();
-            let mut wait_us_total = 0u64;
-            let mut wait_us_max = 0u64;
-            for CommitWork {
-                req,
-                tx,
-                enqueued_at,
-            } in items
-            {
-                // Track queue wait time for each request in the batch.
-                let wait_us = batch_start
-                    .duration_since(enqueued_at)
-                    .as_micros()
-                    .min(u128::from(u64::MAX)) as u64;
-                wait_us_total = wait_us_total.saturating_add(wait_us);
-                wait_us_max = wait_us_max.max(wait_us);
-                txs.push(tx);
-                requests.push(to_rpc_commit(req));
+        let reuse_max_capacity = batch_max
+            .saturating_mul(REUSE_POOL_CAPACITY_MULTIPLIER)
+            .max(1);
+        let reuse_max_cached = limiter.current().clamp(1, REUSE_POOL_MAX_CACHED);
+        let mut item_pool = ReuseVecPool::<CommitWork>::new(reuse_max_cached, reuse_max_capacity);
+        let mut tx_pool = ReuseVecPool::<oneshot::Sender<anyhow::Result<CommitResponse>>>::new(
+            reuse_max_cached,
+            reuse_max_capacity,
+        );
+        let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+        let mut rx_closed = false;
+        loop {
+            // Exit only after queue shutdown and all in-flight RPCs complete.
+            if rx_closed && in_flight.is_empty() {
+                break;
             }
+            tokio::select! {
+                maybe = rx.recv(), if !rx_closed => {
+                    match maybe {
+                        Some(first) => {
+                            let items_buf = item_pool.take(batch_max.max(1));
+                            let mut items = collect_batch_with_progress(
+                                items_buf,
+                                first,
+                                &mut rx,
+                                batch_max,
+                                batch_wait,
+                                &mut in_flight,
+                                |recycle: WaiterBatchRecycle<CommitResponse>| {
+                                    tx_pool.put(recycle.txs);
+                                },
+                            ).await;
 
-            peer_stats
-                .commit_last_dequeue_us
-                .store(epoch_micros(), Ordering::Relaxed);
-            peer_stats
-                .commit_wait_total_us
-                .fetch_add(wait_us_total, Ordering::Relaxed);
-            peer_stats
-                .commit_wait_max_us
-                .fetch_max(wait_us_max, Ordering::Relaxed);
-            peer_stats
-                .commit_wait_count
-                .fetch_add(batch_len, Ordering::Relaxed);
-
-            let client = client.clone();
-            let stats = stats.clone();
-            let peer_stats = peer_stats.clone();
-            let permit = limiter.acquire().await;
-            tokio::spawn(async move {
-                let _permit = permit;
-                peer_stats.commit_inflight.fetch_add(1, Ordering::Relaxed);
-                let rpc_start = std::time::Instant::now();
-                let result = time::timeout(
-                    timeout,
-                    client.commit_batch(rpc::CommitBatchRequest { requests }),
-                )
-                .await;
-                let rpc_us = rpc_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-                peer_stats.commit_inflight.fetch_sub(1, Ordering::Relaxed);
-                stats.record_commit_batch(batch_len, wait_us_total, wait_us_max, rpc_us);
-                peer_stats.commit_latency.record(rpc_us);
-
-                match result {
-                    Ok(Ok(resp)) => {
-                        let resp = resp.into_inner();
-                        if resp.responses.len() != txs.len() {
-                            // Reject if server returned a mismatched response count.
-                            let err = anyhow::anyhow!(
-                                "commit_batch response count mismatch (expected {}, got {})",
-                                txs.len(),
-                                resp.responses.len()
-                            );
-                            peer_stats.commit_errors.fetch_add(1, Ordering::Relaxed);
-                            for tx in txs {
-                                let _ = tx.send(Err(anyhow::anyhow!("{err}")));
+                            let batch_len = items.len() as u64;
+                            peer_stats
+                                .commit_queue
+                                .fetch_sub(batch_len, Ordering::Relaxed);
+                            let mut txs = tx_pool.take(items.len());
+                            let mut requests = Vec::with_capacity(items.len());
+                            let batch_start = std::time::Instant::now();
+                            let mut wait_us_total = 0u64;
+                            let mut wait_us_max = 0u64;
+                            // Build one RPC payload for the current dequeued batch.
+                            for CommitWork {
+                                req,
+                                tx,
+                                enqueued_at,
+                            } in items.drain(..)
+                            {
+                                // Track queue wait time for each request in the batch.
+                                let wait_us = batch_start
+                                    .duration_since(enqueued_at)
+                                    .as_micros()
+                                    .min(u128::from(u64::MAX)) as u64;
+                                wait_us_total = wait_us_total.saturating_add(wait_us);
+                                wait_us_max = wait_us_max.max(wait_us);
+                                txs.push(tx);
+                                requests.push(to_rpc_commit(req));
                             }
-                            return;
-                        }
+                            // Recycle item vector now that all items were drained.
+                            item_pool.put(items);
 
-                        for (tx, r) in txs.into_iter().zip(resp.responses) {
-                            let _ = tx.send(Ok(from_rpc_commit(r)));
+                            peer_stats
+                                .commit_last_dequeue_us
+                                .store(epoch_micros(), Ordering::Relaxed);
+                            peer_stats
+                                .commit_wait_total_us
+                                .fetch_add(wait_us_total, Ordering::Relaxed);
+                            peer_stats
+                                .commit_wait_max_us
+                                .fetch_max(wait_us_max, Ordering::Relaxed);
+                            peer_stats
+                                .commit_wait_count
+                                .fetch_add(batch_len, Ordering::Relaxed);
+
+                            // Saturated lanes wait for one completion before dispatching more.
+                            let permit = acquire_with_progress(&limiter, &mut in_flight).await;
+                            let client = client.clone();
+                            let stats = stats.clone();
+                            let peer_stats = peer_stats.clone();
+                            in_flight.push(async move {
+                                let _permit = permit;
+                                peer_stats.commit_inflight.fetch_add(1, Ordering::Relaxed);
+                                let rpc_start = std::time::Instant::now();
+                                let result = time::timeout(
+                                    timeout,
+                                    client.commit_batch(rpc::CommitBatchRequest { requests }),
+                                )
+                                .await;
+                                let rpc_us = rpc_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                                peer_stats.commit_inflight.fetch_sub(1, Ordering::Relaxed);
+                                stats.record_commit_batch(batch_len, wait_us_total, wait_us_max, rpc_us);
+                                peer_stats.commit_latency.record(rpc_us);
+
+                                match result {
+                                    Ok(Ok(resp)) => {
+                                        let resp = resp.into_inner();
+                                        if resp.responses.len() != txs.len() {
+                                            // Reject if server returned a mismatched response count.
+                                            let err = anyhow::anyhow!(
+                                                "commit_batch response count mismatch (expected {}, got {})",
+                                                txs.len(),
+                                                resp.responses.len()
+                                            );
+                                            peer_stats.commit_errors.fetch_add(1, Ordering::Relaxed);
+                                            for tx in txs.drain(..) {
+                                                let _ = tx.send(Err(anyhow::anyhow!("{err}")));
+                                            }
+                                            return WaiterBatchRecycle { txs };
+                                        }
+
+                                        for (tx, r) in txs.drain(..).zip(resp.responses) {
+                                            let _ = tx.send(Ok(from_rpc_commit(r)));
+                                        }
+                                    }
+                                    Ok(Err(err)) => {
+                                        // RPC error: notify all waiters.
+                                        stats.record_commit_error();
+                                        peer_stats.commit_errors.fetch_add(1, Ordering::Relaxed);
+                                        let err = anyhow::anyhow!("commit_batch rpc failed: {err}");
+                                        for tx in txs.drain(..) {
+                                            let _ = tx.send(Err(anyhow::anyhow!("{err}")));
+                                        }
+                                    }
+                                    Err(_) => {
+                                        // Timeout: notify all waiters.
+                                        stats.record_commit_error();
+                                        peer_stats.commit_timeouts.fetch_add(1, Ordering::Relaxed);
+                                        peer_stats.commit_errors.fetch_add(1, Ordering::Relaxed);
+                                        let err = anyhow::anyhow!("commit_batch rpc timed out");
+                                        for tx in txs.drain(..) {
+                                            let _ = tx.send(Err(anyhow::anyhow!("{err}")));
+                                        }
+                                    }
+                                }
+                                WaiterBatchRecycle { txs }
+                            });
                         }
-                    }
-                    Ok(Err(err)) => {
-                        // RPC error: notify all waiters.
-                        stats.record_commit_error();
-                        peer_stats.commit_errors.fetch_add(1, Ordering::Relaxed);
-                        let err = anyhow::anyhow!("commit_batch rpc failed: {err}");
-                        for tx in txs {
-                            let _ = tx.send(Err(anyhow::anyhow!("{err}")));
-                        }
-                    }
-                    Err(_) => {
-                        // Timeout: notify all waiters.
-                        stats.record_commit_error();
-                        peer_stats.commit_timeouts.fetch_add(1, Ordering::Relaxed);
-                        peer_stats.commit_errors.fetch_add(1, Ordering::Relaxed);
-                        let err = anyhow::anyhow!("commit_batch rpc timed out");
-                        for tx in txs {
-                            let _ = tx.send(Err(anyhow::anyhow!("{err}")));
+                        None => {
+                            rx_closed = true;
                         }
                     }
                 }
-            });
+                done = in_flight.next(), if !in_flight.is_empty() => {
+                    // Keep driving in-flight futures even when queue load is low.
+                    if let Some(recycle) = done {
+                        tx_pool.put(recycle.txs);
+                    }
+                }
+            }
         }
     });
 }
 
-/// Spawn a task that batches recover RPCs per peer.
+/// Spawn a recover batching worker for one peer.
+///
+/// Purpose:
+/// - Batch recover RPC calls and complete all coalesced waiters for each txn.
+///
+/// Design:
+/// - Single worker task owns dequeue and in-flight batch polling.
+/// - Uses `FuturesUnordered` to avoid per-batch helper task churn.
+/// - Applies limiter permits before launching each recover batch future.
+///
+/// Inputs:
+/// - Peer client, queue receiver, timeout/batching knobs, shared stats, the
+///   recover coalescer, and one limiter for this RPC lane.
+///
+/// Outputs:
+/// - Batched recover RPC calls and completion fan-out through coalescer.
 fn spawn_recover_batcher(
     client: rpc::HoloRpcClient,
     mut rx: mpsc::Receiver<RecoverWork>,
@@ -1542,105 +2151,150 @@ fn spawn_recover_batcher(
     limiter: Arc<InflightLimiter>,
 ) {
     tokio::spawn(async move {
-        while let Some(first) = rx.recv().await {
-            let items = collect_batch(first, &mut rx, batch_max, batch_wait).await;
-
-            let batch_len = items.len() as u64;
-            peer_stats
-                .recover_queue
-                .fetch_sub(batch_len, Ordering::Relaxed);
-            let mut requests = Vec::with_capacity(items.len());
-            let mut txn_ids = Vec::with_capacity(items.len());
-            let batch_start = std::time::Instant::now();
-            let mut wait_us_total = 0u64;
-            let mut wait_us_max = 0u64;
-            for RecoverWork { req, enqueued_at } in items {
-                // Track queue wait time for each request in the batch.
-                let wait_us = batch_start
-                    .duration_since(enqueued_at)
-                    .as_micros()
-                    .min(u128::from(u64::MAX)) as u64;
-                wait_us_total = wait_us_total.saturating_add(wait_us);
-                wait_us_max = wait_us_max.max(wait_us);
-                txn_ids.push(req.txn_id);
-                requests.push(to_rpc_recover(req));
+        let reuse_max_capacity = batch_max
+            .saturating_mul(REUSE_POOL_CAPACITY_MULTIPLIER)
+            .max(1);
+        let reuse_max_cached = limiter.current().clamp(1, REUSE_POOL_MAX_CACHED);
+        let mut item_pool = ReuseVecPool::<RecoverWork>::new(reuse_max_cached, reuse_max_capacity);
+        let mut txn_id_pool = ReuseVecPool::<TxnId>::new(reuse_max_cached, reuse_max_capacity);
+        let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+        let mut rx_closed = false;
+        loop {
+            // Exit only after queue shutdown and all in-flight RPCs complete.
+            if rx_closed && in_flight.is_empty() {
+                break;
             }
+            tokio::select! {
+                maybe = rx.recv(), if !rx_closed => {
+                    match maybe {
+                        Some(first) => {
+                            let items_buf = item_pool.take(batch_max.max(1));
+                            let mut items = collect_batch_with_progress(
+                                items_buf,
+                                first,
+                                &mut rx,
+                                batch_max,
+                                batch_wait,
+                                &mut in_flight,
+                                |recycle: RecoverBatchRecycle| {
+                                    txn_id_pool.put(recycle.txn_ids);
+                                },
+                            ).await;
 
-            peer_stats
-                .recover_last_dequeue_us
-                .store(epoch_micros(), Ordering::Relaxed);
-            peer_stats
-                .recover_wait_total_us
-                .fetch_add(wait_us_total, Ordering::Relaxed);
-            peer_stats
-                .recover_wait_max_us
-                .fetch_max(wait_us_max, Ordering::Relaxed);
-            peer_stats
-                .recover_wait_count
-                .fetch_add(batch_len, Ordering::Relaxed);
-
-            let client = client.clone();
-            let stats = stats.clone();
-            let peer_stats = peer_stats.clone();
-            let recover_coalescer = recover_coalescer.clone();
-            let permit = limiter.acquire().await;
-            tokio::spawn(async move {
-                let _permit = permit;
-                peer_stats.recover_inflight.fetch_add(1, Ordering::Relaxed);
-                let rpc_start = std::time::Instant::now();
-                let result = time::timeout(
-                    timeout,
-                    client.recover_batch(rpc::RecoverBatchRequest { requests }),
-                )
-                .await;
-                let rpc_us = rpc_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-                peer_stats.recover_inflight.fetch_sub(1, Ordering::Relaxed);
-                stats.record_recover_batch(batch_len, wait_us_total, wait_us_max, rpc_us);
-                peer_stats.recover_latency.record(rpc_us);
-
-                match result {
-                    Ok(Ok(resp)) => {
-                        let resp = resp.into_inner();
-                        if resp.responses.len() != txn_ids.len() {
-                            // Reject if server returned a mismatched response count.
-                            let err = anyhow::anyhow!(
-                                "recover_batch response count mismatch (expected {}, got {})",
-                                txn_ids.len(),
-                                resp.responses.len()
-                            );
-                            peer_stats.recover_errors.fetch_add(1, Ordering::Relaxed);
-                            for txn_id in txn_ids {
-                                recover_coalescer.complete_err(txn_id, &err).await;
+                            let batch_len = items.len() as u64;
+                            peer_stats
+                                .recover_queue
+                                .fetch_sub(batch_len, Ordering::Relaxed);
+                            let mut requests = Vec::with_capacity(items.len());
+                            let mut txn_ids = txn_id_pool.take(items.len());
+                            let batch_start = std::time::Instant::now();
+                            let mut wait_us_total = 0u64;
+                            let mut wait_us_max = 0u64;
+                            // Build one recover RPC payload for this dequeued batch.
+                            for RecoverWork { req, enqueued_at } in items.drain(..) {
+                                // Track queue wait time for each request in the batch.
+                                let wait_us = batch_start
+                                    .duration_since(enqueued_at)
+                                    .as_micros()
+                                    .min(u128::from(u64::MAX)) as u64;
+                                wait_us_total = wait_us_total.saturating_add(wait_us);
+                                wait_us_max = wait_us_max.max(wait_us);
+                                txn_ids.push(req.txn_id);
+                                requests.push(to_rpc_recover(req));
                             }
-                            return;
-                        }
+                            // Recycle item vector now that all items were drained.
+                            item_pool.put(items);
 
-                        for (txn_id, r) in txn_ids.into_iter().zip(resp.responses) {
-                            recover_coalescer
-                                .complete_ok(txn_id, from_rpc_recover(r))
+                            peer_stats
+                                .recover_last_dequeue_us
+                                .store(epoch_micros(), Ordering::Relaxed);
+                            peer_stats
+                                .recover_wait_total_us
+                                .fetch_add(wait_us_total, Ordering::Relaxed);
+                            peer_stats
+                                .recover_wait_max_us
+                                .fetch_max(wait_us_max, Ordering::Relaxed);
+                            peer_stats
+                                .recover_wait_count
+                                .fetch_add(batch_len, Ordering::Relaxed);
+
+                            // Saturated lanes wait for one completion before dispatching more.
+                            let permit = acquire_with_progress(&limiter, &mut in_flight).await;
+                            let client = client.clone();
+                            let stats = stats.clone();
+                            let peer_stats = peer_stats.clone();
+                            let recover_coalescer = recover_coalescer.clone();
+                            in_flight.push(async move {
+                                let _permit = permit;
+                                peer_stats.recover_inflight.fetch_add(1, Ordering::Relaxed);
+                                let rpc_start = std::time::Instant::now();
+                                let result = time::timeout(
+                                    timeout,
+                                    client.recover_batch(rpc::RecoverBatchRequest { requests }),
+                                )
                                 .await;
+                                let rpc_us = rpc_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                                peer_stats.recover_inflight.fetch_sub(1, Ordering::Relaxed);
+                                stats.record_recover_batch(batch_len, wait_us_total, wait_us_max, rpc_us);
+                                peer_stats.recover_latency.record(rpc_us);
+
+                                match result {
+                                    Ok(Ok(resp)) => {
+                                        let resp = resp.into_inner();
+                                        if resp.responses.len() != txn_ids.len() {
+                                            // Reject if server returned a mismatched response count.
+                                            let err = anyhow::anyhow!(
+                                                "recover_batch response count mismatch (expected {}, got {})",
+                                                txn_ids.len(),
+                                                resp.responses.len()
+                                            );
+                                            peer_stats.recover_errors.fetch_add(1, Ordering::Relaxed);
+                                            for txn_id in txn_ids.drain(..) {
+                                                recover_coalescer.complete_err(txn_id, &err).await;
+                                            }
+                                            return RecoverBatchRecycle { txn_ids };
+                                        }
+
+                                        for (txn_id, r) in txn_ids.drain(..).zip(resp.responses) {
+                                            recover_coalescer
+                                                .complete_ok(txn_id, from_rpc_recover(r))
+                                                .await;
+                                        }
+                                    }
+                                    Ok(Err(err)) => {
+                                        // RPC error: notify all waiters.
+                                        stats.record_recover_error();
+                                        peer_stats.recover_errors.fetch_add(1, Ordering::Relaxed);
+                                        let err = anyhow::anyhow!("recover_batch rpc failed: {err}");
+                                        for txn_id in txn_ids.drain(..) {
+                                            recover_coalescer.complete_err(txn_id, &err).await;
+                                        }
+                                    }
+                                    Err(_) => {
+                                        // Timeout: notify all waiters.
+                                        stats.record_recover_error();
+                                        peer_stats.recover_errors.fetch_add(1, Ordering::Relaxed);
+                                        let err = anyhow::anyhow!("recover_batch rpc timed out");
+                                        for txn_id in txn_ids.drain(..) {
+                                            recover_coalescer.complete_err(txn_id, &err).await;
+                                        }
+                                    }
+                                }
+                                RecoverBatchRecycle { txn_ids }
+                            });
                         }
-                    }
-                    Ok(Err(err)) => {
-                        // RPC error: notify all waiters.
-                        stats.record_recover_error();
-                        peer_stats.recover_errors.fetch_add(1, Ordering::Relaxed);
-                        let err = anyhow::anyhow!("recover_batch rpc failed: {err}");
-                        for txn_id in txn_ids {
-                            recover_coalescer.complete_err(txn_id, &err).await;
-                        }
-                    }
-                    Err(_) => {
-                        // Timeout: notify all waiters.
-                        stats.record_recover_error();
-                        peer_stats.recover_errors.fetch_add(1, Ordering::Relaxed);
-                        let err = anyhow::anyhow!("recover_batch rpc timed out");
-                        for txn_id in txn_ids {
-                            recover_coalescer.complete_err(txn_id, &err).await;
+                        None => {
+                            rx_closed = true;
                         }
                     }
                 }
-            });
+                done = in_flight.next(), if !in_flight.is_empty() => {
+                    // Keep driving in-flight futures even when queue load is low.
+                    if let Some(recycle) = done {
+                        txn_id_pool.put(recycle.txn_ids);
+                    }
+                }
+            }
         }
     });
 }
@@ -2365,7 +3019,7 @@ fn to_rpc_pre_accept(req: PreAcceptRequest) -> rpc::PreAcceptRequest {
     rpc::PreAcceptRequest {
         group_id: req.group_id,
         txn_id: Some(to_rpc_txn_id(req.txn_id)),
-        command: req.command.into(),
+        command: req.command,
         seq: req.seq,
         deps,
         ballot: Some(to_rpc_ballot(req.ballot)),
@@ -2396,7 +3050,7 @@ fn to_rpc_accept(req: AcceptRequest) -> rpc::AcceptRequest {
     rpc::AcceptRequest {
         group_id: req.group_id,
         txn_id: Some(to_rpc_txn_id(req.txn_id)),
-        command: req.command.into(),
+        command: req.command,
         command_digest: req.command_digest.to_vec().into(),
         has_command: req.has_command,
         seq: req.seq,
@@ -2419,7 +3073,7 @@ fn to_rpc_commit(req: CommitRequest) -> rpc::CommitRequest {
     rpc::CommitRequest {
         group_id: req.group_id,
         txn_id: Some(to_rpc_txn_id(req.txn_id)),
-        command: req.command.into(),
+        command: req.command,
         command_digest: req.command_digest.to_vec().into(),
         has_command: req.has_command,
         seq: req.seq,
@@ -2743,5 +3397,361 @@ impl Transport for GrpcTransport {
         txn_id: TxnId,
     ) -> anyhow::Result<bool> {
         GrpcTransport::mark_visible(self, target, group_id, txn_id).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+    /// Verify reusable batching collects ready queue items up to the configured
+    /// batch cap.
+    ///
+    /// Purpose:
+    /// - Validate normal-path behavior for `collect_batch_reuse`.
+    ///
+    /// Design:
+    /// - Seed two queued items and provide one `first` item.
+    /// - Assert dequeue order and batch-size limit behavior.
+    ///
+    /// Inputs:
+    /// - One `first` item and two queued channel items.
+    ///
+    /// Outputs:
+    /// - Batch contains all three items in queue order.
+    #[tokio::test]
+    async fn collect_batch_reuse_collects_ready_items() {
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.send(2u64).await.expect("send second item");
+        tx.send(3u64).await.expect("send third item");
+
+        let batch = collect_batch_reuse(
+            Vec::with_capacity(4),
+            1u64,
+            &mut rx,
+            3,
+            Duration::from_millis(5),
+        )
+        .await;
+
+        assert_eq!(batch, vec![1, 2, 3]);
+    }
+
+    /// Verify reusable batching keeps caller allocation when capacity is
+    /// already sufficient.
+    ///
+    /// Purpose:
+    /// - Validate edge-path reuse where no extra reserve is required.
+    ///
+    /// Design:
+    /// - Pass a buffer with enough capacity and enforce immediate return.
+    /// - Compare allocation pointer before/after.
+    ///
+    /// Inputs:
+    /// - Pre-sized vector buffer and one `first` item.
+    ///
+    /// Outputs:
+    /// - Returned batch reuses the same allocation.
+    #[tokio::test]
+    async fn collect_batch_reuse_reuses_caller_buffer() {
+        let (_tx, mut rx) = mpsc::channel(8);
+        let items = Vec::<u64>::with_capacity(8);
+        let original_ptr = items.as_ptr();
+
+        let batch = collect_batch_reuse(items, 1u64, &mut rx, 4, Duration::from_millis(0)).await;
+
+        assert_eq!(batch, vec![1]);
+        assert_eq!(
+            batch.as_ptr(),
+            original_ptr,
+            "batch builder should retain caller allocation when capacity fits"
+        );
+    }
+
+    /// Verify reusable batching exits cleanly when the input channel is
+    /// disconnected.
+    ///
+    /// Purpose:
+    /// - Validate failure-path behavior for queue shutdown.
+    ///
+    /// Design:
+    /// - Drop sender before collection and assert no hang / no extra items.
+    ///
+    /// Inputs:
+    /// - Disconnected receiver and one `first` item.
+    ///
+    /// Outputs:
+    /// - Returned batch contains only the first item.
+    #[tokio::test]
+    async fn collect_batch_reuse_handles_disconnected_channel() {
+        let (tx, mut rx) = mpsc::channel::<u64>(1);
+        drop(tx);
+
+        let batch = collect_batch_reuse(
+            Vec::with_capacity(2),
+            42u64,
+            &mut rx,
+            8,
+            Duration::from_millis(50),
+        )
+        .await;
+
+        assert_eq!(batch, vec![42]);
+    }
+
+    /// Verify progress-aware batching collects immediately available items up to
+    /// the configured batch size.
+    ///
+    /// Purpose:
+    /// - Validate normal-path batching behavior for `collect_batch_with_progress`.
+    ///
+    /// Design:
+    /// - Seed two queued items, then provide one `first` item and check exact
+    ///   batch shape.
+    ///
+    /// Inputs:
+    /// - One `first` item and two queued channel items.
+    ///
+    /// Outputs:
+    /// - Batch contains exactly `batch_max` items in dequeue order.
+    #[tokio::test]
+    async fn collect_batch_with_progress_collects_ready_items() {
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.send(2u64).await.expect("send second item");
+        tx.send(3u64).await.expect("send third item");
+        let mut in_flight: FuturesUnordered<futures_util::future::Ready<()>> =
+            FuturesUnordered::new();
+        let items = Vec::new();
+
+        let batch = collect_batch_with_progress(
+            items,
+            1,
+            &mut rx,
+            3,
+            Duration::from_millis(5),
+            &mut in_flight,
+            |_ready| {},
+        )
+        .await;
+
+        assert_eq!(batch, vec![1, 2, 3]);
+    }
+
+    /// Verify progress-aware batching keeps in-flight futures moving while
+    /// waiting for additional batch items.
+    ///
+    /// Purpose:
+    /// - Validate the low-tail-latency behavior that avoids stalling active RPCs
+    ///   during batching windows.
+    ///
+    /// Design:
+    /// - Start one short in-flight future and keep the queue empty, forcing the
+    ///   batching function to wait on timeout.
+    /// - Assert that in-flight completion happened before batching returns.
+    ///
+    /// Inputs:
+    /// - Empty queue after first item plus one in-flight completion future.
+    ///
+    /// Outputs:
+    /// - Returned batch has one item and the in-flight future completed.
+    #[tokio::test]
+    async fn collect_batch_with_progress_polls_in_flight_while_waiting() {
+        let (_tx, mut rx) = mpsc::channel(8);
+        let progressed = Arc::new(AtomicBool::new(false));
+        let mut in_flight = FuturesUnordered::new();
+        let progressed_flag = progressed.clone();
+        let completions = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let completions_seen = completions.clone();
+        let items = Vec::new();
+        in_flight.push(async move {
+            time::sleep(Duration::from_millis(10)).await;
+            progressed_flag.store(true, AtomicOrdering::Relaxed);
+        });
+
+        let batch = collect_batch_with_progress(
+            items,
+            1u64,
+            &mut rx,
+            4,
+            Duration::from_millis(40),
+            &mut in_flight,
+            move |_ready| {
+                completions_seen.fetch_add(1, AtomicOrdering::Relaxed);
+            },
+        )
+        .await;
+
+        assert_eq!(batch, vec![1]);
+        assert!(
+            progressed.load(AtomicOrdering::Relaxed),
+            "in-flight future should complete while batcher waits"
+        );
+        assert_eq!(
+            completions.load(AtomicOrdering::Relaxed),
+            1,
+            "batch collection should observe one in-flight completion callback"
+        );
+    }
+
+    /// Verify reusable vector pool returns previously cached allocation with
+    /// preserved capacity.
+    ///
+    /// Purpose:
+    /// - Validate normal-path reuse behavior for `ReuseVecPool`.
+    ///
+    /// Design:
+    /// - Cache one vector, then request a smaller capacity and assert reuse.
+    ///
+    /// Inputs:
+    /// - One cached vector and one take request.
+    ///
+    /// Outputs:
+    /// - Returned vector is empty and keeps the prior allocation capacity.
+    #[test]
+    fn reuse_vec_pool_reuses_cached_capacity() {
+        let mut pool = ReuseVecPool::<u64>::new(2, 64);
+        let mut buf = Vec::with_capacity(16);
+        let original_ptr = buf.as_ptr();
+        buf.extend_from_slice(&[1, 2, 3]);
+        pool.put(buf);
+
+        let out = pool.take(8);
+        assert_eq!(out.len(), 0);
+        assert_eq!(
+            out.as_ptr(),
+            original_ptr,
+            "pool should hand back the same allocation when capacity fits"
+        );
+        assert!(
+            out.capacity() >= 16,
+            "pooled vector should keep prior capacity for reuse"
+        );
+    }
+
+    /// Verify reusable vector pool allocates when empty.
+    ///
+    /// Purpose:
+    /// - Validate edge-path behavior when no vector has been cached yet.
+    ///
+    /// Design:
+    /// - Request capacity from an empty pool and verify minimum allocation.
+    ///
+    /// Inputs:
+    /// - Empty pool and one take request.
+    ///
+    /// Outputs:
+    /// - Fresh vector with requested minimum capacity.
+    #[test]
+    fn reuse_vec_pool_allocates_when_empty() {
+        let mut pool = ReuseVecPool::<u64>::new(2, 64);
+        let out = pool.take(11);
+        assert_eq!(out.len(), 0);
+        assert!(
+            out.capacity() >= 11,
+            "empty pool should allocate requested minimum capacity"
+        );
+    }
+
+    /// Verify reusable vector pool rejects oversized vectors.
+    ///
+    /// Purpose:
+    /// - Validate failure-path protection against retaining pathological memory spikes.
+    ///
+    /// Design:
+    /// - Return one oversized vector to the pool and then request a small one.
+    /// - Assert the pool did not hand back the oversized capacity.
+    ///
+    /// Inputs:
+    /// - One oversized vector where `capacity > max_capacity`.
+    ///
+    /// Outputs:
+    /// - Next `take` allocates a right-sized buffer instead of reusing oversized one.
+    #[test]
+    fn reuse_vec_pool_drops_oversized_vector() {
+        let mut pool = ReuseVecPool::<u64>::new(2, 32);
+        let oversized = Vec::with_capacity(256);
+        pool.put(oversized);
+
+        let out = pool.take(8);
+        assert!(
+            out.capacity() < 256,
+            "oversized vectors should not be retained in reuse pool"
+        );
+    }
+
+    /// Verify `acquire_with_progress` blocks on saturation until one in-flight
+    /// future completes and releases a permit.
+    ///
+    /// Purpose:
+    /// - Validate saturation behavior for the non-spawn in-flight worker model.
+    ///
+    /// Design:
+    /// - Limit concurrency to 1.
+    /// - Hold the only permit inside one in-flight future for a fixed delay.
+    /// - Assert that `acquire_with_progress` does not return before delay.
+    ///
+    /// Inputs:
+    /// - Saturated limiter and one delayed in-flight completion future.
+    ///
+    /// Outputs:
+    /// - One new permit returned only after prior permit is released.
+    #[tokio::test]
+    async fn acquire_with_progress_waits_for_in_flight_completion() {
+        let limiter = Arc::new(InflightLimiter::new(1, 1, 1));
+        let held = limiter.try_acquire().expect("initial permit");
+        let mut in_flight = FuturesUnordered::new();
+        in_flight.push(async move {
+            let _hold = held;
+            time::sleep(Duration::from_millis(20)).await;
+        });
+
+        let start = std::time::Instant::now();
+        let permit = acquire_with_progress(&limiter, &mut in_flight).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(10),
+            "acquire should wait for saturated permit release (elapsed={elapsed:?})"
+        );
+        drop(permit);
+    }
+
+    /// Verify `acquire_with_progress` correctly falls back to blocking acquire
+    /// when saturation exists but no futures are currently tracked.
+    ///
+    /// Purpose:
+    /// - Validate failure/edge behavior in the defensive fallback path.
+    ///
+    /// Design:
+    /// - Saturate limiter outside the in-flight set, then release permit later.
+    /// - Keep `in_flight` empty to force the fallback branch.
+    ///
+    /// Inputs:
+    /// - Saturated limiter with delayed external permit release.
+    ///
+    /// Outputs:
+    /// - Permit returned after delayed release.
+    #[tokio::test]
+    async fn acquire_with_progress_falls_back_when_in_flight_is_empty() {
+        let limiter = Arc::new(InflightLimiter::new(1, 1, 1));
+        let held = limiter.try_acquire().expect("initial permit");
+        let mut in_flight: FuturesUnordered<futures_util::future::Ready<()>> =
+            FuturesUnordered::new();
+
+        tokio::spawn(async move {
+            let _hold = held;
+            time::sleep(Duration::from_millis(15)).await;
+        });
+
+        let start = std::time::Instant::now();
+        let permit = acquire_with_progress(&limiter, &mut in_flight).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(10),
+            "fallback acquire should wait for externally held permit (elapsed={elapsed:?})"
+        );
+        drop(permit);
     }
 }

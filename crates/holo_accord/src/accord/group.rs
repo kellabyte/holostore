@@ -1,9 +1,21 @@
 //! Consensus engine and executor for a single Accord group.
 //!
-//! This file contains the Accord proposal path, conflict tracking, and the
-//! execution loop that applies committed commands to the state machine.
-//! It also wires in batching and background workers (commit-log and apply) to
-//! keep IO and storage costs amortized.
+//! Purpose:
+//! - Drive proposal, recovery, and execution for one replicated Accord group.
+//!
+//! Design:
+//! - Implements quorum rounds (PreAccept/Accept/Commit), dependency tracking,
+//!   and executor progression with bounded background workers.
+//! - Keeps critical proposal paths allocation-light and cancellation-friendly so
+//!   quorum completion does not wait on the slowest replica.
+//!
+//! Inputs:
+//! - Client commands, peer RPC responses, runtime membership/voter updates, and
+//!   durability configuration.
+//!
+//! Outputs:
+//! - Linearizable replicated decisions, state-machine apply/read results,
+//!   commit-log progress, and runtime metrics/debug counters.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -2729,6 +2741,26 @@ impl Group {
         }
     }
 
+    /// Execute one Accept round and stop as soon as voter quorum is reached.
+    ///
+    /// Purpose:
+    /// - Confirm chosen `(seq, deps, command)` with a majority before commit.
+    ///
+    /// Design:
+    /// - Apply locally first when this node is a voter.
+    /// - Fan out peer RPCs via `FuturesUnordered` and poll until quorum.
+    /// - Drop remaining in-flight futures once quorum is satisfied to avoid
+    ///   waiting on slow tail replicas.
+    ///
+    /// Inputs:
+    /// - Transaction identity, ballot, command payload/digest, and chosen
+    ///   sequence/dependency metadata.
+    /// - `inline_command`: whether Accept/Commit RPCs carry full command bytes.
+    ///
+    /// Outputs:
+    /// - `Ok(AcceptResponse { ok: true, .. })` when quorum accepts.
+    /// - `Ok(AcceptResponse { ok: false, promised })` when a higher ballot is observed.
+    /// - `Err(ProposeOnceError::NoQuorum)` when quorum cannot be reached in time.
     async fn run_accept_round(
         &self,
         txn_id: TxnId,
@@ -2779,10 +2811,9 @@ impl Group {
             });
         }
 
-        let (tx, mut rx) = mpsc::channel::<anyhow::Result<AcceptResponse>>(peers.len().max(1));
+        let mut in_flight = FuturesUnordered::new();
         for peer in peers.iter().copied() {
             let transport = self.transport.clone();
-            let tx = tx.clone();
             let req = AcceptRequest {
                 group_id: self.config.group_id,
                 txn_id,
@@ -2793,41 +2824,39 @@ impl Group {
                 seq,
                 deps: deps.clone(),
             };
-            tokio::spawn(async move {
-                let resp = match time::timeout(rpc_timeout, transport.accept(peer, req)).await {
+            in_flight.push(async move {
+                match time::timeout(rpc_timeout, transport.accept(peer, req)).await {
                     Ok(resp) => resp.map_err(|e| anyhow::anyhow!("accept rpc failed: {e}")),
                     Err(_) => Err(anyhow::anyhow!("accept rpc timed out")),
-                };
-                let _ = tx.send(resp).await;
-                Ok::<(), anyhow::Error>(())
+                }
             });
         }
-        drop(tx);
 
         let deadline = time::Instant::now() + rpc_timeout;
         while ok < quorum {
             let remaining = deadline.saturating_duration_since(time::Instant::now());
+            // Abort quorum wait when the round-level budget is exhausted.
             if remaining.is_zero() {
                 break;
             }
-            let recv = time::timeout(remaining, rx.recv()).await;
+            // Poll one completed RPC at a time; pending futures remain in-flight
+            // and are dropped when quorum is satisfied. This does not try to
+            // drain every response once a decision is already reached.
+            let recv = time::timeout(remaining, in_flight.next()).await;
             let Ok(Some(resp)) = recv else {
                 break;
             };
-            match resp {
-                Ok(r) => {
-                    max_promised = max_promised.max(r.promised);
-                    if r.ok {
-                        ok += 1;
-                        if ok >= quorum {
-                            return Ok(AcceptResponse {
-                                ok: true,
-                                promised: max_promised,
-                            });
-                        }
+            if let Ok(r) = resp {
+                max_promised = max_promised.max(r.promised);
+                if r.ok {
+                    ok += 1;
+                    if ok >= quorum {
+                        return Ok(AcceptResponse {
+                            ok: true,
+                            promised: max_promised,
+                        });
                     }
                 }
-                Err(_) => {}
             }
         }
 
@@ -2843,6 +2872,25 @@ impl Group {
         )))
     }
 
+    /// Execute one Commit round and stop as soon as voter quorum ACKs commit.
+    ///
+    /// Purpose:
+    /// - Finalize a decided transaction and replicate commit status broadly.
+    ///
+    /// Design:
+    /// - Apply local commit first when this node is a member.
+    /// - Track quorum only from voter peers, while still sending commit RPCs to
+    ///   all members.
+    /// - Poll peer RPCs via `FuturesUnordered` and return immediately on quorum.
+    ///
+    /// Inputs:
+    /// - Transaction identity, ballot, command payload/digest, and chosen
+    ///   sequence/dependency metadata.
+    /// - `inline_command`: whether Commit RPCs carry full command bytes.
+    ///
+    /// Outputs:
+    /// - `Ok(())` when voter quorum ACKs commit.
+    /// - `Err(ProposeOnceError::NoQuorum)` when quorum cannot be reached in time.
     async fn run_commit_round(
         &self,
         txn_id: TxnId,
@@ -2896,10 +2944,9 @@ impl Group {
             return Ok(());
         }
 
-        let (tx, mut rx) = mpsc::channel::<(bool, bool)>(peers.len().max(1));
+        let mut in_flight = FuturesUnordered::new();
         for peer in peers.iter().copied() {
             let transport = self.transport.clone();
-            let tx = tx.clone();
             let count_for_quorum = voter_set.contains(&peer);
             let req = CommitRequest {
                 group_id: self.config.group_id,
@@ -2911,23 +2958,27 @@ impl Group {
                 seq,
                 deps: deps.clone(),
             };
-            tokio::spawn(async move {
-                let ok = match time::timeout(commit_timeout, transport.commit(peer, req)).await {
+            in_flight.push(async move {
+                let peer_ok = match time::timeout(commit_timeout, transport.commit(peer, req)).await
+                {
                     Ok(res) => res.ok().is_some_and(|r| r.ok),
                     Err(_) => false,
                 };
-                let _ = tx.send((ok, count_for_quorum)).await;
+                (peer_ok, count_for_quorum)
             });
         }
-        drop(tx);
 
         let deadline = time::Instant::now() + self.config.rpc_timeout;
         while ok < quorum {
             let remaining = deadline.saturating_duration_since(time::Instant::now());
+            // Abort quorum wait when the round-level budget is exhausted.
             if remaining.is_zero() {
                 break;
             }
-            let recv = time::timeout(remaining, rx.recv()).await;
+            // Poll one completed RPC at a time; pending futures remain in-flight
+            // and are dropped once commit quorum is satisfied. This does not
+            // wait for non-quorum followers after the decision point.
+            let recv = time::timeout(remaining, in_flight.next()).await;
             let Ok(Some((peer_ok, count_for_quorum))) = recv else {
                 break;
             };
@@ -4421,16 +4472,155 @@ mod tests {
     use super::*;
     use crate::accord::{CommitDurabilityMode, GroupId};
     use async_trait::async_trait;
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{mpsc as std_mpsc, Arc, Mutex};
     use std::time::Duration as StdDuration;
 
-    /// No-op transport for unit tests that invoke local RPC handlers directly.
+    /// Scripted response for one `accept` RPC target in round tests.
+    ///
+    /// Purpose:
+    /// - Control per-peer latency and success/rejection behavior for Accept rounds.
     ///
     /// Design:
-    /// - `rpc_commit` tests do not use remote transport paths.
-    /// - All RPC methods return an error so accidental usage fails loudly.
-    struct NoopTransport;
+    /// - Optional delay simulates slow peers.
+    /// - Outcome captures either a concrete protocol response or a transport error.
+    ///
+    /// Inputs:
+    /// - Delay budget and response outcome.
+    ///
+    /// Outputs:
+    /// - Deterministic scripted `accept` behavior in tests.
+    #[derive(Clone, Debug)]
+    struct AcceptPeerPlan {
+        delay: StdDuration,
+        outcome: AcceptPeerOutcome,
+    }
+
+    #[derive(Clone, Debug)]
+    /// Scripted Accept RPC outcome for one peer in tests.
+    ///
+    /// Purpose:
+    /// - Represent either a valid protocol response or an injected transport failure.
+    ///
+    /// Design:
+    /// - `Response` mirrors `AcceptResponse` fields used by quorum logic.
+    /// - `TransportError` simulates failed RPC delivery/processing.
+    ///
+    /// Inputs:
+    /// - `ok`/`promised` or static error message.
+    ///
+    /// Outputs:
+    /// - Deterministic Accept behavior for one target peer.
+    enum AcceptPeerOutcome {
+        Response { ok: bool, promised: Ballot },
+        TransportError(&'static str),
+    }
+
+    /// Scripted response for one `commit` RPC target in round tests.
+    ///
+    /// Purpose:
+    /// - Control per-peer latency and success/failure behavior for Commit rounds.
+    ///
+    /// Design:
+    /// - Optional delay simulates slow peers.
+    /// - Outcome captures either a protocol ACK or a transport error.
+    ///
+    /// Inputs:
+    /// - Delay budget and response outcome.
+    ///
+    /// Outputs:
+    /// - Deterministic scripted `commit` behavior in tests.
+    #[derive(Clone, Debug)]
+    struct CommitPeerPlan {
+        delay: StdDuration,
+        outcome: CommitPeerOutcome,
+    }
+
+    #[derive(Clone, Debug)]
+    /// Scripted Commit RPC outcome for one peer in tests.
+    ///
+    /// Purpose:
+    /// - Represent either a valid commit ACK or an injected transport failure.
+    ///
+    /// Design:
+    /// - `Response` carries the `ok` bit consumed by quorum counting.
+    /// - `TransportError` simulates failed RPC delivery/processing.
+    ///
+    /// Inputs:
+    /// - `ok` flag or static error message.
+    ///
+    /// Outputs:
+    /// - Deterministic Commit behavior for one target peer.
+    enum CommitPeerOutcome {
+        Response { ok: bool },
+        TransportError(&'static str),
+    }
+
+    /// Scriptable transport used by group-round unit tests.
+    ///
+    /// Purpose:
+    /// - Provide deterministic per-peer behavior for Accept/Commit RPCs.
+    ///
+    /// Design:
+    /// - Accept/Commit methods use configured per-peer plans.
+    /// - All other RPC methods fail loudly to catch accidental test misuse.
+    ///
+    /// Inputs:
+    /// - Optional accept and commit plans keyed by peer id.
+    ///
+    /// Outputs:
+    /// - Transport behavior tailored to one test scenario.
+    struct NoopTransport {
+        accept_plans: Arc<Mutex<HashMap<NodeId, AcceptPeerPlan>>>,
+        commit_plans: Arc<Mutex<HashMap<NodeId, CommitPeerPlan>>>,
+    }
+
+    impl NoopTransport {
+        /// Build a transport with no scripted peer responses.
+        ///
+        /// Purpose:
+        /// - Preserve prior "always fail" behavior for tests that do not use remote RPC paths.
+        ///
+        /// Design:
+        /// - Initializes empty per-peer plan tables.
+        ///
+        /// Inputs:
+        /// - None.
+        ///
+        /// Outputs:
+        /// - `NoopTransport` where all RPC methods fail unless explicitly scripted.
+        fn new() -> Self {
+            Self {
+                accept_plans: Arc::new(Mutex::new(HashMap::new())),
+                commit_plans: Arc::new(Mutex::new(HashMap::new())),
+            }
+        }
+
+        /// Build a transport with scripted Accept/Commit peer plans.
+        ///
+        /// Purpose:
+        /// - Configure deterministic remote behavior for quorum-round tests.
+        ///
+        /// Design:
+        /// - Stores per-peer plans in shared mutex maps for lightweight lookup.
+        ///
+        /// Inputs:
+        /// - `accept_plans`: per-peer Accept behaviors.
+        /// - `commit_plans`: per-peer Commit behaviors.
+        ///
+        /// Outputs:
+        /// - `NoopTransport` with scripted Accept/Commit responses.
+        fn with_plans(
+            accept_plans: HashMap<NodeId, AcceptPeerPlan>,
+            commit_plans: HashMap<NodeId, CommitPeerPlan>,
+        ) -> Self {
+            Self {
+                accept_plans: Arc::new(Mutex::new(accept_plans)),
+                commit_plans: Arc::new(Mutex::new(commit_plans)),
+            }
+        }
+    }
 
     #[async_trait]
     impl Transport for NoopTransport {
@@ -4442,20 +4632,78 @@ mod tests {
             Err(anyhow::anyhow!("transport not used in this test"))
         }
 
+        /// Execute scripted `accept` behavior for one target peer.
+        ///
+        /// Purpose:
+        /// - Feed deterministic Accept outcomes into quorum-round tests.
+        ///
+        /// Design:
+        /// - Reads one plan by target id, applies optional delay, then emits either
+        ///   a protocol response or a transport error.
+        ///
+        /// Inputs:
+        /// - `target`: peer id used to select the plan.
+        /// - `_req`: protocol request payload (unused by scripted responses).
+        ///
+        /// Outputs:
+        /// - `AcceptResponse`/error according to the configured per-peer plan.
         async fn accept(
             &self,
-            _target: NodeId,
+            target: NodeId,
             _req: AcceptRequest,
         ) -> anyhow::Result<AcceptResponse> {
-            Err(anyhow::anyhow!("transport not used in this test"))
+            let plan = self
+                .accept_plans
+                .lock()
+                .expect("accept plan lock")
+                .get(&target)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("transport not used in this test"))?;
+            if !plan.delay.is_zero() {
+                // Simulate a slow peer without blocking executor threads.
+                time::sleep(plan.delay).await;
+            }
+            match plan.outcome {
+                AcceptPeerOutcome::Response { ok, promised } => Ok(AcceptResponse { ok, promised }),
+                AcceptPeerOutcome::TransportError(msg) => Err(anyhow::anyhow!(msg)),
+            }
         }
 
+        /// Execute scripted `commit` behavior for one target peer.
+        ///
+        /// Purpose:
+        /// - Feed deterministic Commit outcomes into quorum-round tests.
+        ///
+        /// Design:
+        /// - Reads one plan by target id, applies optional delay, then emits either
+        ///   a protocol ACK or a transport error.
+        ///
+        /// Inputs:
+        /// - `target`: peer id used to select the plan.
+        /// - `_req`: protocol request payload (unused by scripted responses).
+        ///
+        /// Outputs:
+        /// - `CommitResponse`/error according to the configured per-peer plan.
         async fn commit(
             &self,
-            _target: NodeId,
+            target: NodeId,
             _req: CommitRequest,
         ) -> anyhow::Result<CommitResponse> {
-            Err(anyhow::anyhow!("transport not used in this test"))
+            let plan = self
+                .commit_plans
+                .lock()
+                .expect("commit plan lock")
+                .get(&target)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("transport not used in this test"))?;
+            if !plan.delay.is_zero() {
+                // Simulate a slow peer without blocking executor threads.
+                time::sleep(plan.delay).await;
+            }
+            match plan.outcome {
+                CommitPeerOutcome::Response { ok } => Ok(CommitResponse { ok }),
+                CommitPeerOutcome::TransportError(msg) => Err(anyhow::anyhow!(msg)),
+            }
         }
 
         async fn recover(
@@ -4653,6 +4901,47 @@ mod tests {
         }
     }
 
+    /// Build a multi-node config tuned for quorum-round unit tests.
+    ///
+    /// Purpose:
+    /// - Provide deterministic quorum sizing and timeout behavior for Accept/Commit tests.
+    ///
+    /// Design:
+    /// - Uses caller-supplied members and timeouts with otherwise stable defaults.
+    /// - Supports "observer local node" tests by allowing `node_id` outside the voter set.
+    ///
+    /// Inputs:
+    /// - `node_id`: local test node id.
+    /// - `members`: runtime voter/member ids.
+    /// - `rpc_timeout`: round-level peer wait budget.
+    /// - `propose_timeout`: per-RPC timeout budget for commit fanout.
+    ///
+    /// Outputs:
+    /// - Config suitable for direct `run_accept_round`/`run_commit_round` tests.
+    fn round_test_config(
+        node_id: NodeId,
+        members: Vec<NodeId>,
+        rpc_timeout: StdDuration,
+        propose_timeout: StdDuration,
+    ) -> Config {
+        Config {
+            group_id: 1,
+            node_id,
+            members: members.into_iter().map(|id| Member { id }).collect(),
+            rpc_timeout,
+            propose_timeout,
+            recovery_min_delay: StdDuration::from_millis(10),
+            stall_recover_interval: StdDuration::from_millis(10),
+            preaccept_stall_hits: 1,
+            execute_batch_max: 16,
+            inline_command_in_accept_commit: true,
+            executed_command_cache_max_bytes: 64 * 1024 * 1024,
+            commit_log_batch_max: 16,
+            commit_log_batch_wait: StdDuration::from_micros(50),
+            commit_durability_mode: CommitDurabilityMode::AsyncCommit,
+        }
+    }
+
     /// Build a deterministic commit request for local `rpc_commit` tests.
     ///
     /// Input:
@@ -4685,7 +4974,7 @@ mod tests {
         let commit_log = Arc::new(BlockingDurableCommitLog::new(started_tx, release_rx));
         let group = Arc::new(Group::new(
             test_config(CommitDurabilityMode::SyncCommit),
-            Arc::new(NoopTransport),
+            Arc::new(NoopTransport::new()),
             Arc::new(TestStateMachine),
             Some(commit_log),
         ));
@@ -4720,7 +5009,7 @@ mod tests {
     async fn sync_commit_fails_when_durable_append_fails() {
         let group = Arc::new(Group::new(
             test_config(CommitDurabilityMode::SyncCommit),
-            Arc::new(NoopTransport),
+            Arc::new(NoopTransport::new()),
             Arc::new(TestStateMachine),
             Some(Arc::new(FailingDurableCommitLog)),
         ));
@@ -4737,5 +5026,339 @@ mod tests {
             stats.committed_queue_len, 0,
             "failed durable commit must not enqueue execution"
         );
+    }
+
+    /// Verify Accept round returns immediately once quorum ACKs, without waiting
+    /// for a much slower peer response.
+    ///
+    /// Purpose:
+    /// - Validate Stage 4A behavior: quorum completion should not block on tail peers.
+    ///
+    /// Design:
+    /// - Two peers ACK quickly and one peer responds much later.
+    /// - The test asserts wall-clock completion well below the slow-peer delay.
+    ///
+    /// Inputs:
+    /// - Scripted per-peer Accept delays and responses.
+    ///
+    /// Outputs:
+    /// - Successful Accept response with bounded elapsed time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn accept_round_reaches_quorum_without_waiting_for_slowest_peer() {
+        let ballot = Ballot::initial(7);
+        let transport = NoopTransport::with_plans(
+            HashMap::from([
+                (
+                    1,
+                    AcceptPeerPlan {
+                        delay: StdDuration::from_millis(5),
+                        outcome: AcceptPeerOutcome::Response {
+                            ok: true,
+                            promised: ballot,
+                        },
+                    },
+                ),
+                (
+                    2,
+                    AcceptPeerPlan {
+                        delay: StdDuration::from_millis(10),
+                        outcome: AcceptPeerOutcome::Response {
+                            ok: true,
+                            promised: ballot,
+                        },
+                    },
+                ),
+                (
+                    3,
+                    AcceptPeerPlan {
+                        delay: StdDuration::from_millis(400),
+                        outcome: AcceptPeerOutcome::Response {
+                            ok: true,
+                            promised: ballot,
+                        },
+                    },
+                ),
+            ]),
+            HashMap::new(),
+        );
+        let group = Group::new(
+            round_test_config(
+                99,
+                vec![1, 2, 3],
+                StdDuration::from_millis(120),
+                StdDuration::from_secs(1),
+            ),
+            Arc::new(transport),
+            Arc::new(TestStateMachine),
+            None,
+        );
+
+        let command = Bytes::from_static(b"accept-round-test");
+        let start = time::Instant::now();
+        let resp = group
+            .run_accept_round(
+                TxnId {
+                    node_id: 7,
+                    counter: 1,
+                },
+                ballot,
+                command.clone(),
+                command_digest(&command),
+                1,
+                Vec::new(),
+                true,
+            )
+            .await
+            .expect("accept round should reach quorum");
+        let elapsed = start.elapsed();
+
+        assert!(resp.ok, "accept quorum should succeed");
+        assert!(
+            elapsed < StdDuration::from_millis(200),
+            "accept round should return at quorum instead of waiting for 400ms slow peer (elapsed={elapsed:?})"
+        );
+    }
+
+    /// Verify Accept round reports rejection when a higher promised ballot is observed.
+    ///
+    /// Purpose:
+    /// - Preserve ballot monotonicity behavior while changing fanout implementation.
+    ///
+    /// Design:
+    /// - One peer returns `ok=false` with a higher promised ballot and the others fail.
+    ///
+    /// Inputs:
+    /// - Scripted Accept plans with mixed rejection and transport failures.
+    ///
+    /// Outputs:
+    /// - Non-quorum `AcceptResponse` carrying the higher promised ballot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn accept_round_returns_rejection_when_higher_ballot_observed() {
+        let ballot = Ballot::initial(7);
+        let higher = Ballot {
+            counter: ballot.counter.saturating_add(3),
+            node_id: 3,
+        };
+        let transport = NoopTransport::with_plans(
+            HashMap::from([
+                (
+                    1,
+                    AcceptPeerPlan {
+                        delay: StdDuration::from_millis(5),
+                        outcome: AcceptPeerOutcome::Response {
+                            ok: false,
+                            promised: higher,
+                        },
+                    },
+                ),
+                (
+                    2,
+                    AcceptPeerPlan {
+                        delay: StdDuration::from_millis(5),
+                        outcome: AcceptPeerOutcome::TransportError("injected accept failure"),
+                    },
+                ),
+                (
+                    3,
+                    AcceptPeerPlan {
+                        delay: StdDuration::from_millis(5),
+                        outcome: AcceptPeerOutcome::TransportError("injected accept failure"),
+                    },
+                ),
+            ]),
+            HashMap::new(),
+        );
+        let group = Group::new(
+            round_test_config(
+                99,
+                vec![1, 2, 3],
+                StdDuration::from_millis(80),
+                StdDuration::from_secs(1),
+            ),
+            Arc::new(transport),
+            Arc::new(TestStateMachine),
+            None,
+        );
+
+        let command = Bytes::from_static(b"accept-reject-test");
+        let resp = group
+            .run_accept_round(
+                TxnId {
+                    node_id: 7,
+                    counter: 2,
+                },
+                ballot,
+                command.clone(),
+                command_digest(&command),
+                1,
+                Vec::new(),
+                true,
+            )
+            .await
+            .expect("accept round should surface rejection instead of no-quorum");
+
+        assert!(!resp.ok, "accept should reject on higher promised ballot");
+        assert_eq!(
+            resp.promised, higher,
+            "accept rejection should carry highest promised ballot"
+        );
+    }
+
+    /// Verify Commit round returns immediately once voter quorum ACKs, without
+    /// waiting for a much slower peer response.
+    ///
+    /// Purpose:
+    /// - Validate Stage 4A behavior on commit fanout.
+    ///
+    /// Design:
+    /// - Two peers ACK quickly and one peer responds much later.
+    /// - The test asserts wall-clock completion well below the slow-peer delay.
+    ///
+    /// Inputs:
+    /// - Scripted per-peer Commit delays and responses.
+    ///
+    /// Outputs:
+    /// - Successful commit result with bounded elapsed time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_round_reaches_quorum_without_waiting_for_slowest_peer() {
+        let ballot = Ballot::initial(7);
+        let transport = NoopTransport::with_plans(
+            HashMap::new(),
+            HashMap::from([
+                (
+                    1,
+                    CommitPeerPlan {
+                        delay: StdDuration::from_millis(5),
+                        outcome: CommitPeerOutcome::Response { ok: true },
+                    },
+                ),
+                (
+                    2,
+                    CommitPeerPlan {
+                        delay: StdDuration::from_millis(10),
+                        outcome: CommitPeerOutcome::Response { ok: true },
+                    },
+                ),
+                (
+                    3,
+                    CommitPeerPlan {
+                        delay: StdDuration::from_millis(400),
+                        outcome: CommitPeerOutcome::Response { ok: true },
+                    },
+                ),
+            ]),
+        );
+        let group = Group::new(
+            round_test_config(
+                99,
+                vec![1, 2, 3],
+                StdDuration::from_millis(120),
+                StdDuration::from_secs(1),
+            ),
+            Arc::new(transport),
+            Arc::new(TestStateMachine),
+            None,
+        );
+
+        let command = Bytes::from_static(b"commit-round-test");
+        let start = time::Instant::now();
+        group
+            .run_commit_round(
+                TxnId {
+                    node_id: 7,
+                    counter: 3,
+                },
+                ballot,
+                command.clone(),
+                command_digest(&command),
+                1,
+                Vec::new(),
+                true,
+            )
+            .await
+            .expect("commit round should reach quorum");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < StdDuration::from_millis(200),
+            "commit round should return at quorum instead of waiting for 400ms slow peer (elapsed={elapsed:?})"
+        );
+    }
+
+    /// Verify Commit round returns a no-quorum error when enough voter ACKs are
+    /// not observed before timeout.
+    ///
+    /// Purpose:
+    /// - Preserve existing error behavior while changing fanout implementation.
+    ///
+    /// Design:
+    /// - One peer ACKs quickly, one fails, and one is slower than the round timeout.
+    ///
+    /// Inputs:
+    /// - Scripted per-peer Commit delays and responses.
+    ///
+    /// Outputs:
+    /// - `ProposeOnceError::NoQuorum` result.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_round_returns_no_quorum_when_acks_are_insufficient() {
+        let ballot = Ballot::initial(7);
+        let transport = NoopTransport::with_plans(
+            HashMap::new(),
+            HashMap::from([
+                (
+                    1,
+                    CommitPeerPlan {
+                        delay: StdDuration::from_millis(5),
+                        outcome: CommitPeerOutcome::Response { ok: true },
+                    },
+                ),
+                (
+                    2,
+                    CommitPeerPlan {
+                        delay: StdDuration::from_millis(5),
+                        outcome: CommitPeerOutcome::TransportError("injected commit failure"),
+                    },
+                ),
+                (
+                    3,
+                    CommitPeerPlan {
+                        delay: StdDuration::from_millis(300),
+                        outcome: CommitPeerOutcome::Response { ok: true },
+                    },
+                ),
+            ]),
+        );
+        let group = Group::new(
+            round_test_config(
+                99,
+                vec![1, 2, 3],
+                StdDuration::from_millis(80),
+                StdDuration::from_secs(1),
+            ),
+            Arc::new(transport),
+            Arc::new(TestStateMachine),
+            None,
+        );
+
+        let command = Bytes::from_static(b"commit-noquorum-test");
+        let res = group
+            .run_commit_round(
+                TxnId {
+                    node_id: 7,
+                    counter: 4,
+                },
+                ballot,
+                command.clone(),
+                command_digest(&command),
+                1,
+                Vec::new(),
+                true,
+            )
+            .await;
+
+        match res {
+            Err(ProposeOnceError::NoQuorum(_)) => {}
+            other => panic!("expected no-quorum error, got {other:?}"),
+        }
     }
 }
