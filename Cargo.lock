@@ -2964,7 +2964,9 @@ dependencies = [
  "anyhow",
  "async-trait",
  "blake3",
+ "bytes",
  "futures-util",
+ "hashbrown 0.15.5",
  "tokio",
  "tracing",
 ]
@@ -2999,6 +3001,7 @@ dependencies = [
 name = "holo_store"
 version = "0.1.0"
 dependencies = [
+ "ahash 0.8.12",
  "anyhow",
  "async-trait",
  "bytes",
@@ -3006,6 +3009,7 @@ dependencies = [
  "crc32fast",
  "fjall",
  "futures-util",
+ "hashbrown 0.15.5",
  "holo_accord",
  "mimalloc",
  "pilota",

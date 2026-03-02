@@ -9,8 +9,11 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use ahash::RandomState;
 use anyhow::Context;
 use async_trait::async_trait;
+use bytes::Bytes;
+use hashbrown::HashMap as FastHashMap;
 use holo_accord::accord::{
     AcceptRequest, AcceptResponse, Ballot, CommitRequest, CommitResponse, ExecutedPrefix, GroupId,
     NodeId, PreAcceptRequest, PreAcceptResponse, RecoverRequest, RecoverResponse,
@@ -40,6 +43,8 @@ const LATENCY_BUCKETS_US: [u64; 12] = [
     200_000, // 200ms
     500_000, // 500ms
 ];
+
+type FastMap<K, V> = FastHashMap<K, V, RandomState>;
 
 /// gRPC-based transport that implements Accord's `Transport` trait.
 #[derive(Clone)]
@@ -323,7 +328,7 @@ struct RecoverCoalescerSnapshot {
 /// Coalesces concurrent recover requests for the same transaction.
 #[derive(Default)]
 struct RecoverCoalescer {
-    inner: Mutex<HashMap<TxnId, RecoverEntry>>,
+    inner: Mutex<FastMap<TxnId, RecoverEntry>>,
     coalesced: AtomicU64,
     enqueued: AtomicU64,
     inflight_peak: AtomicU64,
@@ -992,7 +997,7 @@ impl GrpcTransport {
         target: NodeId,
         group_id: u64,
         txn_id: TxnId,
-    ) -> anyhow::Result<Option<Vec<u8>>> {
+    ) -> anyhow::Result<Option<Bytes>> {
         let peer = self.peer(target)?;
         let resp = time::timeout(
             self.rpc_timeout,
@@ -1006,7 +1011,7 @@ impl GrpcTransport {
             Ok(Ok(resp)) => {
                 let resp = resp.into_inner();
                 if resp.has_command {
-                    Ok(Some(resp.command.to_vec()))
+                    Ok(Some(resp.command))
                 } else {
                     Ok(None)
                 }
@@ -2467,7 +2472,7 @@ fn from_rpc_recover(resp: rpc::RecoverResponse) -> RecoverResponse {
             _ => TxnStatus::Unknown,
         },
         accepted_ballot,
-        command: resp.command.to_vec(),
+        command: resp.command,
         seq: resp.seq,
         deps,
     }
@@ -2686,7 +2691,7 @@ impl Transport for GrpcTransport {
         target: NodeId,
         group_id: GroupId,
         txn_id: TxnId,
-    ) -> anyhow::Result<Option<Vec<u8>>> {
+    ) -> anyhow::Result<Option<Bytes>> {
         GrpcTransport::fetch_command(self, target, group_id, txn_id).await
     }
 

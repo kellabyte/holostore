@@ -4,11 +4,12 @@
 //! (`KvStore` in-memory and `FjallEngine` on-disk), a sharded wrapper, and
 //! utilities for encoding/decoding commands used by the Accord state machine.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, Hasher};
 use std::sync::{Arc, RwLock};
 
+use ahash::RandomState;
+use bytes::Bytes;
 use fjall::{Keyspace, PartitionCreateOptions};
 use holo_accord::accord::{txn_group_id, CommandKeys, ExecMeta, NodeId, StateMachine, TxnId};
 use tracing::warn;
@@ -23,13 +24,13 @@ pub trait KvEngine: Send + Sync + 'static {
     /// Read the latest visible value for `key` along with its version.
     fn get_latest(&self, key: &[u8]) -> Option<(Vec<u8>, Version)>;
     /// Batch variant of `get_latest` that preserves input ordering.
-    fn get_latest_batch(&self, keys: &[Vec<u8>]) -> Vec<Option<(Vec<u8>, Version)>>;
+    fn get_latest_batch(&self, keys: &[&[u8]]) -> Vec<Option<(Vec<u8>, Version)>>;
     /// Persist a value for `key` at `version` (initially invisible).
-    fn set(&self, key: Vec<u8>, value: Vec<u8>, version: Version);
+    fn set(&self, key: &[u8], value: &[u8], version: Version);
     /// Persist multiple values in one batch (initially invisible).
-    fn set_batch(&self, items: &[(Vec<u8>, Vec<u8>, Version)]) {
+    fn set_batch(&self, items: &[(&[u8], &[u8], Version)]) {
         for (key, value, version) in items {
-            self.set(key.clone(), value.clone(), *version);
+            self.set(key, value, *version);
         }
     }
     /// Mark a previously written `(key, version)` as visible to readers.
@@ -90,13 +91,13 @@ impl KvEngine for KvStore {
     }
 
     /// Batch helper to read latest values for multiple keys.
-    fn get_latest_batch(&self, keys: &[Vec<u8>]) -> Vec<Option<(Vec<u8>, Version)>> {
+    fn get_latest_batch(&self, keys: &[&[u8]]) -> Vec<Option<(Vec<u8>, Version)>> {
         let Ok(guard) = self.inner.read() else {
             return vec![None; keys.len()];
         };
         let mut out = Vec::with_capacity(keys.len());
         for key in keys {
-            let value = guard.get(key.as_slice()).and_then(|versions| {
+            let value = guard.get(*key).and_then(|versions| {
                 versions
                     .iter()
                     .rev()
@@ -109,19 +110,19 @@ impl KvEngine for KvStore {
     }
 
     /// Insert or update a versioned value (initially invisible).
-    fn set(&self, key: Vec<u8>, value: Vec<u8>, version: Version) {
+    fn set(&self, key: &[u8], value: &[u8], version: Version) {
         if let Ok(mut guard) = self.inner.write() {
-            let entry = guard.entry(key).or_default();
+            let entry = guard.entry(key.to_vec()).or_default();
             // Decide whether to replace an existing version or insert a new one in order.
             match entry.binary_search_by(|v| v.version.cmp(&version)) {
                 // Existing version: overwrite the value in-place.
-                Ok(idx) => entry[idx].value = value,
+                Ok(idx) => entry[idx].value = value.to_vec(),
                 // New version: insert in sorted order and mark invisible.
                 Err(idx) => entry.insert(
                     idx,
                     VersionedValue {
                         version,
-                        value,
+                        value: value.to_vec(),
                         visible: false,
                     },
                 ),
@@ -130,20 +131,20 @@ impl KvEngine for KvStore {
     }
 
     /// Batch variant of `set` with one write lock.
-    fn set_batch(&self, items: &[(Vec<u8>, Vec<u8>, Version)]) {
+    fn set_batch(&self, items: &[(&[u8], &[u8], Version)]) {
         if let Ok(mut guard) = self.inner.write() {
             for (key, value, version) in items {
-                let entry = guard.entry(key.clone()).or_default();
+                let entry = guard.entry(key.to_vec()).or_default();
                 // Decide whether to replace an existing version or insert a new one in order.
                 match entry.binary_search_by(|v| v.version.cmp(version)) {
                     // Existing version: overwrite the value in-place.
-                    Ok(idx) => entry[idx].value = value.clone(),
+                    Ok(idx) => entry[idx].value = value.to_vec(),
                     // New version: insert in sorted order and mark invisible.
                     Err(idx) => entry.insert(
                         idx,
                         VersionedValue {
                             version: *version,
-                            value: value.clone(),
+                            value: value.to_vec(),
                             visible: false,
                         },
                     ),
@@ -208,10 +209,18 @@ pub struct FjallEngine {
     lock: RwLock<()>,
 }
 
+// Deterministic, process-stable seeds for shard selection and peer ordering.
+const SHARD_HASH_STATE: RandomState = RandomState::with_seeds(
+    0x243f_6a88_85a3_08d3,
+    0x1319_8a2e_0370_7344,
+    0xa409_3822_299f_31d0,
+    0x082e_fa98_ec4e_6c89,
+);
+
 /// Hash a key for shard selection and peer ordering.
 pub fn hash_key(bytes: &[u8]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
+    let mut hasher = SHARD_HASH_STATE.build_hasher();
+    hasher.write(bytes);
     hasher.finish()
 }
 
@@ -285,7 +294,7 @@ impl KvEngine for FjallEngine {
     }
 
     /// Batch helper to read latest values for multiple keys.
-    fn get_latest_batch(&self, keys: &[Vec<u8>]) -> Vec<Option<(Vec<u8>, Version)>> {
+    fn get_latest_batch(&self, keys: &[&[u8]]) -> Vec<Option<(Vec<u8>, Version)>> {
         let _guard = match self.lock.read() {
             Ok(guard) => guard,
             // If the lock is poisoned, preserve ordering with missing entries.
@@ -293,7 +302,7 @@ impl KvEngine for FjallEngine {
         };
         let mut out = Vec::with_capacity(keys.len());
         for key in keys {
-            let value = match self.latest.get(key) {
+            let value = match self.latest.get(*key) {
                 Ok(Some(bytes)) => decode_latest_value(&bytes).ok().map(|(version, value)| {
                     // Keep `(value, version)` ordering expected by the trait.
                     (value, version)
@@ -310,21 +319,21 @@ impl KvEngine for FjallEngine {
     }
 
     /// Insert a versioned value (initially invisible) into the versions partition.
-    fn set(&self, key: Vec<u8>, value: Vec<u8>, version: Version) {
+    fn set(&self, key: &[u8], value: &[u8], version: Version) {
         let _guard = match self.lock.write() {
             Ok(guard) => guard,
             // If the lock is poisoned, skip the write rather than panic.
             Err(_) => return,
         };
-        let entry_key = encode_version_key(&key, version);
-        let entry_value = encode_version_value(false, &value);
+        let entry_key = encode_version_key(key, version);
+        let entry_value = encode_version_value(false, value);
         if let Err(err) = self.versions.insert(entry_key, entry_value) {
             warn!(error = ?err, "fjall kv write failed");
         }
     }
 
     /// Batch insert multiple versioned values in one Fjall transaction.
-    fn set_batch(&self, items: &[(Vec<u8>, Vec<u8>, Version)]) {
+    fn set_batch(&self, items: &[(&[u8], &[u8], Version)]) {
         let _guard = match self.lock.write() {
             Ok(guard) => guard,
             // If the lock is poisoned, skip the write rather than panic.
@@ -564,25 +573,23 @@ impl KvEngine for RoutedKvEngine {
         self.shards[shard].get_latest(key)
     }
 
-    fn get_latest_batch(&self, keys: &[Vec<u8>]) -> Vec<Option<(Vec<u8>, Version)>> {
+    fn get_latest_batch(&self, keys: &[&[u8]]) -> Vec<Option<(Vec<u8>, Version)>> {
         if keys.is_empty() {
             return Vec::new();
         }
         let mut results = vec![None; keys.len()];
-        let mut by_shard: Vec<Vec<(usize, Vec<u8>)>> = vec![Vec::new(); self.shards.len()];
+        let mut by_shard: Vec<Vec<usize>> = vec![Vec::new(); self.shards.len()];
         for (idx, key) in keys.iter().enumerate() {
             let shard = self.shard_for_key(key);
-            by_shard[shard].push((idx, key.clone()));
+            by_shard[shard].push(idx);
         }
-        for (shard, items) in by_shard.into_iter().enumerate() {
-            if items.is_empty() {
+        for (shard, indices) in by_shard.into_iter().enumerate() {
+            if indices.is_empty() {
                 continue;
             }
-            let mut shard_keys = Vec::with_capacity(items.len());
-            let mut indices = Vec::with_capacity(items.len());
-            for (idx, key) in items {
-                indices.push(idx);
-                shard_keys.push(key);
+            let mut shard_keys = Vec::with_capacity(indices.len());
+            for idx in &indices {
+                shard_keys.push(keys[*idx]);
             }
             let shard_values = self.shards[shard].get_latest_batch(&shard_keys);
             for (idx, value) in indices.into_iter().zip(shard_values.into_iter()) {
@@ -592,24 +599,28 @@ impl KvEngine for RoutedKvEngine {
         results
     }
 
-    fn set(&self, key: Vec<u8>, value: Vec<u8>, version: Version) {
-        let shard = self.shard_for_key(&key);
+    fn set(&self, key: &[u8], value: &[u8], version: Version) {
+        let shard = self.shard_for_key(key);
         self.shards[shard].set(key, value, version);
     }
 
-    fn set_batch(&self, items: &[(Vec<u8>, Vec<u8>, Version)]) {
+    fn set_batch(&self, items: &[(&[u8], &[u8], Version)]) {
         if items.is_empty() {
             return;
         }
-        let mut by_shard: Vec<Vec<(Vec<u8>, Vec<u8>, Version)>> =
-            vec![Vec::new(); self.shards.len()];
-        for (key, value, version) in items {
+        let mut by_shard: Vec<Vec<usize>> = vec![Vec::new(); self.shards.len()];
+        for (idx, (key, _, _)) in items.iter().enumerate() {
             let shard = self.shard_for_key(key);
-            by_shard[shard].push((key.clone(), value.clone(), *version));
+            by_shard[shard].push(idx);
         }
-        for (shard, batch) in by_shard.into_iter().enumerate() {
-            if batch.is_empty() {
+        for (shard, indices) in by_shard.into_iter().enumerate() {
+            if indices.is_empty() {
                 continue;
+            }
+            let mut batch = Vec::with_capacity(indices.len());
+            for idx in indices {
+                let (key, value, version) = items[idx];
+                batch.push((key, value, version));
             }
             self.shards[shard].set_batch(&batch);
         }
@@ -682,27 +693,25 @@ impl KvEngine for ShardedKvEngine {
     }
 
     /// Batch latest reads across shards while preserving input order.
-    fn get_latest_batch(&self, keys: &[Vec<u8>]) -> Vec<Option<(Vec<u8>, Version)>> {
+    fn get_latest_batch(&self, keys: &[&[u8]]) -> Vec<Option<(Vec<u8>, Version)>> {
         if keys.is_empty() {
             // Empty input means empty output; avoid shard bookkeeping.
             return Vec::new();
         }
         let mut results = vec![None; keys.len()];
-        let mut by_shard: Vec<Vec<(usize, Vec<u8>)>> = vec![Vec::new(); self.shards.len()];
+        let mut by_shard: Vec<Vec<usize>> = vec![Vec::new(); self.shards.len()];
         for (idx, key) in keys.iter().enumerate() {
             let shard = self.shard_for_key(key);
-            by_shard[shard].push((idx, key.clone()));
+            by_shard[shard].push(idx);
         }
-        for (shard, items) in by_shard.into_iter().enumerate() {
-            if items.is_empty() {
+        for (shard, indices) in by_shard.into_iter().enumerate() {
+            if indices.is_empty() {
                 // Skip shards that have no keys assigned.
                 continue;
             }
-            let mut shard_keys = Vec::with_capacity(items.len());
-            let mut indices = Vec::with_capacity(items.len());
-            for (idx, key) in items {
-                indices.push(idx);
-                shard_keys.push(key);
+            let mut shard_keys = Vec::with_capacity(indices.len());
+            for idx in &indices {
+                shard_keys.push(keys[*idx]);
             }
             let shard_values = self.shards[shard].get_latest_batch(&shard_keys);
             for (idx, value) in indices.into_iter().zip(shard_values.into_iter()) {
@@ -713,27 +722,31 @@ impl KvEngine for ShardedKvEngine {
     }
 
     /// Delegate a write to the chosen shard.
-    fn set(&self, key: Vec<u8>, value: Vec<u8>, version: Version) {
-        let shard = self.shard_for_key(&key);
+    fn set(&self, key: &[u8], value: &[u8], version: Version) {
+        let shard = self.shard_for_key(key);
         self.shards[shard].set(key, value, version);
     }
 
     /// Batch writes across shards while preserving per-shard ordering.
-    fn set_batch(&self, items: &[(Vec<u8>, Vec<u8>, Version)]) {
+    fn set_batch(&self, items: &[(&[u8], &[u8], Version)]) {
         if items.is_empty() {
             // Nothing to write, so avoid shard work.
             return;
         }
-        let mut by_shard: Vec<Vec<(Vec<u8>, Vec<u8>, Version)>> =
-            vec![Vec::new(); self.shards.len()];
-        for (key, value, version) in items {
+        let mut by_shard: Vec<Vec<usize>> = vec![Vec::new(); self.shards.len()];
+        for (idx, (key, _, _)) in items.iter().enumerate() {
             let shard = self.shard_for_key(key);
-            by_shard[shard].push((key.clone(), value.clone(), *version));
+            by_shard[shard].push(idx);
         }
-        for (shard, batch) in by_shard.into_iter().enumerate() {
-            if batch.is_empty() {
+        for (shard, indices) in by_shard.into_iter().enumerate() {
+            if indices.is_empty() {
                 // Skip shards that have no items assigned.
                 continue;
+            }
+            let mut batch = Vec::with_capacity(indices.len());
+            for idx in indices {
+                let (key, value, version) = items[idx];
+                batch.push((key, value, version));
             }
             self.shards[shard].set_batch(&batch);
         }
@@ -1072,9 +1085,9 @@ impl StateMachine for KvStateMachine {
     }
 
     /// Apply a batch of commands, coalescing SETs for efficiency.
-    fn apply_batch(&self, items: &[(Vec<u8>, ExecMeta)]) {
+    fn apply_batch(&self, items: &[(Bytes, ExecMeta)]) {
         let _guard = self.split_lock.as_ref().map(|l| l.read().unwrap());
-        let mut sets: Vec<(Vec<u8>, Vec<u8>, Version)> = Vec::new();
+        let mut sets: Vec<(&[u8], &[u8], Version)> = Vec::new();
         for (data, meta) in items {
             if data.is_empty() {
                 // Ignore empty commands to avoid parsing errors.
@@ -1090,7 +1103,7 @@ impl StateMachine for KvStateMachine {
                             // Malformed command; skip this entry.
                             continue;
                         }
-                        let key = data[offset..offset + key_len].to_vec();
+                        let key = &data[offset..offset + key_len];
                         offset += key_len;
                         if let Ok(value_len) = read_u32(data, &mut offset) {
                             let value_len = value_len as usize;
@@ -1098,7 +1111,7 @@ impl StateMachine for KvStateMachine {
                                 // Malformed command; skip this entry.
                                 continue;
                             }
-                            let value = data[offset..offset + value_len].to_vec();
+                            let value = &data[offset..offset + value_len];
                             sets.push((key, value, version));
                         }
                     }
@@ -1119,7 +1132,7 @@ impl StateMachine for KvStateMachine {
                             // Truncated entry; stop scanning this batch.
                             break;
                         }
-                        let key = data[offset..offset + key_len].to_vec();
+                        let key = &data[offset..offset + key_len];
                         offset += key_len;
                         let Ok(value_len) = read_u32(data, &mut offset) else {
                             // Truncated entry; stop scanning this batch.
@@ -1130,7 +1143,7 @@ impl StateMachine for KvStateMachine {
                             // Truncated entry; stop scanning this batch.
                             break;
                         }
-                        let value = data[offset..offset + value_len].to_vec();
+                        let value = &data[offset..offset + value_len];
                         offset += value_len;
                         sets.push((key, value, version));
                     }
@@ -1155,11 +1168,11 @@ impl StateMachine for KvStateMachine {
             CMD_BATCH_GET => {
                 let mut offset = 1;
                 let count = read_u32(data, &mut offset)? as usize;
-                let mut keys = Vec::with_capacity(count);
+                let mut keys: Vec<&[u8]> = Vec::with_capacity(count);
                 for _ in 0..count {
                     let key_len = read_u32(data, &mut offset)? as usize;
                     anyhow::ensure!(offset + key_len <= data.len(), "short key");
-                    keys.push(data[offset..offset + key_len].to_vec());
+                    keys.push(&data[offset..offset + key_len]);
                     offset += key_len;
                 }
                 let latest = self.kv.get_latest_batch(&keys);
@@ -1371,12 +1384,12 @@ fn apply_kv_command(kv: &dyn KvEngine, data: &[u8], version: Version) -> anyhow:
             let mut offset = 1;
             let key_len = read_u32(data, &mut offset)? as usize;
             anyhow::ensure!(offset + key_len <= data.len(), "short key");
-            let key = data[offset..offset + key_len].to_vec();
+            let key = &data[offset..offset + key_len];
             offset += key_len;
 
             let value_len = read_u32(data, &mut offset)? as usize;
             anyhow::ensure!(offset + value_len <= data.len(), "short value");
-            let value = data[offset..offset + value_len].to_vec();
+            let value = &data[offset..offset + value_len];
 
             kv.set(key, value, version);
             Ok(())
@@ -1387,12 +1400,12 @@ fn apply_kv_command(kv: &dyn KvEngine, data: &[u8], version: Version) -> anyhow:
             for _ in 0..count {
                 let key_len = read_u32(data, &mut offset)? as usize;
                 anyhow::ensure!(offset + key_len <= data.len(), "short key");
-                let key = data[offset..offset + key_len].to_vec();
+                let key = &data[offset..offset + key_len];
                 offset += key_len;
 
                 let value_len = read_u32(data, &mut offset)? as usize;
                 anyhow::ensure!(offset + value_len <= data.len(), "short value");
-                let value = data[offset..offset + value_len].to_vec();
+                let value = &data[offset..offset + value_len];
                 offset += value_len;
 
                 kv.set(key, value, version);
@@ -1580,11 +1593,11 @@ mod tests {
             None
         }
 
-        fn get_latest_batch(&self, keys: &[Vec<u8>]) -> Vec<Option<(Vec<u8>, Version)>> {
+        fn get_latest_batch(&self, keys: &[&[u8]]) -> Vec<Option<(Vec<u8>, Version)>> {
             vec![None; keys.len()]
         }
 
-        fn set(&self, _key: Vec<u8>, _value: Vec<u8>, _version: Version) {}
+        fn set(&self, _key: &[u8], _value: &[u8], _version: Version) {}
 
         fn mark_visible(&self, _key: &[u8], _version: Version) -> bool {
             self.mark_visible_calls.fetch_add(1, Ordering::Relaxed);

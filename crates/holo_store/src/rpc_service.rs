@@ -73,7 +73,7 @@ impl rpc::HoloRpc for RpcService {
                     counter: ballot.counter,
                     node_id: ballot.node_id,
                 },
-                command: req.command.to_vec(),
+                command: req.command,
                 seq: req.seq,
                 deps,
             })
@@ -146,7 +146,7 @@ impl rpc::HoloRpc for RpcService {
                         counter: ballot.counter,
                         node_id: ballot.node_id,
                     },
-                    command: item.command.to_vec(),
+                    command: item.command,
                     seq: item.seq,
                     deps,
                 })
@@ -212,9 +212,9 @@ impl rpc::HoloRpc for RpcService {
         let has_command = req.has_command || !req.command.is_empty();
         let command_digest = parse_command_digest(req.command_digest)?;
         let command = if has_command {
-            req.command.to_vec()
+            req.command
         } else {
-            Vec::new()
+            Bytes::new()
         };
 
         let resp = group
@@ -285,9 +285,9 @@ impl rpc::HoloRpc for RpcService {
             let has_command = item.has_command || !item.command.is_empty();
             let command_digest = parse_command_digest(item.command_digest)?;
             let command = if has_command {
-                item.command.to_vec()
+                item.command
             } else {
-                Vec::new()
+                Bytes::new()
             };
 
             let resp = group
@@ -358,9 +358,9 @@ impl rpc::HoloRpc for RpcService {
         let has_command = req.has_command || !req.command.is_empty();
         let command_digest = parse_command_digest(req.command_digest)?;
         let command = if has_command {
-            req.command.to_vec()
+            req.command
         } else {
-            Vec::new()
+            Bytes::new()
         };
 
         let resp = group
@@ -425,9 +425,9 @@ impl rpc::HoloRpc for RpcService {
             let has_command = item.has_command || !item.command.is_empty();
             let command_digest = parse_command_digest(item.command_digest)?;
             let command = if has_command {
-                item.command.to_vec()
+                item.command
             } else {
-                Vec::new()
+                Bytes::new()
             };
 
             let resp = group

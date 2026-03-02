@@ -1,5 +1,8 @@
 //! Background range management: split/merge planning plus split execution.
 //!
+//! Purpose:
+//! - Continuously evaluate data ranges and drive safe split/merge workflows.
+//!
 //! Design overview for pluggable split strategies:
 //! - `SplitStrategyEngine` is the strategy interface boundary used by the loop.
 //! - `Loadops` preserves the original load-first/size-second behavior for baseline comparisons.
@@ -10,6 +13,12 @@
 //! - All split cutovers are coordinated with shard fences in the range controller domain.
 //! - Only affected shards are paused while metadata + migration converge.
 //! - Failure handling uses per-shard backoff and distinguishes transient lease-loss aborts.
+//!
+//! Inputs:
+//! - Cluster state snapshots, shard load telemetry, and manager config thresholds.
+//!
+//! Outputs:
+//! - At-most-one split/merge proposal attempt per manager tick plus health/backoff updates.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -27,11 +36,13 @@ use crate::NodeState;
 
 const SPLIT_FENCE_PREFIX: &str = "split-op";
 const SPLIT_FENCE_STALE_TIMEOUT: Duration = Duration::from_secs(20);
+const SPLIT_FENCE_HOLD_BUDGET: Duration = Duration::from_secs(1);
 const SPLIT_SHARD_DRAIN_LOW_WATERMARK: u64 = 8;
 const SPLIT_SHARD_DRAIN_STABLE_FOR: Duration = Duration::from_millis(100);
 const SPLIT_SHARD_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const SPLIT_FENCE_SYNC_TIMEOUT: Duration = Duration::from_secs(15);
 const SPLIT_CLUSTER_SYNC_TIMEOUT: Duration = Duration::from_secs(15);
+const SPLIT_FENCE_BUDGET_ERR_MARKER: &str = "split_fence_hold_budget_exceeded";
 const SPLIT_FAILURE_BACKOFF_BASE: Duration = Duration::from_millis(250);
 const SPLIT_FAILURE_BACKOFF_MAX: Duration = Duration::from_secs(15);
 const SPLIT_FAILURE_BACKOFF_MAX_SHIFT: u32 = 6;
@@ -939,7 +950,7 @@ async fn maybe_split_once(
         let inflight_split_ops = cluster_state
             .shard_fences
             .values()
-            .filter(|reason| reason.starts_with(SPLIT_FENCE_PREFIX))
+            .filter(|reason| is_split_fence_reason(reason))
             .count();
         if split_decision.staged_backfill
             && inflight_split_ops >= cfg.adaptive_max_concurrent_splits
@@ -983,6 +994,9 @@ async fn maybe_split_once(
 
         let split_res = run_split_with_controller_lease_heartbeat(state.clone(), async {
             ensure_range_controller_leader(state.clone()).await?;
+            // Start fence-hold accounting before publishing fenced metadata so
+            // every under-fence stage shares one strict latency budget.
+            let fence_phase_started = Instant::now();
             let fence_before_epoch = state.cluster_store.epoch();
             for shard_id in &fenced_shards {
                 propose_meta(
@@ -997,49 +1011,68 @@ async fn maybe_split_once(
             }
             let required_fences =
                 fenced_shards_to_expectations(&fenced_shards, &split_fence_op.reason);
+            let local_fence_timeout =
+                split_fence_budget_remaining(fence_phase_started)?.min(SPLIT_FENCE_SYNC_TIMEOUT);
             let fence_epoch = wait_for_local_fences(
                 state.clone(),
                 fence_before_epoch,
                 &required_fences,
                 &[],
-                SPLIT_FENCE_SYNC_TIMEOUT,
+                local_fence_timeout,
             )
             .await?;
+            let cluster_fence_timeout =
+                split_fence_budget_remaining(fence_phase_started)?.min(SPLIT_CLUSTER_SYNC_TIMEOUT);
             wait_for_cluster_converged(
                 state.clone(),
                 fence_epoch,
                 None,
                 &required_fences,
                 &[],
-                SPLIT_CLUSTER_SYNC_TIMEOUT,
+                cluster_fence_timeout,
             )
             .await?;
 
             // Drain only the source shard to a low watermark; global client
             // drains under sustained ingest can starve split progress.
+            let drain_timeout =
+                split_fence_budget_remaining(fence_phase_started)?.min(SPLIT_SHARD_DRAIN_TIMEOUT);
             wait_for_shard_low_watermark(
                 state.clone(),
                 split_decision.shard.shard_index,
                 SPLIT_SHARD_DRAIN_LOW_WATERMARK,
                 SPLIT_SHARD_DRAIN_STABLE_FOR,
-                SPLIT_SHARD_DRAIN_TIMEOUT,
+                drain_timeout,
             )
             .await?;
 
             if split_decision.staged_backfill {
-                staged_split_backfill(
-                    state.clone(),
-                    split_decision.shard.shard_index,
-                    split_decision.target_shard_index,
-                    split_decision.shard.leaseholder,
-                    backfill_targets.as_slice(),
-                    split_decision.split_key.as_slice(),
-                    split_decision.shard.end_key.as_slice(),
-                    cfg.adaptive_backfill_page_limit,
-                    cfg.adaptive_backfill_max_pages,
-                    cfg.adaptive_backfill_max_bps,
+                // Keep the second staged backfill strictly within the remaining
+                // fence budget. If it cannot complete quickly, abort and retry
+                // later instead of holding a split fence for seconds.
+                let backfill_budget = split_fence_budget_remaining(fence_phase_started)?;
+                tokio::time::timeout(
+                    backfill_budget,
+                    staged_split_backfill(
+                        state.clone(),
+                        split_decision.shard.shard_index,
+                        split_decision.target_shard_index,
+                        split_decision.shard.leaseholder,
+                        backfill_targets.as_slice(),
+                        split_decision.split_key.as_slice(),
+                        split_decision.shard.end_key.as_slice(),
+                        cfg.adaptive_backfill_page_limit,
+                        cfg.adaptive_backfill_max_pages,
+                        cfg.adaptive_backfill_max_bps,
+                    ),
                 )
-                .await?;
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "{SPLIT_FENCE_BUDGET_ERR_MARKER}: staged_backfill_timed_out budget_ms={}",
+                        backfill_budget.as_millis()
+                    )
+                })??;
             }
 
             ensure_range_controller_leader(state.clone()).await?;
@@ -1055,8 +1088,10 @@ async fn maybe_split_once(
                 },
             )
             .await?;
+            let split_local_timeout =
+                split_fence_budget_remaining(fence_phase_started)?.min(SPLIT_FENCE_SYNC_TIMEOUT);
             let split_epoch =
-                wait_for_local_epoch(state.clone(), split_before_epoch, SPLIT_FENCE_SYNC_TIMEOUT)
+                wait_for_local_epoch(state.clone(), split_before_epoch, split_local_timeout)
                     .await?;
             state
                 .cluster_store
@@ -1071,13 +1106,15 @@ async fn maybe_split_once(
                     )
                 })?;
             let shard_count = state.cluster_store.state().shards.len();
+            let converge_timeout =
+                split_fence_budget_remaining(fence_phase_started)?.min(SPLIT_CLUSTER_SYNC_TIMEOUT);
             wait_for_cluster_converged(
                 state.clone(),
                 split_epoch,
                 Some(shard_count),
                 &required_fences,
                 &[],
-                SPLIT_CLUSTER_SYNC_TIMEOUT,
+                converge_timeout,
             )
             .await?;
             Ok::<(), anyhow::Error>(())
@@ -1312,6 +1349,27 @@ fn encode_split_fence_reason(token: &str, started_ms: u64) -> String {
     format!("{SPLIT_FENCE_PREFIX}:{token}:{started_ms}")
 }
 
+/// Identify whether a fence reason belongs to a split workflow.
+///
+/// Purpose:
+/// - Share split-fence classification across range management and request-path
+///   gating without duplicating fence-prefix knowledge.
+///
+/// Design:
+/// - Prefix-based check aligned with `encode_split_fence_reason`.
+///
+/// Inputs:
+/// - Raw fence reason string from cluster state.
+///
+/// Outputs:
+/// - `true` when the fence was generated by split orchestration.
+pub(crate) fn is_split_fence_reason(reason: &str) -> bool {
+    reason == SPLIT_FENCE_PREFIX
+        || reason
+            .strip_prefix(SPLIT_FENCE_PREFIX)
+            .is_some_and(|rest| rest.starts_with(':'))
+}
+
 /// Parse split fence metadata previously encoded by `encode_split_fence_reason`.
 ///
 /// Input:
@@ -1320,17 +1378,44 @@ fn encode_split_fence_reason(token: &str, started_ms: u64) -> String {
 /// Output:
 /// - `(token, started_ms)` if format matches split-fence encoding.
 fn parse_split_fence_reason(reason: &str) -> Option<(String, u64)> {
-    let mut parts = reason.split(':');
-    let prefix = parts.next()?;
-    if prefix != SPLIT_FENCE_PREFIX {
+    if !is_split_fence_reason(reason) {
         return None;
     }
+    let mut parts = reason.split(':');
+    let _prefix = parts.next()?;
     let token = parts.next()?.to_string();
     let started_ms = parts.next()?.parse::<u64>().ok()?;
     if parts.next().is_some() {
         return None;
     }
     Some((token, started_ms))
+}
+
+/// Compute remaining budget for a currently active split fence.
+///
+/// Purpose:
+/// - Bound fence lifetime so split workflows fail fast instead of causing
+///   multi-second read/write stalls.
+///
+/// Design:
+/// - Uses a fixed budget from fence-start time.
+/// - Returns an error with a stable marker when the budget is exhausted.
+///
+/// Inputs:
+/// - `started`: monotonic instant when the split fence phase began.
+///
+/// Outputs:
+/// - Remaining duration before the fence budget is exhausted.
+fn split_fence_budget_remaining(started: Instant) -> anyhow::Result<Duration> {
+    let elapsed = started.elapsed();
+    if elapsed >= SPLIT_FENCE_HOLD_BUDGET {
+        anyhow::bail!(
+            "{SPLIT_FENCE_BUDGET_ERR_MARKER}: elapsed_ms={} budget_ms={}",
+            elapsed.as_millis(),
+            SPLIT_FENCE_HOLD_BUDGET.as_millis()
+        );
+    }
+    Ok(SPLIT_FENCE_HOLD_BUDGET.saturating_sub(elapsed))
 }
 
 /// Build expected `(shard_id, reason)` tuples for fence convergence checks.
@@ -2348,7 +2433,9 @@ fn reservoir_replace_index(shard_id: u64, seen: usize, key: &[u8]) -> usize {
 /// - Stable short reason used by telemetry and split-health reporting.
 fn classify_split_failure(err: &anyhow::Error) -> &'static str {
     let text = err.to_string().to_lowercase();
-    if text.contains("controller lease") {
+    if text.contains(SPLIT_FENCE_BUDGET_ERR_MARKER) {
+        "fence_budget_exceeded"
+    } else if text.contains("controller lease") {
         "lease_lost"
     } else if text.contains("cluster convergence") {
         "cluster_convergence_timeout"
@@ -2368,7 +2455,7 @@ fn classify_split_failure(err: &anyhow::Error) -> &'static str {
 
 /// Whether a classified failure should be tracked as transient abort.
 fn is_transient_split_failure(reason: &str) -> bool {
-    matches!(reason, "lease_lost")
+    matches!(reason, "lease_lost" | "fence_budget_exceeded")
 }
 
 /// Register a failure and compute its next retry delay for one shard.
@@ -2521,5 +2608,76 @@ mod tests {
         drop(latest);
         drop(keyspace);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Verify split-fence prefix detection used by read-path gating.
+    ///
+    /// Purpose:
+    /// - Keep split-fence classification stable across modules.
+    ///
+    /// Design:
+    /// - Assert positive and negative prefix matches.
+    ///
+    /// Inputs:
+    /// - Synthetic split and non-split fence reasons.
+    ///
+    /// Outputs:
+    /// - Boolean classification results.
+    #[test]
+    fn split_fence_reason_classifier_matches_prefix() {
+        assert!(is_split_fence_reason("split-op:n1-100-1:100"));
+        assert!(!is_split_fence_reason("merge-op:n1-100-1:100"));
+        assert!(!is_split_fence_reason("split-opx:n1-100-1:100"));
+    }
+
+    /// Verify split fence budget helper returns an error once exhausted.
+    ///
+    /// Purpose:
+    /// - Ensure over-budget split workflows fail fast instead of parking reads.
+    ///
+    /// Design:
+    /// - Build a synthetic start instant older than the configured budget.
+    ///
+    /// Inputs:
+    /// - `Instant` values representing in-budget and over-budget states.
+    ///
+    /// Outputs:
+    /// - Remaining duration for in-budget case, and marker-tagged error for
+    ///   over-budget case.
+    #[test]
+    fn split_fence_budget_remaining_enforces_budget() {
+        let in_budget = split_fence_budget_remaining(Instant::now())
+            .expect("fresh fence phase should have remaining budget");
+        assert!(in_budget <= SPLIT_FENCE_HOLD_BUDGET);
+        assert!(in_budget > Duration::from_millis(0));
+
+        let over_budget_start = Instant::now() - SPLIT_FENCE_HOLD_BUDGET - Duration::from_millis(5);
+        let err = split_fence_budget_remaining(over_budget_start)
+            .expect_err("expired fence phase must fail");
+        assert!(
+            err.to_string().contains(SPLIT_FENCE_BUDGET_ERR_MARKER),
+            "error should include stable budget marker for classification"
+        );
+    }
+
+    /// Verify budget-exhaustion failures are classified as transient split aborts.
+    ///
+    /// Purpose:
+    /// - Keep retry behavior aligned with the fence budget guardrail.
+    ///
+    /// Design:
+    /// - Feed classifier with the marker string and assert transient mapping.
+    ///
+    /// Inputs:
+    /// - Synthetic error containing `SPLIT_FENCE_BUDGET_ERR_MARKER`.
+    ///
+    /// Outputs:
+    /// - Failure reason string and transient classification.
+    #[test]
+    fn split_fence_budget_exhaustion_is_transient_failure() {
+        let err = anyhow::anyhow!("{SPLIT_FENCE_BUDGET_ERR_MARKER}: test");
+        let reason = classify_split_failure(&err);
+        assert_eq!(reason, "fence_budget_exceeded");
+        assert!(is_transient_split_failure(reason));
     }
 }

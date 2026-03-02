@@ -5,7 +5,7 @@
 //! It also wires in batching and background workers (commit-log and apply) to
 //! keep IO and storage costs amortized.
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
@@ -13,6 +13,7 @@ use std::sync::RwLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
+use bytes::Bytes;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use tokio::time;
@@ -54,6 +55,16 @@ fn initial_txn_counter_seed() -> u64 {
 
 fn command_digest(command: &[u8]) -> [u8; 32] {
     *blake3::hash(command).as_bytes()
+}
+
+/// Force command bytes into an owned buffer so long-lived state does not keep
+/// references to larger transient RPC decode buffers.
+fn detach_command_bytes(command: &Bytes) -> Bytes {
+    if command.is_empty() {
+        Bytes::new()
+    } else {
+        Bytes::copy_from_slice(command.as_ref())
+    }
 }
 
 /// Lightweight handle used by callers to submit proposals.
@@ -149,16 +160,18 @@ pub struct DebugStats {
 }
 
 impl Handle {
-    pub async fn propose(&self, command: Vec<u8>) -> anyhow::Result<ProposalResult> {
-        self.group.propose(command).await
+    pub async fn propose(&self, command: impl Into<Bytes>) -> anyhow::Result<ProposalResult> {
+        self.group.propose(command.into()).await
     }
 
     pub async fn propose_read_with_deps(
         &self,
-        command: Vec<u8>,
+        command: impl Into<Bytes>,
         deps: Vec<(TxnId, u64)>,
     ) -> anyhow::Result<ProposalResult> {
-        self.group.propose_read_with_deps(command, deps).await
+        self.group
+            .propose_read_with_deps(command.into(), deps)
+            .await
     }
 }
 
@@ -192,14 +205,14 @@ pub struct Group {
 #[derive(Clone, Debug)]
 struct ApplyItem {
     id: TxnId,
-    command: Vec<u8>,
+    command: Bytes,
     keys: CommandKeys,
     seq: u64,
 }
 
 /// Work item sent to the apply worker (write batch + response channel).
 struct ApplyWork {
-    batch: Vec<(Vec<u8>, ExecMeta)>,
+    batch: Vec<(Bytes, ExecMeta)>,
     tx: oneshot::Sender<ApplyResult>,
 }
 
@@ -863,12 +876,19 @@ impl Group {
             entry
         };
 
-        if entry.command.is_empty() {
+        let command = match entry.command {
+            Some(command) => command,
+            None => self
+                .load_command_from_commit_log(txn_id)
+                .unwrap_or_default(),
+        };
+
+        if command.is_empty() {
             return Ok(true);
         }
 
         self.sm.mark_visible(
-            &entry.command,
+            &command,
             ExecMeta {
                 txn_id,
                 seq: entry.seq,
@@ -921,7 +941,7 @@ impl Group {
                     status: Status::None,
                     updated_at: time::Instant::now(),
                 });
-                rec.command = Some(entry.command.clone());
+                rec.command = Some(detach_command_bytes(&entry.command));
                 rec.command_digest = Some(command_digest(&entry.command));
                 rec.keys = Some(keys.clone());
                 rec.seq = entry.seq.max(1);
@@ -1106,7 +1126,7 @@ impl Group {
         let mut executed_log_max_deps_len = 0usize;
         for entry in state.executed_log.values() {
             executed_log_max_command_bytes =
-                executed_log_max_command_bytes.max(entry.command.len());
+                executed_log_max_command_bytes.max(entry.command.as_ref().map_or(0, Bytes::len));
             executed_log_max_deps_len = executed_log_max_deps_len.max(entry.deps.len());
         }
         DebugStats {
@@ -1255,7 +1275,7 @@ impl Group {
                 .expect("record must exist");
             let digest = command_digest(&req.command);
             if let Some(cmd) = &rec.command {
-                if cmd.as_slice() != req.command.as_slice() {
+                if cmd.as_ref() != req.command.as_ref() {
                     return PreAcceptResponse {
                         ok: false,
                         promised: rec.promised,
@@ -1286,7 +1306,7 @@ impl Group {
                     }
                 }
             } else {
-                rec.command = Some(req.command.clone());
+                rec.command = Some(detach_command_bytes(&req.command));
                 rec.command_digest = Some(digest);
                 if req.command.is_empty() {
                     rec.keys = Some(CommandKeys::default());
@@ -1453,7 +1473,7 @@ impl Group {
                                 }
                             }
                         };
-                        rec.command = Some(cmd);
+                        rec.command = Some(detach_command_bytes(&cmd));
                         rec.command_digest = Some(expected_digest);
                         rec.keys = Some(keys);
                     } else {
@@ -1645,7 +1665,7 @@ impl Group {
                                 Err(_) => return CommitResponse { ok: false },
                             }
                         };
-                        rec.command = Some(cmd);
+                        rec.command = Some(detach_command_bytes(&cmd));
                         rec.command_digest = Some(expected_digest);
                         rec.keys = Some(keys);
                     } else {
@@ -1813,24 +1833,47 @@ impl Group {
         }
     }
 
-    pub async fn rpc_fetch_command(&self, txn_id: TxnId) -> Option<Vec<u8>> {
-        let state = self.state.lock().await;
-        if let Some(rec) = state.records.get(&txn_id) {
-            if let Some(cmd) = rec.command.as_ref() {
-                return Some(cmd.clone());
+    pub async fn rpc_fetch_command(&self, txn_id: TxnId) -> Option<Bytes> {
+        let in_memory = {
+            let state = self.state.lock().await;
+            if let Some(rec) = state.records.get(&txn_id) {
+                if let Some(cmd) = rec.command.as_ref() {
+                    return Some(cmd.clone());
+                }
             }
-        }
-        state
-            .executed_log
-            .get(&txn_id)
-            .map(|entry| entry.command.clone())
+            state
+                .executed_log
+                .get(&txn_id)
+                .and_then(|entry| entry.command.clone())
+        };
+        in_memory.or_else(|| self.load_command_from_commit_log(txn_id))
+    }
+
+    fn load_command_from_commit_log(&self, txn_id: TxnId) -> Option<Bytes> {
+        let log = self.commit_log.as_ref()?;
+        let entries = match log.load() {
+            Ok(entries) => entries,
+            Err(err) => {
+                tracing::warn!(
+                    error = ?err,
+                    txn_id = ?txn_id,
+                    "failed to load commit log while fetching command"
+                );
+                return None;
+            }
+        };
+        entries
+            .into_iter()
+            .rev()
+            .find(|entry| entry.txn_id == txn_id)
+            .map(|entry| entry.command)
     }
 
     async fn fetch_command_from_peers(
         &self,
         txn_id: TxnId,
         expected_digest: [u8; 32],
-    ) -> anyhow::Result<Option<Vec<u8>>> {
+    ) -> anyhow::Result<Option<Bytes>> {
         let peers = self.peers_round_robin();
         if peers.is_empty() {
             return Ok(None);
@@ -1861,7 +1904,7 @@ impl Group {
                 promised: Ballot::zero(),
                 status: TxnStatus::Unknown,
                 accepted_ballot: None,
-                command: Vec::new(),
+                command: Bytes::new(),
                 seq: 0,
                 deps: Vec::new(),
             };
@@ -1869,25 +1912,22 @@ impl Group {
         let now = time::Instant::now();
         let mut state = self.state.lock().await;
         if state.is_executed(&req.txn_id) {
-            if let Some(entry) = state.executed_log.get(&req.txn_id) {
-                return RecoverResponse {
-                    ok: true,
-                    promised: Ballot::zero(),
-                    status: TxnStatus::Executed,
-                    accepted_ballot: None,
-                    command: entry.command.clone(),
-                    seq: entry.seq,
-                    deps: entry.deps.clone(),
-                };
-            }
+            let (command, seq, deps) = state
+                .executed_log
+                .get(&req.txn_id)
+                .map(|entry| (entry.command.clone(), entry.seq, entry.deps.clone()))
+                .unwrap_or((None, 1, Vec::new()));
+            drop(state);
             return RecoverResponse {
                 ok: true,
                 promised: Ballot::zero(),
                 status: TxnStatus::Executed,
                 accepted_ballot: None,
-                command: Vec::new(),
-                seq: 1,
-                deps: Vec::new(),
+                command: command
+                    .or_else(|| self.load_command_from_commit_log(req.txn_id))
+                    .unwrap_or_default(),
+                seq,
+                deps,
             };
         }
 
@@ -1945,7 +1985,10 @@ impl Group {
         let now = time::Instant::now();
         let mut state = self.state.lock().await;
 
-        let mut prefixes = HashMap::new();
+        let mut prefixes = state
+            .reported_executed_prefix_by_peer
+            .remove(&req.from_node_id)
+            .unwrap_or_default();
         for p in req.prefixes {
             prefixes.insert(p.node_id, p.counter);
         }
@@ -1963,19 +2006,20 @@ impl Group {
             &runtime_members,
             &mut state,
             now,
+            self.config.executed_command_cache_max_bytes,
         );
         let _ = Self::maybe_compact_state_locked(&mut state, now);
 
         ReportExecutedResponse { ok: true }
     }
 
-    async fn propose(&self, command: Vec<u8>) -> anyhow::Result<ProposalResult> {
+    async fn propose(&self, command: Bytes) -> anyhow::Result<ProposalResult> {
         self.propose_with_deps(command, None).await
     }
 
     async fn propose_read_with_deps(
         &self,
-        command: Vec<u8>,
+        command: Bytes,
         deps: Vec<(TxnId, u64)>,
     ) -> anyhow::Result<ProposalResult> {
         self.propose_with_deps(command, Some(deps)).await
@@ -1983,7 +2027,7 @@ impl Group {
 
     async fn propose_with_deps(
         &self,
-        command: Vec<u8>,
+        command: Bytes,
         extra_deps: Option<Vec<(TxnId, u64)>>,
     ) -> anyhow::Result<ProposalResult> {
         let start = time::Instant::now();
@@ -2183,8 +2227,11 @@ impl Group {
         members: &[Member],
         state: &mut State,
         now: time::Instant,
+        max_executed_command_cache_bytes: usize,
     ) -> usize {
         const GC_INTERVAL: Duration = Duration::from_millis(500);
+        const MAX_GC_SCAN: usize = 16_384;
+        const MAX_SHED_SCAN: usize = 8_192;
         if now.duration_since(state.last_executed_gc_at) < GC_INTERVAL {
             return 0;
         }
@@ -2219,28 +2266,62 @@ impl Group {
         }
 
         let mut removed = 0usize;
-        let mut new_order = VecDeque::with_capacity(state.executed_log_order.len());
-        while let Some(id) = state.executed_log_order.pop_front() {
-            if !state.visible_txns.contains(&id) {
-                new_order.push_back(id);
-                continue;
-            }
-            let min_prefix = global_min_by_node.get(&id.node_id).copied().unwrap_or(0);
-            if id.counter <= min_prefix {
-                if let Some(entry) = state.executed_log.remove(&id) {
-                    state.executed_log_bytes =
-                        state.executed_log_bytes.saturating_sub(entry.command.len());
-                    state.executed_log_deps_total = state
-                        .executed_log_deps_total
-                        .saturating_sub(entry.deps.len());
+        // Bound per-tick work to avoid long mutex hold times on large logs.
+        let gc_scan = state.executed_log_order.len().min(MAX_GC_SCAN);
+        for _ in 0..gc_scan {
+            let Some(id) = state.executed_log_order.pop_front() else {
+                break;
+            };
+            if state.visible_txns.contains(&id) {
+                let min_prefix = global_min_by_node.get(&id.node_id).copied().unwrap_or(0);
+                if id.counter <= min_prefix {
+                    if let Some(entry) = state.executed_log.remove(&id) {
+                        state.executed_log_bytes = state
+                            .executed_log_bytes
+                            .saturating_sub(entry.command.as_ref().map_or(0, Bytes::len));
+                        state.executed_log_deps_total = state
+                            .executed_log_deps_total
+                            .saturating_sub(entry.deps.len());
+                    }
+                    state.visible_txns.remove(&id);
+                    removed = removed.saturating_add(1);
+                    continue;
                 }
-                state.visible_txns.remove(&id);
-                removed += 1;
-            } else {
-                new_order.push_back(id);
+            }
+            state.executed_log_order.push_back(id);
+        }
+
+        // Keep executed metadata, but shed visible command payloads once the
+        // configured in-memory command cache budget is exceeded.
+        if state.executed_log_bytes > max_executed_command_cache_bytes {
+            let mut overflow = state
+                .executed_log_bytes
+                .saturating_sub(max_executed_command_cache_bytes);
+            let shed_scan = state.executed_log_order.len().min(MAX_SHED_SCAN);
+            for _ in 0..shed_scan {
+                if overflow == 0 {
+                    break;
+                }
+                let Some(id) = state.executed_log_order.pop_front() else {
+                    break;
+                };
+                if state.visible_txns.contains(&id) {
+                    if let Some(entry) = state.executed_log.get_mut(&id) {
+                        if let Some(command) = entry.command.take() {
+                            let len = command.len();
+                            if len > 0 {
+                                state.executed_log_bytes =
+                                    state.executed_log_bytes.saturating_sub(len);
+                                overflow = overflow.saturating_sub(len);
+                                removed = removed.saturating_add(1);
+                            }
+                        }
+                    }
+                }
+                state.executed_log_order.push_back(id);
             }
         }
-        state.executed_log_order = new_order;
+
         state.last_executed_gc_at = now;
         removed
     }
@@ -2249,7 +2330,7 @@ impl Group {
         &self,
         txn_id: TxnId,
         ballot: Ballot,
-        command: Vec<u8>,
+        command: Bytes,
         command_digest: [u8; 32],
         needs_execution: bool,
         forced: Option<&(Vec<TxnId>, u64)>,
@@ -2652,7 +2733,7 @@ impl Group {
         &self,
         txn_id: TxnId,
         ballot: Ballot,
-        command: Vec<u8>,
+        command: Bytes,
         command_digest: [u8; 32],
         seq: u64,
         deps: Vec<TxnId>,
@@ -2666,7 +2747,7 @@ impl Group {
         let (command_payload, has_command) = if inline_command {
             (command.clone(), true)
         } else {
-            (Vec::new(), false)
+            (Bytes::new(), false)
         };
         let mut ok = 0usize;
         let mut max_promised = ballot;
@@ -2766,7 +2847,7 @@ impl Group {
         &self,
         txn_id: TxnId,
         ballot: Ballot,
-        command: Vec<u8>,
+        command: Bytes,
         command_digest: [u8; 32],
         seq: u64,
         deps: Vec<TxnId>,
@@ -2785,7 +2866,7 @@ impl Group {
         let (command_payload, has_command) = if inline_command {
             (command.clone(), true)
         } else {
-            (Vec::new(), false)
+            (Bytes::new(), false)
         };
         let mut ok = 0usize;
         if local_is_member {
@@ -3363,8 +3444,16 @@ impl Group {
                         deps,
                         status,
                         seq,
-                        executed_prefix_by_node: state.executed_prefix_by_node.clone(),
-                        executed_out_of_order: state.executed_out_of_order.clone(),
+                        executed_prefix_by_node: state
+                            .executed_prefix_by_node
+                            .iter()
+                            .map(|(k, v)| (*k, *v))
+                            .collect(),
+                        executed_out_of_order: state
+                            .executed_out_of_order
+                            .iter()
+                            .copied()
+                            .collect(),
                     });
                 }
 
@@ -3523,7 +3612,7 @@ impl Group {
 
         if !write_batch.is_empty() {
             let write_batch_len = write_batch.len();
-            let apply_inline = |batch: &[(Vec<u8>, ExecMeta)]| -> ApplyResult {
+            let apply_inline = |batch: &[(Bytes, ExecMeta)]| -> ApplyResult {
                 let apply_start = time::Instant::now();
                 self.sm.apply_batch(batch);
                 let apply_us = apply_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
@@ -3650,7 +3739,7 @@ impl Group {
                     state.record_executed_value(
                         item.id,
                         ExecutedLogEntry {
-                            command,
+                            command: Some(command),
                             seq: rec.seq.max(1),
                             deps: rec.deps.into_iter().collect(),
                         },
@@ -4077,7 +4166,7 @@ fn first_blocking_dep(chain: &[BlockedStep]) -> Option<(TxnId, Option<Status>, b
 
 #[derive(Debug)]
 struct RecoveryValue {
-    command: Vec<u8>,
+    command: Bytes,
     seq: u64,
     deps: Vec<TxnId>,
 }
@@ -4103,14 +4192,14 @@ fn merge_preaccept(oks: &[PreAcceptResponse]) -> RecoveryValue {
         .into_iter()
         .collect::<Vec<_>>();
     RecoveryValue {
-        command: Vec::new(),
+        command: Bytes::new(),
         seq,
         deps,
     }
 }
 
 fn choose_recovery_value(replies: &[RecoverResponse]) -> anyhow::Result<RecoveryValue> {
-    let mut command: Option<Vec<u8>> = None;
+    let mut command: Option<Bytes> = None;
     let mut seq = 0u64;
     let mut deps = BTreeSet::new();
     let mut saw_committed = false;
@@ -4122,7 +4211,7 @@ fn choose_recovery_value(replies: &[RecoverResponse]) -> anyhow::Result<Recovery
         if !r.command.is_empty() {
             if let Some(cmd) = &command {
                 anyhow::ensure!(
-                    cmd.as_slice() == r.command.as_slice(),
+                    cmd.as_ref() == r.command.as_ref(),
                     "conflicting command bytes"
                 );
             } else {
@@ -4382,7 +4471,7 @@ mod tests {
             _target: NodeId,
             _group_id: GroupId,
             _txn_id: TxnId,
-        ) -> anyhow::Result<Option<Vec<u8>>> {
+        ) -> anyhow::Result<Option<Bytes>> {
             Err(anyhow::anyhow!("transport not used in this test"))
         }
 
@@ -4557,6 +4646,7 @@ mod tests {
             preaccept_stall_hits: 1,
             execute_batch_max: 16,
             inline_command_in_accept_commit: true,
+            executed_command_cache_max_bytes: 64 * 1024 * 1024,
             commit_log_batch_max: 16,
             commit_log_batch_wait: StdDuration::from_micros(50),
             commit_durability_mode: mode,
@@ -4571,7 +4661,7 @@ mod tests {
     /// Output:
     /// - Valid commit request with fixed command payload and digest.
     fn test_commit_request(counter: u64) -> CommitRequest {
-        let command = b"set unit-test-key value".to_vec();
+        let command = Bytes::from_static(b"set unit-test-key value");
         CommitRequest {
             group_id: 1,
             txn_id: TxnId {

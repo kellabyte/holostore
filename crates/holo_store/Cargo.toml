@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+ahash = "0.8"
 async-trait = "0.1"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
@@ -16,6 +17,7 @@ crc32fast = "1"
 futures-util = "0.3"
 fjall = "2.11"
 holo_accord = { path = "../holo_accord" }
+hashbrown = "0.15"
 pilota = "0.13"
 prost = "0.13"
 raft-engine = { version = "0.4", optional = true }
