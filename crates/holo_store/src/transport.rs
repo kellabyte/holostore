@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -39,6 +39,7 @@ use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use tokio::time;
 
 use crate::kv::Version;
+use crate::packed_batch::{decode_items_from_parts, encode_items_to_parts, PackedBatchBuilder};
 use crate::volo_gen::holo_store::rpc;
 
 /// Capacity for each per-peer RPC queue.
@@ -49,6 +50,20 @@ const REUSE_POOL_MAX_CACHED: usize = 64;
 
 /// Upper bound multiplier for retained reusable vector capacities.
 const REUSE_POOL_CAPACITY_MULTIPLIER: usize = 4;
+
+/// Maximum multiplier from configured batch wait to enforced GET queue-age cap.
+const KV_GET_MAX_QUEUE_WAIT_MULTIPLIER: u32 = 4;
+
+/// Minimum enforced GET queue-age cap (microseconds).
+const KV_GET_MIN_QUEUE_WAIT_US: u64 = 250;
+/// Max coalescing delay for low-backlog GET batches (microseconds).
+const KV_GET_LOW_BACKLOG_WAIT_US: u64 = 50;
+/// Queue-depth threshold for immediate GET dispatch when limiter capacity exists.
+const KV_GET_IMMEDIATE_DISPATCH_QUEUE_DEPTH: u64 = 1;
+
+/// Packed-v2 lane capability state: enabled / disabled.
+const V2_CAP_ENABLED: u8 = 1;
+const V2_CAP_DISABLED: u8 = 2;
 
 /// Histogram bucket boundaries for latency metrics (microseconds).
 const LATENCY_BUCKETS_US: [u64; 12] = [
@@ -127,6 +142,7 @@ pub struct RangeTelemetryStat {
 ///
 /// Outputs:
 /// - Batch vector with `1..=batch_max` items unless channel disconnects.
+#[cfg(test)]
 async fn collect_batch_reuse<T>(
     mut items: Vec<T>,
     first: T,
@@ -400,41 +416,60 @@ impl<T> ReuseVecPool<T> {
     }
 }
 
-/// Recycled waiter vector for one completed quorum RPC batch.
+/// Recycled waiter/request vectors for one completed quorum RPC batch.
 ///
 /// Purpose:
-/// - Return oneshot sender vector capacity to the worker pool after completion.
+/// - Return sender and request vector capacities to worker pools after one
+///   batch completes.
 ///
 /// Design:
-/// - Holds drained sender storage only; sender values are consumed before return.
+/// - Holds drained sender and request storage only.
+/// - Sender values are consumed before return.
 ///
 /// Inputs:
-/// - Drained sender vector from one in-flight batch.
+/// - Drained sender and request vectors from one in-flight batch.
 ///
 /// Outputs:
-/// - Reusable sender vector capacity for subsequent batches.
-struct WaiterBatchRecycle<T> {
+/// - Reusable sender/request vector capacities for subsequent batches.
+struct WaiterBatchRecycle<T, Req> {
     txs: Vec<oneshot::Sender<anyhow::Result<T>>>,
+    requests: Vec<Req>,
 }
 
-/// Recycled transaction-id vector for one completed recover batch.
+/// Recycled transaction-id/request vectors for one completed recover batch.
 ///
 /// Purpose:
-/// - Return txn-id vector capacity to the worker pool after completion.
+/// - Return txn-id and request vector capacities to worker pools after
+///   completion.
 ///
 /// Design:
-/// - Holds drained txn id storage only; ids are consumed before return.
+/// - Holds drained txn-id and request storage only; values are consumed before
+///   return.
 ///
 /// Inputs:
-/// - Drained txn-id vector from one in-flight recover batch.
+/// - Drained txn-id and request vectors from one in-flight recover batch.
 ///
 /// Outputs:
-/// - Reusable txn-id vector capacity for subsequent recover batches.
+/// - Reusable txn-id/request vector capacities for subsequent recover batches.
 struct RecoverBatchRecycle {
     txn_ids: Vec<TxnId>,
+    requests: Vec<rpc::RecoverRequest>,
 }
 
 /// Per-peer RPC state and queues.
+///
+/// Purpose:
+/// - Hold all peer-local channels, clients, and limiter handles.
+///
+/// Design:
+/// - Separates read and consensus clients.
+/// - Keeps dedicated GET limiter independent from consensus lane limiters.
+///
+/// Inputs:
+/// - Built from membership and runtime tuning settings.
+///
+/// Outputs:
+/// - Shared by transport call paths and peer snapshot collection.
 #[derive(Clone)]
 struct Peer {
     client: rpc::HoloRpcClient,
@@ -450,6 +485,8 @@ struct Peer {
     accept_limiter: Arc<InflightLimiter>,
     commit_limiter: Arc<InflightLimiter>,
     recover_limiter: Arc<InflightLimiter>,
+    kv_get_limiter: Arc<InflightLimiter>,
+    kv_batch_get_v2_capability: Arc<BatchLaneCapability>,
 }
 
 /// Work item for pre-accept RPCs.
@@ -659,6 +696,349 @@ where
     }
 }
 
+/// Per-batch capability path counters.
+///
+/// Purpose:
+/// - Surface packed-v2 attempt/disable decisions for telemetry.
+///
+/// Design:
+/// - Mutable per-call accumulator that callers merge into lane stats.
+///
+/// Inputs:
+/// - Updated inside v2-only batch call helpers.
+///
+/// Outputs:
+/// - One summarized path decision for the executed batch.
+#[derive(Default, Clone, Copy)]
+struct BatchPathStats {
+    v2_attempted: bool,
+    v2_disabled_event: bool,
+}
+
+/// Packed-v2 capability state for one peer+RPC lane.
+///
+/// Purpose:
+/// - Keep v2-only lanes on the packed fast path and suppress repeated retries
+///   after explicit incompatibility responses.
+///
+/// Design:
+/// - `state` tracks Enabled/Disabled capability.
+/// - All non-disabled lanes attempt v2.
+/// - Explicit `Unimplemented` marks lane disabled to fail fast on subsequent
+///   calls.
+///
+/// Inputs:
+/// - Updated on every batched RPC attempt.
+///
+/// Outputs:
+/// - Deterministic lane-level capability decisions.
+#[derive(Default)]
+struct BatchLaneCapability {
+    state: AtomicU8,
+}
+
+impl BatchLaneCapability {
+    /// Return whether this lane should attempt packed-v2.
+    ///
+    /// Purpose:
+    /// - Decide whether this call should attempt packed-v2.
+    ///
+    /// Design:
+    /// - Enabled lanes always try v2.
+    /// - Disabled lanes never try v2.
+    /// - Unknown lanes also try v2 optimistically.
+    ///
+    /// Inputs:
+    /// - None.
+    ///
+    /// Outputs:
+    /// - `true` when this call should attempt packed-v2.
+    fn should_attempt_v2(&self) -> bool {
+        // A disabled lane has already returned explicit Unimplemented; we
+        // intentionally do not retry to avoid repeated compatibility stalls.
+        !matches!(self.state.load(Ordering::Relaxed), V2_CAP_DISABLED)
+    }
+
+    /// Mark a successful packed-v2 call.
+    ///
+    /// Purpose:
+    /// - Persist v2 capability after a successful packed-v2 call.
+    ///
+    /// Design:
+    /// - Transitions state to enabled.
+    ///
+    /// Inputs:
+    /// - None.
+    ///
+    /// Outputs:
+    /// - Lane remains on fast path for future batches.
+    fn mark_v2_success(&self) {
+        self.state.store(V2_CAP_ENABLED, Ordering::Relaxed);
+    }
+
+    /// Mark explicit v2 unavailability (`Unimplemented`).
+    ///
+    /// Purpose:
+    /// - Disable future packed-v2 attempts for this lane.
+    ///
+    /// Design:
+    /// - Writes disabled state once.
+    ///
+    /// Inputs:
+    /// - None.
+    ///
+    /// Outputs:
+    /// - `true` when this call changed lane state to disabled.
+    fn mark_v2_unimplemented(&self) -> bool {
+        self.state.swap(V2_CAP_DISABLED, Ordering::Relaxed) != V2_CAP_DISABLED
+    }
+}
+
+/// Compute a strict maximum GET queue-age bound from configured batching wait.
+///
+/// Purpose:
+/// - Bound additional batching delay so stale queued GETs flush quickly.
+///
+/// Design:
+/// - Uses a small floor for tiny waits.
+/// - Scales with configured batch wait to preserve coalescing for healthy load.
+///
+/// Inputs:
+/// - `batch_wait`: configured per-lane coalescing window.
+///
+/// Outputs:
+/// - Maximum allowed head-of-queue age before immediate dispatch.
+fn kv_get_max_queue_wait(batch_wait: Duration) -> Duration {
+    let scaled = batch_wait
+        .checked_mul(KV_GET_MAX_QUEUE_WAIT_MULTIPLIER)
+        .unwrap_or(Duration::from_secs(1));
+    scaled.max(Duration::from_micros(KV_GET_MIN_QUEUE_WAIT_US))
+}
+
+/// Clamp GET batch wait so head-of-queue age never exceeds a strict cap.
+///
+/// Purpose:
+/// - Prevent split-stall amplification from waiting an extra full batch window
+///   on already-stale queue heads.
+///
+/// Design:
+/// - If current head age already exceeds `max_queue_wait`, return zero wait.
+/// - Otherwise return the smaller of configured batch wait and remaining age
+///   budget.
+///
+/// Inputs:
+/// - `head_enqueued_at`: enqueue timestamp of first item in batch.
+/// - `batch_start`: dequeue/build start timestamp.
+/// - `batch_wait`: configured coalescing window.
+/// - `max_queue_wait`: strict queue-age cap.
+/// - `queued_items_hint`: queue depth estimate including the head item.
+///
+/// Outputs:
+/// - Effective coalescing wait for this batch.
+fn kv_get_effective_batch_wait(
+    head_enqueued_at: std::time::Instant,
+    batch_start: std::time::Instant,
+    batch_wait: Duration,
+    max_queue_wait: Duration,
+    queued_items_hint: u64,
+) -> Duration {
+    if batch_wait.is_zero() || max_queue_wait.is_zero() {
+        return Duration::ZERO;
+    }
+    let head_age = batch_start.saturating_duration_since(head_enqueued_at);
+    if head_age >= max_queue_wait {
+        // Head item already waited too long in queue: dispatch immediately and
+        // do not wait for extra coalescing.
+        return Duration::ZERO;
+    }
+    let remaining = max_queue_wait - head_age;
+    let mut effective = batch_wait.min(remaining);
+    if queued_items_hint <= 1 {
+        // With only the head item queued, keep a tiny coalescing window so we
+        // can capture immediately arriving neighbors without adding a full batch
+        // wait to median latency.
+        effective = effective.min(Duration::from_micros(KV_GET_LOW_BACKLOG_WAIT_US));
+    }
+    effective
+}
+
+/// Decide whether the GET lane should dispatch immediately without coalescing.
+///
+/// Purpose:
+/// - Protect median read latency when backlog is tiny and limiter capacity is
+///   available.
+///
+/// Design:
+/// - Requires both low queue depth and immediate limiter capacity.
+/// - Intentionally does not bypass batching under backlog/saturation.
+///
+/// Inputs:
+/// - `queued_items_hint`: queue depth estimate including current head.
+/// - `limiter_has_capacity`: non-blocking limiter capacity probe result.
+///
+/// Outputs:
+/// - `true` when current head should skip batching wait.
+fn kv_get_should_dispatch_immediately(queued_items_hint: u64, limiter_has_capacity: bool) -> bool {
+    limiter_has_capacity && queued_items_hint <= KV_GET_IMMEDIATE_DISPATCH_QUEUE_DEPTH
+}
+
+/// Execute one batch RPC using packed-v2 only.
+///
+/// Purpose:
+/// - Use compact packed unary RPCs on all peers in v2-only deployments.
+///
+/// Design:
+/// - Attempt v2 unless lane capability is disabled.
+/// - On `Unimplemented`, disable v2 for this lane and fail fast.
+/// - Reuse caller-owned request vector on successful v2.
+///
+/// Inputs:
+/// - `timeout`: RPC timeout for packed-v2 call.
+/// - `lane_capability`: lane capability state.
+/// - `requests`: caller-owned request vector for one batch.
+/// - `rpc_name`: log/context name for error text.
+/// - `v2_call`: closure invoking v2 packed RPC.
+/// - `path_stats`: per-call capability path counters.
+///
+/// Outputs:
+/// - `(responses, recyclable_requests)` where `recyclable_requests` retains
+///   caller vector capacity when v2 succeeds.
+async fn call_batch_v2_only<Req, Resp, V2Call, V2Future>(
+    timeout: Duration,
+    lane_capability: &BatchLaneCapability,
+    requests: Vec<Req>,
+    rpc_name: &'static str,
+    v2_call: V2Call,
+    path_stats: &mut BatchPathStats,
+) -> anyhow::Result<(Vec<Resp>, Vec<Req>)>
+where
+    Req: pilota::pb::Message + Default,
+    Resp: pilota::pb::Message + Default,
+    V2Call: FnOnce(rpc::PackedBatchRequest) -> V2Future,
+    V2Future: std::future::Future<
+        Output = Result<volo_grpc::Response<rpc::PackedBatchResponse>, volo_grpc::Status>,
+    >,
+{
+    if !lane_capability.should_attempt_v2() {
+        // Fast-fail disabled lanes: this preserves correctness while avoiding
+        // repeated incompatible RPC attempts that cannot succeed.
+        return Err(anyhow::anyhow!(
+            "{rpc_name} packed-v2 lane disabled after explicit unimplemented response"
+        ));
+    }
+    path_stats.v2_attempted = true;
+    let (frame, end_offsets) = encode_items_to_parts(&requests)
+        .map_err(|err| anyhow::anyhow!("{rpc_name} packed request encode failed: {err}"))?;
+    let v2_result = time::timeout(
+        timeout,
+        v2_call(rpc::PackedBatchRequest { frame, end_offsets }),
+    )
+    .await;
+    match v2_result {
+        Ok(Ok(resp)) => {
+            let packed = resp.into_inner();
+            let responses = decode_items_from_parts::<Resp>(packed.frame, &packed.end_offsets)
+                .map_err(|err| {
+                    anyhow::anyhow!("{rpc_name} packed response decode failed: {err}")
+                })?;
+            lane_capability.mark_v2_success();
+            Ok((responses, requests))
+        }
+        Ok(Err(err)) if err.code() == volo_grpc::Code::Unimplemented => {
+            // In v2-only mode, explicit unimplemented is a hard compatibility
+            // failure; we mark lane disabled to avoid repeated incompatible calls.
+            path_stats.v2_disabled_event = lane_capability.mark_v2_unimplemented();
+            Err(anyhow::anyhow!("{rpc_name} packed-v2 unimplemented: {err}"))
+        }
+        Ok(Err(err)) => Err(anyhow::anyhow!("{rpc_name} rpc failed: {err}")),
+        Err(_) => Err(anyhow::anyhow!("{rpc_name} rpc timed out")),
+    }
+}
+
+/// Execute one KV batch-get RPC with packed-v2 only.
+///
+/// Purpose:
+/// - Keep quorum-read hot paths on packed-v2 without materializing intermediate
+///   `Vec<KvGetRequest>` wrappers.
+///
+/// Design:
+/// - Encodes `keys` directly into packed `KvGetRequest` items with
+///   `PackedBatchBuilder`.
+/// - Attempts v2 unless lane capability is disabled.
+/// - On `Unimplemented`, disables v2 for this lane and returns an error.
+///
+/// Inputs:
+/// - `timeout`: RPC timeout for packed-v2 call.
+/// - `lane_capability`: lane capability state.
+/// - `keys`: ordered key payloads for one batch (borrowed so caller retains
+///   vector ownership/capacity).
+/// - `rpc_name`: log/context name for error text.
+/// - `v2_call`: closure invoking packed-v2 RPC.
+/// - `path_stats`: per-call capability path counters.
+///
+/// Outputs:
+/// - Ordered `KvGetResponse` list aligned 1:1 with input keys.
+async fn call_kv_batch_get_v2_only<V2Call, V2Future>(
+    timeout: Duration,
+    lane_capability: &BatchLaneCapability,
+    keys: &[Bytes],
+    rpc_name: &'static str,
+    v2_call: V2Call,
+    path_stats: &mut BatchPathStats,
+) -> anyhow::Result<Vec<rpc::KvGetResponse>>
+where
+    V2Call: FnOnce(rpc::PackedBatchRequest) -> V2Future,
+    V2Future: std::future::Future<
+        Output = Result<volo_grpc::Response<rpc::PackedBatchResponse>, volo_grpc::Status>,
+    >,
+{
+    if !lane_capability.should_attempt_v2() {
+        // Fast-fail disabled lanes: this preserves correctness while avoiding
+        // repeated incompatible RPC attempts that cannot succeed.
+        return Err(anyhow::anyhow!(
+            "{rpc_name} packed-v2 lane disabled after explicit unimplemented response"
+        ));
+    }
+    path_stats.v2_attempted = true;
+    let frame_hint = keys
+        .iter()
+        .map(|key| key.len().saturating_add(8))
+        .sum::<usize>();
+    let mut builder = PackedBatchBuilder::with_capacity(keys.len(), frame_hint);
+    // Preserve key ordering exactly; this loop intentionally does not
+    // reorder/deduplicate keys because caller order defines response routing.
+    for key in keys {
+        let req = rpc::KvGetRequest { key: key.clone() };
+        builder
+            .push(&req)
+            .map_err(|err| anyhow::anyhow!("{rpc_name} packed request encode failed: {err}"))?;
+    }
+    let (frame, end_offsets) = builder.finish();
+    let v2_result = time::timeout(
+        timeout,
+        v2_call(rpc::PackedBatchRequest { frame, end_offsets }),
+    )
+    .await;
+    match v2_result {
+        Ok(Ok(resp)) => {
+            let packed = resp.into_inner();
+            let responses =
+                decode_items_from_parts::<rpc::KvGetResponse>(packed.frame, &packed.end_offsets)
+                    .map_err(|err| {
+                        anyhow::anyhow!("{rpc_name} packed response decode failed: {err}")
+                    })?;
+            lane_capability.mark_v2_success();
+            Ok(responses)
+        }
+        Ok(Err(err)) if err.code() == volo_grpc::Code::Unimplemented => {
+            path_stats.v2_disabled_event = lane_capability.mark_v2_unimplemented();
+            Err(anyhow::anyhow!("{rpc_name} packed-v2 unimplemented: {err}"))
+        }
+        Ok(Err(err)) => Err(anyhow::anyhow!("{rpc_name} rpc failed: {err}")),
+        Err(_) => Err(anyhow::anyhow!("{rpc_name} rpc timed out")),
+    }
+}
+
 /// Guard that releases the in-flight permit on drop.
 struct InflightPermit {
     limiter: Arc<InflightLimiter>,
@@ -839,6 +1219,21 @@ impl GrpcTransport {
         }
     }
 
+    /// Build one peer transport entry and spawn all per-lane workers.
+    ///
+    /// Purpose:
+    /// - Construct isolated per-peer queues, limiters, and worker tasks.
+    ///
+    /// Design:
+    /// - Uses separate clients for consensus and read RPCs.
+    /// - Uses distinct per-lane limiters so GET concurrency is isolated from
+    ///   consensus tuning signals.
+    ///
+    /// Inputs:
+    /// - Peer address plus batching/timeout/limiter knobs.
+    ///
+    /// Outputs:
+    /// - Fully initialized `Peer` with active background workers.
     fn build_peer(
         addr: SocketAddr,
         rpc_timeout: Duration,
@@ -886,6 +1281,12 @@ impl GrpcTransport {
             inflight_tuning.min,
             inflight_tuning.max,
         ));
+        let kv_get_limiter = Arc::new(InflightLimiter::new(
+            inflight_limit,
+            inflight_tuning.min,
+            inflight_tuning.max,
+        ));
+        let kv_batch_get_v2_capability = Arc::new(BatchLaneCapability::default());
 
         spawn_kv_get_batcher(
             read_client.clone(),
@@ -895,6 +1296,7 @@ impl GrpcTransport {
             batch_wait,
             stats.clone(),
             peer_stats.clone(),
+            kv_get_limiter.clone(),
         );
         spawn_pre_accept_batcher(
             consensus_client.clone(),
@@ -952,6 +1354,8 @@ impl GrpcTransport {
             accept_limiter,
             commit_limiter,
             recover_limiter,
+            kv_get_limiter,
+            kv_batch_get_v2_capability,
         }
     }
 
@@ -990,6 +1394,20 @@ impl GrpcTransport {
     }
 
     /// Collect and reset per-peer stats snapshots, applying inflight tuning.
+    ///
+    /// Purpose:
+    /// - Produce peer snapshots for logging/tuning while resetting rolling
+    ///   counters.
+    ///
+    /// Design:
+    /// - Applies adaptive tuning only to consensus lanes.
+    /// - Reports GET lane limit separately to keep read tuning independent.
+    ///
+    /// Inputs:
+    /// - None.
+    ///
+    /// Outputs:
+    /// - One `(peer_id, snapshot)` entry per known peer.
     pub async fn peer_stats_snapshots(&self) -> Vec<(NodeId, PeerStatsSnapshot)> {
         let now_us = epoch_micros();
         let peers = self.peers.read().unwrap().clone();
@@ -1026,10 +1444,12 @@ impl GrpcTransport {
             peer.commit_limiter.adjust(limit);
             peer.recover_limiter.adjust(limit);
             snap.rpc_inflight_limit = limit as u64;
+            snap.kv_get_inflight_limit = peer.kv_get_limiter.current() as u64;
             if changed {
                 tracing::info!(
                     peer = id,
                     inflight_limit = limit,
+                    kv_get_inflight_limit = snap.kv_get_inflight_limit,
                     queue_total = queue_total,
                     wait_max_ms = wait_max_ms,
                     "rpc inflight tuned"
@@ -1041,6 +1461,21 @@ impl GrpcTransport {
     }
 
     /// Perform a batched KV GET via the peer's queue-based pipeline.
+    ///
+    /// Purpose:
+    /// - Enqueue one key read into the per-peer GET batching lane.
+    ///
+    /// Design:
+    /// - Uses queue-based batching worker for coalescing and bounded in-flight
+    ///   execution.
+    /// - Preserves per-request timeout semantics at call site.
+    ///
+    /// Inputs:
+    /// - `target`: remote node id.
+    /// - `key`: key bytes to read.
+    ///
+    /// Outputs:
+    /// - Optional `(value, version)` or an error/timeout.
     pub async fn kv_get(
         &self,
         target: NodeId,
@@ -1050,6 +1485,9 @@ impl GrpcTransport {
 
         let (tx, rx) = oneshot::channel();
         peer.stats.kv_get_sent.fetch_add(1, Ordering::Relaxed);
+        peer.stats
+            .kv_get_last_enqueue_us
+            .store(epoch_micros(), Ordering::Relaxed);
         peer.stats.kv_get_queue.fetch_add(1, Ordering::Relaxed);
         if let Err(_) = peer
             .kv_get_tx
@@ -1072,30 +1510,51 @@ impl GrpcTransport {
         }
     }
 
-    /// Perform a direct batch get RPC against a peer (no coalescing queue).
+    /// Perform a direct batch-get RPC against a peer (no coalescing queue).
+    ///
+    /// Purpose:
+    /// - Serve quorum-read fanout with low allocation overhead.
+    ///
+    /// Design:
+    /// - Uses packed-v2 only and fails fast if peer capability is incompatible.
+    /// - Preserves request order and converts responses to `(value, version)`
+    ///   tuples expected by read-path merge logic.
+    ///
+    /// Inputs:
+    /// - `target`: remote node id.
+    /// - `keys`: ordered key bytes for one shard-local batch.
+    ///
+    /// Outputs:
+    /// - Ordered optional `(value, version)` entries aligned with input keys.
     pub async fn kv_batch_get(
         &self,
         target: NodeId,
-        keys: Vec<Vec<u8>>,
+        keys: Vec<Bytes>,
     ) -> anyhow::Result<Vec<Option<(Vec<u8>, Version)>>> {
         let peer = self.peer(target)?;
-
-        let keys = keys.into_iter().map(Into::into).collect();
         let start = std::time::Instant::now();
-        let result = time::timeout(
+        let mut path_stats = BatchPathStats::default();
+        let client_v2 = peer.read_client.clone();
+        let result = call_kv_batch_get_v2_only(
             self.rpc_timeout,
-            peer.read_client
-                .kv_batch_get(rpc::KvBatchGetRequest { keys }),
+            &peer.kv_batch_get_v2_capability,
+            &keys,
+            "kv_batch_get_v2",
+            move |packed| {
+                let client = client_v2.clone();
+                async move { client.kv_batch_get_v2(packed).await }
+            },
+            &mut path_stats,
         )
         .await;
         let rpc_us = start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        peer.stats.record_kv_get_path_stats(path_stats);
 
         match result {
-            Ok(Ok(resp)) => {
+            Ok(responses) => {
                 self.stats.record_kv_batch_get(rpc_us, false);
-                let resp = resp.into_inner();
-                let mut out = Vec::with_capacity(resp.responses.len());
-                for item in resp.responses {
+                let mut out = Vec::with_capacity(responses.len());
+                for item in responses {
                     if !item.has_value {
                         out.push(None);
                     } else {
@@ -1105,13 +1564,9 @@ impl GrpcTransport {
                 }
                 Ok(out)
             }
-            Ok(Err(err)) => {
+            Err(err) => {
                 self.stats.record_kv_batch_get(rpc_us, true);
-                Err(anyhow::anyhow!("kv_batch_get rpc failed: {err}"))
-            }
-            Err(_) => {
-                self.stats.record_kv_batch_get(rpc_us, true);
-                Err(anyhow::anyhow!("kv_batch_get rpc timed out"))
+                Err(err)
             }
         }
     }
@@ -1442,13 +1897,18 @@ impl GrpcTransport {
 ///
 /// Design:
 /// - One long-lived worker owns dequeue, batch build, and RPC execution.
+/// - Uses `FuturesUnordered` and a dedicated GET limiter to allow bounded
+///   in-flight read batches without borrowing consensus-lane permits.
+/// - Clamps effective batch wait by head queue age so stale reads flush
+///   immediately instead of waiting an extra coalescing window.
 /// - Reuses hot-path vectors (`KvGetWork` item buffers and waiter senders) via
 ///   bounded pools to reduce allocator churn on read-heavy workloads.
 /// - Keeps response fan-out linear and deterministic by preserving original
 ///   queue order within each batch.
 ///
 /// Inputs:
-/// - Peer client, queue receiver, timeout/batching knobs, shared stats.
+/// - Peer client, queue receiver, timeout/batching knobs, shared stats, and
+///   one dedicated GET in-flight limiter.
 ///
 /// Outputs:
 /// - Batched `kv_batch_get` RPC calls and per-request response completion.
@@ -1460,110 +1920,225 @@ fn spawn_kv_get_batcher(
     batch_wait: Duration,
     stats: Arc<RpcStats>,
     peer_stats: Arc<PeerStats>,
+    limiter: Arc<InflightLimiter>,
 ) {
     tokio::spawn(async move {
         let reuse_max_capacity = batch_max
             .saturating_mul(REUSE_POOL_CAPACITY_MULTIPLIER)
             .max(1);
-        let mut item_pool = ReuseVecPool::<KvGetWork>::new(4, reuse_max_capacity);
-        let mut tx_pool = ReuseVecPool::<KvGetReplyTx>::new(4, reuse_max_capacity);
-        while let Some(first) = rx.recv().await {
-            let items_buf = item_pool.take(batch_max.max(1));
-            let mut items =
-                collect_batch_reuse(items_buf, first, &mut rx, batch_max, batch_wait).await;
-
-            let batch_len = items.len() as u64;
-            peer_stats
-                .kv_get_queue
-                .fetch_sub(batch_len, Ordering::Relaxed);
-            let mut txs = tx_pool.take(items.len());
-            let mut keys = Vec::with_capacity(items.len());
-            let batch_start = std::time::Instant::now();
-            let mut wait_us_total = 0u64;
-            let mut wait_us_max = 0u64;
-            // Build one batch request in dequeue order so response fan-out maps
-            // 1:1 to queued waiters. We intentionally do not re-order keys.
-            for KvGetWork {
-                key,
-                tx,
-                enqueued_at,
-            } in items.drain(..)
-            {
-                // Track queue wait time for each request in the batch.
-                let wait_us = batch_start
-                    .duration_since(enqueued_at)
-                    .as_micros()
-                    .min(u128::from(u64::MAX)) as u64;
-                wait_us_total = wait_us_total.saturating_add(wait_us);
-                wait_us_max = wait_us_max.max(wait_us);
-                txs.push(tx);
-                keys.push(key.into());
+        let reuse_max_cached = limiter.current().clamp(1, REUSE_POOL_MAX_CACHED);
+        let mut item_pool = ReuseVecPool::<KvGetWork>::new(reuse_max_cached, reuse_max_capacity);
+        let mut tx_pool = ReuseVecPool::<KvGetReplyTx>::new(reuse_max_cached, reuse_max_capacity);
+        let mut key_pool = ReuseVecPool::<Bytes>::new(reuse_max_cached, reuse_max_capacity);
+        let v2_capability = Arc::new(BatchLaneCapability::default());
+        let max_queue_wait = kv_get_max_queue_wait(batch_wait);
+        let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+        let mut rx_closed = false;
+        loop {
+            // Exit only after queue shutdown and all in-flight RPCs complete.
+            if rx_closed && in_flight.is_empty() {
+                break;
             }
-            // Recycle the now-drained item buffer immediately.
-            item_pool.put(items);
+            tokio::select! {
+                maybe = rx.recv(), if !rx_closed => {
+                    match maybe {
+                        Some(first) => {
+                            let dequeue_start = std::time::Instant::now();
+                            let queued_items_hint = peer_stats.kv_get_queue.load(Ordering::Relaxed);
+                            // Probe limiter capacity only on low-backlog shapes where
+                            // immediate dispatch is potentially beneficial.
+                            let mut preacquired_permit: Option<InflightPermit> =
+                                if queued_items_hint <= KV_GET_IMMEDIATE_DISPATCH_QUEUE_DEPTH {
+                                    limiter.try_acquire()
+                                } else {
+                                    None
+                                };
+                            let effective_wait = if kv_get_should_dispatch_immediately(
+                                queued_items_hint,
+                                preacquired_permit.is_some(),
+                            ) {
+                                // With minimal backlog and available capacity, bypass
+                                // coalescing delay to protect p50/p75.
+                                Duration::ZERO
+                            } else {
+                                // Backlog or saturation path: release speculative permit and
+                                // retain queue-age-capped batching behavior.
+                                preacquired_permit = None;
+                                kv_get_effective_batch_wait(
+                                    first.enqueued_at,
+                                    dequeue_start,
+                                    batch_wait,
+                                    max_queue_wait,
+                                    queued_items_hint,
+                                )
+                            };
+                            let items_buf = item_pool.take(batch_max.max(1));
+                            let mut items = collect_batch_with_progress(
+                                items_buf,
+                                first,
+                                &mut rx,
+                                batch_max,
+                                effective_wait,
+                                &mut in_flight,
+                                |recycle: WaiterBatchRecycle<Option<(Vec<u8>, Version)>, Bytes>| {
+                                    tx_pool.put(recycle.txs);
+                                    key_pool.put(recycle.requests);
+                                },
+                            ).await;
 
-            peer_stats.kv_get_inflight.fetch_add(1, Ordering::Relaxed);
-            let rpc_start = std::time::Instant::now();
-            // `volo` unary calls consume the request message by value; this keys
-            // vector is intentionally one-per-batch until the transport API can
-            // support reclaimable request buffers.
-            let result = time::timeout(
-                timeout,
-                client.kv_batch_get(rpc::KvBatchGetRequest { keys }),
-            )
-            .await;
-            let rpc_us = rpc_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-            peer_stats.kv_get_inflight.fetch_sub(1, Ordering::Relaxed);
-            stats.record_kv_get_batch(batch_len, wait_us_total, wait_us_max, rpc_us);
-            peer_stats.kv_get_latency.record(rpc_us);
+                            let batch_len = items.len() as u64;
+                            peer_stats
+                                .kv_get_queue
+                                .fetch_sub(batch_len, Ordering::Relaxed);
+                            let mut txs = tx_pool.take(items.len());
+                            let mut keys = key_pool.take(items.len());
+                            let batch_start = std::time::Instant::now();
+                            let mut wait_us_total = 0u64;
+                            let mut wait_us_max = 0u64;
+                            let mut head_wait_us = 0u64;
+                            let mut first_in_batch = true;
+                            // Build one batch request in dequeue order so response fan-out maps
+                            // 1:1 to queued waiters. We intentionally do not re-order keys.
+                            for KvGetWork {
+                                key,
+                                tx,
+                                enqueued_at,
+                            } in items.drain(..)
+                            {
+                                // Track queue wait time for each request in the batch.
+                                let wait_us = batch_start
+                                    .duration_since(enqueued_at)
+                                    .as_micros()
+                                    .min(u128::from(u64::MAX)) as u64;
+                                if first_in_batch {
+                                    // Head queue age approximates batch staleness at dispatch.
+                                    head_wait_us = wait_us;
+                                    first_in_batch = false;
+                                }
+                                wait_us_total = wait_us_total.saturating_add(wait_us);
+                                wait_us_max = wait_us_max.max(wait_us);
+                                txs.push(tx);
+                                // Keep key payload transfer zero-copy at this layer.
+                                keys.push(Bytes::from(key));
+                            }
+                            // Recycle the now-drained item buffer immediately.
+                            item_pool.put(items);
 
-            match result {
-                Ok(Ok(resp)) => {
-                    let resp = resp.into_inner();
-                    if resp.responses.len() != txs.len() {
-                        // Reject if server returned a mismatched response count.
-                        let err = anyhow::anyhow!(
-                            "kv_batch_get response count mismatch (expected {}, got {})",
-                            txs.len(),
-                            resp.responses.len()
-                        );
-                        peer_stats.kv_get_errors.fetch_add(1, Ordering::Relaxed);
-                        for tx in txs.drain(..) {
-                            let _ = tx.send(Err(anyhow::anyhow!("{err}")));
+                            peer_stats
+                                .kv_get_last_dequeue_us
+                                .store(epoch_micros(), Ordering::Relaxed);
+                            peer_stats
+                                .kv_get_wait_total_us
+                                .fetch_add(wait_us_total, Ordering::Relaxed);
+                            peer_stats
+                                .kv_get_wait_max_us
+                                .fetch_max(wait_us_max, Ordering::Relaxed);
+                            peer_stats
+                                .kv_get_wait_count
+                                .fetch_add(batch_len, Ordering::Relaxed);
+                            peer_stats
+                                .kv_get_head_wait_total_us
+                                .fetch_add(head_wait_us, Ordering::Relaxed);
+                            peer_stats
+                                .kv_get_head_wait_max_us
+                                .fetch_max(head_wait_us, Ordering::Relaxed);
+                            peer_stats
+                                .kv_get_head_wait_count
+                                .fetch_add(1, Ordering::Relaxed);
+
+                            // Track limiter saturation separately for GET so read-tail tuning
+                            // can be isolated from consensus lane behavior.
+                            let (permit, saturated) = if let Some(permit) = preacquired_permit {
+                                (permit, false)
+                            } else if let Some(permit) = limiter.try_acquire() {
+                                (permit, false)
+                            } else {
+                                (acquire_with_progress(&limiter, &mut in_flight).await, true)
+                            };
+                            if saturated {
+                                peer_stats
+                                    .kv_get_limiter_saturated
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+
+                            let client = client.clone();
+                            let stats = stats.clone();
+                            let peer_stats = peer_stats.clone();
+                            let v2_capability = v2_capability.clone();
+                            in_flight.push(async move {
+                                let _permit = permit;
+                                peer_stats.kv_get_inflight.fetch_add(1, Ordering::Relaxed);
+                                let rpc_start = std::time::Instant::now();
+                                let client_v2 = client.clone();
+                                let mut path_stats = BatchPathStats::default();
+                                let result = call_kv_batch_get_v2_only(
+                                    timeout,
+                                    &v2_capability,
+                                    &keys,
+                                    "kv_batch_get_v2",
+                                    move |packed| {
+                                        let client = client_v2.clone();
+                                        async move { client.kv_batch_get_v2(packed).await }
+                                    },
+                                    &mut path_stats,
+                                )
+                                .await;
+                                let rpc_us = rpc_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                                peer_stats.kv_get_inflight.fetch_sub(1, Ordering::Relaxed);
+                                stats.record_kv_get_batch(batch_len, wait_us_total, wait_us_max, rpc_us);
+                                peer_stats.kv_get_latency.record(rpc_us);
+                                peer_stats.record_kv_get_path_stats(path_stats);
+
+                                match result {
+                                    Ok(responses) => {
+                                        if responses.len() != txs.len() {
+                                            // Reject if server returned a mismatched response count.
+                                            let err = anyhow::anyhow!(
+                                                "kv_batch_get response count mismatch (expected {}, got {})",
+                                                txs.len(),
+                                                responses.len()
+                                            );
+                                            peer_stats.kv_get_errors.fetch_add(1, Ordering::Relaxed);
+                                            for tx in txs.drain(..) {
+                                                let _ = tx.send(Err(anyhow::anyhow!("{err}")));
+                                            }
+                                            return WaiterBatchRecycle { txs, requests: keys };
+                                        }
+
+                                        for (tx, item) in txs.drain(..).zip(responses) {
+                                            if !item.has_value {
+                                                let _ = tx.send(Ok(None));
+                                            } else {
+                                                let version = from_rpc_version(item.version);
+                                                let _ = tx.send(Ok(Some((item.value.to_vec(), version))));
+                                            }
+                                        }
+                                        WaiterBatchRecycle { txs, requests: keys }
+                                    }
+                                    Err(err) => {
+                                        // RPC error (or timeout): notify all waiters.
+                                        stats.record_kv_get_error();
+                                        peer_stats.kv_get_errors.fetch_add(1, Ordering::Relaxed);
+                                        let err = anyhow::anyhow!("{err}");
+                                        for tx in txs.drain(..) {
+                                            let _ = tx.send(Err(anyhow::anyhow!("{err}")));
+                                        }
+                                        WaiterBatchRecycle { txs, requests: keys }
+                                    }
+                                }
+                            });
                         }
-                        tx_pool.put(txs);
-                        continue;
-                    }
-
-                    for (tx, item) in txs.drain(..).zip(resp.responses) {
-                        if !item.has_value {
-                            let _ = tx.send(Ok(None));
-                        } else {
-                            let version = from_rpc_version(item.version);
-                            let _ = tx.send(Ok(Some((item.value.to_vec(), version))));
+                        None => {
+                            rx_closed = true;
                         }
                     }
-                    tx_pool.put(txs);
                 }
-                Ok(Err(err)) => {
-                    // RPC error: notify all waiters.
-                    stats.record_kv_get_error();
-                    peer_stats.kv_get_errors.fetch_add(1, Ordering::Relaxed);
-                    let err = anyhow::anyhow!("kv_batch_get rpc failed: {err}");
-                    for tx in txs.drain(..) {
-                        let _ = tx.send(Err(anyhow::anyhow!("{err}")));
+                done = in_flight.next(), if !in_flight.is_empty() => {
+                    // Keep driving in-flight futures even when queue load is low.
+                    if let Some(recycle) = done {
+                        tx_pool.put(recycle.txs);
+                        key_pool.put(recycle.requests);
                     }
-                    tx_pool.put(txs);
-                }
-                Err(_) => {
-                    // Timeout: notify all waiters.
-                    stats.record_kv_get_error();
-                    peer_stats.kv_get_errors.fetch_add(1, Ordering::Relaxed);
-                    let err = anyhow::anyhow!("kv_batch_get rpc timed out");
-                    for tx in txs.drain(..) {
-                        let _ = tx.send(Err(anyhow::anyhow!("{err}")));
-                    }
-                    tx_pool.put(txs);
                 }
             }
         }
@@ -1609,6 +2184,9 @@ fn spawn_pre_accept_batcher(
             reuse_max_cached,
             reuse_max_capacity,
         );
+        let mut request_pool =
+            ReuseVecPool::<rpc::PreAcceptRequest>::new(reuse_max_cached, reuse_max_capacity);
+        let v2_capability = Arc::new(BatchLaneCapability::default());
         let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
         let mut rx_closed = false;
         loop {
@@ -1628,8 +2206,9 @@ fn spawn_pre_accept_batcher(
                                 batch_max,
                                 batch_wait,
                                 &mut in_flight,
-                                |recycle: WaiterBatchRecycle<PreAcceptResponse>| {
+                                |recycle: WaiterBatchRecycle<PreAcceptResponse, rpc::PreAcceptRequest>| {
                                     tx_pool.put(recycle.txs);
+                                    request_pool.put(recycle.requests);
                                 },
                             ).await;
 
@@ -1638,7 +2217,7 @@ fn spawn_pre_accept_batcher(
                                 .pre_accept_queue
                                 .fetch_sub(batch_len, Ordering::Relaxed);
                             let mut txs = tx_pool.take(items.len());
-                            let mut requests = Vec::with_capacity(items.len());
+                            let mut requests = request_pool.take(items.len());
                             let batch_start = std::time::Instant::now();
                             let mut wait_us_total = 0u64;
                             let mut wait_us_max = 0u64;
@@ -1680,15 +2259,25 @@ fn spawn_pre_accept_batcher(
                             let client = client.clone();
                             let stats = stats.clone();
                             let peer_stats = peer_stats.clone();
+                            let v2_capability = v2_capability.clone();
                             in_flight.push(async move {
                                 let _permit = permit;
                                 peer_stats
                                     .pre_accept_inflight
                                     .fetch_add(1, Ordering::Relaxed);
                                 let rpc_start = std::time::Instant::now();
-                                let result = time::timeout(
+                                let client_v2 = client.clone();
+                                let mut path_stats = BatchPathStats::default();
+                                let result = call_batch_v2_only(
                                     timeout,
-                                    client.pre_accept_batch(rpc::PreAcceptBatchRequest { requests }),
+                                    &v2_capability,
+                                    requests,
+                                    "pre_accept_batch_v2",
+                                    move |packed| {
+                                        let client = client_v2.clone();
+                                        async move { client.pre_accept_batch_v2(packed).await }
+                                    },
+                                    &mut path_stats,
                                 )
                                 .await;
                                 let rpc_us = rpc_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
@@ -1697,51 +2286,51 @@ fn spawn_pre_accept_batcher(
                                     .fetch_sub(1, Ordering::Relaxed);
                                 stats.record_pre_accept_batch(batch_len, wait_us_total, wait_us_max, rpc_us);
                                 peer_stats.pre_accept_latency.record(rpc_us);
+                                peer_stats.record_pre_accept_path_stats(path_stats);
 
                                 match result {
-                                    Ok(Ok(resp)) => {
-                                        let resp = resp.into_inner();
-                                        if resp.responses.len() != txs.len() {
+                                    Ok((responses, requests)) => {
+                                        if responses.len() != txs.len() {
                                             // Reject if server returned a mismatched response count.
                                             let err = anyhow::anyhow!(
                                                 "pre_accept_batch response count mismatch (expected {}, got {})",
                                                 txs.len(),
-                                                resp.responses.len()
+                                                responses.len()
                                             );
                                             peer_stats.pre_accept_errors.fetch_add(1, Ordering::Relaxed);
                                             for tx in txs.drain(..) {
                                                 let _ = tx.send(Err(anyhow::anyhow!("{err}")));
                                             }
-                                            return WaiterBatchRecycle { txs };
+                                            return WaiterBatchRecycle { txs, requests };
                                         }
 
-                                        for (tx, r) in txs.drain(..).zip(resp.responses) {
+                                        for (tx, r) in txs.drain(..).zip(responses) {
                                             let _ = tx.send(Ok(from_rpc_pre_accept(r)));
                                         }
+                                        WaiterBatchRecycle { txs, requests }
                                     }
-                                    Ok(Err(err)) => {
+                                    Err(err) => {
                                         // RPC error: notify all waiters.
                                         stats.record_pre_accept_error();
+                                        if err
+                                            .to_string()
+                                            .contains("timed out")
+                                        {
+                                            peer_stats
+                                                .pre_accept_timeouts
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        }
                                         peer_stats.pre_accept_errors.fetch_add(1, Ordering::Relaxed);
-                                        let err = anyhow::anyhow!("pre_accept_batch rpc failed: {err}");
+                                        let err = anyhow::anyhow!("{err}");
                                         for tx in txs.drain(..) {
                                             let _ = tx.send(Err(anyhow::anyhow!("{err}")));
                                         }
-                                    }
-                                    Err(_) => {
-                                        // Timeout: notify all waiters.
-                                        stats.record_pre_accept_error();
-                                        peer_stats
-                                            .pre_accept_timeouts
-                                            .fetch_add(1, Ordering::Relaxed);
-                                        peer_stats.pre_accept_errors.fetch_add(1, Ordering::Relaxed);
-                                        let err = anyhow::anyhow!("pre_accept_batch rpc timed out");
-                                        for tx in txs.drain(..) {
-                                            let _ = tx.send(Err(anyhow::anyhow!("{err}")));
-                                        }
+                                        // Preserve pool capacity after errors so the next batch
+                                        // can reuse request storage without fresh allocation.
+                                        let requests = Vec::with_capacity(batch_len as usize);
+                                        WaiterBatchRecycle { txs, requests }
                                     }
                                 }
-                                WaiterBatchRecycle { txs }
                             });
                         }
                         None => {
@@ -1753,6 +2342,7 @@ fn spawn_pre_accept_batcher(
                     // Keep driving in-flight futures even when queue load is low.
                     if let Some(recycle) = done {
                         tx_pool.put(recycle.txs);
+                        request_pool.put(recycle.requests);
                     }
                 }
             }
@@ -1796,6 +2386,9 @@ fn spawn_accept_batcher(
             reuse_max_cached,
             reuse_max_capacity,
         );
+        let mut request_pool =
+            ReuseVecPool::<rpc::AcceptRequest>::new(reuse_max_cached, reuse_max_capacity);
+        let v2_capability = Arc::new(BatchLaneCapability::default());
         let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
         let mut rx_closed = false;
         loop {
@@ -1815,8 +2408,9 @@ fn spawn_accept_batcher(
                                 batch_max,
                                 batch_wait,
                                 &mut in_flight,
-                                |recycle: WaiterBatchRecycle<AcceptResponse>| {
+                                |recycle: WaiterBatchRecycle<AcceptResponse, rpc::AcceptRequest>| {
                                     tx_pool.put(recycle.txs);
+                                    request_pool.put(recycle.requests);
                                 },
                             ).await;
 
@@ -1825,7 +2419,7 @@ fn spawn_accept_batcher(
                                 .accept_queue
                                 .fetch_sub(batch_len, Ordering::Relaxed);
                             let mut txs = tx_pool.take(items.len());
-                            let mut requests = Vec::with_capacity(items.len());
+                            let mut requests = request_pool.take(items.len());
                             let batch_start = std::time::Instant::now();
                             let mut wait_us_total = 0u64;
                             let mut wait_us_max = 0u64;
@@ -1867,62 +2461,72 @@ fn spawn_accept_batcher(
                             let client = client.clone();
                             let stats = stats.clone();
                             let peer_stats = peer_stats.clone();
+                            let v2_capability = v2_capability.clone();
                             in_flight.push(async move {
                                 let _permit = permit;
                                 peer_stats.accept_inflight.fetch_add(1, Ordering::Relaxed);
                                 let rpc_start = std::time::Instant::now();
-                                let result = time::timeout(
+                                let client_v2 = client.clone();
+                                let mut path_stats = BatchPathStats::default();
+                                let result = call_batch_v2_only(
                                     timeout,
-                                    client.accept_batch(rpc::AcceptBatchRequest { requests }),
+                                    &v2_capability,
+                                    requests,
+                                    "accept_batch_v2",
+                                    move |packed| {
+                                        let client = client_v2.clone();
+                                        async move { client.accept_batch_v2(packed).await }
+                                    },
+                                    &mut path_stats,
                                 )
                                 .await;
                                 let rpc_us = rpc_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
                                 peer_stats.accept_inflight.fetch_sub(1, Ordering::Relaxed);
                                 stats.record_accept_batch(batch_len, wait_us_total, wait_us_max, rpc_us);
                                 peer_stats.accept_latency.record(rpc_us);
+                                peer_stats.record_accept_path_stats(path_stats);
 
                                 match result {
-                                    Ok(Ok(resp)) => {
-                                        let resp = resp.into_inner();
-                                        if resp.responses.len() != txs.len() {
+                                    Ok((responses, requests)) => {
+                                        if responses.len() != txs.len() {
                                             // Reject if server returned a mismatched response count.
                                             let err = anyhow::anyhow!(
                                                 "accept_batch response count mismatch (expected {}, got {})",
                                                 txs.len(),
-                                                resp.responses.len()
+                                                responses.len()
                                             );
                                             peer_stats.accept_errors.fetch_add(1, Ordering::Relaxed);
                                             for tx in txs.drain(..) {
                                                 let _ = tx.send(Err(anyhow::anyhow!("{err}")));
                                             }
-                                            return WaiterBatchRecycle { txs };
+                                            return WaiterBatchRecycle { txs, requests };
                                         }
 
-                                        for (tx, r) in txs.drain(..).zip(resp.responses) {
+                                        for (tx, r) in txs.drain(..).zip(responses) {
                                             let _ = tx.send(Ok(from_rpc_accept(r)));
                                         }
+                                        WaiterBatchRecycle { txs, requests }
                                     }
-                                    Ok(Err(err)) => {
+                                    Err(err) => {
                                         // RPC error: notify all waiters.
                                         stats.record_accept_error();
+                                        if err
+                                            .to_string()
+                                            .contains("timed out")
+                                        {
+                                            peer_stats.accept_timeouts.fetch_add(1, Ordering::Relaxed);
+                                        }
                                         peer_stats.accept_errors.fetch_add(1, Ordering::Relaxed);
-                                        let err = anyhow::anyhow!("accept_batch rpc failed: {err}");
+                                        let err = anyhow::anyhow!("{err}");
                                         for tx in txs.drain(..) {
                                             let _ = tx.send(Err(anyhow::anyhow!("{err}")));
                                         }
-                                    }
-                                    Err(_) => {
-                                        // Timeout: notify all waiters.
-                                        stats.record_accept_error();
-                                        peer_stats.accept_timeouts.fetch_add(1, Ordering::Relaxed);
-                                        peer_stats.accept_errors.fetch_add(1, Ordering::Relaxed);
-                                        let err = anyhow::anyhow!("accept_batch rpc timed out");
-                                        for tx in txs.drain(..) {
-                                            let _ = tx.send(Err(anyhow::anyhow!("{err}")));
-                                        }
+                                        // Preserve pool capacity after errors so the next batch
+                                        // can reuse request storage without fresh allocation.
+                                        let requests = Vec::with_capacity(batch_len as usize);
+                                        WaiterBatchRecycle { txs, requests }
                                     }
                                 }
-                                WaiterBatchRecycle { txs }
                             });
                         }
                         None => {
@@ -1934,6 +2538,7 @@ fn spawn_accept_batcher(
                     // Keep driving in-flight futures even when queue load is low.
                     if let Some(recycle) = done {
                         tx_pool.put(recycle.txs);
+                        request_pool.put(recycle.requests);
                     }
                 }
             }
@@ -1978,6 +2583,9 @@ fn spawn_commit_batcher(
             reuse_max_cached,
             reuse_max_capacity,
         );
+        let mut request_pool =
+            ReuseVecPool::<rpc::CommitRequest>::new(reuse_max_cached, reuse_max_capacity);
+        let v2_capability = Arc::new(BatchLaneCapability::default());
         let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
         let mut rx_closed = false;
         loop {
@@ -1997,8 +2605,9 @@ fn spawn_commit_batcher(
                                 batch_max,
                                 batch_wait,
                                 &mut in_flight,
-                                |recycle: WaiterBatchRecycle<CommitResponse>| {
+                                |recycle: WaiterBatchRecycle<CommitResponse, rpc::CommitRequest>| {
                                     tx_pool.put(recycle.txs);
+                                    request_pool.put(recycle.requests);
                                 },
                             ).await;
 
@@ -2007,7 +2616,7 @@ fn spawn_commit_batcher(
                                 .commit_queue
                                 .fetch_sub(batch_len, Ordering::Relaxed);
                             let mut txs = tx_pool.take(items.len());
-                            let mut requests = Vec::with_capacity(items.len());
+                            let mut requests = request_pool.take(items.len());
                             let batch_start = std::time::Instant::now();
                             let mut wait_us_total = 0u64;
                             let mut wait_us_max = 0u64;
@@ -2049,62 +2658,72 @@ fn spawn_commit_batcher(
                             let client = client.clone();
                             let stats = stats.clone();
                             let peer_stats = peer_stats.clone();
+                            let v2_capability = v2_capability.clone();
                             in_flight.push(async move {
                                 let _permit = permit;
                                 peer_stats.commit_inflight.fetch_add(1, Ordering::Relaxed);
                                 let rpc_start = std::time::Instant::now();
-                                let result = time::timeout(
+                                let client_v2 = client.clone();
+                                let mut path_stats = BatchPathStats::default();
+                                let result = call_batch_v2_only(
                                     timeout,
-                                    client.commit_batch(rpc::CommitBatchRequest { requests }),
+                                    &v2_capability,
+                                    requests,
+                                    "commit_batch_v2",
+                                    move |packed| {
+                                        let client = client_v2.clone();
+                                        async move { client.commit_batch_v2(packed).await }
+                                    },
+                                    &mut path_stats,
                                 )
                                 .await;
                                 let rpc_us = rpc_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
                                 peer_stats.commit_inflight.fetch_sub(1, Ordering::Relaxed);
                                 stats.record_commit_batch(batch_len, wait_us_total, wait_us_max, rpc_us);
                                 peer_stats.commit_latency.record(rpc_us);
+                                peer_stats.record_commit_path_stats(path_stats);
 
                                 match result {
-                                    Ok(Ok(resp)) => {
-                                        let resp = resp.into_inner();
-                                        if resp.responses.len() != txs.len() {
+                                    Ok((responses, requests)) => {
+                                        if responses.len() != txs.len() {
                                             // Reject if server returned a mismatched response count.
                                             let err = anyhow::anyhow!(
                                                 "commit_batch response count mismatch (expected {}, got {})",
                                                 txs.len(),
-                                                resp.responses.len()
+                                                responses.len()
                                             );
                                             peer_stats.commit_errors.fetch_add(1, Ordering::Relaxed);
                                             for tx in txs.drain(..) {
                                                 let _ = tx.send(Err(anyhow::anyhow!("{err}")));
                                             }
-                                            return WaiterBatchRecycle { txs };
+                                            return WaiterBatchRecycle { txs, requests };
                                         }
 
-                                        for (tx, r) in txs.drain(..).zip(resp.responses) {
+                                        for (tx, r) in txs.drain(..).zip(responses) {
                                             let _ = tx.send(Ok(from_rpc_commit(r)));
                                         }
+                                        WaiterBatchRecycle { txs, requests }
                                     }
-                                    Ok(Err(err)) => {
+                                    Err(err) => {
                                         // RPC error: notify all waiters.
                                         stats.record_commit_error();
+                                        if err
+                                            .to_string()
+                                            .contains("timed out")
+                                        {
+                                            peer_stats.commit_timeouts.fetch_add(1, Ordering::Relaxed);
+                                        }
                                         peer_stats.commit_errors.fetch_add(1, Ordering::Relaxed);
-                                        let err = anyhow::anyhow!("commit_batch rpc failed: {err}");
+                                        let err = anyhow::anyhow!("{err}");
                                         for tx in txs.drain(..) {
                                             let _ = tx.send(Err(anyhow::anyhow!("{err}")));
                                         }
-                                    }
-                                    Err(_) => {
-                                        // Timeout: notify all waiters.
-                                        stats.record_commit_error();
-                                        peer_stats.commit_timeouts.fetch_add(1, Ordering::Relaxed);
-                                        peer_stats.commit_errors.fetch_add(1, Ordering::Relaxed);
-                                        let err = anyhow::anyhow!("commit_batch rpc timed out");
-                                        for tx in txs.drain(..) {
-                                            let _ = tx.send(Err(anyhow::anyhow!("{err}")));
-                                        }
+                                        // Preserve pool capacity after errors so the next batch
+                                        // can reuse request storage without fresh allocation.
+                                        let requests = Vec::with_capacity(batch_len as usize);
+                                        WaiterBatchRecycle { txs, requests }
                                     }
                                 }
-                                WaiterBatchRecycle { txs }
                             });
                         }
                         None => {
@@ -2116,6 +2735,7 @@ fn spawn_commit_batcher(
                     // Keep driving in-flight futures even when queue load is low.
                     if let Some(recycle) = done {
                         tx_pool.put(recycle.txs);
+                        request_pool.put(recycle.requests);
                     }
                 }
             }
@@ -2157,6 +2777,9 @@ fn spawn_recover_batcher(
         let reuse_max_cached = limiter.current().clamp(1, REUSE_POOL_MAX_CACHED);
         let mut item_pool = ReuseVecPool::<RecoverWork>::new(reuse_max_cached, reuse_max_capacity);
         let mut txn_id_pool = ReuseVecPool::<TxnId>::new(reuse_max_cached, reuse_max_capacity);
+        let mut request_pool =
+            ReuseVecPool::<rpc::RecoverRequest>::new(reuse_max_cached, reuse_max_capacity);
+        let v2_capability = Arc::new(BatchLaneCapability::default());
         let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
         let mut rx_closed = false;
         loop {
@@ -2178,6 +2801,7 @@ fn spawn_recover_batcher(
                                 &mut in_flight,
                                 |recycle: RecoverBatchRecycle| {
                                     txn_id_pool.put(recycle.txn_ids);
+                                    request_pool.put(recycle.requests);
                                 },
                             ).await;
 
@@ -2185,7 +2809,7 @@ fn spawn_recover_batcher(
                             peer_stats
                                 .recover_queue
                                 .fetch_sub(batch_len, Ordering::Relaxed);
-                            let mut requests = Vec::with_capacity(items.len());
+                            let mut requests = request_pool.take(items.len());
                             let mut txn_ids = txn_id_pool.take(items.len());
                             let batch_start = std::time::Instant::now();
                             let mut wait_us_total = 0u64;
@@ -2224,63 +2848,68 @@ fn spawn_recover_batcher(
                             let stats = stats.clone();
                             let peer_stats = peer_stats.clone();
                             let recover_coalescer = recover_coalescer.clone();
+                            let v2_capability = v2_capability.clone();
                             in_flight.push(async move {
                                 let _permit = permit;
                                 peer_stats.recover_inflight.fetch_add(1, Ordering::Relaxed);
                                 let rpc_start = std::time::Instant::now();
-                                let result = time::timeout(
+                                let client_v2 = client.clone();
+                                let mut path_stats = BatchPathStats::default();
+                                let result = call_batch_v2_only(
                                     timeout,
-                                    client.recover_batch(rpc::RecoverBatchRequest { requests }),
+                                    &v2_capability,
+                                    requests,
+                                    "recover_batch_v2",
+                                    move |packed| {
+                                        let client = client_v2.clone();
+                                        async move { client.recover_batch_v2(packed).await }
+                                    },
+                                    &mut path_stats,
                                 )
                                 .await;
                                 let rpc_us = rpc_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
                                 peer_stats.recover_inflight.fetch_sub(1, Ordering::Relaxed);
                                 stats.record_recover_batch(batch_len, wait_us_total, wait_us_max, rpc_us);
                                 peer_stats.recover_latency.record(rpc_us);
+                                peer_stats.record_recover_path_stats(path_stats);
 
                                 match result {
-                                    Ok(Ok(resp)) => {
-                                        let resp = resp.into_inner();
-                                        if resp.responses.len() != txn_ids.len() {
+                                    Ok((responses, requests)) => {
+                                        if responses.len() != txn_ids.len() {
                                             // Reject if server returned a mismatched response count.
                                             let err = anyhow::anyhow!(
                                                 "recover_batch response count mismatch (expected {}, got {})",
                                                 txn_ids.len(),
-                                                resp.responses.len()
+                                                responses.len()
                                             );
                                             peer_stats.recover_errors.fetch_add(1, Ordering::Relaxed);
                                             for txn_id in txn_ids.drain(..) {
                                                 recover_coalescer.complete_err(txn_id, &err).await;
                                             }
-                                            return RecoverBatchRecycle { txn_ids };
+                                            return RecoverBatchRecycle { txn_ids, requests };
                                         }
 
-                                        for (txn_id, r) in txn_ids.drain(..).zip(resp.responses) {
+                                        for (txn_id, r) in txn_ids.drain(..).zip(responses) {
                                             recover_coalescer
                                                 .complete_ok(txn_id, from_rpc_recover(r))
                                                 .await;
                                         }
+                                        RecoverBatchRecycle { txn_ids, requests }
                                     }
-                                    Ok(Err(err)) => {
+                                    Err(err) => {
                                         // RPC error: notify all waiters.
                                         stats.record_recover_error();
                                         peer_stats.recover_errors.fetch_add(1, Ordering::Relaxed);
-                                        let err = anyhow::anyhow!("recover_batch rpc failed: {err}");
+                                        let err = anyhow::anyhow!("{err}");
                                         for txn_id in txn_ids.drain(..) {
                                             recover_coalescer.complete_err(txn_id, &err).await;
                                         }
-                                    }
-                                    Err(_) => {
-                                        // Timeout: notify all waiters.
-                                        stats.record_recover_error();
-                                        peer_stats.recover_errors.fetch_add(1, Ordering::Relaxed);
-                                        let err = anyhow::anyhow!("recover_batch rpc timed out");
-                                        for txn_id in txn_ids.drain(..) {
-                                            recover_coalescer.complete_err(txn_id, &err).await;
-                                        }
+                                        // Preserve pool capacity after errors so the next batch
+                                        // can reuse request storage without fresh allocation.
+                                        let requests = Vec::with_capacity(batch_len as usize);
+                                        RecoverBatchRecycle { txn_ids, requests }
                                     }
                                 }
-                                RecoverBatchRecycle { txn_ids }
                             });
                         }
                         None => {
@@ -2292,6 +2921,7 @@ fn spawn_recover_batcher(
                     // Keep driving in-flight futures even when queue load is low.
                     if let Some(recycle) = done {
                         txn_id_pool.put(recycle.txn_ids);
+                        request_pool.put(recycle.requests);
                     }
                 }
             }
@@ -2497,6 +3127,19 @@ fn percentile_us(counts: &[u64; LATENCY_BUCKETS_US.len() + 1], p: f64, max_us: u
 }
 
 /// Per-peer counters and histograms used to build `PeerStatsSnapshot`.
+///
+/// Purpose:
+/// - Track queue, wait, latency, and packed-v2 capability telemetry per peer.
+///
+/// Design:
+/// - Uses atomics for low-overhead concurrent updates.
+/// - Maintains separate read-lane and consensus-lane counters.
+///
+/// Inputs:
+/// - Updated by transport enqueue paths and worker completions.
+///
+/// Outputs:
+/// - Reset-on-read snapshots for logging and adaptive tuning.
 #[derive(Default)]
 struct PeerStats {
     kv_get_queue: AtomicU64,
@@ -2519,6 +3162,25 @@ struct PeerStats {
     accept_latency: LatencyHistogram,
     commit_latency: LatencyHistogram,
     recover_latency: LatencyHistogram,
+    kv_get_last_enqueue_us: AtomicU64,
+    kv_get_last_dequeue_us: AtomicU64,
+    kv_get_wait_total_us: AtomicU64,
+    kv_get_wait_max_us: AtomicU64,
+    kv_get_wait_count: AtomicU64,
+    kv_get_head_wait_total_us: AtomicU64,
+    kv_get_head_wait_max_us: AtomicU64,
+    kv_get_head_wait_count: AtomicU64,
+    kv_get_limiter_saturated: AtomicU64,
+    kv_get_v2_attempted: AtomicU64,
+    kv_get_v2_disabled_events: AtomicU64,
+    pre_accept_v2_attempted: AtomicU64,
+    pre_accept_v2_disabled_events: AtomicU64,
+    accept_v2_attempted: AtomicU64,
+    accept_v2_disabled_events: AtomicU64,
+    commit_v2_attempted: AtomicU64,
+    commit_v2_disabled_events: AtomicU64,
+    recover_v2_attempted: AtomicU64,
+    recover_v2_disabled_events: AtomicU64,
     pre_accept_last_enqueue_us: AtomicU64,
     accept_last_enqueue_us: AtomicU64,
     commit_last_enqueue_us: AtomicU64,
@@ -2555,6 +3217,19 @@ struct PeerStats {
 }
 
 /// Snapshot of per-peer stats for logging and tuning.
+///
+/// Purpose:
+/// - Provide one immutable per-peer telemetry view for logs/CSV/tuning loops.
+///
+/// Design:
+/// - Aggregates queue, wait, latency, capability, and limiter fields.
+/// - Values are computed from reset-on-read counters in `PeerStats`.
+///
+/// Inputs:
+/// - Produced by `PeerStats::snapshot_and_reset`.
+///
+/// Outputs:
+/// - Stable, serializable metrics payload used by observability code.
 #[derive(Default, Debug, Clone)]
 pub struct PeerStatsSnapshot {
     pub kv_get_queue: u64,
@@ -2573,6 +3248,25 @@ pub struct PeerStatsSnapshot {
     pub commit_sent: u64,
     pub recover_sent: u64,
     pub kv_get_latency: LatencySnapshot,
+    pub kv_get_wait_count: u64,
+    pub kv_get_wait_avg_ms: f64,
+    pub kv_get_wait_max_ms: f64,
+    pub kv_get_head_wait_count: u64,
+    pub kv_get_head_wait_avg_ms: f64,
+    pub kv_get_head_wait_max_ms: f64,
+    pub kv_get_last_enqueue_age_ms: f64,
+    pub kv_get_last_dequeue_age_ms: f64,
+    pub kv_get_limiter_saturated: u64,
+    pub kv_get_v2_attempted: u64,
+    pub kv_get_v2_disabled_events: u64,
+    pub pre_accept_v2_attempted: u64,
+    pub pre_accept_v2_disabled_events: u64,
+    pub accept_v2_attempted: u64,
+    pub accept_v2_disabled_events: u64,
+    pub commit_v2_attempted: u64,
+    pub commit_v2_disabled_events: u64,
+    pub recover_v2_attempted: u64,
+    pub recover_v2_disabled_events: u64,
     pub pre_accept_latency: LatencySnapshot,
     pub accept_latency: LatencySnapshot,
     pub commit_latency: LatencySnapshot,
@@ -2605,6 +3299,7 @@ pub struct PeerStatsSnapshot {
     pub recover_waiters_peak: u64,
     pub recover_waiters_avg: f64,
     pub rpc_inflight_limit: u64,
+    pub kv_get_inflight_limit: u64,
     pub kv_get_errors: u64,
     pub pre_accept_errors: u64,
     pub accept_errors: u64,
@@ -2621,7 +3316,55 @@ pub struct PeerStatsSnapshot {
 
 impl PeerStats {
     /// Snapshot and reset counters, computing averages and ages.
+    ///
+    /// Purpose:
+    /// - Convert mutable per-peer counters into one log-friendly snapshot.
+    ///
+    /// Design:
+    /// - Uses atomic swap/load to avoid allocation and minimize contention.
+    /// - Computes wait/age aggregates for read and consensus lanes.
+    ///
+    /// Inputs:
+    /// - `now_us`: current epoch microseconds for age calculations.
+    ///
+    /// Outputs:
+    /// - One `PeerStatsSnapshot` with reset rolling counters.
     fn snapshot_and_reset(&self, now_us: u64) -> PeerStatsSnapshot {
+        let kv_get_last_enqueue_us = self.kv_get_last_enqueue_us.load(Ordering::Relaxed);
+        let kv_get_last_dequeue_us = self.kv_get_last_dequeue_us.load(Ordering::Relaxed);
+        let kv_get_wait_count = self.kv_get_wait_count.swap(0, Ordering::Relaxed);
+        let kv_get_wait_total_us = self.kv_get_wait_total_us.swap(0, Ordering::Relaxed);
+        let kv_get_wait_max_us = self.kv_get_wait_max_us.swap(0, Ordering::Relaxed);
+        let kv_get_wait_avg_ms = if kv_get_wait_count == 0 {
+            // No samples recorded.
+            0.0
+        } else {
+            (kv_get_wait_total_us as f64 / kv_get_wait_count as f64) / 1000.0
+        };
+        let kv_get_wait_max_ms = kv_get_wait_max_us as f64 / 1000.0;
+        let kv_get_head_wait_count = self.kv_get_head_wait_count.swap(0, Ordering::Relaxed);
+        let kv_get_head_wait_total_us = self.kv_get_head_wait_total_us.swap(0, Ordering::Relaxed);
+        let kv_get_head_wait_max_us = self.kv_get_head_wait_max_us.swap(0, Ordering::Relaxed);
+        let kv_get_head_wait_avg_ms = if kv_get_head_wait_count == 0 {
+            // No samples recorded.
+            0.0
+        } else {
+            (kv_get_head_wait_total_us as f64 / kv_get_head_wait_count as f64) / 1000.0
+        };
+        let kv_get_head_wait_max_ms = kv_get_head_wait_max_us as f64 / 1000.0;
+        let kv_get_last_enqueue_age_ms = if kv_get_last_enqueue_us == 0 {
+            // No enqueue has happened yet.
+            0.0
+        } else {
+            now_us.saturating_sub(kv_get_last_enqueue_us) as f64 / 1000.0
+        };
+        let kv_get_last_dequeue_age_ms = if kv_get_last_dequeue_us == 0 {
+            // No dequeue has happened yet.
+            0.0
+        } else {
+            now_us.saturating_sub(kv_get_last_dequeue_us) as f64 / 1000.0
+        };
+
         let pre_accept_last_enqueue_us = self.pre_accept_last_enqueue_us.load(Ordering::Relaxed);
         let accept_last_enqueue_us = self.accept_last_enqueue_us.load(Ordering::Relaxed);
         let commit_last_enqueue_us = self.commit_last_enqueue_us.load(Ordering::Relaxed);
@@ -2740,6 +3483,27 @@ impl PeerStats {
             commit_sent: self.commit_sent.swap(0, Ordering::Relaxed),
             recover_sent: self.recover_sent.swap(0, Ordering::Relaxed),
             kv_get_latency: self.kv_get_latency.snapshot_and_reset(),
+            kv_get_wait_count,
+            kv_get_wait_avg_ms,
+            kv_get_wait_max_ms,
+            kv_get_head_wait_count,
+            kv_get_head_wait_avg_ms,
+            kv_get_head_wait_max_ms,
+            kv_get_last_enqueue_age_ms,
+            kv_get_last_dequeue_age_ms,
+            kv_get_limiter_saturated: self.kv_get_limiter_saturated.swap(0, Ordering::Relaxed),
+            kv_get_v2_attempted: self.kv_get_v2_attempted.swap(0, Ordering::Relaxed),
+            kv_get_v2_disabled_events: self.kv_get_v2_disabled_events.swap(0, Ordering::Relaxed),
+            pre_accept_v2_attempted: self.pre_accept_v2_attempted.swap(0, Ordering::Relaxed),
+            pre_accept_v2_disabled_events: self
+                .pre_accept_v2_disabled_events
+                .swap(0, Ordering::Relaxed),
+            accept_v2_attempted: self.accept_v2_attempted.swap(0, Ordering::Relaxed),
+            accept_v2_disabled_events: self.accept_v2_disabled_events.swap(0, Ordering::Relaxed),
+            commit_v2_attempted: self.commit_v2_attempted.swap(0, Ordering::Relaxed),
+            commit_v2_disabled_events: self.commit_v2_disabled_events.swap(0, Ordering::Relaxed),
+            recover_v2_attempted: self.recover_v2_attempted.swap(0, Ordering::Relaxed),
+            recover_v2_disabled_events: self.recover_v2_disabled_events.swap(0, Ordering::Relaxed),
             pre_accept_latency: self.pre_accept_latency.snapshot_and_reset(),
             accept_latency: self.accept_latency.snapshot_and_reset(),
             commit_latency: self.commit_latency.snapshot_and_reset(),
@@ -2772,6 +3536,7 @@ impl PeerStats {
             recover_waiters_peak: 0,
             recover_waiters_avg: 0.0,
             rpc_inflight_limit: 0,
+            kv_get_inflight_limit: 0,
             kv_get_errors: self.kv_get_errors.swap(0, Ordering::Relaxed),
             pre_accept_errors: self.pre_accept_errors.swap(0, Ordering::Relaxed),
             accept_errors: self.accept_errors.swap(0, Ordering::Relaxed),
@@ -2784,6 +3549,121 @@ impl PeerStats {
             accept_queue_full: self.accept_queue_full.swap(0, Ordering::Relaxed),
             commit_queue_full: self.commit_queue_full.swap(0, Ordering::Relaxed),
             recover_queue_full: self.recover_queue_full.swap(0, Ordering::Relaxed),
+        }
+    }
+
+    /// Record packed-v2 path counters for one completed GET batch.
+    ///
+    /// Purpose:
+    /// - Expose packed-v2 attempt/disable behavior for read-tail diagnosis.
+    ///
+    /// Design:
+    /// - Increment only the counters relevant to the observed path.
+    ///
+    /// Inputs:
+    /// - `path`: per-batch capability path flags.
+    ///
+    /// Outputs:
+    /// - Updated per-peer counters consumed by snapshot logging/CSV.
+    fn record_kv_get_path_stats(&self, path: BatchPathStats) {
+        if path.v2_attempted {
+            self.kv_get_v2_attempted.fetch_add(1, Ordering::Relaxed);
+        }
+        if path.v2_disabled_event {
+            self.kv_get_v2_disabled_events
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Record packed-v2 path counters for one completed pre-accept batch.
+    ///
+    /// Purpose:
+    /// - Expose packed-v2 attempt/disable behavior for pre-accept lane diagnosis.
+    ///
+    /// Design:
+    /// - Increments only counters corresponding to observed packed-v2 path flags.
+    ///
+    /// Inputs:
+    /// - `path`: per-batch capability path flags.
+    ///
+    /// Outputs:
+    /// - Updated pre-accept lane counters consumed by snapshots.
+    fn record_pre_accept_path_stats(&self, path: BatchPathStats) {
+        if path.v2_attempted {
+            self.pre_accept_v2_attempted.fetch_add(1, Ordering::Relaxed);
+        }
+        if path.v2_disabled_event {
+            self.pre_accept_v2_disabled_events
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Record packed-v2 path counters for one completed accept batch.
+    ///
+    /// Purpose:
+    /// - Expose packed-v2 attempt/disable behavior for accept lane diagnosis.
+    ///
+    /// Design:
+    /// - Increments only counters corresponding to observed packed-v2 path flags.
+    ///
+    /// Inputs:
+    /// - `path`: per-batch capability path flags.
+    ///
+    /// Outputs:
+    /// - Updated accept lane counters consumed by snapshots.
+    fn record_accept_path_stats(&self, path: BatchPathStats) {
+        if path.v2_attempted {
+            self.accept_v2_attempted.fetch_add(1, Ordering::Relaxed);
+        }
+        if path.v2_disabled_event {
+            self.accept_v2_disabled_events
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Record packed-v2 path counters for one completed commit batch.
+    ///
+    /// Purpose:
+    /// - Expose packed-v2 attempt/disable behavior for commit lane diagnosis.
+    ///
+    /// Design:
+    /// - Increments only counters corresponding to observed packed-v2 path flags.
+    ///
+    /// Inputs:
+    /// - `path`: per-batch capability path flags.
+    ///
+    /// Outputs:
+    /// - Updated commit lane counters consumed by snapshots.
+    fn record_commit_path_stats(&self, path: BatchPathStats) {
+        if path.v2_attempted {
+            self.commit_v2_attempted.fetch_add(1, Ordering::Relaxed);
+        }
+        if path.v2_disabled_event {
+            self.commit_v2_disabled_events
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Record packed-v2 path counters for one completed recover batch.
+    ///
+    /// Purpose:
+    /// - Expose packed-v2 attempt/disable behavior for recover lane diagnosis.
+    ///
+    /// Design:
+    /// - Increments only counters corresponding to observed packed-v2 path flags.
+    ///
+    /// Inputs:
+    /// - `path`: per-batch capability path flags.
+    ///
+    /// Outputs:
+    /// - Updated recover lane counters consumed by snapshots.
+    fn record_recover_path_stats(&self, path: BatchPathStats) {
+        if path.v2_attempted {
+            self.recover_v2_attempted.fetch_add(1, Ordering::Relaxed);
+        }
+        if path.v2_disabled_event {
+            self.recover_v2_disabled_events
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -3098,6 +3978,7 @@ fn to_rpc_recover(req: RecoverRequest) -> rpc::RecoverRequest {
 
 /// Convert an RPC recover response into a local response.
 fn from_rpc_recover(resp: rpc::RecoverResponse) -> RecoverResponse {
+    let has_command = resp.has_command || !resp.command.is_empty();
     let promised = from_rpc_ballot(resp.promised);
     let accepted_ballot = resp.accepted_ballot.map(|b| Ballot {
         counter: b.counter,
@@ -3127,6 +4008,16 @@ fn from_rpc_recover(resp: rpc::RecoverResponse) -> RecoverResponse {
         },
         accepted_ballot,
         command: resp.command,
+        command_digest: if resp.command_digest.is_empty() {
+            None
+        } else if resp.command_digest.len() == 32 {
+            let mut digest = [0u8; 32];
+            digest.copy_from_slice(resp.command_digest.as_ref());
+            Some(digest)
+        } else {
+            None
+        },
+        has_command,
         seq: resp.seq,
         deps,
     }
@@ -3753,5 +4644,564 @@ mod tests {
             "fallback acquire should wait for externally held permit (elapsed={elapsed:?})"
         );
         drop(permit);
+    }
+
+    /// Verify GET batch wait is clamped to zero when the head request already
+    /// exceeded the strict queue-age budget.
+    ///
+    /// Purpose:
+    /// - Validate stall-prevention behavior for stale queued reads.
+    ///
+    /// Design:
+    /// - Build a synthetic enqueue/dequeue timeline where head age exceeds the
+    ///   max queue wait and assert immediate dispatch.
+    ///
+    /// Inputs:
+    /// - One stale head enqueue timestamp and non-zero configured batch wait.
+    ///
+    /// Outputs:
+    /// - Effective wait equals zero.
+    #[test]
+    fn kv_get_effective_batch_wait_flushes_stale_head_immediately() {
+        let now = std::time::Instant::now();
+        let head_enqueued = now - Duration::from_millis(5);
+        let batch_wait = Duration::from_millis(2);
+        let max_queue_wait = Duration::from_millis(3);
+
+        let effective =
+            kv_get_effective_batch_wait(head_enqueued, now, batch_wait, max_queue_wait, 8);
+        assert_eq!(
+            effective,
+            Duration::ZERO,
+            "stale head item should bypass additional batching wait"
+        );
+    }
+
+    /// Verify GET batch wait is clamped to remaining queue-age budget when the
+    /// head item is partially aged but not yet stale.
+    ///
+    /// Purpose:
+    /// - Validate normal-path queue-age clamping behavior.
+    ///
+    /// Design:
+    /// - Construct a timeline where head age consumes part of the max budget.
+    /// - Assert returned wait equals remaining budget (not full configured wait).
+    ///
+    /// Inputs:
+    /// - Head age below cap, with configured wait larger than remaining budget.
+    ///
+    /// Outputs:
+    /// - Effective wait equals remaining queue-age budget.
+    #[test]
+    fn kv_get_effective_batch_wait_clamps_to_remaining_budget() {
+        let now = std::time::Instant::now();
+        let head_enqueued = now - Duration::from_millis(3);
+        let batch_wait = Duration::from_millis(4);
+        let max_queue_wait = Duration::from_millis(5);
+
+        let effective =
+            kv_get_effective_batch_wait(head_enqueued, now, batch_wait, max_queue_wait, 8);
+        assert_eq!(effective, Duration::from_millis(2));
+    }
+
+    /// Verify low-backlog GET batches cap coalescing wait to protect p50.
+    ///
+    /// Purpose:
+    /// - Ensure read batching stays latency-friendly when queue depth is one.
+    ///
+    /// Design:
+    /// - Use non-zero configured wait and queue-depth hint of one.
+    /// - Assert wait is clamped to the low-backlog cap.
+    ///
+    /// Inputs:
+    /// - Fresh head item with healthy queue-age budget.
+    ///
+    /// Outputs:
+    /// - Effective wait is capped at `KV_GET_LOW_BACKLOG_WAIT_US`.
+    #[test]
+    fn kv_get_effective_batch_wait_caps_low_backlog_delay() {
+        let now = std::time::Instant::now();
+        let head_enqueued = now;
+        let batch_wait = Duration::from_millis(1);
+        let max_queue_wait = Duration::from_millis(8);
+
+        let effective =
+            kv_get_effective_batch_wait(head_enqueued, now, batch_wait, max_queue_wait, 1);
+        assert_eq!(
+            effective,
+            Duration::from_micros(KV_GET_LOW_BACKLOG_WAIT_US),
+            "single-item backlog should not wait a full batching window"
+        );
+    }
+
+    /// Verify immediate-dispatch gate enables low-backlog GET fast path when
+    /// limiter capacity is available.
+    ///
+    /// Purpose:
+    /// - Validate p50-focused fast path behavior under uncongested load.
+    ///
+    /// Design:
+    /// - Uses queue depth at low-backlog threshold with available capacity.
+    ///
+    /// Inputs:
+    /// - `queued_items_hint=1`, `limiter_has_capacity=true`.
+    ///
+    /// Outputs:
+    /// - `true` immediate-dispatch decision.
+    #[test]
+    fn kv_get_should_dispatch_immediately_low_backlog_with_capacity() {
+        assert!(kv_get_should_dispatch_immediately(1, true));
+    }
+
+    /// Verify immediate-dispatch gate remains disabled when limiter capacity is
+    /// unavailable.
+    ///
+    /// Purpose:
+    /// - Preserve backpressure behavior under saturation.
+    ///
+    /// Design:
+    /// - Uses low queue depth but no limiter capacity.
+    ///
+    /// Inputs:
+    /// - `queued_items_hint=1`, `limiter_has_capacity=false`.
+    ///
+    /// Outputs:
+    /// - `false` immediate-dispatch decision.
+    #[test]
+    fn kv_get_should_not_dispatch_immediately_without_capacity() {
+        assert!(!kv_get_should_dispatch_immediately(1, false));
+    }
+
+    /// Verify immediate-dispatch gate remains disabled when backlog exceeds the
+    /// low-latency threshold.
+    ///
+    /// Purpose:
+    /// - Keep batching active when queue depth indicates useful coalescing.
+    ///
+    /// Design:
+    /// - Uses queue depth above threshold with capacity available.
+    ///
+    /// Inputs:
+    /// - `queued_items_hint=2`, `limiter_has_capacity=true`.
+    ///
+    /// Outputs:
+    /// - `false` immediate-dispatch decision.
+    #[test]
+    fn kv_get_should_not_dispatch_immediately_for_backlog() {
+        assert!(!kv_get_should_dispatch_immediately(2, true));
+    }
+
+    /// Verify unknown lanes optimistically attempt packed-v2.
+    ///
+    /// Purpose:
+    /// - Ensure startup traffic on upgraded peers stays on the v2 fast path.
+    ///
+    /// Design:
+    /// - Leaves lane state as default.
+    /// - Returns one successful packed-v2 response.
+    ///
+    /// Inputs:
+    /// - One `KvGetRequest` and default capability state.
+    ///
+    /// Outputs:
+    /// - v2 response is returned and lane is promoted to enabled.
+    #[tokio::test]
+    async fn call_batch_v2_unknown_lane_attempts_v2() {
+        let lane = BatchLaneCapability::default();
+        let requests = vec![rpc::KvGetRequest {
+            key: Bytes::from_static(b"k0"),
+        }];
+        let mut path_stats = BatchPathStats::default();
+        let (responses, _recyclable_requests): (Vec<rpc::KvGetResponse>, Vec<rpc::KvGetRequest>) =
+            call_batch_v2_only(
+                Duration::from_millis(100),
+                &lane,
+                requests,
+                "kv_batch_get",
+                move |packed| async move {
+                    let decoded = decode_items_from_parts::<rpc::KvGetRequest>(
+                        packed.frame,
+                        &packed.end_offsets,
+                    )
+                    .expect("decode packed v2 requests");
+                    let responses = decoded
+                        .into_iter()
+                        .map(|req| rpc::KvGetResponse {
+                            has_value: true,
+                            value: req.key,
+                            version: None,
+                        })
+                        .collect::<Vec<_>>();
+                    let (frame, end_offsets) =
+                        encode_items_to_parts(&responses).expect("encode packed v2 responses");
+                    Ok(volo_grpc::Response::new(rpc::PackedBatchResponse {
+                        frame,
+                        end_offsets,
+                    }))
+                },
+                &mut path_stats,
+            )
+            .await
+            .expect("unknown lane should succeed via v2");
+
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].value.as_ref(), b"k0");
+        assert_eq!(lane.state.load(AtomicOrdering::Relaxed), V2_CAP_ENABLED);
+        assert!(path_stats.v2_attempted);
+        assert!(!path_stats.v2_disabled_event);
+    }
+
+    /// Verify packed-v2 batch helper returns v2 responses and preserves request
+    /// vector capacity on the fast path.
+    ///
+    /// Purpose:
+    /// - Validate normal-path behavior for `call_batch_v2_only`.
+    ///
+    /// Design:
+    /// - Encode two request items into a packed v2 call.
+    /// - Decode them inside the v2 closure and return packed responses.
+    ///
+    /// Inputs:
+    /// - Two `KvGetRequest` items and v2-enabled capability flag.
+    ///
+    /// Outputs:
+    /// - Two decoded v2 responses and recyclable request vector with original
+    ///   item count retained.
+    #[tokio::test]
+    async fn call_batch_v2_uses_fast_path_and_reuses_requests() {
+        let lane = BatchLaneCapability::default();
+        lane.state.store(V2_CAP_ENABLED, AtomicOrdering::Relaxed);
+        let requests = vec![
+            rpc::KvGetRequest {
+                key: Bytes::from_static(b"k0"),
+            },
+            rpc::KvGetRequest {
+                key: Bytes::from_static(b"k1"),
+            },
+        ];
+
+        let mut path_stats = BatchPathStats::default();
+        let (responses, recyclable_requests): (Vec<rpc::KvGetResponse>, Vec<rpc::KvGetRequest>) =
+            call_batch_v2_only(
+                Duration::from_millis(100),
+                &lane,
+                requests,
+                "kv_batch_get",
+                move |packed| async move {
+                    let decoded = decode_items_from_parts::<rpc::KvGetRequest>(
+                        packed.frame,
+                        &packed.end_offsets,
+                    )
+                    .expect("decode packed v2 requests");
+                    let responses = decoded
+                        .into_iter()
+                        .map(|req| rpc::KvGetResponse {
+                            has_value: true,
+                            value: req.key,
+                            version: Some(rpc::Version {
+                                seq: 1,
+                                txn_id: Some(rpc::TxnId {
+                                    node_id: 7,
+                                    counter: 9,
+                                }),
+                            }),
+                        })
+                        .collect::<Vec<_>>();
+                    let (frame, end_offsets) =
+                        encode_items_to_parts(&responses).expect("encode packed v2 responses");
+                    Ok(volo_grpc::Response::new(rpc::PackedBatchResponse {
+                        frame,
+                        end_offsets,
+                    }))
+                },
+                &mut path_stats,
+            )
+            .await
+            .expect("v2 call should succeed");
+
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0].value.as_ref(), b"k0");
+        assert_eq!(responses[1].value.as_ref(), b"k1");
+        assert_eq!(recyclable_requests.len(), 2);
+        assert_eq!(lane.state.load(AtomicOrdering::Relaxed), V2_CAP_ENABLED);
+        assert!(path_stats.v2_attempted);
+        assert!(!path_stats.v2_disabled_event);
+    }
+
+    /// Verify packed-v2 helper disables lane and errors on `Unimplemented`.
+    ///
+    /// Purpose:
+    /// - Validate v2-only failure behavior for incompatible peers.
+    ///
+    /// Design:
+    /// - Return `Unimplemented` from v2 closure.
+    /// - Assert helper returns error and lane transitions to disabled.
+    ///
+    /// Inputs:
+    /// - Two `KvGetRequest` items and v2-enabled capability flag.
+    ///
+    /// Outputs:
+    /// - Error returned and disabled-lane marker recorded.
+    #[tokio::test]
+    async fn call_batch_v2_disables_lane_on_unimplemented_and_errors() {
+        let lane = BatchLaneCapability::default();
+        lane.state.store(V2_CAP_ENABLED, AtomicOrdering::Relaxed);
+        let requests = vec![
+            rpc::KvGetRequest {
+                key: Bytes::from_static(b"k0"),
+            },
+            rpc::KvGetRequest {
+                key: Bytes::from_static(b"k1"),
+            },
+        ];
+
+        let mut path_stats = BatchPathStats::default();
+        let err = call_batch_v2_only::<rpc::KvGetRequest, rpc::KvGetResponse, _, _>(
+            Duration::from_millis(100),
+            &lane,
+            requests,
+            "kv_batch_get",
+            move |_packed| async move { Err(volo_grpc::Status::unimplemented("no v2")) },
+            &mut path_stats,
+        )
+        .await
+        .expect_err("v2-only mode should fail on unimplemented");
+
+        assert!(
+            err.to_string().contains("packed-v2 unimplemented"),
+            "error should report unimplemented incompatibility"
+        );
+        assert_eq!(lane.state.load(AtomicOrdering::Relaxed), V2_CAP_DISABLED);
+        assert!(path_stats.v2_attempted);
+        assert!(path_stats.v2_disabled_event);
+    }
+
+    /// Verify packed-v2 helper returns an error when response payload decode
+    /// fails.
+    ///
+    /// Purpose:
+    /// - Validate failure-path handling for malformed v2 response envelopes.
+    ///
+    /// Design:
+    /// - Return a packed response with one trailing unindexed byte so decode
+    ///   fails with frame-length mismatch.
+    ///
+    /// Inputs:
+    /// - One `KvGetRequest` item and malformed packed v2 response.
+    ///
+    /// Outputs:
+    /// - Error from packed decode and unchanged v2 capability flag.
+    #[tokio::test]
+    async fn call_batch_v2_returns_error_on_malformed_response() {
+        let lane = BatchLaneCapability::default();
+        lane.state.store(V2_CAP_ENABLED, AtomicOrdering::Relaxed);
+        let requests = vec![rpc::KvGetRequest {
+            key: Bytes::from_static(b"k0"),
+        }];
+
+        let mut path_stats = BatchPathStats::default();
+        let err = call_batch_v2_only::<rpc::KvGetRequest, rpc::KvGetResponse, _, _>(
+            Duration::from_millis(100),
+            &lane,
+            requests,
+            "kv_batch_get",
+            move |_packed| async move {
+                let responses = vec![rpc::KvGetResponse {
+                    has_value: true,
+                    value: Bytes::from_static(b"v0"),
+                    version: Some(rpc::Version {
+                        seq: 1,
+                        txn_id: Some(rpc::TxnId {
+                            node_id: 1,
+                            counter: 1,
+                        }),
+                    }),
+                }];
+                let (frame, end_offsets) =
+                    encode_items_to_parts(&responses).expect("encode packed response");
+                let mut malformed = frame.to_vec();
+                malformed.push(0);
+                Ok(volo_grpc::Response::new(rpc::PackedBatchResponse {
+                    frame: Bytes::from(malformed),
+                    end_offsets,
+                }))
+            },
+            &mut path_stats,
+        )
+        .await
+        .expect_err("malformed packed response should fail");
+
+        assert!(
+            err.to_string().contains("packed response decode failed"),
+            "error should report packed decode failure; got: {err}"
+        );
+        assert_eq!(
+            lane.state.load(AtomicOrdering::Relaxed),
+            V2_CAP_ENABLED,
+            "non-unimplemented errors should not disable v2 capability"
+        );
+        assert!(path_stats.v2_attempted);
+        assert!(!path_stats.v2_disabled_event);
+    }
+
+    /// Verify direct KV batch-get helper uses packed-v2 on unknown lanes.
+    ///
+    /// Purpose:
+    /// - Validate normal-path behavior for read-fanout v2 encoding.
+    ///
+    /// Design:
+    /// - Starts with default capability state.
+    /// - Decodes packed request keys inside the v2 closure.
+    /// - Returns packed responses.
+    ///
+    /// Inputs:
+    /// - Two raw key payloads.
+    ///
+    /// Outputs:
+    /// - Two decoded responses with matching values and enabled lane state.
+    #[tokio::test]
+    async fn call_kv_batch_get_v2_only_uses_v2_on_unknown_lane() {
+        let lane = BatchLaneCapability::default();
+        let keys = vec![Bytes::from_static(b"k0"), Bytes::from_static(b"k1")];
+        let mut path_stats = BatchPathStats::default();
+        let responses = call_kv_batch_get_v2_only(
+            Duration::from_millis(100),
+            &lane,
+            &keys,
+            "kv_batch_get",
+            move |packed| async move {
+                let decoded =
+                    decode_items_from_parts::<rpc::KvGetRequest>(packed.frame, &packed.end_offsets)
+                        .expect("decode packed kv_get requests");
+                assert_eq!(decoded.len(), 2);
+                assert_eq!(decoded[0].key.as_ref(), b"k0");
+                assert_eq!(decoded[1].key.as_ref(), b"k1");
+                let responses = vec![
+                    rpc::KvGetResponse {
+                        has_value: true,
+                        value: Bytes::from_static(b"v0"),
+                        version: None,
+                    },
+                    rpc::KvGetResponse {
+                        has_value: true,
+                        value: Bytes::from_static(b"v1"),
+                        version: None,
+                    },
+                ];
+                let (frame, end_offsets) =
+                    encode_items_to_parts(&responses).expect("encode packed kv_get responses");
+                Ok(volo_grpc::Response::new(rpc::PackedBatchResponse {
+                    frame,
+                    end_offsets,
+                }))
+            },
+            &mut path_stats,
+        )
+        .await
+        .expect("v2 path should succeed");
+
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0].value.as_ref(), b"v0");
+        assert_eq!(responses[1].value.as_ref(), b"v1");
+        assert_eq!(lane.state.load(AtomicOrdering::Relaxed), V2_CAP_ENABLED);
+        assert!(path_stats.v2_attempted);
+        assert!(!path_stats.v2_disabled_event);
+    }
+
+    /// Verify direct KV batch-get helper errors on `Unimplemented`.
+    ///
+    /// Purpose:
+    /// - Validate v2-only behavior for incompatible peers.
+    ///
+    /// Design:
+    /// - Returns `Unimplemented` from v2 closure.
+    /// - Asserts helper reports error and disables the lane.
+    ///
+    /// Inputs:
+    /// - Two raw key payloads and v2-enabled capability state.
+    ///
+    /// Outputs:
+    /// - Error is returned and lane state becomes disabled.
+    #[tokio::test]
+    async fn call_kv_batch_get_v2_only_unimplemented_errors() {
+        let lane = BatchLaneCapability::default();
+        lane.state.store(V2_CAP_ENABLED, AtomicOrdering::Relaxed);
+        let keys = vec![Bytes::from_static(b"k0"), Bytes::from_static(b"k1")];
+        let mut path_stats = BatchPathStats::default();
+        let err = call_kv_batch_get_v2_only(
+            Duration::from_millis(100),
+            &lane,
+            &keys,
+            "kv_batch_get",
+            move |_packed| async move { Err(volo_grpc::Status::unimplemented("no v2")) },
+            &mut path_stats,
+        )
+        .await
+        .expect_err("v2-only mode should fail on unimplemented");
+
+        assert!(
+            err.to_string().contains("packed-v2 unimplemented"),
+            "error should report unimplemented incompatibility"
+        );
+        assert_eq!(lane.state.load(AtomicOrdering::Relaxed), V2_CAP_DISABLED);
+        assert!(path_stats.v2_attempted);
+        assert!(path_stats.v2_disabled_event);
+    }
+
+    /// Verify per-lane packed-v2 counters are recorded and reset.
+    ///
+    /// Purpose:
+    /// - Validate uniform visibility across GET and consensus lanes.
+    ///
+    /// Design:
+    /// - Applies one synthetic path update per lane.
+    /// - Snapshots once to verify increments, then again to verify reset.
+    ///
+    /// Inputs:
+    /// - Synthetic `BatchPathStats` values for all lanes.
+    ///
+    /// Outputs:
+    /// - First snapshot includes expected counters; second snapshot zeros them.
+    #[test]
+    fn peer_stats_snapshot_includes_all_lane_path_counters() {
+        let stats = PeerStats::default();
+        stats.record_kv_get_path_stats(BatchPathStats {
+            v2_attempted: true,
+            v2_disabled_event: true,
+        });
+        stats.record_pre_accept_path_stats(BatchPathStats {
+            v2_attempted: true,
+            v2_disabled_event: true,
+        });
+        stats.record_accept_path_stats(BatchPathStats {
+            v2_attempted: false,
+            v2_disabled_event: false,
+        });
+        // Edge path: no flags set should not increment commit counters.
+        stats.record_commit_path_stats(BatchPathStats::default());
+        stats.record_recover_path_stats(BatchPathStats {
+            v2_attempted: true,
+            // Failure-path shape: lane disabled after unimplemented response.
+            v2_disabled_event: true,
+        });
+
+        let snap = stats.snapshot_and_reset(epoch_micros());
+        assert_eq!(snap.kv_get_v2_attempted, 1);
+        assert_eq!(snap.kv_get_v2_disabled_events, 1);
+        assert_eq!(snap.pre_accept_v2_attempted, 1);
+        assert_eq!(snap.pre_accept_v2_disabled_events, 1);
+        assert_eq!(snap.accept_v2_attempted, 0);
+        assert_eq!(snap.accept_v2_disabled_events, 0);
+        assert_eq!(snap.commit_v2_attempted, 0);
+        assert_eq!(snap.commit_v2_disabled_events, 0);
+        assert_eq!(snap.recover_v2_attempted, 1);
+        assert_eq!(snap.recover_v2_disabled_events, 1);
+
+        let reset = stats.snapshot_and_reset(epoch_micros());
+        assert_eq!(reset.kv_get_v2_attempted, 0);
+        assert_eq!(reset.pre_accept_v2_attempted, 0);
+        assert_eq!(reset.accept_v2_disabled_events, 0);
+        assert_eq!(reset.commit_v2_disabled_events, 0);
+        assert_eq!(reset.recover_v2_attempted, 0);
     }
 }

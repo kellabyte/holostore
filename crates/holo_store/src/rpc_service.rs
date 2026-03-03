@@ -1,8 +1,21 @@
 //! gRPC service handlers that adapt network requests into Accord operations.
 //!
-//! This module is the server-side counterpart to `transport.rs`, translating
-//! protobuf messages into local Accord types and returning responses.
+//! Purpose:
+//! - Serve transport and control-plane RPCs by translating wire messages into
+//!   local state-machine and Accord operations.
+//!
+//! Design:
+//! - Use packed unary v2 batch handlers that decode/encode compact packed
+//!   frames for lower per-item wrapper overhead.
+//!
+//! Inputs:
+//! - Unary and batched protobuf RPC requests from transport clients.
+//!
+//! Outputs:
+//! - Protobuf responses mapped from local results, with packed v2 used for
+//!   batch consensus/read lanes.
 
+use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -12,6 +25,7 @@ use serde_json;
 
 use crate::cluster::{ClusterCommand, MemberState, ShardDesc};
 use crate::kv::Version;
+use crate::packed_batch::{decode_items_from_parts, encode_items_to_parts};
 use crate::volo_gen::holo_store::rpc;
 use crate::NodeState;
 
@@ -27,6 +41,295 @@ impl RpcService {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
+    }
+}
+
+/// Decode errors for packed `KvGetRequest` key extraction.
+///
+/// Purpose:
+/// - Report malformed packed GET envelopes without materializing full request
+///   structs.
+///
+/// Design:
+/// - Keeps variant payloads compact and deterministic for transport error logs.
+/// - Carries item index and concise reason to aid debugging.
+///
+/// Inputs:
+/// - Produced by packed offset/key parsers in `decode_packed_kv_get_keys`.
+///
+/// Outputs:
+/// - Structured decode failure that maps to gRPC `invalid_argument`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PackedKvGetDecodeError {
+    OffsetNotStrictlyIncreasing {
+        index: usize,
+        previous: u32,
+        current: u32,
+    },
+    OffsetOutOfBounds {
+        index: usize,
+        end: u32,
+        frame_len: usize,
+    },
+    FrameLengthMismatch {
+        consumed: usize,
+        frame_len: usize,
+    },
+    MessageDecode {
+        index: usize,
+        reason: &'static str,
+    },
+}
+
+impl fmt::Display for PackedKvGetDecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OffsetNotStrictlyIncreasing {
+                index,
+                previous,
+                current,
+            } => write!(
+                f,
+                "packed kv_get item #{index} end offset not strictly increasing: prev={previous}, cur={current}"
+            ),
+            Self::OffsetOutOfBounds {
+                index,
+                end,
+                frame_len,
+            } => write!(
+                f,
+                "packed kv_get item #{index} end offset out of bounds: end={end}, frame_len={frame_len}"
+            ),
+            Self::FrameLengthMismatch { consumed, frame_len } => write!(
+                f,
+                "packed kv_get offsets do not consume full frame: consumed={consumed}, frame_len={frame_len}"
+            ),
+            Self::MessageDecode { index, reason } => {
+                write!(f, "packed kv_get item #{index} decode failed: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PackedKvGetDecodeError {}
+
+/// Decode packed `KvGetRequest` keys into borrowed slices.
+///
+/// Purpose:
+/// - Avoid per-item request allocation in `kv_batch_get_v2` by extracting only
+///   key field slices.
+///
+/// Design:
+/// - Validates monotonic offsets and full-frame coverage.
+/// - Parses each protobuf item in place and borrows key bytes from `frame`.
+/// - Preserves request ordering and does not deduplicate keys.
+///
+/// Inputs:
+/// - `frame`: packed protobuf payload bytes.
+/// - `end_offsets`: exclusive end offset for each packed item.
+///
+/// Outputs:
+/// - Ordered borrowed key slices, one per packed request.
+fn decode_packed_kv_get_keys<'a>(
+    frame: &'a Bytes,
+    end_offsets: &[u32],
+) -> Result<Vec<&'a [u8]>, PackedKvGetDecodeError> {
+    if end_offsets.is_empty() {
+        if frame.is_empty() {
+            return Ok(Vec::new());
+        }
+        return Err(PackedKvGetDecodeError::FrameLengthMismatch {
+            consumed: 0,
+            frame_len: frame.len(),
+        });
+    }
+
+    let mut keys = Vec::with_capacity(end_offsets.len());
+    let mut start = 0usize;
+    // Parse each item exactly once in request order; this intentionally does
+    // not recover from malformed offsets because partial decode would violate
+    // response fan-out alignment guarantees.
+    for (index, end) in end_offsets.iter().copied().enumerate() {
+        let end_usize = end as usize;
+        if end <= start as u32 {
+            return Err(PackedKvGetDecodeError::OffsetNotStrictlyIncreasing {
+                index,
+                previous: start as u32,
+                current: end,
+            });
+        }
+        if end_usize > frame.len() {
+            return Err(PackedKvGetDecodeError::OffsetOutOfBounds {
+                index,
+                end,
+                frame_len: frame.len(),
+            });
+        }
+        let key = decode_kv_get_key_from_item(&frame[start..end_usize], index)?;
+        keys.push(key);
+        start = end_usize;
+    }
+
+    if start != frame.len() {
+        return Err(PackedKvGetDecodeError::FrameLengthMismatch {
+            consumed: start,
+            frame_len: frame.len(),
+        });
+    }
+    Ok(keys)
+}
+
+/// Decode field `key` (`bytes key = 1`) from one `KvGetRequest` payload.
+///
+/// Purpose:
+/// - Extract only the key field while skipping unknown protobuf fields.
+///
+/// Design:
+/// - Uses a minimal wire parser (varint tags + standard wire-type skipping).
+/// - Accepts unknown fields for forward compatibility.
+/// - Returns the last observed key field, matching protobuf semantics.
+///
+/// Inputs:
+/// - `item`: one encoded `KvGetRequest` protobuf payload.
+/// - `item_index`: item index for error context.
+///
+/// Outputs:
+/// - Borrowed key bytes slice from `item`.
+fn decode_kv_get_key_from_item<'a>(
+    item: &'a [u8],
+    item_index: usize,
+) -> Result<&'a [u8], PackedKvGetDecodeError> {
+    let mut offset = 0usize;
+    let mut key = None::<&[u8]>;
+    // Walk wire fields linearly; this intentionally does not allocate or build
+    // a full request struct because only field #1 is needed for local reads.
+    while offset < item.len() {
+        let tag = decode_uvarint(item, &mut offset).map_err(|reason| {
+            PackedKvGetDecodeError::MessageDecode {
+                index: item_index,
+                reason,
+            }
+        })?;
+        let field_number = tag >> 3;
+        let wire_type = (tag & 0x07) as u8;
+
+        if field_number == 1 && wire_type == 2 {
+            let len = decode_uvarint(item, &mut offset).map_err(|reason| {
+                PackedKvGetDecodeError::MessageDecode {
+                    index: item_index,
+                    reason,
+                }
+            })? as usize;
+            let end = offset.saturating_add(len);
+            if end > item.len() {
+                return Err(PackedKvGetDecodeError::MessageDecode {
+                    index: item_index,
+                    reason: "key length exceeds message bounds",
+                });
+            }
+            key = Some(&item[offset..end]);
+            offset = end;
+            continue;
+        }
+
+        skip_protobuf_wire_value(item, &mut offset, wire_type).map_err(|reason| {
+            PackedKvGetDecodeError::MessageDecode {
+                index: item_index,
+                reason,
+            }
+        })?;
+    }
+
+    key.ok_or(PackedKvGetDecodeError::MessageDecode {
+        index: item_index,
+        reason: "missing key field",
+    })
+}
+
+/// Decode one protobuf varint and advance `offset`.
+///
+/// Purpose:
+/// - Support lightweight packed-item field parsing without allocating.
+///
+/// Design:
+/// - Reads up to 10 bytes and rejects overlong/truncated varints.
+///
+/// Inputs:
+/// - `buf`: protobuf payload bytes.
+/// - `offset`: mutable cursor position.
+///
+/// Outputs:
+/// - Decoded unsigned varint value.
+fn decode_uvarint(buf: &[u8], offset: &mut usize) -> Result<u64, &'static str> {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    for _ in 0..10 {
+        if *offset >= buf.len() {
+            return Err("truncated varint");
+        }
+        let byte = buf[*offset];
+        *offset += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if (byte & 0x80) == 0 {
+            return Ok(value);
+        }
+        shift += 7;
+    }
+    Err("varint too long")
+}
+
+/// Skip one protobuf wire value at `offset`.
+///
+/// Purpose:
+/// - Skip unknown fields while parsing only the `KvGetRequest.key` field.
+///
+/// Design:
+/// - Supports protobuf wire types used by scalar and bytes fields.
+/// - Rejects unsupported start/end group types.
+///
+/// Inputs:
+/// - `buf`: protobuf payload bytes.
+/// - `offset`: mutable cursor position after wire tag.
+/// - `wire_type`: protobuf wire type for current field.
+///
+/// Outputs:
+/// - Advanced cursor positioned at the next field.
+fn skip_protobuf_wire_value(
+    buf: &[u8],
+    offset: &mut usize,
+    wire_type: u8,
+) -> Result<(), &'static str> {
+    match wire_type {
+        0 => {
+            let _ = decode_uvarint(buf, offset)?;
+            Ok(())
+        }
+        1 => {
+            let end = offset.saturating_add(8);
+            if end > buf.len() {
+                return Err("fixed64 exceeds message bounds");
+            }
+            *offset = end;
+            Ok(())
+        }
+        2 => {
+            let len = decode_uvarint(buf, offset)? as usize;
+            let end = offset.saturating_add(len);
+            if end > buf.len() {
+                return Err("length-delimited field exceeds message bounds");
+            }
+            *offset = end;
+            Ok(())
+        }
+        5 => {
+            let end = offset.saturating_add(4);
+            if end > buf.len() {
+                return Err("fixed32 exceeds message bounds");
+            }
+            *offset = end;
+            Ok(())
+        }
+        _ => Err("unsupported wire type"),
     }
 }
 
@@ -101,18 +404,41 @@ impl rpc::HoloRpc for RpcService {
         }))
     }
 
-    /// Handle a batched pre-accept RPC request.
-    async fn pre_accept_batch(
+    /// Handle a packed v2 pre-accept batch RPC request.
+    ///
+    /// Purpose:
+    /// - Process compact unary pre-accept batches for the v2-only transport path.
+    ///
+    /// Design:
+    /// - Decode packed request items into `PreAcceptRequest`s.
+    /// - Execute requests sequentially in original order.
+    /// - Encode responses back into packed frame parts.
+    ///
+    /// Inputs:
+    /// - Packed frame + offsets containing `PreAcceptRequest` items.
+    ///
+    /// Outputs:
+    /// - Packed frame + offsets containing `PreAcceptResponse` items.
+    async fn pre_accept_batch_v2(
         &self,
-        req: volo_grpc::Request<rpc::PreAcceptBatchRequest>,
-    ) -> Result<volo_grpc::Response<rpc::PreAcceptBatchResponse>, volo_grpc::Status> {
+        req: volo_grpc::Request<rpc::PackedBatchRequest>,
+    ) -> Result<volo_grpc::Response<rpc::PackedBatchResponse>, volo_grpc::Status> {
         self.maybe_delay().await;
         let start = std::time::Instant::now();
         let _inflight = self.state.rpc_handler_stats.track_pre_accept();
         let req = req.into_inner();
-        let mut responses = Vec::with_capacity(req.requests.len());
+        let requests =
+            decode_items_from_parts::<rpc::PreAcceptRequest>(req.frame, &req.end_offsets).map_err(
+                |err| {
+                    volo_grpc::Status::invalid_argument(format!(
+                        "invalid packed pre_accept_batch_v2 request: {err}"
+                    ))
+                },
+            )?;
+        let mut responses = Vec::with_capacity(requests.len());
 
-        for item in req.requests {
+        // Preserve request ordering to keep response fan-out alignment exact.
+        for item in requests {
             let group = self
                 .state
                 .group(item.group_id)
@@ -172,10 +498,17 @@ impl rpc::HoloRpc for RpcService {
             });
         }
 
-        let resp = volo_grpc::Response::new(rpc::PreAcceptBatchResponse { responses });
+        let (frame, end_offsets) = encode_items_to_parts(&responses).map_err(|err| {
+            volo_grpc::Status::internal(format!(
+                "failed to encode packed pre_accept_batch_v2 response: {err}"
+            ))
+        })?;
         let us = start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         self.state.rpc_handler_stats.record_pre_accept_batch(us);
-        Ok(resp)
+        Ok(volo_grpc::Response::new(rpc::PackedBatchResponse {
+            frame,
+            end_offsets,
+        }))
     }
 
     /// Handle a single accept RPC request.
@@ -248,18 +581,39 @@ impl rpc::HoloRpc for RpcService {
         Ok(resp)
     }
 
-    /// Handle a batched accept RPC request.
-    async fn accept_batch(
+    /// Handle a packed v2 accept batch RPC request.
+    ///
+    /// Purpose:
+    /// - Process compact unary accept batches for the v2-only transport path.
+    ///
+    /// Design:
+    /// - Decode packed request items into `AcceptRequest`s.
+    /// - Execute requests sequentially in original order.
+    /// - Encode responses back into packed frame parts.
+    ///
+    /// Inputs:
+    /// - Packed frame + offsets containing `AcceptRequest` items.
+    ///
+    /// Outputs:
+    /// - Packed frame + offsets containing `AcceptResponse` items.
+    async fn accept_batch_v2(
         &self,
-        req: volo_grpc::Request<rpc::AcceptBatchRequest>,
-    ) -> Result<volo_grpc::Response<rpc::AcceptBatchResponse>, volo_grpc::Status> {
+        req: volo_grpc::Request<rpc::PackedBatchRequest>,
+    ) -> Result<volo_grpc::Response<rpc::PackedBatchResponse>, volo_grpc::Status> {
         self.maybe_delay().await;
         let start = std::time::Instant::now();
         let _inflight = self.state.rpc_handler_stats.track_accept();
         let req = req.into_inner();
-        let mut responses = Vec::with_capacity(req.requests.len());
+        let requests = decode_items_from_parts::<rpc::AcceptRequest>(req.frame, &req.end_offsets)
+            .map_err(|err| {
+            volo_grpc::Status::invalid_argument(format!(
+                "invalid packed accept_batch_v2 request: {err}"
+            ))
+        })?;
+        let mut responses = Vec::with_capacity(requests.len());
 
-        for item in req.requests {
+        // Preserve request ordering to keep response fan-out alignment exact.
+        for item in requests {
             let group = self
                 .state
                 .group(item.group_id)
@@ -281,7 +635,6 @@ impl rpc::HoloRpc for RpcService {
                     counter: d.counter,
                 })
                 .collect();
-            // Decide whether a command payload is present.
             let has_command = item.has_command || !item.command.is_empty();
             let command_digest = parse_command_digest(item.command_digest)?;
             let command = if has_command {
@@ -318,10 +671,17 @@ impl rpc::HoloRpc for RpcService {
             });
         }
 
-        let resp = volo_grpc::Response::new(rpc::AcceptBatchResponse { responses });
+        let (frame, end_offsets) = encode_items_to_parts(&responses).map_err(|err| {
+            volo_grpc::Status::internal(format!(
+                "failed to encode packed accept_batch_v2 response: {err}"
+            ))
+        })?;
         let us = start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         self.state.rpc_handler_stats.record_accept_batch(us);
-        Ok(resp)
+        Ok(volo_grpc::Response::new(rpc::PackedBatchResponse {
+            frame,
+            end_offsets,
+        }))
     }
 
     /// Handle a single commit RPC request.
@@ -388,18 +748,39 @@ impl rpc::HoloRpc for RpcService {
         Ok(resp)
     }
 
-    /// Handle a batched commit RPC request.
-    async fn commit_batch(
+    /// Handle a packed v2 commit batch RPC request.
+    ///
+    /// Purpose:
+    /// - Process compact unary commit batches for the v2-only transport path.
+    ///
+    /// Design:
+    /// - Decode packed request items into `CommitRequest`s.
+    /// - Execute requests sequentially in original order.
+    /// - Encode responses back into packed frame parts.
+    ///
+    /// Inputs:
+    /// - Packed frame + offsets containing `CommitRequest` items.
+    ///
+    /// Outputs:
+    /// - Packed frame + offsets containing `CommitResponse` items.
+    async fn commit_batch_v2(
         &self,
-        req: volo_grpc::Request<rpc::CommitBatchRequest>,
-    ) -> Result<volo_grpc::Response<rpc::CommitBatchResponse>, volo_grpc::Status> {
+        req: volo_grpc::Request<rpc::PackedBatchRequest>,
+    ) -> Result<volo_grpc::Response<rpc::PackedBatchResponse>, volo_grpc::Status> {
         self.maybe_delay().await;
         let start = std::time::Instant::now();
         let _inflight = self.state.rpc_handler_stats.track_commit();
         let req = req.into_inner();
-        let mut responses = Vec::with_capacity(req.requests.len());
+        let requests = decode_items_from_parts::<rpc::CommitRequest>(req.frame, &req.end_offsets)
+            .map_err(|err| {
+            volo_grpc::Status::invalid_argument(format!(
+                "invalid packed commit_batch_v2 request: {err}"
+            ))
+        })?;
+        let mut responses = Vec::with_capacity(requests.len());
 
-        for item in req.requests {
+        // Preserve request ordering to keep response fan-out alignment exact.
+        for item in requests {
             let group = self
                 .state
                 .group(item.group_id)
@@ -421,7 +802,6 @@ impl rpc::HoloRpc for RpcService {
                     counter: d.counter,
                 })
                 .collect();
-            // Decide whether a command payload is present.
             let has_command = item.has_command || !item.command.is_empty();
             let command_digest = parse_command_digest(item.command_digest)?;
             let command = if has_command {
@@ -452,10 +832,17 @@ impl rpc::HoloRpc for RpcService {
             responses.push(rpc::CommitResponse { ok: resp.ok });
         }
 
-        let resp = volo_grpc::Response::new(rpc::CommitBatchResponse { responses });
+        let (frame, end_offsets) = encode_items_to_parts(&responses).map_err(|err| {
+            volo_grpc::Status::internal(format!(
+                "failed to encode packed commit_batch_v2 response: {err}"
+            ))
+        })?;
         let us = start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         self.state.rpc_handler_stats.record_commit_batch(us);
-        Ok(resp)
+        Ok(volo_grpc::Response::new(rpc::PackedBatchResponse {
+            frame,
+            end_offsets,
+        }))
     }
 
     /// Handle a single recover RPC request.
@@ -524,21 +911,44 @@ impl rpc::HoloRpc for RpcService {
             status,
             accepted_ballot,
             command: resp.command.into(),
+            command_digest: recover_command_digest_bytes(resp.command_digest),
+            has_command: resp.has_command,
             seq: resp.seq,
             deps,
         }))
     }
 
-    /// Handle a batched recover RPC request.
-    async fn recover_batch(
+    /// Handle a packed v2 recover batch RPC request.
+    ///
+    /// Purpose:
+    /// - Process compact unary recover batches for the v2-only transport path.
+    ///
+    /// Design:
+    /// - Decode packed request items into `RecoverRequest`s.
+    /// - Execute requests sequentially in original order.
+    /// - Encode responses back into packed frame parts.
+    ///
+    /// Inputs:
+    /// - Packed frame + offsets containing `RecoverRequest` items.
+    ///
+    /// Outputs:
+    /// - Packed frame + offsets containing `RecoverResponse` items.
+    async fn recover_batch_v2(
         &self,
-        req: volo_grpc::Request<rpc::RecoverBatchRequest>,
-    ) -> Result<volo_grpc::Response<rpc::RecoverBatchResponse>, volo_grpc::Status> {
+        req: volo_grpc::Request<rpc::PackedBatchRequest>,
+    ) -> Result<volo_grpc::Response<rpc::PackedBatchResponse>, volo_grpc::Status> {
         self.maybe_delay().await;
         let req = req.into_inner();
-        let mut responses = Vec::with_capacity(req.requests.len());
+        let requests = decode_items_from_parts::<rpc::RecoverRequest>(req.frame, &req.end_offsets)
+            .map_err(|err| {
+                volo_grpc::Status::invalid_argument(format!(
+                    "invalid packed recover_batch_v2 request: {err}"
+                ))
+            })?;
+        let mut responses = Vec::with_capacity(requests.len());
 
-        for item in req.requests {
+        // Preserve request ordering to keep response fan-out alignment exact.
+        for item in requests {
             let group = self
                 .state
                 .group(item.group_id)
@@ -576,7 +986,6 @@ impl rpc::HoloRpc for RpcService {
                 .collect();
 
             let status = match resp.status {
-                // Map local status into the wire enum.
                 accord::TxnStatus::Unknown => rpc::TxnStatus::TXN_STATUS_UNKNOWN,
                 accord::TxnStatus::PreAccepted => rpc::TxnStatus::TXN_STATUS_PREACCEPTED,
                 accord::TxnStatus::Accepted => rpc::TxnStatus::TXN_STATUS_ACCEPTED,
@@ -598,13 +1007,21 @@ impl rpc::HoloRpc for RpcService {
                 status,
                 accepted_ballot,
                 command: resp.command.into(),
+                command_digest: recover_command_digest_bytes(resp.command_digest),
+                has_command: resp.has_command,
                 seq: resp.seq,
                 deps,
             });
         }
 
-        Ok(volo_grpc::Response::new(rpc::RecoverBatchResponse {
-            responses,
+        let (frame, end_offsets) = encode_items_to_parts(&responses).map_err(|err| {
+            volo_grpc::Status::internal(format!(
+                "failed to encode packed recover_batch_v2 response: {err}"
+            ))
+        })?;
+        Ok(volo_grpc::Response::new(rpc::PackedBatchResponse {
+            frame,
+            end_offsets,
         }))
     }
 
@@ -833,16 +1250,36 @@ impl rpc::HoloRpc for RpcService {
         Ok(volo_grpc::Response::new(resp))
     }
 
-    /// Handle a local KV batch GET RPC (non-consensus, used for quorum reads).
-    async fn kv_batch_get(
+    /// Handle a packed v2 local KV batch GET RPC request.
+    ///
+    /// Purpose:
+    /// - Process compact unary read batches for the v2-only transport path.
+    ///
+    /// Design:
+    /// - Decode packed request key slices directly from the frame.
+    /// - Resolve values in original key order.
+    /// - Encode `KvGetResponse` items back into packed frame parts.
+    ///
+    /// Inputs:
+    /// - Packed frame + offsets containing `KvGetRequest` items.
+    ///
+    /// Outputs:
+    /// - Packed frame + offsets containing `KvGetResponse` items.
+    async fn kv_batch_get_v2(
         &self,
-        req: volo_grpc::Request<rpc::KvBatchGetRequest>,
-    ) -> Result<volo_grpc::Response<rpc::KvBatchGetResponse>, volo_grpc::Status> {
+        req: volo_grpc::Request<rpc::PackedBatchRequest>,
+    ) -> Result<volo_grpc::Response<rpc::PackedBatchResponse>, volo_grpc::Status> {
         self.maybe_delay().await;
         let req = req.into_inner();
-        let keys = req.keys.into_iter().map(|k| k.to_vec()).collect::<Vec<_>>();
-        let values = self.state.kv_latest_batch(&keys);
+        let key_refs = decode_packed_kv_get_keys(&req.frame, &req.end_offsets).map_err(|err| {
+            volo_grpc::Status::invalid_argument(format!(
+                "invalid packed kv_batch_get_v2 request: {err}"
+            ))
+        })?;
+        let values = self.state.kv_latest_batch(&key_refs);
         let mut responses = Vec::with_capacity(values.len());
+        // Keep response order aligned with request order; this loop does not
+        // attempt reordering or deduplication.
         for item in values {
             match item {
                 Some((value, version)) => responses.push(rpc::KvGetResponse {
@@ -857,8 +1294,15 @@ impl rpc::HoloRpc for RpcService {
                 }),
             }
         }
-        Ok(volo_grpc::Response::new(rpc::KvBatchGetResponse {
-            responses,
+
+        let (frame, end_offsets) = encode_items_to_parts(&responses).map_err(|err| {
+            volo_grpc::Status::internal(format!(
+                "failed to encode packed kv_batch_get_v2 response: {err}"
+            ))
+        })?;
+        Ok(volo_grpc::Response::new(rpc::PackedBatchResponse {
+            frame,
+            end_offsets,
         }))
     }
 
@@ -1659,6 +2103,26 @@ fn parse_command_digest(bytes: Bytes) -> Result<[u8; 32], volo_grpc::Status> {
     Ok(out)
 }
 
+/// Convert optional recover digest bytes into wire format.
+///
+/// Purpose:
+/// - Emit recover command digest metadata without allocating intermediary
+///   vectors.
+///
+/// Design:
+/// - Uses empty bytes to represent absent digest for protobuf compatibility.
+///
+/// Inputs:
+/// - Optional fixed-size digest from Accord recovery state.
+///
+/// Outputs:
+/// - Wire `bytes` payload for `rpc::RecoverResponse.command_digest`.
+fn recover_command_digest_bytes(digest: Option<[u8; 32]>) -> Bytes {
+    digest
+        .map(|d| Bytes::copy_from_slice(&d))
+        .unwrap_or_default()
+}
+
 async fn propose_meta(state: Arc<NodeState>, cmd: ClusterCommand) -> anyhow::Result<()> {
     state.propose_meta_command(cmd).await
 }
@@ -1912,5 +2376,100 @@ async fn wait_for_merge_visible(
             );
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+
+    use super::{decode_packed_kv_get_keys, PackedKvGetDecodeError};
+    use crate::packed_batch::encode_items_to_parts;
+    use crate::volo_gen::holo_store::rpc;
+
+    /// Verify packed GET key decoder preserves request order on normal input.
+    ///
+    /// Purpose:
+    /// - Validate zero-copy key extraction for well-formed packed GET batches.
+    ///
+    /// Design:
+    /// - Encode two `KvGetRequest` items with distinct keys.
+    /// - Decode borrowed key slices and assert stable ordering.
+    ///
+    /// Inputs:
+    /// - Well-formed packed frame produced by shared batch encoder.
+    ///
+    /// Outputs:
+    /// - Ordered borrowed key slices matching original requests.
+    #[test]
+    fn decode_packed_kv_get_keys_normal_path() {
+        let requests = vec![
+            rpc::KvGetRequest {
+                key: Bytes::from_static(b"k0"),
+            },
+            rpc::KvGetRequest {
+                key: Bytes::from_static(b"k1"),
+            },
+        ];
+        let (frame, end_offsets) =
+            encode_items_to_parts(&requests).expect("encode packed requests");
+        let keys = decode_packed_kv_get_keys(&frame, &end_offsets).expect("decode packed keys");
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0], b"k0");
+        assert_eq!(keys[1], b"k1");
+    }
+
+    /// Verify decoder handles duplicate key fields by returning the last field.
+    ///
+    /// Purpose:
+    /// - Confirm compatibility with protobuf "last field wins" semantics.
+    ///
+    /// Design:
+    /// - Build one message containing duplicate field #1 entries.
+    /// - Decode key and assert the final field is selected.
+    ///
+    /// Inputs:
+    /// - One packed item payload with two `key` fields.
+    ///
+    /// Outputs:
+    /// - Decoder returns the last key value.
+    #[test]
+    fn decode_packed_kv_get_keys_duplicate_key_field_edge_path() {
+        // Field 1 (len=1, 'a'), then field 1 again (len=1, 'b').
+        let frame = Bytes::from_static(&[0x0a, 0x01, b'a', 0x0a, 0x01, b'b']);
+        let end_offsets = vec![frame.len() as u32];
+        let keys = decode_packed_kv_get_keys(&frame, &end_offsets).expect("decode packed keys");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0], b"b");
+    }
+
+    /// Verify decoder rejects malformed GET items that omit the key field.
+    ///
+    /// Purpose:
+    /// - Validate failure-path handling for malformed packed GET messages.
+    ///
+    /// Design:
+    /// - Provide one item with unrelated field #2 only.
+    /// - Assert decode returns a missing-key error variant.
+    ///
+    /// Inputs:
+    /// - One malformed packed message without field `key`.
+    ///
+    /// Outputs:
+    /// - `PackedKvGetDecodeError::MessageDecode` with `"missing key field"`.
+    #[test]
+    fn decode_packed_kv_get_keys_failure_path_missing_key() {
+        // Field 2 varint value 1; no field 1 key.
+        let frame = Bytes::from_static(&[0x10, 0x01]);
+        let end_offsets = vec![frame.len() as u32];
+        let err =
+            decode_packed_kv_get_keys(&frame, &end_offsets).expect_err("missing key should fail");
+        assert_eq!(
+            err,
+            PackedKvGetDecodeError::MessageDecode {
+                index: 0,
+                reason: "missing key field",
+            }
+        );
     }
 }

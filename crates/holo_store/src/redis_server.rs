@@ -250,6 +250,22 @@ async fn handle_conn(socket: TcpStream, state: Arc<NodeState>) -> anyhow::Result
                 } else {
                     client_batch.get_wait_total_us as f64 / client_batch.get_batches as f64
                 };
+                let client_get_avg_effective_wait_us = if client_batch.get_batches == 0 {
+                    0.0
+                } else {
+                    client_batch.get_effective_wait_total_us as f64
+                        / client_batch.get_batches as f64
+                };
+                let client_get_avg_collect_us = if client_batch.get_batches == 0 {
+                    0.0
+                } else {
+                    client_batch.get_collect_total_us as f64 / client_batch.get_batches as f64
+                };
+                let client_get_avg_queue_hint = if client_batch.get_batches == 0 {
+                    0.0
+                } else {
+                    client_batch.get_queue_hint_total as f64 / client_batch.get_batches as f64
+                };
                 let wal_stats = wal::stats_snapshot();
                 let wal_fsync_avg_us = if wal_stats.fsync_count == 0 {
                     // Avoid divide-by-zero when there are no fsyncs.
@@ -270,7 +286,7 @@ async fn handle_conn(socket: TcpStream, state: Arc<NodeState>) -> anyhow::Result
                     wal_stats.batch_total_bytes as f64 / wal_stats.batch_count as f64
                 };
                 let mut msg = format!(
-                    "records.len={} records.cap={} records.status.none={} records.status.preaccepted={} records.status.accepted={} records.status.committed={} records.status.executing={} records.status.executed={} records.missing.command={} records.missing.keys={} records.committed_missing.command={} records.committed_missing.keys={} committed_queue.len={} committed_queue.ghost={} frontier.keys={} frontier.entries={} executed_prefix_nodes={} executed_out_of_order.len={} executed_log.len={} executed_log.cap={} executed_log_order.cap={} executed_log.command_bytes={} executed_log.max_command_bytes={} executed_log.deps_total={} executed_log.max_deps_len={} reported_executed_peers={} recovering.len={} read_waiters.len={} proposal_timeouts={} execute_timeouts={} recovery.attempts={} recovery.successes={} recovery.failures={} recovery.timeouts={} recovery.noops={} recovery.last_ms={} exec.progress.count={} exec.progress.total_us={} exec.progress.max_us={} exec.progress.true={} exec.progress.false={} exec.progress.errors={} exec.recover.count={} exec.recover.total_us={} exec.recover.max_us={} exec.recover.true={} exec.recover.false={} exec.recover.errors={} apply.write.count={} apply.write.total_us={} apply.write.max_us={} apply.read.count={} apply.read.total_us={} apply.read.max_us={} apply.batch.count={} apply.batch.total_us={} apply.batch.max_us={} apply.visible.count={} apply.visible.total_us={} apply.visible.max_us={} apply.state.count={} apply.state.total_us={} apply.state.max_us={} fast_path.count={} slow_path.count={} rpc.pre_accept.batches={} rpc.pre_accept.items={} rpc.pre_accept.avg_batch={:.2} rpc.pre_accept.max_batch={} rpc.accept.batches={} rpc.accept.items={} rpc.accept.avg_batch={:.2} rpc.accept.max_batch={} rpc.commit.batches={} rpc.commit.items={} rpc.commit.avg_batch={:.2} rpc.commit.max_batch={} client.set.batches={} client.set.items={} client.set.avg_batch={:.2} client.set.max_batch={} client.set.avg_wait_us={:.2} client.set.max_wait_us={} client.get.batches={} client.get.items={} client.get.avg_batch={:.2} client.get.max_batch={} client.get.avg_wait_us={:.2} client.get.max_wait_us={} wal.fsync.count={} wal.fsync.total_us={} wal.fsync.avg_us={:.2} wal.fsync.max_us={} wal.batch.count={} wal.batch.items={} wal.batch.avg_items={:.2} wal.batch.max_items={} wal.batch.total_bytes={} wal.batch.avg_bytes={:.2} wal.batch.max_bytes={}",
+                    "records.len={} records.cap={} records.status.none={} records.status.preaccepted={} records.status.accepted={} records.status.committed={} records.status.executing={} records.status.executed={} records.missing.command={} records.missing.keys={} records.committed_missing.command={} records.committed_missing.keys={} committed_queue.len={} committed_queue.ghost={} frontier.keys={} frontier.entries={} executed_prefix_nodes={} executed_out_of_order.len={} executed_log.len={} executed_log.cap={} executed_log_order.cap={} executed_log.command_bytes={} executed_log.max_command_bytes={} executed_log.deps_total={} executed_log.max_deps_len={} reported_executed_peers={} recovering.len={} read_waiters.len={} proposal_timeouts={} execute_timeouts={} recovery.attempts={} recovery.successes={} recovery.failures={} recovery.timeouts={} recovery.noops={} recovery.last_ms={} exec.progress.count={} exec.progress.total_us={} exec.progress.max_us={} exec.progress.true={} exec.progress.false={} exec.progress.errors={} exec.recover.count={} exec.recover.total_us={} exec.recover.max_us={} exec.recover.true={} exec.recover.false={} exec.recover.errors={} apply.write.count={} apply.write.total_us={} apply.write.max_us={} apply.read.count={} apply.read.total_us={} apply.read.max_us={} apply.batch.count={} apply.batch.total_us={} apply.batch.max_us={} apply.visible.count={} apply.visible.total_us={} apply.visible.max_us={} apply.state.count={} apply.state.total_us={} apply.state.max_us={} fast_path.count={} slow_path.count={} rpc.pre_accept.batches={} rpc.pre_accept.items={} rpc.pre_accept.avg_batch={:.2} rpc.pre_accept.max_batch={} rpc.accept.batches={} rpc.accept.items={} rpc.accept.avg_batch={:.2} rpc.accept.max_batch={} rpc.commit.batches={} rpc.commit.items={} rpc.commit.avg_batch={:.2} rpc.commit.max_batch={} client.set.batches={} client.set.items={} client.set.avg_batch={:.2} client.set.max_batch={} client.set.avg_wait_us={:.2} client.set.max_wait_us={} client.get.batches={} client.get.items={} client.get.avg_batch={:.2} client.get.max_batch={} client.get.avg_wait_us={:.2} client.get.max_wait_us={} client.get.avg_effective_wait_us={:.2} client.get.max_effective_wait_us={} client.get.avg_collect_us={:.2} client.get.max_collect_us={} client.get.avg_queue_hint={:.2} client.get.max_queue_hint={} client.get.wait_reason.zero={} client.get.wait_reason.immediate={} client.get.wait_reason.stale={} client.get.wait_reason.low_backlog={} client.get.wait_reason.queue_age_cap={} client.get.wait_reason.configured={} client.get.collect_reason.max_items={} client.get.collect_reason.deadline={} client.get.collect_reason.idle={} client.get.collect_reason.closed={} wal.fsync.count={} wal.fsync.total_us={} wal.fsync.avg_us={:.2} wal.fsync.max_us={} wal.batch.count={} wal.batch.items={} wal.batch.avg_items={:.2} wal.batch.max_items={} wal.batch.total_bytes={} wal.batch.avg_bytes={:.2} wal.batch.max_bytes={}",
                     stats.records_len,
                     stats.records_capacity,
                     stats.records_status_none_len,
@@ -360,6 +376,22 @@ async fn handle_conn(socket: TcpStream, state: Arc<NodeState>) -> anyhow::Result
                     client_batch.get_max_items,
                     client_get_avg_wait_us,
                     client_batch.get_wait_max_us,
+                    client_get_avg_effective_wait_us,
+                    client_batch.get_effective_wait_max_us,
+                    client_get_avg_collect_us,
+                    client_batch.get_collect_max_us,
+                    client_get_avg_queue_hint,
+                    client_batch.get_queue_hint_max,
+                    client_batch.get_wait_reason_zero_batches,
+                    client_batch.get_wait_reason_immediate_batches,
+                    client_batch.get_wait_reason_stale_batches,
+                    client_batch.get_wait_reason_low_backlog_batches,
+                    client_batch.get_wait_reason_queue_age_cap_batches,
+                    client_batch.get_wait_reason_configured_batches,
+                    client_batch.get_collect_reason_full_batches,
+                    client_batch.get_collect_reason_deadline_batches,
+                    client_batch.get_collect_reason_idle_batches,
+                    client_batch.get_collect_reason_closed_batches,
                     wal_stats.fsync_count,
                     wal_stats.fsync_total_us,
                     wal_fsync_avg_us,

@@ -95,6 +95,7 @@ pub(super) struct State {
 #[derive(Clone, Debug)]
 pub(super) struct ExecutedLogEntry {
     pub(super) command: Option<Bytes>,
+    pub(super) command_digest: Option<[u8; 32]>,
     pub(super) seq: u64,
     pub(super) deps: Vec<TxnId>,
 }

@@ -1,16 +1,28 @@
+// Purpose:
+// - Define the gRPC wire contract for HoloStore transport and control-plane RPCs.
+//
+// Design:
+// - Use packed unary v2 batch methods for hot consensus/read paths to reduce
+//   per-item protobuf wrapper overhead and eliminate legacy compatibility lanes.
+//
+// Inputs:
+// - Consensus batch requests, read-batch requests, and cluster/control requests.
+//
+// Outputs:
+// - Wire messages returned by server handlers and consumed by transport clients.
 syntax = "proto3";
 
 package holo_store.rpc;
 
 service HoloRpc {
   rpc PreAccept(PreAcceptRequest) returns (PreAcceptResponse);
-  rpc PreAcceptBatch(PreAcceptBatchRequest) returns (PreAcceptBatchResponse);
+  rpc PreAcceptBatchV2(PackedBatchRequest) returns (PackedBatchResponse);
   rpc Accept(AcceptRequest) returns (AcceptResponse);
-  rpc AcceptBatch(AcceptBatchRequest) returns (AcceptBatchResponse);
+  rpc AcceptBatchV2(PackedBatchRequest) returns (PackedBatchResponse);
   rpc Commit(CommitRequest) returns (CommitResponse);
-  rpc CommitBatch(CommitBatchRequest) returns (CommitBatchResponse);
+  rpc CommitBatchV2(PackedBatchRequest) returns (PackedBatchResponse);
   rpc Recover(RecoverRequest) returns (RecoverResponse);
-  rpc RecoverBatch(RecoverBatchRequest) returns (RecoverBatchResponse);
+  rpc RecoverBatchV2(PackedBatchRequest) returns (PackedBatchResponse);
   rpc FetchCommand(FetchCommandRequest) returns (FetchCommandResponse);
   rpc ReportExecuted(ReportExecutedRequest) returns (ReportExecutedResponse);
   rpc LastCommitted(LastCommittedRequest) returns (LastCommittedResponse);
@@ -19,7 +31,7 @@ service HoloRpc {
   rpc Executed(ExecutedRequest) returns (ExecutedResponse);
   rpc MarkVisible(MarkVisibleRequest) returns (MarkVisibleResponse);
   rpc KvGet(KvGetRequest) returns (KvGetResponse);
-  rpc KvBatchGet(KvBatchGetRequest) returns (KvBatchGetResponse);
+  rpc KvBatchGetV2(PackedBatchRequest) returns (PackedBatchResponse);
   rpc Join(JoinRequest) returns (JoinResponse);
   rpc ClusterState(ClusterStateRequest) returns (ClusterStateResponse);
   rpc ClusterAddNode(ClusterAddNodeRequest) returns (ClusterAddNodeResponse);
@@ -64,12 +76,22 @@ message KvGetResponse {
   Version version = 3;
 }
 
-message KvBatchGetRequest {
-  repeated bytes keys = 1;
+// Packed unary batch envelope used by v2 RPC methods.
+//
+// `frame` stores each protobuf item payload back-to-back without per-item batch
+// wrapper overhead. `end_offsets` stores the exclusive end byte offset of each
+// item in `frame`.
+message PackedBatchRequest {
+  bytes frame = 1;
+  repeated uint32 end_offsets = 2;
 }
 
-message KvBatchGetResponse {
-  repeated KvGetResponse responses = 1;
+// Packed unary batch response envelope used by v2 RPC methods.
+//
+// Response items use the same packed framing contract as `PackedBatchRequest`.
+message PackedBatchResponse {
+  bytes frame = 1;
+  repeated uint32 end_offsets = 2;
 }
 
 enum TxnStatus {
@@ -96,14 +118,6 @@ message PreAcceptResponse {
   Ballot promised = 4;
 }
 
-message PreAcceptBatchRequest {
-  repeated PreAcceptRequest requests = 1;
-}
-
-message PreAcceptBatchResponse {
-  repeated PreAcceptResponse responses = 1;
-}
-
 message AcceptRequest {
   uint64 group_id = 1;
   TxnId txn_id = 2;
@@ -118,14 +132,6 @@ message AcceptRequest {
 message AcceptResponse {
   bool ok = 1;
   Ballot promised = 2;
-}
-
-message AcceptBatchRequest {
-  repeated AcceptRequest requests = 1;
-}
-
-message AcceptBatchResponse {
-  repeated AcceptResponse responses = 1;
 }
 
 message CommitRequest {
@@ -143,14 +149,6 @@ message CommitResponse {
   bool ok = 1;
 }
 
-message CommitBatchRequest {
-  repeated CommitRequest requests = 1;
-}
-
-message CommitBatchResponse {
-  repeated CommitResponse responses = 1;
-}
-
 message RecoverRequest {
   uint64 group_id = 1;
   TxnId txn_id = 2;
@@ -165,14 +163,8 @@ message RecoverResponse {
   bytes command = 5;
   uint64 seq = 6;
   repeated TxnId deps = 7;
-}
-
-message RecoverBatchRequest {
-  repeated RecoverRequest requests = 1;
-}
-
-message RecoverBatchResponse {
-  repeated RecoverResponse responses = 1;
+  bytes command_digest = 8;
+  bool has_command = 9;
 }
 
 message FetchCommandRequest {

@@ -1,8 +1,22 @@
 //! Key/value storage primitives and command encoding for the HoloStore node.
 //!
-//! This module provides the `KvEngine` abstraction, two engine implementations
-//! (`KvStore` in-memory and `FjallEngine` on-disk), a sharded wrapper, and
-//! utilities for encoding/decoding commands used by the Accord state machine.
+//! Purpose:
+//! - Provide the storage abstraction and command codec used by the Accord KV
+//!   state machine.
+//!
+//! Design:
+//! - Expose a `KvEngine` trait with in-memory, Fjall-backed, and sharded/routed
+//!   implementations.
+//! - Keep hot command apply/read paths zero-copy where possible by using
+//!   borrowed key/value slices.
+//!
+//! Inputs:
+//! - Encoded KV commands and membership commands from Accord apply/read hooks.
+//! - Key/value byte slices passed to engine methods.
+//!
+//! Outputs:
+//! - Versioned KV reads/writes, visibility updates, and decoded command
+//!   key-dependency sets.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher};
@@ -40,9 +54,21 @@ pub trait KvEngine: Send + Sync + 'static {
     fn mark_visible(&self, key: &[u8], version: Version) -> bool;
     /// Batch variant of `mark_visible`.
     ///
-    /// Returns the number of keys whose latest entry transitioned from missing
-    /// to present.
-    fn mark_visible_batch(&self, keys: &[Vec<u8>], version: Version) -> u64 {
+    /// Purpose:
+    /// - Mark many keys visible in one call while preserving key-order
+    ///   semantics for deterministic behavior.
+    ///
+    /// Design:
+    /// - Accepts borrowed key slices to avoid forcing caller-side key cloning.
+    /// - Default implementation delegates to per-key `mark_visible`.
+    ///
+    /// Inputs:
+    /// - `keys`: borrowed key slices to mark visible at `version`.
+    /// - `version`: committed version to mark visible.
+    ///
+    /// Outputs:
+    /// - Count of keys whose latest index transitioned from missing to present.
+    fn mark_visible_batch(&self, keys: &[&[u8]], version: Version) -> u64 {
         let mut inserted_latest = 0u64;
         for key in keys {
             if self.mark_visible(key, version) {
@@ -176,13 +202,26 @@ impl KvEngine for KvStore {
     }
 
     /// Batch visibility update with one write lock.
-    fn mark_visible_batch(&self, keys: &[Vec<u8>], version: Version) -> u64 {
+    ///
+    /// Purpose:
+    /// - Amortize lock overhead for many visibility updates.
+    ///
+    /// Design:
+    /// - Uses borrowed key slices from caller to avoid key cloning.
+    ///
+    /// Inputs:
+    /// - `keys`: borrowed key slices.
+    /// - `version`: committed version to expose.
+    ///
+    /// Outputs:
+    /// - Count of keys that gained a latest entry.
+    fn mark_visible_batch(&self, keys: &[&[u8]], version: Version) -> u64 {
         let mut inserted_latest = 0u64;
         let Ok(mut guard) = self.inner.write() else {
             return 0;
         };
         for key in keys {
-            let Some(entry) = guard.get_mut(key.as_slice()) else {
+            let Some(entry) = guard.get_mut(*key) else {
                 continue;
             };
             let had_visible = entry.iter().any(|v| v.visible);
@@ -429,7 +468,21 @@ impl KvEngine for FjallEngine {
     }
 
     /// Mark many keys visible with one Fjall batch commit.
-    fn mark_visible_batch(&self, keys: &[Vec<u8>], version: Version) -> u64 {
+    ///
+    /// Purpose:
+    /// - Batch visibility updates in one durable commit.
+    ///
+    /// Design:
+    /// - Deduplicates borrowed keys to avoid duplicate writes/counting.
+    /// - Falls back to per-key updates only if the batch commit fails.
+    ///
+    /// Inputs:
+    /// - `keys`: borrowed key slices.
+    /// - `version`: committed version to expose.
+    ///
+    /// Outputs:
+    /// - Count of keys that gained a latest entry.
+    fn mark_visible_batch(&self, keys: &[&[u8]], version: Version) -> u64 {
         if keys.is_empty() {
             return 0;
         }
@@ -438,10 +491,11 @@ impl KvEngine for FjallEngine {
         // double-counting inserted-latest transitions.
         let mut unique_keys = Vec::with_capacity(keys.len());
         let mut seen: HashSet<&[u8]> = HashSet::with_capacity(keys.len());
-        for key in keys {
-            let key_slice = key.as_slice();
-            if seen.insert(key_slice) {
-                unique_keys.push(key_slice);
+        for &key in keys {
+            // Keep only the first occurrence for each key in this batch. This
+            // does not alter correctness because mark-visible is idempotent.
+            if seen.insert(key) {
+                unique_keys.push(key);
             }
         }
         if unique_keys.is_empty() {
@@ -631,7 +685,22 @@ impl KvEngine for RoutedKvEngine {
         self.shards[shard].mark_visible(key, version)
     }
 
-    fn mark_visible_batch(&self, keys: &[Vec<u8>], version: Version) -> u64 {
+    /// Batch visibility updates across routed shards.
+    ///
+    /// Purpose:
+    /// - Route visibility updates to the owning shard without cloning keys.
+    ///
+    /// Design:
+    /// - Buckets input indices per shard, then passes borrowed key slices to
+    ///   shard engines.
+    ///
+    /// Inputs:
+    /// - `keys`: borrowed key slices.
+    /// - `version`: committed version to expose.
+    ///
+    /// Outputs:
+    /// - Total inserted-latest count across all shards.
+    fn mark_visible_batch(&self, keys: &[&[u8]], version: Version) -> u64 {
         if keys.is_empty() {
             return 0;
         }
@@ -639,19 +708,24 @@ impl KvEngine for RoutedKvEngine {
             return self.shards[0].mark_visible_batch(keys, version);
         }
 
-        let mut by_shard: Vec<Vec<Vec<u8>>> = vec![Vec::new(); self.shards.len()];
-        for key in keys {
+        let mut by_shard: Vec<Vec<usize>> = vec![Vec::new(); self.shards.len()];
+        for (idx, key) in keys.iter().enumerate() {
+            // Bucket indices to avoid cloning keys into per-shard vectors.
             let shard = self.shard_for_key(key);
-            by_shard[shard].push(key.clone());
+            by_shard[shard].push(idx);
         }
 
         let mut inserted = 0u64;
-        for (shard, batch) in by_shard.into_iter().enumerate() {
-            if batch.is_empty() {
+        for (shard, indices) in by_shard.into_iter().enumerate() {
+            if indices.is_empty() {
                 continue;
             }
-            inserted =
-                inserted.saturating_add(self.shards[shard].mark_visible_batch(&batch, version));
+            let mut shard_keys = Vec::with_capacity(indices.len());
+            for idx in indices {
+                shard_keys.push(keys[idx]);
+            }
+            inserted = inserted
+                .saturating_add(self.shards[shard].mark_visible_batch(&shard_keys, version));
         }
         inserted
     }
@@ -759,7 +833,22 @@ impl KvEngine for ShardedKvEngine {
     }
 
     /// Batch visibility updates across shards.
-    fn mark_visible_batch(&self, keys: &[Vec<u8>], version: Version) -> u64 {
+    ///
+    /// Purpose:
+    /// - Route visibility updates to owning shards while preserving aggregate
+    ///   inserted-latest accounting.
+    ///
+    /// Design:
+    /// - Buckets input indices by shard and forwards borrowed slices, avoiding
+    ///   key cloning.
+    ///
+    /// Inputs:
+    /// - `keys`: borrowed key slices.
+    /// - `version`: committed version to expose.
+    ///
+    /// Outputs:
+    /// - Total inserted-latest count across all shards.
+    fn mark_visible_batch(&self, keys: &[&[u8]], version: Version) -> u64 {
         if keys.is_empty() {
             return 0;
         }
@@ -767,19 +856,24 @@ impl KvEngine for ShardedKvEngine {
             return self.shards[0].mark_visible_batch(keys, version);
         }
 
-        let mut by_shard: Vec<Vec<Vec<u8>>> = vec![Vec::new(); self.shards.len()];
-        for key in keys {
+        let mut by_shard: Vec<Vec<usize>> = vec![Vec::new(); self.shards.len()];
+        for (idx, key) in keys.iter().enumerate() {
+            // Bucket indices to avoid cloning keys into per-shard vectors.
             let shard = self.shard_for_key(key);
-            by_shard[shard].push(key.clone());
+            by_shard[shard].push(idx);
         }
 
         let mut inserted = 0u64;
-        for (shard, batch) in by_shard.into_iter().enumerate() {
-            if batch.is_empty() {
+        for (shard, indices) in by_shard.into_iter().enumerate() {
+            if indices.is_empty() {
                 continue;
             }
-            inserted =
-                inserted.saturating_add(self.shards[shard].mark_visible_batch(&batch, version));
+            let mut shard_keys = Vec::with_capacity(indices.len());
+            for idx in indices {
+                shard_keys.push(keys[idx]);
+            }
+            inserted = inserted
+                .saturating_add(self.shards[shard].mark_visible_batch(&shard_keys, version));
         }
         inserted
     }
@@ -1212,6 +1306,20 @@ impl StateMachine for KvStateMachine {
     }
 
     /// Mark all written keys in a command as visible.
+    ///
+    /// Purpose:
+    /// - Publish committed write versions so reads can observe them.
+    ///
+    /// Design:
+    /// - Parses command keys once, then passes borrowed key slices into the
+    ///   engine batch-visibility API.
+    ///
+    /// Inputs:
+    /// - `data`: encoded committed command.
+    /// - `meta`: execution metadata providing committed version.
+    ///
+    /// Outputs:
+    /// - Updates engine visibility state and emits optional visibility delta.
     fn mark_visible(&self, data: &[u8], meta: ExecMeta) {
         let _guard = self.split_lock.as_ref().map(|l| l.read().unwrap());
         if data.is_empty() {
@@ -1226,9 +1334,10 @@ impl StateMachine for KvStateMachine {
                 return;
             }
         };
+        let key_refs = keys.writes.iter().map(|k| k.as_slice()).collect::<Vec<_>>();
         let visibility_delta = self
             .kv
-            .mark_visible_batch(&keys.writes, version)
+            .mark_visible_batch(&key_refs, version)
             .min(i64::MAX as u64) as i64;
         if visibility_delta != 0 {
             if let Some(hook) = &self.visibility_hook {
@@ -1291,6 +1400,12 @@ pub fn encode_batch_set(items: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
 
 /// Encode a batch GET command with multiple keys.
 pub fn encode_batch_get(keys: &[Vec<u8>]) -> Vec<u8> {
+    let key_refs = keys.iter().map(|key| key.as_slice()).collect::<Vec<_>>();
+    encode_batch_get_slices(&key_refs)
+}
+
+/// Encode a batch GET command from borrowed key slices.
+pub fn encode_batch_get_slices(keys: &[&[u8]]) -> Vec<u8> {
     let mut size = 1 + 4;
     for key in keys {
         size += 4 + key.len();
@@ -1604,7 +1719,7 @@ mod tests {
             true
         }
 
-        fn mark_visible_batch(&self, keys: &[Vec<u8>], _version: Version) -> u64 {
+        fn mark_visible_batch(&self, keys: &[&[u8]], _version: Version) -> u64 {
             self.mark_visible_batch_calls
                 .fetch_add(1, Ordering::Relaxed);
             self.mark_visible_batch_items
@@ -1635,6 +1750,54 @@ mod tests {
 
         assert_eq!(engine.mark_visible_batch_calls.load(Ordering::Relaxed), 1);
         assert_eq!(engine.mark_visible_batch_items.load(Ordering::Relaxed), 3);
+        assert_eq!(engine.mark_visible_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn kv_state_machine_mark_visible_ignores_empty_command() {
+        let engine = Arc::new(BatchTrackingEngine::default());
+        let sm = KvStateMachine::new(engine.clone(), None);
+        sm.mark_visible(
+            &[],
+            ExecMeta {
+                seq: 1,
+                txn_id: TxnId {
+                    node_id: 1,
+                    counter: 1,
+                },
+            },
+        );
+
+        assert_eq!(engine.mark_visible_batch_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(engine.mark_visible_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn kv_state_machine_mark_visible_skips_malformed_batch_set() {
+        let engine = Arc::new(BatchTrackingEngine::default());
+        let sm = KvStateMachine::new(engine.clone(), None);
+
+        // Malformed command: declares one batch item but truncates before
+        // value bytes. This should not call into the engine visibility path.
+        let mut malformed = Vec::new();
+        malformed.push(CMD_BATCH_SET);
+        malformed.extend_from_slice(&1u32.to_be_bytes()); // item count
+        malformed.extend_from_slice(&2u32.to_be_bytes()); // key len
+        malformed.extend_from_slice(b"k1");
+        malformed.extend_from_slice(&4u32.to_be_bytes()); // value len
+
+        sm.mark_visible(
+            &malformed,
+            ExecMeta {
+                seq: 2,
+                txn_id: TxnId {
+                    node_id: 1,
+                    counter: 2,
+                },
+            },
+        );
+
+        assert_eq!(engine.mark_visible_batch_calls.load(Ordering::Relaxed), 0);
         assert_eq!(engine.mark_visible_calls.load(Ordering::Relaxed), 0);
     }
 }

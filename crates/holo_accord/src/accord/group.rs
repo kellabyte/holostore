@@ -79,6 +79,35 @@ fn detach_command_bytes(command: &Bytes) -> Bytes {
     }
 }
 
+/// Build recover-response command fields from optional bytes/digest.
+///
+/// Purpose:
+/// - Encode command presence explicitly so recovery can differentiate a
+///   committed NOOP from a missing non-empty command.
+///
+/// Design:
+/// - `has_command` is `true` only when command bytes are present.
+/// - `command_digest` is populated from bytes when present, otherwise from the
+///   provided digest hint.
+///
+/// Inputs:
+/// - `command`: optional recovered command bytes.
+/// - `digest_hint`: optional digest sourced from record/executed metadata.
+///
+/// Outputs:
+/// - Tuple `(command_bytes, command_digest, has_command)` used by
+///   `RecoverResponse`.
+fn recover_response_payload(
+    command: Option<Bytes>,
+    digest_hint: Option<[u8; 32]>,
+) -> (Bytes, Option<[u8; 32]>, bool) {
+    if let Some(command) = command {
+        let digest = command_digest(&command);
+        return (command, Some(digest), true);
+    }
+    (Bytes::new(), digest_hint, false)
+}
+
 /// Lightweight handle used by callers to submit proposals.
 #[derive(Clone)]
 pub struct Handle {
@@ -808,22 +837,36 @@ impl Group {
     }
 
     pub async fn last_committed_for_keys(&self, keys: &[Vec<u8>]) -> Vec<Option<(TxnId, u64)>> {
+        let key_refs = keys.iter().map(|key| key.as_slice()).collect::<Vec<_>>();
+        self.last_committed_for_key_slices(&key_refs).await
+    }
+
+    pub async fn last_committed_for_key_slices(&self, keys: &[&[u8]]) -> Vec<Option<(TxnId, u64)>> {
         let state = self.state.lock().await;
         keys.iter()
-            .map(|k| state.last_committed_write_by_key.get(k).copied())
+            .map(|k| state.last_committed_write_by_key.get(*k).copied())
             .collect()
     }
 
     pub async fn observe_last_committed(&self, keys: &[Vec<u8>], values: &[Option<(TxnId, u64)>]) {
+        let key_refs = keys.iter().map(|key| key.as_slice()).collect::<Vec<_>>();
+        self.observe_last_committed_slices(&key_refs, values).await;
+    }
+
+    pub async fn observe_last_committed_slices(
+        &self,
+        keys: &[&[u8]],
+        values: &[Option<(TxnId, u64)>],
+    ) {
         let mut state = self.state.lock().await;
         for (key, item) in keys.iter().zip(values.iter()) {
             let Some((txn_id, seq)) = item else { continue };
-            match state.last_committed_write_by_key.get(key) {
+            match state.last_committed_write_by_key.get(*key) {
                 Some((_, cur_seq)) if *cur_seq >= *seq => continue,
                 _ => {
                     state
                         .last_committed_write_by_key
-                        .insert(key.clone(), (*txn_id, *seq));
+                        .insert((*key).to_vec(), (*txn_id, *seq));
                 }
             }
         }
@@ -1911,12 +1954,15 @@ impl Group {
 
     pub async fn rpc_recover(&self, req: RecoverRequest) -> RecoverResponse {
         if !self.local_is_voter() {
+            let (command, command_digest, has_command) = recover_response_payload(None, None);
             return RecoverResponse {
                 ok: false,
                 promised: Ballot::zero(),
                 status: TxnStatus::Unknown,
                 accepted_ballot: None,
-                command: Bytes::new(),
+                command,
+                command_digest,
+                has_command,
                 seq: 0,
                 deps: Vec::new(),
             };
@@ -1924,20 +1970,30 @@ impl Group {
         let now = time::Instant::now();
         let mut state = self.state.lock().await;
         if state.is_executed(&req.txn_id) {
-            let (command, seq, deps) = state
+            let (command, command_digest, seq, deps) = state
                 .executed_log
                 .get(&req.txn_id)
-                .map(|entry| (entry.command.clone(), entry.seq, entry.deps.clone()))
-                .unwrap_or((None, 1, Vec::new()));
+                .map(|entry| {
+                    (
+                        entry.command.clone(),
+                        entry.command_digest,
+                        entry.seq,
+                        entry.deps.clone(),
+                    )
+                })
+                .unwrap_or((None, None, 1, Vec::new()));
             drop(state);
+            let command = command.or_else(|| self.load_command_from_commit_log(req.txn_id));
+            let (command, command_digest, has_command) =
+                recover_response_payload(command, command_digest);
             return RecoverResponse {
                 ok: true,
                 promised: Ballot::zero(),
                 status: TxnStatus::Executed,
                 accepted_ballot: None,
-                command: command
-                    .or_else(|| self.load_command_from_commit_log(req.txn_id))
-                    .unwrap_or_default(),
+                command,
+                command_digest,
+                has_command,
                 seq,
                 deps,
             };
@@ -1956,24 +2012,47 @@ impl Group {
         });
 
         if rec.status >= Status::Committed {
+            let promised = rec.promised;
+            let status = status_to_txn_status(rec.status);
+            let accepted_ballot = rec.accepted_ballot;
+            let seq = rec.seq;
+            let deps = rec.deps.iter().copied().collect::<Vec<_>>();
+            let mut command = rec.command.clone();
+            let digest_hint = rec.command_digest;
+            drop(state);
+
+            // When command bytes are absent from the in-memory record, try the
+            // commit log before responding so recovery can avoid false
+            // "committed but no command" stalls.
+            if command.is_none() {
+                command = self.load_command_from_commit_log(req.txn_id);
+            }
+            let (command, command_digest, has_command) =
+                recover_response_payload(command, digest_hint);
             return RecoverResponse {
                 ok: true,
-                promised: rec.promised,
-                status: status_to_txn_status(rec.status),
-                accepted_ballot: rec.accepted_ballot,
-                command: rec.command.clone().unwrap_or_default(),
-                seq: rec.seq,
-                deps: rec.deps.iter().copied().collect(),
+                promised,
+                status,
+                accepted_ballot,
+                command,
+                command_digest,
+                has_command,
+                seq,
+                deps,
             };
         }
 
         if req.ballot < rec.promised {
+            let (command, command_digest, has_command) =
+                recover_response_payload(rec.command.clone(), rec.command_digest);
             return RecoverResponse {
                 ok: false,
                 promised: rec.promised,
                 status: status_to_txn_status(rec.status),
                 accepted_ballot: rec.accepted_ballot,
-                command: rec.command.clone().unwrap_or_default(),
+                command,
+                command_digest,
+                has_command,
                 seq: rec.seq,
                 deps: rec.deps.iter().copied().collect(),
             };
@@ -1981,13 +2060,17 @@ impl Group {
 
         rec.promised = req.ballot;
         rec.updated_at = now;
+        let (command, command_digest, has_command) =
+            recover_response_payload(rec.command.clone(), rec.command_digest);
 
         RecoverResponse {
             ok: true,
             promised: rec.promised,
             status: status_to_txn_status(rec.status),
             accepted_ballot: rec.accepted_ballot,
-            command: rec.command.clone().unwrap_or_default(),
+            command,
+            command_digest,
+            has_command,
             seq: rec.seq,
             deps: rec.deps.iter().copied().collect(),
         }
@@ -2318,6 +2401,14 @@ impl Group {
                     break;
                 };
                 if state.visible_txns.contains(&id) {
+                    let min_prefix = global_min_by_node.get(&id.node_id).copied().unwrap_or(0);
+                    if id.counter > min_prefix {
+                        // Do not shed command bytes for entries that are not
+                        // globally visible yet; lagging replicas may still
+                        // need fetch/recovery payloads for these txns.
+                        state.executed_log_order.push_back(id);
+                        continue;
+                    }
                     if let Some(entry) = state.executed_log.get_mut(&id) {
                         if let Some(command) = entry.command.take() {
                             let len = command.len();
@@ -3786,11 +3877,22 @@ impl Group {
                 for key in &item.keys.writes {
                     state.last_write_by_key.insert(key.clone(), item.id);
                 }
-                if let Some(command) = rec.command.take() {
+                // Preserve executed command bytes for recovery/fetch. If the
+                // in-memory record lost command bytes, attempt commit-log load
+                // before recording executed metadata.
+                let command = rec
+                    .command
+                    .take()
+                    .or_else(|| self.load_command_from_commit_log(item.id));
+                if let Some(command) = command {
+                    let digest = rec
+                        .command_digest
+                        .unwrap_or_else(|| command_digest(&command));
                     state.record_executed_value(
                         item.id,
                         ExecutedLogEntry {
                             command: Some(command),
+                            command_digest: Some(digest),
                             seq: rec.seq.max(1),
                             deps: rec.deps.into_iter().collect(),
                         },
@@ -3984,7 +4086,30 @@ impl Group {
                 anyhow::bail!("recovery failed to reach quorum (ok={ok}, quorum={quorum})");
             }
 
-            let chosen = choose_recovery_value(&replies)?;
+            let chosen = match choose_recovery_value(&replies)? {
+                RecoveryChoice::Ready(value) => value,
+                RecoveryChoice::MissingCommittedCommand { digest } => {
+                    // A quorum reported committed status with a stable digest
+                    // but omitted bytes. Try direct fetch before failing this
+                    // recovery loop iteration.
+                    if let Some(command) = self.fetch_command_from_peers(txn_id, digest).await? {
+                        RecoveryValue {
+                            command,
+                            seq: replies.iter().map(|r| r.seq).max().unwrap_or(1).max(1),
+                            deps: replies
+                                .iter()
+                                .flat_map(|r| r.deps.iter().copied())
+                                .collect::<BTreeSet<_>>()
+                                .into_iter()
+                                .collect(),
+                        }
+                    } else {
+                        anyhow::bail!(
+                            "recovery saw committed txn digest but peer fetch returned no command"
+                        );
+                    }
+                }
+            };
             let is_noop = chosen.command.is_empty();
             if is_noop {
                 tracing::debug!(txn_id = ?txn_id, "recovery committing noop");
@@ -4222,6 +4347,28 @@ struct RecoveryValue {
     deps: Vec<TxnId>,
 }
 
+/// Result of merging recover replies.
+///
+/// Purpose:
+/// - Distinguish a fully-resolved recovery value from the special case where
+///   replicas agree on a committed digest but did not include command bytes.
+///
+/// Design:
+/// - `Ready` carries concrete command/seq/deps for accept+commit.
+/// - `MissingCommittedCommand` carries the required digest so caller can run a
+///   peer `fetch_command` probe before retrying.
+///
+/// Inputs:
+/// - Produced by `choose_recovery_value`.
+///
+/// Outputs:
+/// - Consumed by `recover_txn_inner`.
+#[derive(Debug)]
+enum RecoveryChoice {
+    Ready(RecoveryValue),
+    MissingCommittedCommand { digest: [u8; 32] },
+}
+
 #[derive(Debug)]
 enum ProposeOnceError {
     Rejected { promised: Ballot },
@@ -4249,8 +4396,27 @@ fn merge_preaccept(oks: &[PreAcceptResponse]) -> RecoveryValue {
     }
 }
 
-fn choose_recovery_value(replies: &[RecoverResponse]) -> anyhow::Result<RecoveryValue> {
+/// Merge a quorum of recover replies into one recovery decision.
+///
+/// Purpose:
+/// - Derive one deterministic value for accept/commit during recovery.
+///
+/// Design:
+/// - Enforces command consistency when bytes are present.
+/// - Uses explicit `has_command`/`command_digest` metadata to distinguish:
+///   committed NOOP (legal empty command) vs committed missing non-empty
+///   command (requires fetch before proposing).
+///
+/// Inputs:
+/// - `replies`: quorum of `RecoverResponse` values.
+///
+/// Outputs:
+/// - `RecoveryChoice::Ready` when value is fully known.
+/// - `RecoveryChoice::MissingCommittedCommand` when digest is known but bytes
+///   are absent from all committed/executed replies.
+fn choose_recovery_value(replies: &[RecoverResponse]) -> anyhow::Result<RecoveryChoice> {
     let mut command: Option<Bytes> = None;
+    let mut digest: Option<[u8; 32]> = None;
     let mut seq = 0u64;
     let mut deps = BTreeSet::new();
     let mut saw_committed = false;
@@ -4259,7 +4425,7 @@ fn choose_recovery_value(replies: &[RecoverResponse]) -> anyhow::Result<Recovery
         if matches!(r.status, TxnStatus::Committed | TxnStatus::Executed) {
             saw_committed = true;
         }
-        if !r.command.is_empty() {
+        if r.has_command && !r.command.is_empty() {
             if let Some(cmd) = &command {
                 anyhow::ensure!(
                     cmd.as_ref() == r.command.as_ref(),
@@ -4268,22 +4434,44 @@ fn choose_recovery_value(replies: &[RecoverResponse]) -> anyhow::Result<Recovery
             } else {
                 command = Some(r.command.clone());
             }
+            let computed = command_digest(&r.command);
+            if let Some(existing) = digest {
+                anyhow::ensure!(existing == computed, "conflicting command digests");
+            } else {
+                digest = Some(computed);
+            }
+        } else if let Some(reply_digest) = r.command_digest {
+            if let Some(existing) = digest {
+                anyhow::ensure!(existing == reply_digest, "conflicting command digests");
+            } else {
+                digest = Some(reply_digest);
+            }
         }
         seq = seq.max(r.seq);
         deps.extend(r.deps.iter().copied());
     }
 
+    if command.is_none() && saw_committed {
+        if let Some(digest) = digest {
+            if digest == command_digest(&[]) {
+                return Ok(RecoveryChoice::Ready(RecoveryValue {
+                    command: Bytes::new(),
+                    seq: seq.max(1),
+                    deps: deps.into_iter().collect(),
+                }));
+            }
+            return Ok(RecoveryChoice::MissingCommittedCommand { digest });
+        }
+        anyhow::bail!("recovery saw committed txn but no replica returned command or digest");
+    }
     // If no replica can provide a value, recover by committing a NOOP command.
     // (This can happen when a txn was observed as a dependency but never reached quorum.)
-    if command.is_none() && saw_committed {
-        anyhow::bail!("recovery saw committed txn but no replica returned command");
-    }
     let command = command.unwrap_or_default();
-    Ok(RecoveryValue {
+    Ok(RecoveryChoice::Ready(RecoveryValue {
         command,
         seq: seq.max(1),
         deps: deps.into_iter().collect(),
-    })
+    }))
 }
 
 fn find_recovery_target_deep(state: &State, start: TxnId, limit: usize) -> Option<TxnId> {
@@ -5360,5 +5548,132 @@ mod tests {
             Err(ProposeOnceError::NoQuorum(_)) => {}
             other => panic!("expected no-quorum error, got {other:?}"),
         }
+    }
+
+    /// Verify recovery merge accepts explicitly-encoded committed NOOP replies.
+    ///
+    /// Purpose:
+    /// - Prevent false "missing command" failures when committed value is the
+    ///   empty NOOP command.
+    ///
+    /// Design:
+    /// - Build one committed reply with `has_command=true` and empty command.
+    /// - Assert merged choice is a ready NOOP value.
+    ///
+    /// Inputs:
+    /// - One committed recover reply with empty command payload.
+    ///
+    /// Outputs:
+    /// - `RecoveryChoice::Ready` containing empty command bytes.
+    #[test]
+    fn choose_recovery_value_accepts_explicit_committed_noop() {
+        let reply = RecoverResponse {
+            ok: true,
+            promised: Ballot::zero(),
+            status: TxnStatus::Committed,
+            accepted_ballot: None,
+            command: Bytes::new(),
+            command_digest: Some(command_digest(&[])),
+            has_command: true,
+            seq: 7,
+            deps: Vec::new(),
+        };
+
+        let choice = choose_recovery_value(&[reply]).expect("noop recovery merge should succeed");
+        match choice {
+            RecoveryChoice::Ready(value) => {
+                assert!(value.command.is_empty(), "expected merged NOOP command");
+                assert_eq!(value.seq, 7);
+            }
+            other => panic!("expected ready recovery value, got {other:?}"),
+        }
+    }
+
+    /// Verify recovery merge asks caller to fetch bytes when digest is known
+    /// but no committed reply includes command bytes.
+    ///
+    /// Purpose:
+    /// - Cover the recovery edge path that previously produced repeated
+    ///   committed-missing-command stalls.
+    ///
+    /// Design:
+    /// - Build one committed reply with digest metadata and `has_command=false`.
+    /// - Assert merge output requests command fetch for that digest.
+    ///
+    /// Inputs:
+    /// - One committed recover reply with missing command bytes.
+    ///
+    /// Outputs:
+    /// - `RecoveryChoice::MissingCommittedCommand`.
+    #[test]
+    fn choose_recovery_value_flags_missing_committed_command() {
+        let cmd = Bytes::from_static(b"recover-me");
+        let digest = command_digest(&cmd);
+        let reply = RecoverResponse {
+            ok: true,
+            promised: Ballot::zero(),
+            status: TxnStatus::Committed,
+            accepted_ballot: None,
+            command: Bytes::new(),
+            command_digest: Some(digest),
+            has_command: false,
+            seq: 3,
+            deps: Vec::new(),
+        };
+
+        let choice =
+            choose_recovery_value(&[reply]).expect("missing-command recovery merge should succeed");
+        match choice {
+            RecoveryChoice::MissingCommittedCommand { digest: got } => {
+                assert_eq!(got, digest);
+            }
+            other => panic!("expected missing-command recovery choice, got {other:?}"),
+        }
+    }
+
+    /// Verify recovery merge rejects conflicting committed digests.
+    ///
+    /// Purpose:
+    /// - Preserve safety by rejecting incompatible committed values.
+    ///
+    /// Design:
+    /// - Feed two committed replies with different digest metadata.
+    /// - Assert merge returns an error.
+    ///
+    /// Inputs:
+    /// - Two committed recover replies with distinct digests.
+    ///
+    /// Outputs:
+    /// - Error from `choose_recovery_value`.
+    #[test]
+    fn choose_recovery_value_rejects_conflicting_committed_digests() {
+        let a = RecoverResponse {
+            ok: true,
+            promised: Ballot::zero(),
+            status: TxnStatus::Committed,
+            accepted_ballot: None,
+            command: Bytes::new(),
+            command_digest: Some(command_digest(b"a")),
+            has_command: false,
+            seq: 1,
+            deps: Vec::new(),
+        };
+        let b = RecoverResponse {
+            ok: true,
+            promised: Ballot::zero(),
+            status: TxnStatus::Committed,
+            accepted_ballot: None,
+            command: Bytes::new(),
+            command_digest: Some(command_digest(b"b")),
+            has_command: false,
+            seq: 1,
+            deps: Vec::new(),
+        };
+
+        let err = choose_recovery_value(&[a, b]).expect_err("conflicting digests should fail");
+        assert!(
+            err.to_string().contains("conflicting command digests"),
+            "unexpected error: {err}"
+        );
     }
 }

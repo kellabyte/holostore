@@ -351,12 +351,30 @@ pub enum TxnStatus {
 }
 
 #[derive(Clone, Debug)]
+/// Recovery reply from one replica.
+///
+/// Purpose:
+/// - Report per-transaction recovery state so callers can derive a quorum-safe
+///   value for accept/commit.
+///
+/// Design:
+/// - Carries status/ballot metadata plus command bytes when available.
+/// - Exposes `command_digest` even when `has_command=false` so callers can
+///   distinguish a committed NOOP from a missing non-empty command.
+///
+/// Inputs:
+/// - Produced by `rpc_recover` from local record/executed state.
+///
+/// Outputs:
+/// - Consumed by recovery quorum merge logic.
 pub struct RecoverResponse {
     pub ok: bool,
     pub promised: Ballot,
     pub status: TxnStatus,
     pub accepted_ballot: Option<Ballot>,
     pub command: Bytes,
+    pub command_digest: Option<[u8; 32]>,
+    pub has_command: bool,
     pub seq: u64,
     pub deps: Vec<TxnId>,
 }
