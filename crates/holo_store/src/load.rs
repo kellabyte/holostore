@@ -11,11 +11,10 @@
 //!   descriptor). In the current implementation each range is backed by one
 //!   shard index, so this is equivalent in practice.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crate::kv;
 /// Bucket count used for sampled hot-key concentration approximation.
 pub const HOT_KEY_BUCKETS: usize = 32;
 const HOT_KEY_SAMPLE_MASK: u64 = 0x0f; // 1 / 16 sampling
@@ -280,9 +279,7 @@ impl ShardLoadTracker {
 /// Output:
 /// - `Some(offset)` when the key is sampled, `None` when skipped by sampling mask.
 fn hot_bucket_offset(shard_index: usize, key: &[u8]) -> Option<usize> {
-    let mut hasher = DefaultHasher::new();
-    key.hash(&mut hasher);
-    let hash = hasher.finish();
+    let hash = kv::hash_key(key);
     if (hash & HOT_KEY_SAMPLE_MASK) != 0 {
         return None;
     }

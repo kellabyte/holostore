@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use std::{env, str::FromStr};
 
 use anyhow::Context;
+use bytes::Bytes;
 use crc32fast::Hasher;
 #[cfg(feature = "raft-engine")]
 use holo_accord::accord::{txn_group_id, GroupId};
@@ -1398,7 +1399,7 @@ fn encode_entry(entry: &CommitLogEntry) -> Vec<u8> {
         out.extend_from_slice(&dep.counter.to_be_bytes());
     }
     out.extend_from_slice(&(entry.command.len() as u32).to_be_bytes());
-    out.extend_from_slice(&entry.command);
+    out.extend_from_slice(entry.command.as_ref());
     out
 }
 
@@ -1425,7 +1426,7 @@ fn decode_entry(buf: &[u8]) -> anyhow::Result<CommitLogEntry> {
     }
     let cmd_len = read_u32_at(buf, &mut offset)? as usize;
     anyhow::ensure!(offset + cmd_len <= buf.len(), "wal entry short command");
-    let command = buf[offset..offset + cmd_len].to_vec();
+    let command = Bytes::copy_from_slice(&buf[offset..offset + cmd_len]);
     Ok(CommitLogEntry {
         txn_id: TxnId { node_id, counter },
         seq,
@@ -1597,7 +1598,7 @@ mod tests {
             txn_id: make_txn(group_id, seq),
             seq,
             deps: Vec::new(),
-            command: format!("set:{seq}").into_bytes(),
+            command: format!("set:{seq}").into_bytes().into(),
         }
     }
 

@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 
 /// Logical identifier for an Accord group (shard).
 pub type GroupId = u64;
@@ -125,6 +126,13 @@ pub struct Config {
     pub preaccept_stall_hits: u32,
     pub execute_batch_max: usize,
     pub inline_command_in_accept_commit: bool,
+    /// Soft cap for in-memory executed command payload bytes retained for
+    /// recovery/fetch fast paths.
+    ///
+    /// When exceeded, the oldest visible executed entries drop their cached
+    /// command payload and keep only metadata (seq/deps). Missing payloads are
+    /// fetched from WAL/peers on demand.
+    pub executed_command_cache_max_bytes: usize,
     pub commit_log_batch_max: usize,
     pub commit_log_batch_wait: Duration,
     /// Commit ACK durability policy for this group (`async` vs `sync` ACK).
@@ -180,7 +188,7 @@ impl CommandKeys {
 pub trait StateMachine: Send + Sync + 'static {
     fn command_keys(&self, data: &[u8]) -> anyhow::Result<CommandKeys>;
     fn apply(&self, data: &[u8], meta: ExecMeta);
-    fn apply_batch(&self, items: &[(Vec<u8>, ExecMeta)]) {
+    fn apply_batch(&self, items: &[(Bytes, ExecMeta)]) {
         for (data, meta) in items {
             self.apply(data, *meta);
         }
@@ -198,7 +206,7 @@ pub struct CommitLogEntry {
     pub txn_id: TxnId,
     pub seq: u64,
     pub deps: Vec<TxnId>,
-    pub command: Vec<u8>,
+    pub command: Bytes,
 }
 
 /// Commit-log append options controlling durability semantics for this request.
@@ -278,7 +286,7 @@ pub struct PreAcceptRequest {
     pub group_id: GroupId,
     pub txn_id: TxnId,
     pub ballot: Ballot,
-    pub command: Vec<u8>,
+    pub command: Bytes,
     pub seq: u64,
     pub deps: Vec<TxnId>,
 }
@@ -296,7 +304,7 @@ pub struct AcceptRequest {
     pub group_id: GroupId,
     pub txn_id: TxnId,
     pub ballot: Ballot,
-    pub command: Vec<u8>,
+    pub command: Bytes,
     pub command_digest: [u8; 32],
     pub has_command: bool,
     pub seq: u64,
@@ -314,7 +322,7 @@ pub struct CommitRequest {
     pub group_id: GroupId,
     pub txn_id: TxnId,
     pub ballot: Ballot,
-    pub command: Vec<u8>,
+    pub command: Bytes,
     pub command_digest: [u8; 32],
     pub has_command: bool,
     pub seq: u64,
@@ -343,12 +351,30 @@ pub enum TxnStatus {
 }
 
 #[derive(Clone, Debug)]
+/// Recovery reply from one replica.
+///
+/// Purpose:
+/// - Report per-transaction recovery state so callers can derive a quorum-safe
+///   value for accept/commit.
+///
+/// Design:
+/// - Carries status/ballot metadata plus command bytes when available.
+/// - Exposes `command_digest` even when `has_command=false` so callers can
+///   distinguish a committed NOOP from a missing non-empty command.
+///
+/// Inputs:
+/// - Produced by `rpc_recover` from local record/executed state.
+///
+/// Outputs:
+/// - Consumed by recovery quorum merge logic.
 pub struct RecoverResponse {
     pub ok: bool,
     pub promised: Ballot,
     pub status: TxnStatus,
     pub accepted_ballot: Option<Ballot>,
-    pub command: Vec<u8>,
+    pub command: Bytes,
+    pub command_digest: Option<[u8; 32]>,
+    pub has_command: bool,
     pub seq: u64,
     pub deps: Vec<TxnId>,
 }
@@ -398,7 +424,7 @@ pub trait Transport: Send + Sync + 'static {
         target: NodeId,
         group_id: GroupId,
         txn_id: TxnId,
-    ) -> anyhow::Result<Option<Vec<u8>>>;
+    ) -> anyhow::Result<Option<Bytes>>;
 
     async fn report_executed(
         &self,

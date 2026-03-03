@@ -1,9 +1,7 @@
 //! Control-plane cluster metadata and membership state machine.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeMap;
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,8 +11,7 @@ use holo_accord::accord::{CommandKeys, ExecMeta, NodeId, StateMachine};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
-use crate::kv::encode_key_prefix;
-use crate::kv::ShardRouter;
+use crate::kv::{encode_key_prefix, hash_key, ShardRouter};
 use fjall::{Keyspace, PartitionCreateOptions};
 /// Cluster member state.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -3288,12 +3285,6 @@ mod tests {
         drop(keyspace);
         let _ = std::fs::remove_dir_all(&dir);
     }
-}
-
-fn hash_key(bytes: &[u8]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    hasher.finish()
 }
 
 fn key_in_range(key: &[u8], start: &[u8], end: &[u8]) -> bool {

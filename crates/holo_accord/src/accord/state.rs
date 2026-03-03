@@ -5,12 +5,17 @@
 //! separate from the consensus logic so that state operations remain testable
 //! and easy to reason about.
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 
+use bytes::Bytes;
+use hashbrown::{HashMap, HashSet};
 use tokio::sync::oneshot;
 use tokio::time;
 
 use super::{Ballot, CommandKeys, NodeId, TxnId, TxnStatus};
+
+type FastMap<K, V> = HashMap<K, V>;
+type FastSet<T> = HashSet<T>;
 
 /// Lifecycle state for a transaction record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -28,7 +33,7 @@ pub(super) enum Status {
 pub(super) struct Record {
     pub(super) promised: Ballot,
     pub(super) accepted_ballot: Option<Ballot>,
-    pub(super) command: Option<Vec<u8>>,
+    pub(super) command: Option<Bytes>,
     pub(super) command_digest: Option<[u8; 32]>,
     pub(super) keys: Option<CommandKeys>,
     pub(super) seq: u64,
@@ -47,33 +52,33 @@ pub(super) struct Record {
 pub(super) struct State {
     pub(super) next_txn_counter: u64,
     pub(super) next_ballot_counter: u64,
-    pub(super) records: HashMap<TxnId, Record>,
-    pub(super) frontier_by_key: HashMap<Vec<u8>, BTreeSet<TxnId>>,
-    pub(super) last_write_by_key: HashMap<Vec<u8>, TxnId>,
-    pub(super) last_committed_write_by_key: HashMap<Vec<u8>, (TxnId, u64)>,
+    pub(super) records: FastMap<TxnId, Record>,
+    pub(super) frontier_by_key: FastMap<Vec<u8>, BTreeSet<TxnId>>,
+    pub(super) last_write_by_key: FastMap<Vec<u8>, TxnId>,
+    pub(super) last_committed_write_by_key: FastMap<Vec<u8>, (TxnId, u64)>,
     /// All committed transactions, ordered by sequence for deterministic scans.
     pub(super) committed_queue: BTreeSet<(u64, TxnId)>,
     /// Subset of committed transactions whose dependencies are already executed.
     pub(super) committed_ready: BTreeSet<(u64, TxnId)>,
     /// Remaining unmet dependencies for a committed transaction.
-    pub(super) pending_committed_deps: HashMap<TxnId, usize>,
+    pub(super) pending_committed_deps: FastMap<TxnId, usize>,
     /// Reverse dependency index to wake dependents when a txn executes.
-    pub(super) committed_dependents: HashMap<TxnId, HashSet<TxnId>>,
+    pub(super) committed_dependents: FastMap<TxnId, FastSet<TxnId>>,
     /// Dependencies we registered per txn so we can unlink on removal.
-    pub(super) committed_dep_links: HashMap<TxnId, Vec<TxnId>>,
-    pub(super) executed_prefix_by_node: HashMap<NodeId, u64>,
-    pub(super) reported_executed_prefix_by_peer: HashMap<NodeId, HashMap<NodeId, u64>>,
-    pub(super) executed_out_of_order: HashSet<TxnId>,
-    pub(super) executed_log: HashMap<TxnId, ExecutedLogEntry>,
+    pub(super) committed_dep_links: FastMap<TxnId, Vec<TxnId>>,
+    pub(super) executed_prefix_by_node: FastMap<NodeId, u64>,
+    pub(super) reported_executed_prefix_by_peer: FastMap<NodeId, FastMap<NodeId, u64>>,
+    pub(super) executed_out_of_order: FastSet<TxnId>,
+    pub(super) executed_log: FastMap<TxnId, ExecutedLogEntry>,
     pub(super) executed_log_order: VecDeque<TxnId>,
     pub(super) executed_log_bytes: usize,
     pub(super) executed_log_deps_total: usize,
-    pub(super) visible_txns: HashSet<TxnId>,
-    pub(super) recovering: HashSet<TxnId>,
-    pub(super) recovery_attempts_by_txn: HashMap<TxnId, u64>,
-    pub(super) recovery_last_attempt: HashMap<TxnId, time::Instant>,
-    pub(super) stalled_preaccept_counts: HashMap<TxnId, u32>,
-    pub(super) read_waiters: HashMap<TxnId, oneshot::Sender<anyhow::Result<Option<Vec<u8>>>>>,
+    pub(super) visible_txns: FastSet<TxnId>,
+    pub(super) recovering: FastSet<TxnId>,
+    pub(super) recovery_attempts_by_txn: FastMap<TxnId, u64>,
+    pub(super) recovery_last_attempt: FastMap<TxnId, time::Instant>,
+    pub(super) stalled_preaccept_counts: FastMap<TxnId, u32>,
+    pub(super) read_waiters: FastMap<TxnId, oneshot::Sender<anyhow::Result<Option<Vec<u8>>>>>,
     pub(super) proposal_timeouts: u64,
     pub(super) execute_timeouts: u64,
     pub(super) recovery_attempts: u64,
@@ -89,7 +94,8 @@ pub(super) struct State {
 /// Value stored for executed transactions to satisfy reads and recovery.
 #[derive(Clone, Debug)]
 pub(super) struct ExecutedLogEntry {
-    pub(super) command: Vec<u8>,
+    pub(super) command: Option<Bytes>,
+    pub(super) command_digest: Option<[u8; 32]>,
     pub(super) seq: u64,
     pub(super) deps: Vec<TxnId>,
 }
@@ -270,10 +276,11 @@ impl State {
     }
 
     pub(super) fn record_executed_value(&mut self, txn_id: TxnId, value: ExecutedLogEntry) {
-        let new_len = value.command.len();
+        let new_len = value.command.as_ref().map_or(0, Bytes::len);
         let new_deps = value.deps.len();
         if let Some(old) = self.executed_log.insert(txn_id, value) {
-            self.executed_log_bytes = self.executed_log_bytes + new_len - old.command.len();
+            let old_len = old.command.as_ref().map_or(0, Bytes::len);
+            self.executed_log_bytes = self.executed_log_bytes + new_len - old_len;
             self.executed_log_deps_total = self.executed_log_deps_total + new_deps - old.deps.len();
         } else {
             self.executed_log_order.push_back(txn_id);

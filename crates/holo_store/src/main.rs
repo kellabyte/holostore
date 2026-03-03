@@ -1,8 +1,17 @@
 // HoloStore node binary entry point.
 //
-// This file wires together the Accord consensus groups, KV engine, WAL, gRPC
-// transport, and Redis protocol server. It also hosts the CLI and runtime
-// configuration, as well as performance/statistics logging.
+// Purpose:
+// - Assemble and run one HoloStore node process.
+//
+// Design:
+// - Wires Accord consensus groups, KV engine, WAL, transport, and Redis server.
+// - Keeps client routing, batching, and control-plane orchestration in one runtime.
+//
+// Inputs:
+// - CLI/runtime configuration, client Redis commands, cluster metadata updates.
+//
+// Outputs:
+// - Linearizable command execution, RPC services, and operational metrics/logs.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
@@ -14,6 +23,7 @@ use std::sync::{Arc, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context};
+use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use fjall::{Keyspace, PartitionCreateOptions, PersistMode};
 use futures_util::future::BoxFuture;
@@ -29,6 +39,7 @@ mod cluster;
 mod kv;
 mod load;
 mod meta_manager;
+mod packed_batch;
 mod range_manager;
 mod rebalance_manager;
 mod redis_server;
@@ -656,6 +667,14 @@ pub struct NodeArgs {
     )]
     accord_inline_command_in_accept_commit: bool,
 
+    /// Soft cap for in-memory executed command bytes per group before cache shedding.
+    #[arg(
+        long,
+        env = "HOLO_ACCORD_EXECUTED_COMMAND_CACHE_MAX_BYTES",
+        default_value_t = 64 * 1024 * 1024
+    )]
+    accord_executed_command_cache_max_bytes: usize,
+
     /// Log process CPU/RSS stats every N milliseconds (0 disables).
     #[arg(long, env = "HOLO_PROC_STATS_INTERVAL_MS", default_value_t = 0)]
     proc_stats_interval_ms: u64,
@@ -743,13 +762,25 @@ pub struct NodeArgs {
     #[arg(long, env = "HOLO_CLIENT_GET_BATCH_MAX", default_value_t = 256)]
     client_get_batch_max: usize,
 
-    /// How long to wait to coalesce client ops into a batch (microseconds).
-    #[arg(long, env = "HOLO_CLIENT_BATCH_WAIT_US", default_value_t = 200)]
+    /// How long to wait to coalesce SET client ops into a batch (microseconds).
+    #[arg(long, env = "HOLO_CLIENT_BATCH_WAIT_US", default_value_t = 50)]
     client_batch_wait_us: u64,
 
-    /// Max in-flight client batches.
-    #[arg(long, env = "HOLO_CLIENT_BATCH_INFLIGHT", default_value_t = 4)]
+    /// Optional read-specific coalescing wait (microseconds).
+    ///
+    /// When unset, GET batching reuses `HOLO_CLIENT_BATCH_WAIT_US`.
+    #[arg(long, env = "HOLO_CLIENT_GET_BATCH_WAIT_US")]
+    client_get_batch_wait_us: Option<u64>,
+
+    /// Max in-flight SET client batches.
+    #[arg(long, env = "HOLO_CLIENT_BATCH_INFLIGHT", default_value_t = 8)]
     client_batch_inflight: usize,
+
+    /// Optional read-specific max in-flight GET batches.
+    ///
+    /// When unset, GET batching reuses `HOLO_CLIENT_BATCH_INFLIGHT`.
+    #[arg(long, env = "HOLO_CLIENT_GET_BATCH_INFLIGHT")]
+    client_get_batch_inflight: Option<usize>,
 
     /// Queue depth for client batchers.
     #[arg(long, env = "HOLO_CLIENT_BATCH_QUEUE", default_value_t = 8192)]
@@ -1117,7 +1148,7 @@ impl LocalRangeStats {
             if !in_start || !in_end {
                 continue;
             }
-            engine.set(entry.key.clone(), entry.value.clone(), entry.version);
+            engine.set(&entry.key, &entry.value, entry.version);
             if engine.mark_visible(&entry.key, entry.version) {
                 inserted_latest += 1;
             }
@@ -1750,6 +1781,22 @@ struct ClientBatchStats {
     get_max_items: AtomicU64,
     get_wait_total_us: AtomicU64,
     get_wait_max_us: AtomicU64,
+    get_effective_wait_total_us: AtomicU64,
+    get_effective_wait_max_us: AtomicU64,
+    get_collect_total_us: AtomicU64,
+    get_collect_max_us: AtomicU64,
+    get_queue_hint_total: AtomicU64,
+    get_queue_hint_max: AtomicU64,
+    get_wait_reason_zero_batches: AtomicU64,
+    get_wait_reason_immediate_batches: AtomicU64,
+    get_wait_reason_stale_batches: AtomicU64,
+    get_wait_reason_low_backlog_batches: AtomicU64,
+    get_wait_reason_queue_age_cap_batches: AtomicU64,
+    get_wait_reason_configured_batches: AtomicU64,
+    get_collect_reason_full_batches: AtomicU64,
+    get_collect_reason_deadline_batches: AtomicU64,
+    get_collect_reason_idle_batches: AtomicU64,
+    get_collect_reason_closed_batches: AtomicU64,
 }
 
 /// Snapshot of client batcher stats.
@@ -1765,6 +1812,22 @@ struct ClientBatchStatsSnapshot {
     get_max_items: u64,
     get_wait_total_us: u64,
     get_wait_max_us: u64,
+    get_effective_wait_total_us: u64,
+    get_effective_wait_max_us: u64,
+    get_collect_total_us: u64,
+    get_collect_max_us: u64,
+    get_queue_hint_total: u64,
+    get_queue_hint_max: u64,
+    get_wait_reason_zero_batches: u64,
+    get_wait_reason_immediate_batches: u64,
+    get_wait_reason_stale_batches: u64,
+    get_wait_reason_low_backlog_batches: u64,
+    get_wait_reason_queue_age_cap_batches: u64,
+    get_wait_reason_configured_batches: u64,
+    get_collect_reason_full_batches: u64,
+    get_collect_reason_deadline_batches: u64,
+    get_collect_reason_idle_batches: u64,
+    get_collect_reason_closed_batches: u64,
 }
 
 impl ClientBatchStats {
@@ -1778,12 +1841,77 @@ impl ClientBatchStats {
     }
 
     /// Record a completed GET batch with item count and queue wait time.
-    fn record_get(&self, items: u64, wait_us: u64) {
+    fn record_get(
+        &self,
+        items: u64,
+        wait_us: u64,
+        effective_wait_us: u64,
+        collect_us: u64,
+        queue_hint: u64,
+        wait_reason: ClientGetWaitReason,
+        collect_reason: ClientGetCollectStopReason,
+    ) {
         self.get_batches.fetch_add(1, Ordering::Relaxed);
         self.get_items.fetch_add(items, Ordering::Relaxed);
         self.get_max_items.fetch_max(items, Ordering::Relaxed);
         self.get_wait_total_us.fetch_add(wait_us, Ordering::Relaxed);
         self.get_wait_max_us.fetch_max(wait_us, Ordering::Relaxed);
+        self.get_effective_wait_total_us
+            .fetch_add(effective_wait_us, Ordering::Relaxed);
+        self.get_effective_wait_max_us
+            .fetch_max(effective_wait_us, Ordering::Relaxed);
+        self.get_collect_total_us
+            .fetch_add(collect_us, Ordering::Relaxed);
+        self.get_collect_max_us
+            .fetch_max(collect_us, Ordering::Relaxed);
+        self.get_queue_hint_total
+            .fetch_add(queue_hint, Ordering::Relaxed);
+        self.get_queue_hint_max
+            .fetch_max(queue_hint, Ordering::Relaxed);
+        match wait_reason {
+            ClientGetWaitReason::ZeroWaitConfigured => {
+                self.get_wait_reason_zero_batches
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ClientGetWaitReason::ImmediateTinyFastPath => {
+                self.get_wait_reason_immediate_batches
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ClientGetWaitReason::StaleHeadFlush => {
+                self.get_wait_reason_stale_batches
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ClientGetWaitReason::LowBacklogClamp => {
+                self.get_wait_reason_low_backlog_batches
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ClientGetWaitReason::QueueAgeClamp => {
+                self.get_wait_reason_queue_age_cap_batches
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ClientGetWaitReason::ConfiguredWait => {
+                self.get_wait_reason_configured_batches
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        match collect_reason {
+            ClientGetCollectStopReason::MaxItems => {
+                self.get_collect_reason_full_batches
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ClientGetCollectStopReason::Deadline => {
+                self.get_collect_reason_deadline_batches
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ClientGetCollectStopReason::QueueIdle => {
+                self.get_collect_reason_idle_batches
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ClientGetCollectStopReason::QueueClosed => {
+                self.get_collect_reason_closed_batches
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Snapshot and reset client batch stats.
@@ -1799,30 +1927,208 @@ impl ClientBatchStats {
             get_max_items: self.get_max_items.swap(0, Ordering::Relaxed),
             get_wait_total_us: self.get_wait_total_us.swap(0, Ordering::Relaxed),
             get_wait_max_us: self.get_wait_max_us.swap(0, Ordering::Relaxed),
+            get_effective_wait_total_us: self
+                .get_effective_wait_total_us
+                .swap(0, Ordering::Relaxed),
+            get_effective_wait_max_us: self.get_effective_wait_max_us.swap(0, Ordering::Relaxed),
+            get_collect_total_us: self.get_collect_total_us.swap(0, Ordering::Relaxed),
+            get_collect_max_us: self.get_collect_max_us.swap(0, Ordering::Relaxed),
+            get_queue_hint_total: self.get_queue_hint_total.swap(0, Ordering::Relaxed),
+            get_queue_hint_max: self.get_queue_hint_max.swap(0, Ordering::Relaxed),
+            get_wait_reason_zero_batches: self
+                .get_wait_reason_zero_batches
+                .swap(0, Ordering::Relaxed),
+            get_wait_reason_immediate_batches: self
+                .get_wait_reason_immediate_batches
+                .swap(0, Ordering::Relaxed),
+            get_wait_reason_stale_batches: self
+                .get_wait_reason_stale_batches
+                .swap(0, Ordering::Relaxed),
+            get_wait_reason_low_backlog_batches: self
+                .get_wait_reason_low_backlog_batches
+                .swap(0, Ordering::Relaxed),
+            get_wait_reason_queue_age_cap_batches: self
+                .get_wait_reason_queue_age_cap_batches
+                .swap(0, Ordering::Relaxed),
+            get_wait_reason_configured_batches: self
+                .get_wait_reason_configured_batches
+                .swap(0, Ordering::Relaxed),
+            get_collect_reason_full_batches: self
+                .get_collect_reason_full_batches
+                .swap(0, Ordering::Relaxed),
+            get_collect_reason_deadline_batches: self
+                .get_collect_reason_deadline_batches
+                .swap(0, Ordering::Relaxed),
+            get_collect_reason_idle_batches: self
+                .get_collect_reason_idle_batches
+                .swap(0, Ordering::Relaxed),
+            get_collect_reason_closed_batches: self
+                .get_collect_reason_closed_batches
+                .swap(0, Ordering::Relaxed),
+        }
+    }
+
+    /// Snapshot client batch stats without resetting counters.
+    fn snapshot(&self) -> ClientBatchStatsSnapshot {
+        ClientBatchStatsSnapshot {
+            set_batches: self.set_batches.load(Ordering::Relaxed),
+            set_items: self.set_items.load(Ordering::Relaxed),
+            set_max_items: self.set_max_items.load(Ordering::Relaxed),
+            set_wait_total_us: self.set_wait_total_us.load(Ordering::Relaxed),
+            set_wait_max_us: self.set_wait_max_us.load(Ordering::Relaxed),
+            get_batches: self.get_batches.load(Ordering::Relaxed),
+            get_items: self.get_items.load(Ordering::Relaxed),
+            get_max_items: self.get_max_items.load(Ordering::Relaxed),
+            get_wait_total_us: self.get_wait_total_us.load(Ordering::Relaxed),
+            get_wait_max_us: self.get_wait_max_us.load(Ordering::Relaxed),
+            get_effective_wait_total_us: self.get_effective_wait_total_us.load(Ordering::Relaxed),
+            get_effective_wait_max_us: self.get_effective_wait_max_us.load(Ordering::Relaxed),
+            get_collect_total_us: self.get_collect_total_us.load(Ordering::Relaxed),
+            get_collect_max_us: self.get_collect_max_us.load(Ordering::Relaxed),
+            get_queue_hint_total: self.get_queue_hint_total.load(Ordering::Relaxed),
+            get_queue_hint_max: self.get_queue_hint_max.load(Ordering::Relaxed),
+            get_wait_reason_zero_batches: self.get_wait_reason_zero_batches.load(Ordering::Relaxed),
+            get_wait_reason_immediate_batches: self
+                .get_wait_reason_immediate_batches
+                .load(Ordering::Relaxed),
+            get_wait_reason_stale_batches: self
+                .get_wait_reason_stale_batches
+                .load(Ordering::Relaxed),
+            get_wait_reason_low_backlog_batches: self
+                .get_wait_reason_low_backlog_batches
+                .load(Ordering::Relaxed),
+            get_wait_reason_queue_age_cap_batches: self
+                .get_wait_reason_queue_age_cap_batches
+                .load(Ordering::Relaxed),
+            get_wait_reason_configured_batches: self
+                .get_wait_reason_configured_batches
+                .load(Ordering::Relaxed),
+            get_collect_reason_full_batches: self
+                .get_collect_reason_full_batches
+                .load(Ordering::Relaxed),
+            get_collect_reason_deadline_batches: self
+                .get_collect_reason_deadline_batches
+                .load(Ordering::Relaxed),
+            get_collect_reason_idle_batches: self
+                .get_collect_reason_idle_batches
+                .load(Ordering::Relaxed),
+            get_collect_reason_closed_batches: self
+                .get_collect_reason_closed_batches
+                .load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl ClientBatchStatsSnapshot {
+    /// Compute a saturating delta against an earlier cumulative snapshot.
+    fn saturating_delta(&self, older: &Self) -> Self {
+        Self {
+            set_batches: self.set_batches.saturating_sub(older.set_batches),
+            set_items: self.set_items.saturating_sub(older.set_items),
+            set_max_items: self.set_max_items,
+            set_wait_total_us: self
+                .set_wait_total_us
+                .saturating_sub(older.set_wait_total_us),
+            set_wait_max_us: self.set_wait_max_us,
+            get_batches: self.get_batches.saturating_sub(older.get_batches),
+            get_items: self.get_items.saturating_sub(older.get_items),
+            get_max_items: self.get_max_items,
+            get_wait_total_us: self
+                .get_wait_total_us
+                .saturating_sub(older.get_wait_total_us),
+            get_wait_max_us: self.get_wait_max_us,
+            get_effective_wait_total_us: self
+                .get_effective_wait_total_us
+                .saturating_sub(older.get_effective_wait_total_us),
+            get_effective_wait_max_us: self.get_effective_wait_max_us,
+            get_collect_total_us: self
+                .get_collect_total_us
+                .saturating_sub(older.get_collect_total_us),
+            get_collect_max_us: self.get_collect_max_us,
+            get_queue_hint_total: self
+                .get_queue_hint_total
+                .saturating_sub(older.get_queue_hint_total),
+            get_queue_hint_max: self.get_queue_hint_max,
+            get_wait_reason_zero_batches: self
+                .get_wait_reason_zero_batches
+                .saturating_sub(older.get_wait_reason_zero_batches),
+            get_wait_reason_immediate_batches: self
+                .get_wait_reason_immediate_batches
+                .saturating_sub(older.get_wait_reason_immediate_batches),
+            get_wait_reason_stale_batches: self
+                .get_wait_reason_stale_batches
+                .saturating_sub(older.get_wait_reason_stale_batches),
+            get_wait_reason_low_backlog_batches: self
+                .get_wait_reason_low_backlog_batches
+                .saturating_sub(older.get_wait_reason_low_backlog_batches),
+            get_wait_reason_queue_age_cap_batches: self
+                .get_wait_reason_queue_age_cap_batches
+                .saturating_sub(older.get_wait_reason_queue_age_cap_batches),
+            get_wait_reason_configured_batches: self
+                .get_wait_reason_configured_batches
+                .saturating_sub(older.get_wait_reason_configured_batches),
+            get_collect_reason_full_batches: self
+                .get_collect_reason_full_batches
+                .saturating_sub(older.get_collect_reason_full_batches),
+            get_collect_reason_deadline_batches: self
+                .get_collect_reason_deadline_batches
+                .saturating_sub(older.get_collect_reason_deadline_batches),
+            get_collect_reason_idle_batches: self
+                .get_collect_reason_idle_batches
+                .saturating_sub(older.get_collect_reason_idle_batches),
+            get_collect_reason_closed_batches: self
+                .get_collect_reason_closed_batches
+                .saturating_sub(older.get_collect_reason_closed_batches),
         }
     }
 }
 
 /// Configuration for client request batching.
+///
+/// Purpose:
+/// - Hold independent SET/GET batching and concurrency knobs.
+///
+/// Design:
+/// - Allows read-path wait/in-flight tuning without perturbing SET batching.
+///
+/// Inputs:
+/// - CLI/environment-derived batching limits and wait windows.
+///
+/// Outputs:
+/// - Immutable per-worker configuration consumed by SET/GET batchers.
 #[derive(Clone, Copy)]
 struct ClientBatchConfig {
     set_max: usize,
     get_max: usize,
-    wait: Duration,
-    inflight: usize,
+    set_wait: Duration,
+    get_wait: Duration,
+    set_inflight: usize,
+    get_inflight: usize,
 }
 
 /// Work item representing a batched SET request.
 struct BatchSetWork {
     items: Vec<(Vec<u8>, Vec<u8>)>,
-    tx: oneshot::Sender<anyhow::Result<()>>,
+    tx: BatchSetReplyTx,
     enqueued_at: Instant,
 }
+
+/// One batched SET response payload.
+type BatchSetReply = anyhow::Result<()>;
+
+/// One completion channel for a batched SET request.
+type BatchSetReplyTx = oneshot::Sender<BatchSetReply>;
+
+/// One batched GET response payload.
+type BatchGetReply = anyhow::Result<Vec<Option<Vec<u8>>>>;
+
+/// One completion channel for a batched GET request.
+type BatchGetReplyTx = oneshot::Sender<BatchGetReply>;
 
 /// Work item representing a batched GET request.
 struct BatchGetWork {
     keys: Vec<Vec<u8>>,
-    tx: oneshot::Sender<anyhow::Result<Vec<Option<Vec<u8>>>>>,
+    tx: BatchGetReplyTx,
     enqueued_at: Instant,
 }
 
@@ -2032,6 +2338,52 @@ impl OpStats {
             errors: self.errors.load(Ordering::Relaxed),
             total_us: self.total_us.load(Ordering::Relaxed),
             max_us: self.max_us.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Request intent used by key-availability waits around shard fences.
+///
+/// Purpose:
+/// - Keep write paths conservative while allowing read paths to bypass
+///   split-only fences that are known to cause tail-latency spikes.
+///
+/// Design:
+/// - `Write` blocks on every fence reason.
+/// - `Read` only blocks on non-split fence reasons.
+///
+/// Inputs:
+/// - Request intent (`Read` or `Write`).
+/// - Fence reason string from cluster metadata.
+///
+/// Outputs:
+/// - Boolean indicating whether the request must wait for fence clear.
+enum KeyFenceWaitMode {
+    Read,
+    Write,
+}
+
+impl KeyFenceWaitMode {
+    /// Decide whether a fence reason should block this request mode.
+    ///
+    /// Purpose:
+    /// - Preserve correctness for writes while reducing read stalls caused by
+    ///   long-running split workflows.
+    ///
+    /// Design:
+    /// - Reads bypass fences generated by range splits.
+    /// - Writes keep strict blocking semantics for all fences.
+    ///
+    /// Inputs:
+    /// - `reason`: fence reason stored in cluster state.
+    ///
+    /// Outputs:
+    /// - `true` when the caller must wait before routing/proposing.
+    fn blocks_on_fence(self, reason: &str) -> bool {
+        match self {
+            Self::Write => true,
+            Self::Read => !range_manager::is_split_fence_reason(reason),
         }
     }
 }
@@ -2534,7 +2886,19 @@ impl NodeState {
     }
 
     /// Batch read latest visible values from the local KV engine.
-    fn kv_latest_batch(&self, keys: &[Vec<u8>]) -> Vec<Option<(Vec<u8>, kv::Version)>> {
+    ///
+    /// Purpose:
+    /// - Resolve many latest-value lookups with one engine call.
+    ///
+    /// Design:
+    /// - Accepts borrowed key slices to avoid caller-side key cloning.
+    ///
+    /// Inputs:
+    /// - `keys`: borrowed key slices in requested output order.
+    ///
+    /// Outputs:
+    /// - Latest `(value, version)` per key, preserving input order.
+    fn kv_latest_batch(&self, keys: &[&[u8]]) -> Vec<Option<(Vec<u8>, kv::Version)>> {
         self.kv_engine.get_latest_batch(keys)
     }
 
@@ -2796,6 +3160,23 @@ impl NodeState {
         Ok(in_range.len() as u64)
     }
 
+    /// Conditionally replicate latest rows for a shard range.
+    ///
+    /// Purpose:
+    /// - Apply conditional writes only when expected versions still match.
+    ///
+    /// Design:
+    /// - Verifies routed keys belong to the target shard.
+    /// - Uses borrowed key slices for latest-version reads to avoid
+    ///   intermediate key cloning in the read path.
+    ///
+    /// Inputs:
+    /// - `shard_index`: target shard index.
+    /// - `start_key`/`end_key`: key range filter.
+    /// - `entries`: conditional write intents.
+    ///
+    /// Outputs:
+    /// - Number of applied/conflicting rows plus applied versions.
     async fn write_range_latest_conditional_replicated(
         &self,
         shard_index: usize,
@@ -2825,7 +3206,8 @@ impl NodeState {
             .collect::<Vec<_>>();
         self.ensure_keys_route_to_shard(shard_index, &keys)?;
 
-        let latest = self.kv_latest_batch(&keys);
+        let key_refs = keys.iter().map(|key| key.as_slice()).collect::<Vec<_>>();
+        let latest = self.kv_latest_batch(&key_refs);
         let mut conflicts = 0u64;
         for (entry, latest_item) in in_range.iter().zip(latest.into_iter()) {
             match latest_item {
@@ -2880,6 +3262,21 @@ impl NodeState {
         })
     }
 
+    /// Wait until local latest values match the committed replicated writes.
+    ///
+    /// Purpose:
+    /// - Provide a post-commit visibility barrier for replicated write paths.
+    ///
+    /// Design:
+    /// - Polls only unresolved keys until timeout.
+    /// - Converts pending keys to borrowed slices per poll to avoid additional
+    ///   per-key allocations inside KV batch reads.
+    ///
+    /// Inputs:
+    /// - `items`: committed `(key, value)` pairs expected to become visible.
+    ///
+    /// Outputs:
+    /// - Versions observed once all values are visible, or timeout error.
     async fn wait_for_latest_values(
         &self,
         items: &[(Vec<u8>, Vec<u8>)],
@@ -2895,7 +3292,11 @@ impl NodeState {
         let mut versions = vec![None; items.len()];
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            let latest = self.kv_latest_batch(&pending_keys);
+            let pending_key_refs = pending_keys
+                .iter()
+                .map(|key| key.as_slice())
+                .collect::<Vec<_>>();
+            let latest = self.kv_latest_batch(&pending_key_refs);
             let mut next_pending_indices = Vec::with_capacity(pending_indices.len());
             let mut next_pending_keys = Vec::with_capacity(pending_keys.len());
             for ((idx, key), latest_item) in pending_indices
@@ -2937,6 +3338,11 @@ impl NodeState {
         self.client_batch_stats.snapshot_and_reset()
     }
 
+    /// Snapshot client batch stats without resetting counters.
+    fn client_batch_stats_snapshot_cumulative(&self) -> ClientBatchStatsSnapshot {
+        self.client_batch_stats.snapshot()
+    }
+
     /// Block client request execution while range operations are in progress.
     async fn wait_until_unfrozen(&self) {
         while self.cluster_store.frozen() {
@@ -2944,13 +3350,29 @@ impl NodeState {
         }
     }
 
-    /// Block while any key in the request maps to a currently fenced shard.
-    async fn wait_until_keys_available(&self, keys: &[Vec<u8>]) {
+    /// Block while any key in the request maps to an unavailable fenced shard.
+    ///
+    /// Purpose:
+    /// - Prevent writes from racing split/merge control flow while keeping reads
+    ///   off the split-fence slow path.
+    ///
+    /// Design:
+    /// - Poll cluster metadata and evaluate only shards touched by this request.
+    /// - Reads bypass split-only fences; writes block on every fence reason.
+    ///
+    /// Inputs:
+    /// - `keys`: request keys as borrowed byte slices.
+    /// - `mode`: read/write intent used for fence policy decisions.
+    ///
+    /// Outputs:
+    /// - Returns after all relevant key routes are unfenced for this mode.
+    async fn wait_until_keys_available(&self, keys: &[&[u8]], mode: KeyFenceWaitMode) {
         if keys.is_empty() {
             self.wait_until_unfrozen().await;
             return;
         }
         loop {
+            // Global freeze remains authoritative for all request modes.
             if self.cluster_store.frozen() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
                 continue;
@@ -2975,11 +3397,15 @@ impl NodeState {
                 snapshot
                     .shard_fences
                     .get(&shard_id)
-                    .map(|reason| (shard_id, reason.clone()))
+                    // Reads intentionally do not block on split fences so
+                    // split planning/drain windows do not create multi-second
+                    // tail spikes. Non-split fences still block for safety.
+                    .filter(|reason| mode.blocks_on_fence(reason))
             });
             if blocked.is_none() {
                 return;
             }
+            // Keep wait polling coarse to avoid burning CPU under sustained fences.
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
@@ -2990,8 +3416,12 @@ impl NodeState {
             // Nothing to do.
             return Ok(());
         }
-        let keys = items.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>();
-        self.wait_until_keys_available(&keys).await;
+        let keys = items
+            .iter()
+            .map(|(key, _)| key.as_slice())
+            .collect::<Vec<_>>();
+        self.wait_until_keys_available(&keys, KeyFenceWaitMode::Write)
+            .await;
         let (tx, rx) = oneshot::channel();
         let work = BatchSetWork {
             items,
@@ -3134,8 +3564,12 @@ impl NodeState {
             // Nothing to do.
             return Ok(());
         }
-        let keys = items.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>();
-        self.wait_until_keys_available(&keys).await;
+        let keys = items
+            .iter()
+            .map(|(key, _)| key.as_slice())
+            .collect::<Vec<_>>();
+        self.wait_until_keys_available(&keys, KeyFenceWaitMode::Write)
+            .await;
         let _inflight_guard = self.enter_client_op();
         let mut by_shard: Vec<Vec<(Vec<u8>, Vec<u8>)>> = vec![Vec::new(); self.data_shards];
         {
@@ -3194,7 +3628,9 @@ impl NodeState {
             // Nothing to do.
             return Ok(Vec::new());
         }
-        self.wait_until_keys_available(&keys).await;
+        let key_slices = keys.iter().map(|key| key.as_slice()).collect::<Vec<_>>();
+        self.wait_until_keys_available(&key_slices, KeyFenceWaitMode::Read)
+            .await;
 
         let (tx, rx) = oneshot::channel();
         let work = BatchGetWork {
@@ -3218,9 +3654,12 @@ impl NodeState {
             // Nothing to do.
             return Ok(Vec::new());
         }
-        self.wait_until_keys_available(&keys).await;
+        let key_slices = keys.iter().map(|key| key.as_slice()).collect::<Vec<_>>();
+        self.wait_until_keys_available(&key_slices, KeyFenceWaitMode::Read)
+            .await;
+        let keys = keys.into_iter().map(Bytes::from).collect::<Vec<_>>();
         let _inflight_guard = self.enter_client_op();
-        let mut by_shard: Vec<Vec<(usize, Vec<u8>)>> = vec![Vec::new(); self.data_shards];
+        let mut by_shard: Vec<Vec<usize>> = vec![Vec::new(); self.data_shards];
         {
             // Take split lock and range snapshot once for the whole routing pass.
             let _guard = self.split_lock.read().unwrap();
@@ -3231,27 +3670,48 @@ impl NodeState {
             };
             let ranges = range_snapshot.as_deref();
             for (idx, key) in keys.iter().enumerate() {
-                let shard = self.shard_for_key_with_snapshot(key, ranges);
-                by_shard[shard].push((idx, key.clone()));
+                let shard = self.shard_for_key_with_snapshot(key.as_ref(), ranges);
+                by_shard[shard].push(idx);
             }
+        }
+
+        if matches!(self.read_mode, ReadMode::Local) {
+            let mut out = vec![None; keys.len()];
+            for (shard, indices) in by_shard.into_iter().enumerate() {
+                if indices.is_empty() {
+                    continue;
+                }
+                self.shard_load.record_get_ops(shard, indices.len() as u64);
+                let mut shard_keys = Vec::with_capacity(indices.len());
+                for idx in &indices {
+                    self.shard_load
+                        .record_read_key_sample(shard, keys[*idx].as_ref());
+                    shard_keys.push(keys[*idx].as_ref());
+                }
+                let values = self.kv_engine.get_latest_batch(&shard_keys);
+                for (idx, value) in indices.into_iter().zip(values.into_iter()) {
+                    out[idx] = value.map(|(v, _)| v);
+                }
+            }
+            return Ok(out);
         }
 
         let mut out = vec![None; keys.len()];
         let mut futs = FuturesUnordered::new();
 
-        for (shard, entries) in by_shard.into_iter().enumerate() {
-            if entries.is_empty() {
+        for (shard, shard_indices) in by_shard.into_iter().enumerate() {
+            if shard_indices.is_empty() {
                 // Skip shards with no work.
                 continue;
             }
             // Track client-visible read load per shard (best-effort).
-            self.shard_load.record_get_ops(shard, entries.len() as u64);
-            let mut shard_keys = Vec::with_capacity(entries.len());
-            let mut shard_indices = Vec::with_capacity(entries.len());
-            for (idx, key) in entries {
-                self.shard_load.record_read_key_sample(shard, &key);
-                shard_indices.push(idx);
-                shard_keys.push(key);
+            self.shard_load
+                .record_get_ops(shard, shard_indices.len() as u64);
+            let mut shard_keys = Vec::with_capacity(shard_indices.len());
+            for idx in &shard_indices {
+                let key = &keys[*idx];
+                self.shard_load.record_read_key_sample(shard, key.as_ref());
+                shard_keys.push(key.clone());
             }
 
             let handle = self.handle_for_shard(shard);
@@ -3262,8 +3722,15 @@ impl NodeState {
                 let values = match read_mode {
                     ReadMode::Accord => {
                         // Accord reads: enforce read barriers before reading.
+                        let barrier_key_refs = shard_keys
+                            .iter()
+                            .map(|key| key.as_ref())
+                            .collect::<Vec<_>>();
                         let deps = match this
-                            .ensure_read_barrier_shard(GROUP_DATA_BASE + shard as u64, &shard_keys)
+                            .ensure_read_barrier_shard(
+                                GROUP_DATA_BASE + shard as u64,
+                                &barrier_key_refs,
+                            )
                             .await
                         {
                             Ok(versions) => versions,
@@ -3282,8 +3749,8 @@ impl NodeState {
                                 return Err(err);
                             }
                         };
-                        let expected = shard_keys.len();
-                        let cmd = kv::encode_batch_get(&shard_keys);
+                        let expected = barrier_key_refs.len();
+                        let cmd = kv::encode_batch_get_slices(&barrier_key_refs);
                         let res = handle.propose_read_with_deps(cmd, deps).await?;
                         let accord::ProposalResult::Read(value) = res else {
                             anyhow::bail!("BATCH_GET expected read result, got {res:?}");
@@ -3298,12 +3765,9 @@ impl NodeState {
                         decoded
                     }
                     // Local reads use the local KV engine without barriers.
-                    ReadMode::Local => this
-                        .kv_engine
-                        .get_latest_batch(&shard_keys)
-                        .into_iter()
-                        .map(|item| item.map(|(v, _)| v))
-                        .collect(),
+                    ReadMode::Local => {
+                        unreachable!("local reads are handled by the zero-copy path")
+                    }
                     // Quorum reads consult a quorum of peers and pick latest values.
                     ReadMode::Quorum => this.quorum_batch_get_shard(shard_keys).await?,
                 };
@@ -3367,45 +3831,57 @@ impl NodeState {
         res
     }
 
-    /// Ensure read barriers for the keys in a shard by waiting for latest commits.
+    /// Ensure a shard-level read barrier before proposing one accord read batch.
+    ///
+    /// Purpose:
+    /// - Preserve linearizable reads by ensuring locally-executed visibility for
+    ///   quorum-observed committed writes on the target keys.
+    ///
+    /// Design:
+    /// - Collect merged per-key `(txn_id, seq)` and per-origin max wait targets
+    ///   from local + remote `last_committed` responses.
+    /// - Update group-local last-committed hints once per shard batch.
+    /// - Fast-path skip `wait_executed` when executed prefixes already satisfy
+    ///   all per-origin wait targets.
+    ///
+    /// Inputs:
+    /// - `group_id`: data-group id for the shard.
+    /// - `keys`: borrowed key slices contained in one shard GET batch.
+    ///
+    /// Outputs:
+    /// - Dependency vector for `propose_read_with_deps`.
     async fn ensure_read_barrier_shard(
         &self,
         group_id: GroupId,
-        keys: &[Vec<u8>],
+        keys: &[&[u8]],
     ) -> anyhow::Result<Vec<(TxnId, u64)>> {
         if keys.is_empty() {
             // No keys means no barrier required.
             return Ok(Vec::new());
         }
-        let responses = self.quorum_last_committed_shard(group_id, keys).await?;
-        let max_by_key = merge_last_committed(&responses, keys.len());
-        let mut unique = std::collections::HashMap::<TxnId, u64>::new();
-        for replica in responses {
-            for item in replica {
-                if let Some((txn_id, _)) = item {
-                    // Track each unique transaction observed in responses.
-                    unique.entry(txn_id).or_insert(0);
-                }
-            }
-        }
-        if unique.is_empty() {
+        let barrier = self
+            .collect_read_barrier_state_shard(group_id, keys)
+            .await?;
+        let deps = read_barrier_deps_from_max_by_key(&barrier.max_by_key);
+        if deps.is_empty() {
             // No outstanding commits to wait for.
             return Ok(Vec::new());
         }
         let group = self
             .group(group_id)
             .ok_or_else(|| anyhow::anyhow!("data group missing"))?;
-        group.observe_last_committed(keys, &max_by_key).await;
-        for item in &max_by_key {
-            if let Some((txn_id, seq)) = item {
-                // Update sequences to the max observed per key.
-                unique.insert(*txn_id, *seq);
-            }
-        }
-        for (txn_id, seq) in unique.iter() {
-            let _ = seq;
-            match tokio::time::timeout(self.read_barrier_timeout, group.wait_executed(*txn_id))
-                .await
+        group
+            .observe_last_committed_slices(keys, &barrier.max_by_key)
+            .await;
+
+        let executed = group.executed_prefixes().await;
+        let pending = read_barrier_pending_wait_targets(&barrier.wait_targets, &executed);
+
+        // Only wait for targets not already covered by local executed prefixes.
+        // This avoids per-batch waiter churn when barrier visibility is already
+        // satisfied, and intentionally does not skip dependency propagation.
+        for txn_id in pending {
+            match tokio::time::timeout(self.read_barrier_timeout, group.wait_executed(txn_id)).await
             {
                 // Success path: the txn has executed.
                 Ok(Ok(())) => {}
@@ -3417,31 +3893,55 @@ impl NodeState {
                 }
             }
         }
-        Ok(unique.into_iter().collect())
+        Ok(deps)
     }
 
-    /// Fetch last-committed info from a quorum (or all peers if configured).
-    async fn quorum_last_committed_shard(
+    /// Collect merged read-barrier state for one shard batch.
+    ///
+    /// Purpose:
+    /// - Build one per-shard barrier snapshot used by `ensure_read_barrier_shard`.
+    ///
+    /// Design:
+    /// - Starts from local `last_committed` values.
+    /// - Queries remotes until quorum (or all peers if configured), merging
+    ///   responses on arrival without storing per-replica matrices.
+    /// - Launches only the minimum remote requests needed for quorum in the
+    ///   common case to reduce per-batch RPC/state-transition overhead.
+    ///
+    /// Inputs:
+    /// - `group_id`: data-group id for the shard.
+    /// - `keys`: borrowed key slices contained in one shard GET batch.
+    ///
+    /// Outputs:
+    /// - `ReadBarrierShardState` containing merged key maxima + wait targets.
+    async fn collect_read_barrier_state_shard(
         &self,
         group_id: GroupId,
-        keys: &[Vec<u8>],
-    ) -> anyhow::Result<Vec<Vec<Option<(TxnId, u64)>>>> {
+        keys: &[&[u8]],
+    ) -> anyhow::Result<ReadBarrierShardState> {
         let group = self
             .group(group_id)
             .ok_or_else(|| anyhow::anyhow!("data group missing"))?;
-        let mut results: Vec<Vec<Option<(TxnId, u64)>>> = Vec::new();
-        results.push(group.last_committed_for_keys(keys).await);
+        let mut max_by_key = vec![None; keys.len()];
+        let mut wait_targets = HashMap::<NodeId, TxnId>::new();
+        let local = group.last_committed_for_key_slices(keys).await;
+        merge_last_committed_replica_checked(&mut max_by_key, &local, &mut wait_targets)?;
 
         let quorum = (self.member_ids.len() / 2) + 1;
         let mut ok = 1usize;
         if ok >= quorum && !self.read_barrier_all_peers {
             // Local response is enough for quorum when all-peers isn't required.
-            return Ok(results);
+            return Ok(ReadBarrierShardState {
+                max_by_key,
+                wait_targets,
+            });
         }
 
         let seed = keys.first().map(|k| kv::hash_key(k)).unwrap_or(0);
         let peers = self.peers_for_seed(seed);
         let mut futs = FuturesUnordered::new();
+        let rpc_keys = keys.iter().map(|key| (*key).to_vec()).collect::<Vec<_>>();
+        let mut next_idx = 0usize;
 
         let launch_next = |futs: &mut FuturesUnordered<_>,
                            peer: NodeId,
@@ -3449,24 +3949,47 @@ impl NodeState {
                            transport: &Arc<GrpcTransport>| {
             let transport = transport.clone();
             let keys = keys.to_vec();
-            let group_id = group_id;
             futs.push(async move { transport.last_committed(peer, group_id, keys).await });
         };
 
-        for peer in &peers {
-            launch_next(&mut futs, *peer, keys, &self.transport);
+        let needed = if self.read_barrier_all_peers {
+            peers.len()
+        } else {
+            (quorum - ok).min(peers.len())
+        };
+        while next_idx < needed {
+            // Start with the minimum remote fanout needed to satisfy target.
+            let peer = peers[next_idx];
+            next_idx += 1;
+            launch_next(&mut futs, peer, &rpc_keys, &self.transport);
         }
 
         while let Some(resp) = futs.next().await {
             match resp {
                 Ok(values) => {
-                    results.push(values);
+                    merge_last_committed_replica_checked(
+                        &mut max_by_key,
+                        &values,
+                        &mut wait_targets,
+                    )?;
                     ok += 1;
+                    if ok >= quorum && !self.read_barrier_all_peers {
+                        // Quorum satisfied: stop collecting to avoid extra
+                        // state transitions and setup work on this read path.
+                        break;
+                    }
                 }
                 Err(err) => {
                     // Log and ignore failed peers; quorum will decide success.
                     tracing::debug!(error = ?err, "last_committed rpc failed");
                 }
+            }
+
+            if ok < quorum && next_idx < peers.len() {
+                // Extend fanout only when quorum is still unmet.
+                let peer = peers[next_idx];
+                next_idx += 1;
+                launch_next(&mut futs, peer, &rpc_keys, &self.transport);
             }
         }
 
@@ -3483,7 +4006,10 @@ impl NodeState {
                 "last_committed quorum failed (ok={ok}, quorum={quorum})"
             );
         }
-        Ok(results)
+        Ok(ReadBarrierShardState {
+            max_by_key,
+            wait_targets,
+        })
     }
 
     /// Perform a quorum GET and return the latest value.
@@ -3559,27 +4085,28 @@ impl NodeState {
     /// Perform a quorum batch GET for a shard and merge latest results.
     async fn quorum_batch_get_shard(
         &self,
-        keys: Vec<Vec<u8>>,
+        keys: Vec<Bytes>,
     ) -> anyhow::Result<Vec<Option<Vec<u8>>>> {
         let quorum = (self.member_ids.len() / 2) + 1;
         let mut ok = 1usize;
 
         let mut results: Vec<Vec<Option<(Vec<u8>, kv::Version)>>> = Vec::new();
-        results.push(self.kv_engine.get_latest_batch(&keys));
+        let key_refs = keys.iter().map(|k| k.as_ref()).collect::<Vec<_>>();
+        results.push(self.kv_engine.get_latest_batch(&key_refs));
 
         if ok >= quorum {
             // Local read already satisfies quorum.
             return Ok(merge_quorum_results(&results, keys.len()));
         }
 
-        let seed = keys.first().map(|k| kv::hash_key(k)).unwrap_or(0);
+        let seed = keys.first().map(|k| kv::hash_key(k.as_ref())).unwrap_or(0);
         let peers = self.peers_for_seed(seed);
         let mut next_idx = 0usize;
 
         let mut futs = FuturesUnordered::new();
         let launch_next = |futs: &mut FuturesUnordered<_>,
                            peer: NodeId,
-                           keys: &Vec<Vec<u8>>,
+                           keys: &Vec<Bytes>,
                            transport: &Arc<GrpcTransport>| {
             let transport = transport.clone();
             let keys = keys.clone();
@@ -3764,67 +4291,221 @@ fn meta_membership_sets(
     (members, voters)
 }
 
+/// Why one SET batch collection pass stopped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClientSetCollectStopReason {
+    MaxItems,
+    Deadline,
+    QueueIdle,
+    QueueClosed,
+}
+
+/// Collected SET batch plus stop reason used for telemetry.
+struct ClientSetBatchCollected {
+    batch: Vec<BatchSetWork>,
+    stop_reason: ClientSetCollectStopReason,
+}
+
+/// Maximum multiplier from configured SET wait to enforced queue-age cap.
+const CLIENT_SET_MAX_QUEUE_WAIT_MULTIPLIER: u32 = 4;
+/// Minimum enforced SET queue-age cap (microseconds).
+const CLIENT_SET_MIN_QUEUE_WAIT_US: u64 = 250;
+
+/// Compute a strict maximum SET queue-age bound from configured batching wait.
+///
+/// Purpose:
+/// - Bound additional coalescing delay so stale queued writes flush quickly.
+///
+/// Design:
+/// - Uses a floor for tiny waits.
+/// - Scales with configured wait to preserve coalescing under healthy load.
+///
+/// Inputs:
+/// - `batch_wait`: configured SET coalescing window.
+///
+/// Outputs:
+/// - Maximum allowed head-of-queue age before immediate dispatch.
+fn client_set_max_queue_wait(batch_wait: Duration) -> Duration {
+    let scaled = batch_wait
+        .checked_mul(CLIENT_SET_MAX_QUEUE_WAIT_MULTIPLIER)
+        .unwrap_or(Duration::from_secs(1));
+    scaled.max(Duration::from_micros(CLIENT_SET_MIN_QUEUE_WAIT_US))
+}
+
+/// Clamp SET batch wait so head queue-age never exceeds a strict cap.
+///
+/// Purpose:
+/// - Prevent write tail amplification from adding a full coalescing window on
+///   already-stale head requests.
+///
+/// Design:
+/// - Dispatches immediately when head queue-age already exceeded cap.
+/// - Otherwise clamps wait by remaining queue-age budget.
+///
+/// Inputs:
+/// - `head_enqueued_at`: enqueue timestamp of head request.
+/// - `batch_start`: dequeue/build start timestamp.
+/// - `batch_wait`: configured coalescing window.
+/// - `max_queue_wait`: strict queue-age cap.
+///
+/// Outputs:
+/// - Effective coalescing wait for this merged SET batch.
+fn client_set_effective_batch_wait(
+    head_enqueued_at: Instant,
+    batch_start: Instant,
+    batch_wait: Duration,
+    max_queue_wait: Duration,
+) -> Duration {
+    if batch_wait.is_zero() || max_queue_wait.is_zero() {
+        return Duration::ZERO;
+    }
+    let head_age = batch_start.saturating_duration_since(head_enqueued_at);
+    if head_age >= max_queue_wait {
+        // The head item already waited long enough. Dispatch now and do not add
+        // extra coalescing delay.
+        return Duration::ZERO;
+    }
+    let remaining = max_queue_wait - head_age;
+    batch_wait.min(remaining)
+}
+
+/// Collect a client SET batch while still polling in-flight completion futures.
+///
+/// Purpose:
+/// - Build bounded SET batches without stalling already running write batches.
+///
+/// Design:
+/// - Reuses caller-provided batch vector.
+/// - Starts from one required work item.
+/// - Fills using `try_recv` fast-path.
+/// - While waiting for more work, polls both queue receive and one in-flight
+///   completion callback.
+///
+/// Inputs:
+/// - `batch`: reusable vector buffer from caller pool.
+/// - `first`: first already-dequeued work item.
+/// - `rx`: SET work receiver.
+/// - `max_items`: hard cap on merged write count.
+/// - `wait`: soft coalescing window.
+/// - `in_flight`: running SET batch futures.
+/// - `on_in_flight`: callback for each completed future output.
+///
+/// Outputs:
+/// - Batched work vector sized by queue/time limits plus stop reason.
+async fn collect_set_batch_with_progress<Fut, F>(
+    mut batch: Vec<BatchSetWork>,
+    first: BatchSetWork,
+    rx: &mut mpsc::Receiver<BatchSetWork>,
+    max_items: usize,
+    wait: Duration,
+    in_flight: &mut FuturesUnordered<Fut>,
+    mut on_in_flight: F,
+) -> ClientSetBatchCollected
+where
+    Fut: std::future::Future,
+    F: FnMut(Fut::Output),
+{
+    batch.clear();
+    let target_capacity = max_items.max(1);
+    if batch.capacity() < target_capacity {
+        // Grow once up to the configured target and retain for reuse.
+        batch.reserve(target_capacity - batch.capacity());
+    }
+    let mut items = first.items.len();
+    batch.push(first);
+
+    let deadline = if wait.is_zero() {
+        None
+    } else {
+        Some(Instant::now() + wait)
+    };
+    // Continue until size/deadline/channel constraints stop collection.
+    let stop_reason = 'collect: loop {
+        if items >= max_items {
+            break 'collect ClientSetCollectStopReason::MaxItems;
+        }
+        match rx.try_recv() {
+            Ok(work) => {
+                items = items.saturating_add(work.items.len());
+                batch.push(work);
+                continue;
+            }
+            Err(mpsc::error::TryRecvError::Empty) => {}
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                break 'collect ClientSetCollectStopReason::QueueClosed;
+            }
+        }
+
+        let Some(deadline) = deadline else {
+            break 'collect ClientSetCollectStopReason::QueueIdle;
+        };
+        let now = Instant::now();
+        if now >= deadline {
+            break 'collect ClientSetCollectStopReason::Deadline;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        // While waiting for more queue work, keep in-flight batches moving so
+        // completion fan-out and buffer reclamation are not stalled.
+        tokio::select! {
+            maybe = rx.recv() => {
+                match maybe {
+                    Some(work) => {
+                        items = items.saturating_add(work.items.len());
+                        batch.push(work);
+                    }
+                    None => {
+                        break 'collect ClientSetCollectStopReason::QueueClosed;
+                    }
+                }
+            }
+            _ = tokio::time::sleep(remaining) => {
+                break 'collect ClientSetCollectStopReason::Deadline;
+            }
+            done = in_flight.next(), if !in_flight.is_empty() => {
+                if let Some(output) = done {
+                    on_in_flight(output);
+                }
+            }
+        }
+    };
+
+    ClientSetBatchCollected { batch, stop_reason }
+}
+
 /// Collect a batch of SET work items up to size/time limits.
+///
+/// Purpose:
+/// - Keep the enqueue path simple for the production SET worker.
+///
+/// Design:
+/// - Reuses the progress-aware collector with an empty in-flight set.
+///
+/// Inputs:
+/// - `first`: first already-dequeued work item.
+/// - `rx`: SET work receiver.
+/// - `max_items`: hard cap on merged write count.
+/// - `wait`: soft coalescing window.
+///
+/// Outputs:
+/// - Batched work vector sized by queue/time limits.
 async fn collect_set_batch(
     first: BatchSetWork,
     rx: &mut mpsc::Receiver<BatchSetWork>,
     max_items: usize,
     wait: Duration,
 ) -> Vec<BatchSetWork> {
-    let mut batch = Vec::with_capacity(max_items.max(1));
-    let mut items = 0usize;
-    items += first.items.len();
-    batch.push(first);
-
-    // Decide whether to wait for more items based on the configured wait time.
-    let deadline = if wait.is_zero() {
-        None
-    } else {
-        Some(Instant::now() + wait)
-    };
-
-    'outer: loop {
-        // Stop when we hit the maximum batch size.
-        if items >= max_items {
-            break;
-        }
-        match rx.try_recv() {
-            Ok(work) => {
-                items += work.items.len();
-                batch.push(work);
-                continue;
-            }
-            Err(mpsc::error::TryRecvError::Empty) => {}
-            Err(mpsc::error::TryRecvError::Disconnected) => break,
-        }
-
-        // No deadline means we are done collecting.
-        let Some(deadline) = deadline else {
-            break;
-        };
-        let now = Instant::now();
-        // Stop when the batching window expires.
-        if now >= deadline {
-            break;
-        }
-        let remaining = deadline.saturating_duration_since(now);
-        tokio::select! {
-            maybe = rx.recv() => {
-                match maybe {
-                    Some(work) => {
-                        items += work.items.len();
-                        batch.push(work);
-                    }
-                    None => break 'outer,
-                }
-            }
-            _ = tokio::time::sleep(remaining) => {
-                break;
-            }
-        }
-    }
-
-    batch
+    let mut in_flight = FuturesUnordered::<futures_util::future::Ready<()>>::new();
+    collect_set_batch_with_progress(
+        Vec::new(),
+        first,
+        rx,
+        max_items,
+        wait,
+        &mut in_flight,
+        |_| {},
+    )
+    .await
+    .batch
 }
 
 fn chunk_batch_set_items_by_limits(
@@ -3858,81 +4539,448 @@ fn chunk_batch_set_items_by_limits(
     chunks
 }
 
-/// Collect a batch of GET work items up to size/time limits.
-async fn collect_get_batch(
+/// Maximum number of reusable vectors cached by the client GET worker pools.
+const CLIENT_GET_REUSE_POOL_MAX_CACHED: usize = 64;
+
+/// Upper bound multiplier for retained client GET worker vector capacities.
+const CLIENT_GET_REUSE_POOL_CAPACITY_MULTIPLIER: usize = 4;
+/// Maximum multiplier from configured GET wait to enforced queue-age cap.
+const CLIENT_GET_MAX_QUEUE_WAIT_MULTIPLIER: u32 = 4;
+/// Minimum enforced GET queue-age cap (microseconds).
+const CLIENT_GET_MIN_QUEUE_WAIT_US: u64 = 250;
+/// Max coalescing delay for low-backlog GET batches (microseconds).
+const CLIENT_GET_LOW_BACKLOG_WAIT_US: u64 = 50;
+/// Queue-depth threshold for immediate GET dispatch.
+const CLIENT_GET_IMMEDIATE_DISPATCH_QUEUE_DEPTH: usize = 1;
+/// Tiny request threshold (keys) eligible for immediate dispatch fast path.
+const CLIENT_GET_TINY_REQUEST_MAX_KEYS: usize = 1;
+
+/// Bounded pool of reusable vectors for the client GET batcher.
+///
+/// Purpose:
+/// - Reuse hot-path vector allocations across completed GET batches.
+///
+/// Design:
+/// - Caches cleared vectors up to `max_cached`.
+/// - Drops oversized vectors (capacity above `max_capacity`) so one spike does
+///   not pin excess memory.
+///
+/// Inputs:
+/// - Pool bounds and returned vectors from completed work.
+///
+/// Outputs:
+/// - Recycled vectors for subsequent batches or dropped vectors when bounds are
+///   exceeded.
+struct ClientReuseVecPool<T> {
+    free: Vec<Vec<T>>,
+    max_cached: usize,
+    max_capacity: usize,
+}
+
+impl<T> ClientReuseVecPool<T> {
+    /// Create an empty bounded vector pool.
+    ///
+    /// Purpose:
+    /// - Configure vector reuse bounds for one worker lane.
+    ///
+    /// Design:
+    /// - Clamps bounds to at least one.
+    ///
+    /// Inputs:
+    /// - `max_cached`: max number of vectors retained.
+    /// - `max_capacity`: max capacity of vectors eligible for retention.
+    ///
+    /// Outputs:
+    /// - New empty pool.
+    fn new(max_cached: usize, max_capacity: usize) -> Self {
+        Self {
+            free: Vec::new(),
+            max_cached: max_cached.max(1),
+            max_capacity: max_capacity.max(1),
+        }
+    }
+
+    /// Take an empty vector with at least `min_capacity`.
+    ///
+    /// Purpose:
+    /// - Avoid per-batch allocations for common batch sizes.
+    ///
+    /// Design:
+    /// - Reuses any cached vector with sufficient capacity.
+    /// - Falls back to a fresh vector when none are suitable.
+    ///
+    /// Inputs:
+    /// - `min_capacity`: required lower bound for returned capacity.
+    ///
+    /// Outputs:
+    /// - Empty vector ready for caller writes.
+    fn take(&mut self, min_capacity: usize) -> Vec<T> {
+        let min_capacity = min_capacity.max(1);
+        if let Some(index) = self
+            .free
+            .iter()
+            .position(|candidate| candidate.capacity() >= min_capacity)
+        {
+            let mut reused = self.free.swap_remove(index);
+            reused.clear();
+            return reused;
+        }
+        Vec::with_capacity(min_capacity)
+    }
+
+    /// Return a vector to the pool when retention bounds allow.
+    ///
+    /// Purpose:
+    /// - Keep reuse effective without retaining pathological allocations.
+    ///
+    /// Design:
+    /// - Clears vector elements before retention.
+    /// - Rejects empty, oversized, or over-quota vectors.
+    ///
+    /// Inputs:
+    /// - `vec`: candidate vector to recycle.
+    ///
+    /// Outputs:
+    /// - Vector cached for reuse or dropped.
+    fn put(&mut self, mut vec: Vec<T>) {
+        vec.clear();
+        if vec.capacity() == 0 {
+            return;
+        }
+        // Avoid pinning very large one-off buffers.
+        if vec.capacity() > self.max_capacity {
+            return;
+        }
+        if self.free.len() >= self.max_cached {
+            return;
+        }
+        self.free.push(vec);
+    }
+}
+
+/// Recyclable vectors returned from one completed client GET batch.
+///
+/// Purpose:
+/// - Return responder/split vector capacities to worker pools after completion.
+///
+/// Design:
+/// - Holds only drained vectors whose payloads were already consumed.
+///
+/// Inputs:
+/// - Drained vectors from one completed in-flight batch.
+///
+/// Outputs:
+/// - Reusable vector capacity for future batches.
+struct ClientGetBatchRecycle {
+    responders: Vec<BatchGetReplyTx>,
+    splits: Vec<usize>,
+}
+
+/// Why the GET batcher selected a specific coalescing wait.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClientGetWaitReason {
+    ZeroWaitConfigured,
+    ImmediateTinyFastPath,
+    StaleHeadFlush,
+    LowBacklogClamp,
+    QueueAgeClamp,
+    ConfiguredWait,
+}
+
+/// Coalescing wait decision for one GET batch dequeue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClientGetWaitDecision {
+    wait: Duration,
+    reason: ClientGetWaitReason,
+}
+
+/// Why one GET batch collection pass stopped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClientGetCollectStopReason {
+    MaxItems,
+    Deadline,
+    QueueIdle,
+    QueueClosed,
+}
+
+/// Collected GET batch plus stop reason used for telemetry.
+struct ClientGetBatchCollected {
+    batch: Vec<BatchGetWork>,
+    stop_reason: ClientGetCollectStopReason,
+}
+
+/// Compute a strict maximum GET queue-age bound from configured batching wait.
+///
+/// Purpose:
+/// - Bound additional coalescing delay so stale queued reads flush quickly.
+///
+/// Design:
+/// - Uses a floor for tiny waits.
+/// - Scales with configured wait to preserve coalescing under healthy load.
+///
+/// Inputs:
+/// - `batch_wait`: configured GET coalescing window.
+///
+/// Outputs:
+/// - Maximum allowed head-of-queue age before immediate dispatch.
+fn client_get_max_queue_wait(batch_wait: Duration) -> Duration {
+    let scaled = batch_wait
+        .checked_mul(CLIENT_GET_MAX_QUEUE_WAIT_MULTIPLIER)
+        .unwrap_or(Duration::from_secs(1));
+    scaled.max(Duration::from_micros(CLIENT_GET_MIN_QUEUE_WAIT_US))
+}
+
+/// Decide whether client GET batching should dispatch the head item immediately.
+///
+/// Purpose:
+/// - Protect median latency for tiny reads under shallow backlog.
+///
+/// Design:
+/// - Requires small queue depth and available in-flight slot.
+/// - Restricts bypass to tiny requests (single-key reads).
+///
+/// Inputs:
+/// - `queued_items_hint`: queue depth estimate including the head item.
+/// - `in_flight`: currently active merged GET batches.
+/// - `max_in_flight`: configured concurrent merged GET batch cap.
+/// - `head_key_count`: key count in the head request.
+///
+/// Outputs:
+/// - `true` when the head should skip coalescing delay.
+fn client_get_should_dispatch_immediately(
+    queued_items_hint: usize,
+    in_flight: usize,
+    max_in_flight: usize,
+    head_key_count: usize,
+) -> bool {
+    in_flight < max_in_flight
+        && queued_items_hint <= CLIENT_GET_IMMEDIATE_DISPATCH_QUEUE_DEPTH
+        && head_key_count <= CLIENT_GET_TINY_REQUEST_MAX_KEYS
+}
+
+/// Clamp GET batch wait so head queue-age never exceeds a strict cap.
+///
+/// Purpose:
+/// - Prevent split-stall amplification from adding a full coalescing window
+///   on already-stale head requests.
+///
+/// Design:
+/// - Dispatches immediately for tiny low-backlog requests with available
+///   in-flight capacity.
+/// - Dispatches immediately when head queue-age already exceeded cap.
+/// - Otherwise clamps wait by remaining queue-age budget.
+///
+/// Inputs:
+/// - `head_enqueued_at`: enqueue timestamp of head request.
+/// - `batch_start`: dequeue/build start timestamp.
+/// - `batch_wait`: configured coalescing window.
+/// - `max_queue_wait`: strict queue-age cap.
+/// - `queued_items_hint`: queue depth estimate including head.
+/// - `in_flight`: currently active merged GET batches.
+/// - `max_in_flight`: configured concurrent merged GET batch cap.
+/// - `head_key_count`: key count in the head request.
+///
+/// Outputs:
+/// - Effective coalescing wait for this merged GET batch.
+fn client_get_effective_batch_wait(
+    head_enqueued_at: Instant,
+    batch_start: Instant,
+    batch_wait: Duration,
+    max_queue_wait: Duration,
+    queued_items_hint: usize,
+    in_flight: usize,
+    max_in_flight: usize,
+    head_key_count: usize,
+) -> ClientGetWaitDecision {
+    if batch_wait.is_zero() || max_queue_wait.is_zero() {
+        return ClientGetWaitDecision {
+            wait: Duration::ZERO,
+            reason: ClientGetWaitReason::ZeroWaitConfigured,
+        };
+    }
+    if client_get_should_dispatch_immediately(
+        queued_items_hint,
+        in_flight,
+        max_in_flight,
+        head_key_count,
+    ) {
+        return ClientGetWaitDecision {
+            wait: Duration::ZERO,
+            reason: ClientGetWaitReason::ImmediateTinyFastPath,
+        };
+    }
+    let head_age = batch_start.saturating_duration_since(head_enqueued_at);
+    if head_age >= max_queue_wait {
+        // The head item already waited long enough. Dispatch now and do not
+        // add extra coalescing delay.
+        return ClientGetWaitDecision {
+            wait: Duration::ZERO,
+            reason: ClientGetWaitReason::StaleHeadFlush,
+        };
+    }
+    let remaining = max_queue_wait - head_age;
+    let mut effective = batch_wait.min(remaining);
+    let mut reason = if effective < batch_wait {
+        ClientGetWaitReason::QueueAgeClamp
+    } else {
+        ClientGetWaitReason::ConfiguredWait
+    };
+    if queued_items_hint <= 1 {
+        // Under shallow backlog, keep a tiny wait window so near-concurrent
+        // neighbors can still coalesce without paying a full batch wait.
+        let low_backlog = Duration::from_micros(CLIENT_GET_LOW_BACKLOG_WAIT_US);
+        if effective > low_backlog {
+            effective = low_backlog;
+            reason = ClientGetWaitReason::LowBacklogClamp;
+        }
+    }
+    ClientGetWaitDecision {
+        wait: effective,
+        reason,
+    }
+}
+
+/// Collect a client GET batch while still polling in-flight completion futures.
+///
+/// Purpose:
+/// - Build bounded GET batches without stalling already running read batches.
+///
+/// Design:
+/// - Reuses caller-provided batch vector.
+/// - Starts from one required work item.
+/// - Fills using `try_recv` fast-path.
+/// - While waiting for more work, polls both queue receive and one in-flight
+///   completion callback.
+///
+/// Inputs:
+/// - `batch`: reusable vector buffer from caller pool.
+/// - `first`: first already-dequeued work item.
+/// - `rx`: GET work receiver.
+/// - `max_items`: hard cap on merged key count.
+/// - `wait`: soft coalescing window.
+/// - `in_flight`: running GET batch futures.
+/// - `on_in_flight`: callback for each completed future output.
+///
+/// Outputs:
+/// - Batched work vector sized by queue/time limits plus stop reason.
+async fn collect_get_batch_with_progress<Fut, F>(
+    mut batch: Vec<BatchGetWork>,
     first: BatchGetWork,
     rx: &mut mpsc::Receiver<BatchGetWork>,
     max_items: usize,
     wait: Duration,
-) -> Vec<BatchGetWork> {
-    let mut batch = Vec::with_capacity(max_items.max(1));
-    let mut items = 0usize;
-    items += first.keys.len();
+    in_flight: &mut FuturesUnordered<Fut>,
+    mut on_in_flight: F,
+) -> ClientGetBatchCollected
+where
+    Fut: std::future::Future,
+    F: FnMut(Fut::Output),
+{
+    batch.clear();
+    let target_capacity = max_items.max(1);
+    if batch.capacity() < target_capacity {
+        // Grow once up to the configured target and retain for reuse.
+        batch.reserve(target_capacity - batch.capacity());
+    }
+    let mut items = first.keys.len();
     batch.push(first);
 
-    // Decide whether to wait for more items based on the configured wait time.
     let deadline = if wait.is_zero() {
         None
     } else {
         Some(Instant::now() + wait)
     };
-
-    'outer: loop {
-        // Stop when we hit the maximum batch size.
+    // Continue until size/deadline/channel constraints stop collection.
+    let stop_reason = 'collect: loop {
         if items >= max_items {
-            break;
+            break 'collect ClientGetCollectStopReason::MaxItems;
         }
         match rx.try_recv() {
             Ok(work) => {
-                items += work.keys.len();
+                items = items.saturating_add(work.keys.len());
                 batch.push(work);
                 continue;
             }
             Err(mpsc::error::TryRecvError::Empty) => {}
-            Err(mpsc::error::TryRecvError::Disconnected) => break,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                break 'collect ClientGetCollectStopReason::QueueClosed;
+            }
         }
 
-        // No deadline means we are done collecting.
         let Some(deadline) = deadline else {
-            break;
+            break 'collect ClientGetCollectStopReason::QueueIdle;
         };
         let now = Instant::now();
-        // Stop when the batching window expires.
         if now >= deadline {
-            break;
+            break 'collect ClientGetCollectStopReason::Deadline;
         }
         let remaining = deadline.saturating_duration_since(now);
+        // While waiting for more queue work, keep in-flight batches moving so
+        // completion fan-out and buffer reclamation are not stalled.
         tokio::select! {
             maybe = rx.recv() => {
                 match maybe {
                     Some(work) => {
-                        items += work.keys.len();
+                        items = items.saturating_add(work.keys.len());
                         batch.push(work);
                     }
-                    None => break 'outer,
+                    None => {
+                        break 'collect ClientGetCollectStopReason::QueueClosed;
+                    }
                 }
             }
             _ = tokio::time::sleep(remaining) => {
-                break;
+                break 'collect ClientGetCollectStopReason::Deadline;
+            }
+            done = in_flight.next(), if !in_flight.is_empty() => {
+                if let Some(output) = done {
+                    on_in_flight(output);
+                }
             }
         }
-    }
+    };
 
-    batch
+    ClientGetBatchCollected { batch, stop_reason }
 }
 
 /// Spawn the SET batcher that coalesces client requests.
+///
+/// Purpose:
+/// - Merge adjacent SET requests into bounded write batches.
+///
+/// Design:
+/// - Uses one dequeue task plus bounded in-flight workers.
+/// - Applies adaptive wait policy with queue-age deadline flush and tiny-write
+///   immediate dispatch to protect write p99.9/MAX.
+/// - Preserves requester completion semantics by fanning one result to each
+///   participant.
+///
+/// Inputs:
+/// - Shared node state, SET queue receiver, and SET batch config values.
+///
+/// Outputs:
+/// - One completion response per queued SET request.
 fn spawn_set_batcher(
     state: Arc<NodeState>,
     mut rx: mpsc::Receiver<BatchSetWork>,
     cfg: ClientBatchConfig,
 ) {
     let max_items = cfg.set_max.max(1);
-    let wait = cfg.wait;
-    let inflight = Arc::new(Semaphore::new(cfg.inflight.max(1)));
+    let configured_wait = cfg.set_wait;
+    let max_queue_wait = client_set_max_queue_wait(configured_wait);
+    let max_inflight = cfg.set_inflight.max(1);
+    let inflight = Arc::new(Semaphore::new(max_inflight));
     tokio::spawn(async move {
         while let Some(first) = rx.recv().await {
-            let batch = collect_set_batch(first, &mut rx, max_items, wait).await;
+            let dequeue_start = Instant::now();
+            let effective_wait = client_set_effective_batch_wait(
+                first.enqueued_at,
+                dequeue_start,
+                configured_wait,
+                max_queue_wait,
+            );
+
+            let batch = collect_set_batch(first, &mut rx, max_items, effective_wait).await;
             let permit = match inflight.clone().acquire_owned().await {
                 Ok(permit) => permit,
                 Err(_) => return,
@@ -3989,85 +5037,219 @@ fn spawn_set_batcher(
 }
 
 /// Spawn the GET batcher that coalesces client requests.
+///
+/// Purpose:
+/// - Batch client GET requests before the read path while preserving per-request
+///   response partitioning.
+///
+/// Design:
+/// - One worker task owns dequeue, batch build, and in-flight polling.
+/// - Uses `FuturesUnordered` for bounded in-flight batch execution without
+///   per-batch `tokio::spawn` churn.
+/// - Reuses batch/responders/splits vectors through bounded pools.
+/// - Applies adaptive wait policy with queue-age deadline flush and tiny-read
+///   immediate dispatch to protect p50/p75 latency.
+/// - Splits merged responses back to original request boundaries in queue order.
+///
+/// Inputs:
+/// - Shared node state, GET queue receiver, and client batching config.
+///
+/// Outputs:
+/// - One response per queued client request in original order.
 fn spawn_get_batcher(
     state: Arc<NodeState>,
     mut rx: mpsc::Receiver<BatchGetWork>,
     cfg: ClientBatchConfig,
 ) {
     let max_items = cfg.get_max.max(1);
-    let wait = cfg.wait;
-    let inflight = Arc::new(Semaphore::new(cfg.inflight.max(1)));
+    let configured_wait = cfg.get_wait;
+    let max_queue_wait = client_get_max_queue_wait(configured_wait);
+    let max_inflight = cfg.get_inflight.max(1);
     tokio::spawn(async move {
-        while let Some(first) = rx.recv().await {
-            let batch = collect_get_batch(first, &mut rx, max_items, wait).await;
-            let permit = match inflight.clone().acquire_owned().await {
-                Ok(permit) => permit,
-                Err(_) => return,
-            };
-            let state = state.clone();
-            tokio::spawn(async move {
-                let _permit = permit;
-                let wait_us = batch
-                    .first()
-                    .map(|w| {
-                        w.enqueued_at
-                            .elapsed()
-                            .as_micros()
-                            .min(u128::from(u64::MAX)) as u64
-                    })
-                    .unwrap_or(0);
-                let total_items: usize = batch.iter().map(|w| w.keys.len()).sum();
-                let mut responders = Vec::with_capacity(batch.len());
-                let mut splits = Vec::with_capacity(batch.len());
-                let mut keys = Vec::with_capacity(total_items);
-                for work in batch {
-                    splits.push(work.keys.len());
-                    keys.extend(work.keys);
-                    responders.push(work.tx);
-                }
+        let reuse_max_capacity = max_items
+            .saturating_mul(CLIENT_GET_REUSE_POOL_CAPACITY_MULTIPLIER)
+            .max(1);
+        let reuse_max_cached = max_inflight.clamp(1, CLIENT_GET_REUSE_POOL_MAX_CACHED);
+        let mut batch_pool =
+            ClientReuseVecPool::<BatchGetWork>::new(reuse_max_cached, reuse_max_capacity);
+        let mut responder_pool =
+            ClientReuseVecPool::<BatchGetReplyTx>::new(reuse_max_cached, reuse_max_capacity);
+        let mut split_pool = ClientReuseVecPool::<usize>::new(reuse_max_cached, reuse_max_capacity);
+        let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+        let mut rx_closed = false;
 
-                if total_items == 0 {
-                    // Respond immediately to empty batches.
-                    for tx in responders {
-                        let _ = tx.send(Ok(Vec::new()));
-                    }
-                    return;
-                }
-
-                state
-                    .client_batch_stats
-                    .record_get(total_items as u64, wait_us);
-                let res = state.execute_batch_get_direct(keys).await;
-                match res {
-                    Ok(values) => {
-                        if values.len() != total_items {
-                            // Guard against mismatched batch sizing.
-                            let msg = format!(
-                                "batch get result count mismatch (expected {total_items}, got {})",
-                                values.len()
+        loop {
+            // Exit only after queue shutdown and all in-flight batches complete.
+            if rx_closed && in_flight.is_empty() {
+                break;
+            }
+            tokio::select! {
+                maybe = rx.recv(), if !rx_closed && in_flight.len() < max_inflight => {
+                    match maybe {
+                        Some(first) => {
+                            let dequeue_start = Instant::now();
+                            // Approximate queue depth including this head item. We
+                            // intentionally avoid a synchronized global counter here to
+                            // keep dequeue hot-path lock-free.
+                            let queued_items_hint = rx.len().saturating_add(1);
+                            // Compute an adaptive wait that protects median latency for
+                            // tiny/shallow reads while still allowing coalescing under
+                            // backlog. This does not bypass in-flight bounds.
+                            let wait_decision = client_get_effective_batch_wait(
+                                first.enqueued_at,
+                                dequeue_start,
+                                configured_wait,
+                                max_queue_wait,
+                                queued_items_hint,
+                                in_flight.len(),
+                                max_inflight,
+                                first.keys.len(),
                             );
-                            for tx in responders {
-                                let _ = tx.send(Err(anyhow!(msg.clone())));
+                            let batch_buf = batch_pool.take(max_items.max(1));
+                            let collect_started = Instant::now();
+                            let collected = collect_get_batch_with_progress(
+                                batch_buf,
+                                first,
+                                &mut rx,
+                                max_items,
+                                wait_decision.wait,
+                                &mut in_flight,
+                                |recycle: ClientGetBatchRecycle| {
+                                    responder_pool.put(recycle.responders);
+                                    split_pool.put(recycle.splits);
+                                },
+                            ).await;
+                            let collect_us = collect_started
+                                .elapsed()
+                                .as_micros()
+                                .min(u128::from(u64::MAX)) as u64;
+                            let mut batch = collected.batch;
+                            let wait_us = batch
+                                .first()
+                                .map(|w| {
+                                    w.enqueued_at
+                                        .elapsed()
+                                        .as_micros()
+                                        .min(u128::from(u64::MAX)) as u64
+                                })
+                                .unwrap_or(0);
+                            let total_items: usize = batch.iter().map(|w| w.keys.len()).sum();
+                            let mut responders = responder_pool.take(batch.len());
+                            let mut splits = split_pool.take(batch.len());
+                            let mut keys = Vec::with_capacity(total_items);
+                            // Flatten one merged key vector while preserving request order.
+                            for work in batch.drain(..) {
+                                splits.push(work.keys.len());
+                                keys.extend(work.keys);
+                                responders.push(work.tx);
                             }
-                            return;
+                            // Recycle work-item buffer immediately after draining.
+                            batch_pool.put(batch);
+
+                            if total_items == 0 {
+                                // Empty merged workload: complete all waiters without touching KV path.
+                                for tx in responders.drain(..) {
+                                    let _ = tx.send(Ok(Vec::new()));
+                                }
+                                responder_pool.put(responders);
+                                split_pool.put(splits);
+                                continue;
+                            }
+
+                            state
+                                .client_batch_stats
+                                .record_get(
+                                    total_items as u64,
+                                    wait_us,
+                                    wait_decision
+                                        .wait
+                                        .as_micros()
+                                        .min(u128::from(u64::MAX))
+                                        as u64,
+                                    collect_us,
+                                    queued_items_hint as u64,
+                                    wait_decision.reason,
+                                    collected.stop_reason,
+                                );
+                            let state = state.clone();
+                            in_flight.push(async move {
+                                let res = state.execute_batch_get_direct(keys).await;
+                                match res {
+                                    Ok(values) => {
+                                        if values.len() != total_items {
+                                            // Guard against mismatched batch sizing and fail the whole
+                                            // merged batch so no requester waits indefinitely.
+                                            let msg = format!(
+                                                "batch get result count mismatch (expected {total_items}, got {})",
+                                                values.len()
+                                            );
+                                            for tx in responders.drain(..) {
+                                                let _ = tx.send(Err(anyhow!(msg.clone())));
+                                            }
+                                            splits.clear();
+                                            return ClientGetBatchRecycle { responders, splits };
+                                        }
+
+                                        let mut values_iter = values.into_iter();
+                                        {
+                                            let mut responder_iter = responders.drain(..);
+                                            for count in splits.iter().copied() {
+                                                let Some(tx) = responder_iter.next() else {
+                                                    break;
+                                                };
+                                                // Move each partition out of merged values so fan-out
+                                                // avoids per-request slice-clone materialization.
+                                                let mut chunk = Vec::with_capacity(count);
+                                                let mut split_ok = true;
+                                                for _ in 0..count {
+                                                    if let Some(value) = values_iter.next() {
+                                                        chunk.push(value);
+                                                    } else {
+                                                        split_ok = false;
+                                                        break;
+                                                    }
+                                                }
+                                                if split_ok {
+                                                    let _ = tx.send(Ok(chunk));
+                                                } else {
+                                                    let msg = "batch get split mismatch during fanout"
+                                                        .to_string();
+                                                    let _ = tx.send(Err(anyhow!(msg.clone())));
+                                                    for tx in responder_iter.by_ref() {
+                                                        let _ = tx.send(Err(anyhow!(msg.clone())));
+                                                    }
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        splits.clear();
+                                        ClientGetBatchRecycle { responders, splits }
+                                    }
+                                    Err(err) => {
+                                        // Send one shared error to all requesters in this merged batch.
+                                        let msg = err.to_string();
+                                        for tx in responders.drain(..) {
+                                            let _ = tx.send(Err(anyhow!(msg.clone())));
+                                        }
+                                        splits.clear();
+                                        ClientGetBatchRecycle { responders, splits }
+                                    }
+                                }
+                            });
                         }
-                        let mut offset = 0usize;
-                        for (tx, count) in responders.into_iter().zip(splits) {
-                            let end = offset + count;
-                            let slice = values[offset..end].to_vec();
-                            offset = end;
-                            let _ = tx.send(Ok(slice));
-                        }
-                    }
-                    Err(err) => {
-                        // Send the same error to all batch participants.
-                        let msg = err.to_string();
-                        for tx in responders {
-                            let _ = tx.send(Err(anyhow!(msg.clone())));
+                        None => {
+                            rx_closed = true;
                         }
                     }
                 }
-            });
+                done = in_flight.next(), if !in_flight.is_empty() => {
+                    // Keep driving completion and vector reclamation even when queue is briefly idle.
+                    if let Some(recycle) = done {
+                        responder_pool.put(recycle.responders);
+                        split_pool.put(recycle.splits);
+                    }
+                }
+            }
         }
     });
 }
@@ -4125,29 +5307,148 @@ fn merge_quorum_results(
     merged
 }
 
-/// Merge per-replica last-committed (txn_id, seq) by highest seq per key.
-fn merge_last_committed(
-    results: &[Vec<Option<(TxnId, u64)>>],
-    key_count: usize,
-) -> Vec<Option<(TxnId, u64)>> {
-    let mut merged = Vec::with_capacity(key_count);
-    for idx in 0..key_count {
-        let mut best: Option<(TxnId, u64)> = None;
-        for replica in results {
-            if let Some((txn_id, seq)) = replica.get(idx).and_then(|o| o.as_ref()) {
-                let replace = match &best {
-                    None => true,
-                    Some((_, cur_seq)) => *seq > *cur_seq,
-                };
-                if replace {
-                    // Keep the highest sequence number across replicas.
-                    best = Some((*txn_id, *seq));
-                }
-            }
+/// Per-shard read-barrier state merged from local + remote `last_committed`.
+///
+/// Purpose:
+/// - Carry all information needed to enforce one shard-level read barrier with
+///   minimal per-batch allocations and bookkeeping.
+///
+/// Design:
+/// - `max_by_key` stores one highest-seq `(txn_id, seq)` per input key.
+/// - `wait_targets` stores one max-counter transaction per origin node so wait
+///   checks are coalesced to prefix waits instead of per-key waits.
+///
+/// Inputs:
+/// - Built from local and remote `last_committed` responses for one shard batch.
+///
+/// Outputs:
+/// - Consumed by `ensure_read_barrier_shard` to derive deps + pending waits.
+#[derive(Debug)]
+struct ReadBarrierShardState {
+    max_by_key: Vec<Option<(TxnId, u64)>>,
+    wait_targets: HashMap<NodeId, TxnId>,
+}
+
+/// Merge one replica's `last_committed` vector into barrier accumulators.
+///
+/// Purpose:
+/// - Incrementally merge shard-barrier state as replica responses arrive.
+///
+/// Design:
+/// - Updates per-key maxima by highest observed sequence.
+/// - Coalesces waits by tracking max counter per origin node.
+/// - Validates vector length to reject malformed/misaligned RPC responses.
+///
+/// Inputs:
+/// - `max_by_key`: mutable accumulator sized to input key count.
+/// - `replica`: one replica response vector.
+/// - `wait_targets`: mutable per-origin max-counter accumulator.
+///
+/// Outputs:
+/// - `Ok(())` on successful merge.
+/// - `Err(...)` when response length mismatches expected key count.
+fn merge_last_committed_replica_checked(
+    max_by_key: &mut [Option<(TxnId, u64)>],
+    replica: &[Option<(TxnId, u64)>],
+    wait_targets: &mut HashMap<NodeId, TxnId>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        max_by_key.len() == replica.len(),
+        "last_committed response count mismatch (expected {}, got {})",
+        max_by_key.len(),
+        replica.len()
+    );
+
+    // Merge each key slot once and keep only the strongest observed state.
+    for (idx, item) in replica.iter().enumerate() {
+        let Some((txn_id, seq)) = item else { continue };
+
+        let replace = match max_by_key[idx] {
+            None => true,
+            Some((_, cur_seq)) => *seq > cur_seq,
+        };
+        if replace {
+            max_by_key[idx] = Some((*txn_id, *seq));
         }
-        merged.push(best);
+
+        // Track one wait target per origin. Prefix execution by counter means
+        // waiting on the max counter implies all lower counters are executed.
+        wait_targets
+            .entry(txn_id.node_id)
+            .and_modify(|cur| {
+                if txn_id.counter > cur.counter {
+                    *cur = *txn_id;
+                }
+            })
+            .or_insert(*txn_id);
     }
-    merged
+    Ok(())
+}
+
+/// Build forced read dependencies from merged per-key barrier maxima.
+///
+/// Purpose:
+/// - Produce a compact dependency set for `propose_read_with_deps`.
+///
+/// Design:
+/// - Deduplicates by transaction id.
+/// - Retains the highest observed sequence per transaction.
+/// - Intentionally excludes non-maximal per-key entries to minimize forced-deps
+///   materialization overhead in the read proposal hot path.
+///
+/// Inputs:
+/// - `max_by_key`: merged highest-seq barrier item for each key.
+///
+/// Outputs:
+/// - Deduplicated `(txn_id, seq)` dependency vector.
+fn read_barrier_deps_from_max_by_key(max_by_key: &[Option<(TxnId, u64)>]) -> Vec<(TxnId, u64)> {
+    let mut deps = HashMap::<TxnId, u64>::new();
+    for item in max_by_key {
+        let Some((txn_id, seq)) = item else { continue };
+        deps.entry(*txn_id)
+            .and_modify(|cur| *cur = (*cur).max(*seq))
+            .or_insert(*seq);
+    }
+    deps.into_iter().collect()
+}
+
+/// Filter wait targets already covered by local executed prefixes.
+///
+/// Purpose:
+/// - Skip unnecessary `wait_executed` calls when barrier visibility is already
+///   satisfied before the wait phase starts.
+///
+/// Design:
+/// - Reads one executed-prefix snapshot for all origins.
+/// - Returns only origin targets whose counter is above local executed prefix.
+/// - Keeps evaluation independent per origin node; it does not enforce global
+///   ordering beyond Accord's per-origin prefix semantics.
+///
+/// Inputs:
+/// - `wait_targets`: per-origin max-counter wait targets.
+/// - `executed`: local executed prefix snapshot.
+///
+/// Outputs:
+/// - Pending wait targets that still require `wait_executed`.
+fn read_barrier_pending_wait_targets(
+    wait_targets: &HashMap<NodeId, TxnId>,
+    executed: &[accord::ExecutedPrefix],
+) -> Vec<TxnId> {
+    let mut executed_by_node = HashMap::<NodeId, u64>::new();
+    // Snapshot each origin's executed counter once so per-target checks are
+    // O(1) map reads, not repeated scans over executed prefixes.
+    for prefix in executed {
+        executed_by_node.insert(prefix.node_id, prefix.counter);
+    }
+
+    let mut pending = Vec::with_capacity(wait_targets.len());
+    for txn_id in wait_targets.values().copied() {
+        let executed_counter = executed_by_node.get(&txn_id.node_id).copied().unwrap_or(0);
+        if executed_counter < txn_id.counter {
+            pending.push(txn_id);
+        }
+    }
+    pending
 }
 
 /// Log aggregated RPC stats from the transport layer.
@@ -4289,7 +5590,96 @@ fn log_proposal_kind(kind: &str, snap: &OpStatsSnapshot) {
     );
 }
 
+/// Log aggregated client SET/GET batcher stats for one interval.
+fn log_client_batch_stats(snap: &ClientBatchStatsSnapshot) {
+    if snap.set_batches == 0 && snap.get_batches == 0 {
+        return;
+    }
+    let set_avg_batch = if snap.set_batches == 0 {
+        0.0
+    } else {
+        snap.set_items as f64 / snap.set_batches as f64
+    };
+    let set_avg_wait_ms = if snap.set_batches == 0 {
+        0.0
+    } else {
+        (snap.set_wait_total_us as f64 / snap.set_batches as f64) / 1000.0
+    };
+    let get_avg_batch = if snap.get_batches == 0 {
+        0.0
+    } else {
+        snap.get_items as f64 / snap.get_batches as f64
+    };
+    let get_avg_wait_ms = if snap.get_batches == 0 {
+        0.0
+    } else {
+        (snap.get_wait_total_us as f64 / snap.get_batches as f64) / 1000.0
+    };
+    let get_avg_effective_wait_ms = if snap.get_batches == 0 {
+        0.0
+    } else {
+        (snap.get_effective_wait_total_us as f64 / snap.get_batches as f64) / 1000.0
+    };
+    let get_avg_collect_ms = if snap.get_batches == 0 {
+        0.0
+    } else {
+        (snap.get_collect_total_us as f64 / snap.get_batches as f64) / 1000.0
+    };
+    let get_avg_queue_hint = if snap.get_batches == 0 {
+        0.0
+    } else {
+        snap.get_queue_hint_total as f64 / snap.get_batches as f64
+    };
+
+    tracing::info!(
+        set_batches = snap.set_batches,
+        set_items = snap.set_items,
+        set_avg_batch = set_avg_batch,
+        set_max_batch = snap.set_max_items,
+        set_avg_wait_ms = set_avg_wait_ms,
+        set_max_wait_ms = snap.set_wait_max_us as f64 / 1000.0,
+        get_batches = snap.get_batches,
+        get_items = snap.get_items,
+        get_avg_batch = get_avg_batch,
+        get_max_batch = snap.get_max_items,
+        get_avg_head_wait_ms = get_avg_wait_ms,
+        get_max_head_wait_ms = snap.get_wait_max_us as f64 / 1000.0,
+        get_avg_effective_wait_ms = get_avg_effective_wait_ms,
+        get_max_effective_wait_ms = snap.get_effective_wait_max_us as f64 / 1000.0,
+        get_avg_collect_ms = get_avg_collect_ms,
+        get_max_collect_ms = snap.get_collect_max_us as f64 / 1000.0,
+        get_avg_queue_hint = get_avg_queue_hint,
+        get_max_queue_hint = snap.get_queue_hint_max,
+        get_wait_reason_zero = snap.get_wait_reason_zero_batches,
+        get_wait_reason_immediate = snap.get_wait_reason_immediate_batches,
+        get_wait_reason_stale = snap.get_wait_reason_stale_batches,
+        get_wait_reason_low_backlog = snap.get_wait_reason_low_backlog_batches,
+        get_wait_reason_queue_age_cap = snap.get_wait_reason_queue_age_cap_batches,
+        get_wait_reason_configured = snap.get_wait_reason_configured_batches,
+        get_collect_reason_max_items = snap.get_collect_reason_full_batches,
+        get_collect_reason_deadline = snap.get_collect_reason_deadline_batches,
+        get_collect_reason_idle = snap.get_collect_reason_idle_batches,
+        get_collect_reason_closed = snap.get_collect_reason_closed_batches,
+        "client batch stats"
+    );
+}
+
 /// Log per-peer RPC queue and latency stats.
+///
+/// Purpose:
+/// - Emit one structured telemetry event per peer for queue, latency, and
+///   packed-v2 capability diagnosis.
+///
+/// Design:
+/// - Includes read-lane queue-age and capability counters to diagnose tail
+///   stalls without requiring CSV parsing.
+///
+/// Inputs:
+/// - `peer_id`: remote peer identifier.
+/// - `snap`: one reset-on-read transport snapshot.
+///
+/// Outputs:
+/// - One `tracing::info!` event with peer-level transport metrics.
 fn log_peer_queue_stats(peer_id: NodeId, snap: &transport::PeerStatsSnapshot) {
     let pre = &snap.pre_accept_latency;
     let acc = &snap.accept_latency;
@@ -4305,6 +5695,20 @@ fn log_peer_queue_stats(peer_id: NodeId, snap: &transport::PeerStatsSnapshot) {
         kv_get_avg_ms = kv.avg_ms,
         kv_get_p95_ms = kv.p95_ms,
         kv_get_p99_ms = kv.p99_ms,
+        kv_get_wait_count = snap.kv_get_wait_count,
+        kv_get_wait_avg_ms = snap.kv_get_wait_avg_ms,
+        kv_get_wait_max_ms = snap.kv_get_wait_max_ms,
+        kv_get_head_wait_count = snap.kv_get_head_wait_count,
+        kv_get_head_wait_avg_ms = snap.kv_get_head_wait_avg_ms,
+        kv_get_head_wait_max_ms = snap.kv_get_head_wait_max_ms,
+        kv_get_last_enqueue_age_ms = snap.kv_get_last_enqueue_age_ms,
+        kv_get_last_dequeue_age_ms = snap.kv_get_last_dequeue_age_ms,
+        kv_get_limiter_saturated = snap.kv_get_limiter_saturated,
+        kv_get_v2_attempted = snap.kv_get_v2_attempted,
+        kv_get_v2_disabled_events = snap.kv_get_v2_disabled_events,
+        kv_get_inflight_limit = snap.kv_get_inflight_limit,
+        pre_accept_v2_attempted = snap.pre_accept_v2_attempted,
+        pre_accept_v2_disabled_events = snap.pre_accept_v2_disabled_events,
         pre_accept_queue = snap.pre_accept_queue,
         pre_accept_inflight = snap.pre_accept_inflight,
         pre_accept_sent = snap.pre_accept_sent,
@@ -4337,6 +5741,8 @@ fn log_peer_queue_stats(peer_id: NodeId, snap: &transport::PeerStatsSnapshot) {
         accept_wait_max_ms = snap.accept_wait_max_ms,
         accept_last_enqueue_age_ms = snap.accept_last_enqueue_age_ms,
         accept_last_dequeue_age_ms = snap.accept_last_dequeue_age_ms,
+        accept_v2_attempted = snap.accept_v2_attempted,
+        accept_v2_disabled_events = snap.accept_v2_disabled_events,
         commit_queue = snap.commit_queue,
         commit_inflight = snap.commit_inflight,
         commit_sent = snap.commit_sent,
@@ -4353,6 +5759,8 @@ fn log_peer_queue_stats(peer_id: NodeId, snap: &transport::PeerStatsSnapshot) {
         commit_wait_max_ms = snap.commit_wait_max_ms,
         commit_last_enqueue_age_ms = snap.commit_last_enqueue_age_ms,
         commit_last_dequeue_age_ms = snap.commit_last_dequeue_age_ms,
+        commit_v2_attempted = snap.commit_v2_attempted,
+        commit_v2_disabled_events = snap.commit_v2_disabled_events,
         recover_queue = snap.recover_queue,
         recover_queue_peak = snap.recover_queue_peak,
         recover_inflight = snap.recover_inflight,
@@ -4375,12 +5783,26 @@ fn log_peer_queue_stats(peer_id: NodeId, snap: &transport::PeerStatsSnapshot) {
         recover_enqueued = snap.recover_enqueued,
         recover_waiters_peak = snap.recover_waiters_peak,
         recover_waiters_avg = snap.recover_waiters_avg,
+        recover_v2_attempted = snap.recover_v2_attempted,
+        recover_v2_disabled_events = snap.recover_v2_disabled_events,
         rpc_inflight_limit = snap.rpc_inflight_limit,
         "rpc peer queues"
     );
 }
 
 /// Log a short summary identifying the slowest peer.
+///
+/// Purpose:
+/// - Surface the currently most-backlogged peer in a compact periodic log line.
+///
+/// Design:
+/// - Uses combined read + consensus queue depth for backlog ranking.
+///
+/// Inputs:
+/// - `peers`: current per-peer snapshots.
+///
+/// Outputs:
+/// - One `tracing::info!` summary event when at least one peer exists.
 fn log_peer_summary(peers: &[(NodeId, transport::PeerStatsSnapshot)]) {
     if peers.is_empty() {
         // Nothing to summarize.
@@ -4390,12 +5812,14 @@ fn log_peer_summary(peers: &[(NodeId, transport::PeerStatsSnapshot)]) {
     let mut slow_queue = 0u64;
     let mut slow_sent = 0u64;
     for (peer_id, snap) in peers {
-        let queue_total = snap.pre_accept_queue + snap.accept_queue + snap.commit_queue;
+        let queue_total =
+            snap.kv_get_queue + snap.pre_accept_queue + snap.accept_queue + snap.commit_queue;
         if queue_total > slow_queue {
             // Track the peer with the largest combined queue.
             slow_queue = queue_total;
             slow_peer = *peer_id;
-            slow_sent = snap.pre_accept_sent + snap.accept_sent + snap.commit_sent;
+            slow_sent =
+                snap.kv_get_sent + snap.pre_accept_sent + snap.accept_sent + snap.commit_sent;
         }
     }
     tracing::info!(
@@ -4407,12 +5831,37 @@ fn log_peer_summary(peers: &[(NodeId, transport::PeerStatsSnapshot)]) {
 }
 
 /// CSV writer for periodic peer RPC stats.
+///
+/// Purpose:
+/// - Persist peer transport snapshots for offline latency/backpressure analysis.
+///
+/// Design:
+/// - Holds one append-only buffered file writer and emits one denormalized row
+///   per peer snapshot.
+///
+/// Inputs:
+/// - Receives periodic `PeerStatsSnapshot` values from transport telemetry.
+///
+/// Outputs:
+/// - Appended CSV rows containing queue, latency, and packed-v2 capability stats.
 struct PeerStatsCsv {
     writer: BufWriter<std::fs::File>,
 }
 
 impl PeerStatsCsv {
     /// Open or create the CSV file, writing a header if the file is empty.
+    ///
+    /// Purpose:
+    /// - Initialize persistent peer-telemetry export for offline analysis.
+    ///
+    /// Design:
+    /// - Appends to existing file and writes a schema header only on empty file.
+    ///
+    /// Inputs:
+    /// - `path`: filesystem path for the CSV output.
+    ///
+    /// Outputs:
+    /// - `Some(PeerStatsCsv)` when file setup succeeds; `None` otherwise.
     fn open(path: &str) -> Option<Self> {
         let file = OpenOptions::new()
             .create(true)
@@ -4430,15 +5879,17 @@ impl PeerStatsCsv {
             let header = concat!(
                 "ts_ms,node_id,peer_id,queue_total,inflight_total,sent_total,",
                 "kv_get_queue,kv_get_inflight,kv_get_sent,kv_get_errors,kv_get_count,kv_get_avg_ms,kv_get_p95_ms,kv_get_p99_ms,kv_get_max_ms,",
-                "pre_accept_queue,pre_accept_inflight,pre_accept_sent,pre_accept_errors,pre_accept_timeouts,pre_accept_queue_full,pre_accept_count,pre_accept_avg_ms,pre_accept_p95_ms,pre_accept_p99_ms,pre_accept_max_ms,pre_accept_wait_count,pre_accept_wait_avg_ms,pre_accept_wait_max_ms,pre_accept_last_enqueue_age_ms,pre_accept_last_dequeue_age_ms,",
-                "accept_queue,accept_inflight,accept_sent,accept_errors,accept_timeouts,accept_queue_full,accept_count,accept_avg_ms,accept_p95_ms,accept_p99_ms,accept_max_ms,accept_wait_count,accept_wait_avg_ms,accept_wait_max_ms,accept_last_enqueue_age_ms,accept_last_dequeue_age_ms,",
-                "commit_queue,commit_inflight,commit_sent,commit_errors,commit_timeouts,commit_queue_full,commit_count,commit_avg_ms,commit_p95_ms,commit_p99_ms,commit_max_ms,commit_wait_count,commit_wait_avg_ms,commit_wait_max_ms,commit_last_enqueue_age_ms,commit_last_dequeue_age_ms,",
+                "kv_get_wait_count,kv_get_wait_avg_ms,kv_get_wait_max_ms,kv_get_head_wait_count,kv_get_head_wait_avg_ms,kv_get_head_wait_max_ms,kv_get_last_enqueue_age_ms,kv_get_last_dequeue_age_ms,kv_get_limiter_saturated,kv_get_v2_attempted,kv_get_v2_disabled_events,kv_get_inflight_limit,",
+                "pre_accept_queue,pre_accept_inflight,pre_accept_sent,pre_accept_errors,pre_accept_timeouts,pre_accept_queue_full,pre_accept_count,pre_accept_avg_ms,pre_accept_p95_ms,pre_accept_p99_ms,pre_accept_max_ms,pre_accept_wait_count,pre_accept_wait_avg_ms,pre_accept_wait_max_ms,pre_accept_last_enqueue_age_ms,pre_accept_last_dequeue_age_ms,pre_accept_v2_attempted,pre_accept_v2_disabled_events,",
+                "accept_queue,accept_inflight,accept_sent,accept_errors,accept_timeouts,accept_queue_full,accept_count,accept_avg_ms,accept_p95_ms,accept_p99_ms,accept_max_ms,accept_wait_count,accept_wait_avg_ms,accept_wait_max_ms,accept_last_enqueue_age_ms,accept_last_dequeue_age_ms,accept_v2_attempted,accept_v2_disabled_events,",
+                "commit_queue,commit_inflight,commit_sent,commit_errors,commit_timeouts,commit_queue_full,commit_count,commit_avg_ms,commit_p95_ms,commit_p99_ms,commit_max_ms,commit_wait_count,commit_wait_avg_ms,commit_wait_max_ms,commit_last_enqueue_age_ms,commit_last_dequeue_age_ms,commit_v2_attempted,commit_v2_disabled_events,",
                 "recover_queue,recover_queue_peak,recover_inflight,recover_sent,recover_errors,recover_queue_full,",
                 "recover_count,recover_avg_ms,recover_p95_ms,recover_p99_ms,recover_max_ms,",
                 "recover_wait_count,recover_wait_avg_ms,recover_wait_max_ms,",
                 "recover_last_enqueue_age_ms,recover_last_dequeue_age_ms,",
                 "recover_inflight_txns,recover_inflight_peak,recover_coalesced,recover_enqueued,",
                 "recover_waiters_peak,recover_waiters_avg,",
+                "recover_v2_attempted,recover_v2_disabled_events,",
                 "rpc_inflight_limit\n",
             );
             if writer.write_all(header.as_bytes()).is_err() {
@@ -4451,6 +5902,22 @@ impl PeerStatsCsv {
     }
 
     /// Append a single per-peer snapshot row to the CSV file.
+    ///
+    /// Purpose:
+    /// - Persist one normalized peer snapshot row for time-series analysis.
+    ///
+    /// Design:
+    /// - Writes one denormalized line with transport counters and latency
+    ///   summaries, including GET queue-age and packed-v2 capability fields.
+    ///
+    /// Inputs:
+    /// - `ts_ms`: sample timestamp in milliseconds.
+    /// - `node_id`: local node id.
+    /// - `peer_id`: remote peer id.
+    /// - `snap`: one peer snapshot.
+    ///
+    /// Outputs:
+    /// - One appended CSV line.
     fn write_snapshot(
         &mut self,
         ts_ms: u128,
@@ -4480,98 +5947,116 @@ impl PeerStatsCsv {
         let com = &snap.commit_latency;
         let rec = &snap.recover_latency;
 
-        let _ = writeln!(
-            self.writer,
-            "{ts_ms},{node_id},{peer_id},{queue_total},{inflight_total},{sent_total},\
-{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},\
-{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},\
-{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},\
-{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},\
-{},{},{},{},{},{},\
-{},{:.3},{:.3},{:.3},{:.3},\
-{},{:.3},{:.3},{:.3},{:.3},\
-{},{},{},{},{},{:.3},{}",
-            snap.kv_get_queue,
-            snap.kv_get_inflight,
-            snap.kv_get_sent,
-            snap.kv_get_errors,
-            kv.count,
-            kv.avg_ms,
-            kv.p95_ms,
-            kv.p99_ms,
-            kv.max_ms,
-            snap.pre_accept_queue,
-            snap.pre_accept_inflight,
-            snap.pre_accept_sent,
-            snap.pre_accept_errors,
-            snap.pre_accept_timeouts,
-            snap.pre_accept_queue_full,
-            pre.count,
-            pre.avg_ms,
-            pre.p95_ms,
-            pre.p99_ms,
-            pre.max_ms,
-            snap.pre_accept_wait_count,
-            snap.pre_accept_wait_avg_ms,
-            snap.pre_accept_wait_max_ms,
-            snap.pre_accept_last_enqueue_age_ms,
-            snap.pre_accept_last_dequeue_age_ms,
-            snap.accept_queue,
-            snap.accept_inflight,
-            snap.accept_sent,
-            snap.accept_errors,
-            snap.accept_timeouts,
-            snap.accept_queue_full,
-            acc.count,
-            acc.avg_ms,
-            acc.p95_ms,
-            acc.p99_ms,
-            acc.max_ms,
-            snap.accept_wait_count,
-            snap.accept_wait_avg_ms,
-            snap.accept_wait_max_ms,
-            snap.accept_last_enqueue_age_ms,
-            snap.accept_last_dequeue_age_ms,
-            snap.commit_queue,
-            snap.commit_inflight,
-            snap.commit_sent,
-            snap.commit_errors,
-            snap.commit_timeouts,
-            snap.commit_queue_full,
-            com.count,
-            com.avg_ms,
-            com.p95_ms,
-            com.p99_ms,
-            com.max_ms,
-            snap.commit_wait_count,
-            snap.commit_wait_avg_ms,
-            snap.commit_wait_max_ms,
-            snap.commit_last_enqueue_age_ms,
-            snap.commit_last_dequeue_age_ms,
-            snap.recover_queue,
-            snap.recover_queue_peak,
-            snap.recover_inflight,
-            snap.recover_sent,
-            snap.recover_errors,
-            snap.recover_queue_full,
-            rec.count,
-            rec.avg_ms,
-            rec.p95_ms,
-            rec.p99_ms,
-            rec.max_ms,
-            snap.recover_wait_count,
-            snap.recover_wait_avg_ms,
-            snap.recover_wait_max_ms,
-            snap.recover_last_enqueue_age_ms,
-            snap.recover_last_dequeue_age_ms,
-            snap.recover_inflight_txns,
-            snap.recover_inflight_peak,
-            snap.recover_coalesced,
-            snap.recover_enqueued,
-            snap.recover_waiters_peak,
-            snap.recover_waiters_avg,
-            snap.rpc_inflight_limit,
-        );
+        let row = [
+            ts_ms.to_string(),
+            node_id.to_string(),
+            peer_id.to_string(),
+            queue_total.to_string(),
+            inflight_total.to_string(),
+            sent_total.to_string(),
+            snap.kv_get_queue.to_string(),
+            snap.kv_get_inflight.to_string(),
+            snap.kv_get_sent.to_string(),
+            snap.kv_get_errors.to_string(),
+            kv.count.to_string(),
+            format!("{:.3}", kv.avg_ms),
+            format!("{:.3}", kv.p95_ms),
+            format!("{:.3}", kv.p99_ms),
+            format!("{:.3}", kv.max_ms),
+            snap.kv_get_wait_count.to_string(),
+            format!("{:.3}", snap.kv_get_wait_avg_ms),
+            format!("{:.3}", snap.kv_get_wait_max_ms),
+            snap.kv_get_head_wait_count.to_string(),
+            format!("{:.3}", snap.kv_get_head_wait_avg_ms),
+            format!("{:.3}", snap.kv_get_head_wait_max_ms),
+            format!("{:.3}", snap.kv_get_last_enqueue_age_ms),
+            format!("{:.3}", snap.kv_get_last_dequeue_age_ms),
+            snap.kv_get_limiter_saturated.to_string(),
+            snap.kv_get_v2_attempted.to_string(),
+            snap.kv_get_v2_disabled_events.to_string(),
+            snap.kv_get_inflight_limit.to_string(),
+            snap.pre_accept_queue.to_string(),
+            snap.pre_accept_inflight.to_string(),
+            snap.pre_accept_sent.to_string(),
+            snap.pre_accept_errors.to_string(),
+            snap.pre_accept_timeouts.to_string(),
+            snap.pre_accept_queue_full.to_string(),
+            pre.count.to_string(),
+            format!("{:.3}", pre.avg_ms),
+            format!("{:.3}", pre.p95_ms),
+            format!("{:.3}", pre.p99_ms),
+            format!("{:.3}", pre.max_ms),
+            snap.pre_accept_wait_count.to_string(),
+            format!("{:.3}", snap.pre_accept_wait_avg_ms),
+            format!("{:.3}", snap.pre_accept_wait_max_ms),
+            format!("{:.3}", snap.pre_accept_last_enqueue_age_ms),
+            format!("{:.3}", snap.pre_accept_last_dequeue_age_ms),
+            snap.pre_accept_v2_attempted.to_string(),
+            snap.pre_accept_v2_disabled_events.to_string(),
+            snap.accept_queue.to_string(),
+            snap.accept_inflight.to_string(),
+            snap.accept_sent.to_string(),
+            snap.accept_errors.to_string(),
+            snap.accept_timeouts.to_string(),
+            snap.accept_queue_full.to_string(),
+            acc.count.to_string(),
+            format!("{:.3}", acc.avg_ms),
+            format!("{:.3}", acc.p95_ms),
+            format!("{:.3}", acc.p99_ms),
+            format!("{:.3}", acc.max_ms),
+            snap.accept_wait_count.to_string(),
+            format!("{:.3}", snap.accept_wait_avg_ms),
+            format!("{:.3}", snap.accept_wait_max_ms),
+            format!("{:.3}", snap.accept_last_enqueue_age_ms),
+            format!("{:.3}", snap.accept_last_dequeue_age_ms),
+            snap.accept_v2_attempted.to_string(),
+            snap.accept_v2_disabled_events.to_string(),
+            snap.commit_queue.to_string(),
+            snap.commit_inflight.to_string(),
+            snap.commit_sent.to_string(),
+            snap.commit_errors.to_string(),
+            snap.commit_timeouts.to_string(),
+            snap.commit_queue_full.to_string(),
+            com.count.to_string(),
+            format!("{:.3}", com.avg_ms),
+            format!("{:.3}", com.p95_ms),
+            format!("{:.3}", com.p99_ms),
+            format!("{:.3}", com.max_ms),
+            snap.commit_wait_count.to_string(),
+            format!("{:.3}", snap.commit_wait_avg_ms),
+            format!("{:.3}", snap.commit_wait_max_ms),
+            format!("{:.3}", snap.commit_last_enqueue_age_ms),
+            format!("{:.3}", snap.commit_last_dequeue_age_ms),
+            snap.commit_v2_attempted.to_string(),
+            snap.commit_v2_disabled_events.to_string(),
+            snap.recover_queue.to_string(),
+            snap.recover_queue_peak.to_string(),
+            snap.recover_inflight.to_string(),
+            snap.recover_sent.to_string(),
+            snap.recover_errors.to_string(),
+            snap.recover_queue_full.to_string(),
+            rec.count.to_string(),
+            format!("{:.3}", rec.avg_ms),
+            format!("{:.3}", rec.p95_ms),
+            format!("{:.3}", rec.p99_ms),
+            format!("{:.3}", rec.max_ms),
+            snap.recover_wait_count.to_string(),
+            format!("{:.3}", snap.recover_wait_avg_ms),
+            format!("{:.3}", snap.recover_wait_max_ms),
+            format!("{:.3}", snap.recover_last_enqueue_age_ms),
+            format!("{:.3}", snap.recover_last_dequeue_age_ms),
+            snap.recover_inflight_txns.to_string(),
+            snap.recover_inflight_peak.to_string(),
+            snap.recover_coalesced.to_string(),
+            snap.recover_enqueued.to_string(),
+            snap.recover_waiters_peak.to_string(),
+            format!("{:.3}", snap.recover_waiters_avg),
+            snap.recover_v2_attempted.to_string(),
+            snap.recover_v2_disabled_events.to_string(),
+            snap.rpc_inflight_limit.to_string(),
+        ]
+        .join(",");
+        let _ = writeln!(self.writer, "{row}");
     }
 }
 
@@ -5327,6 +6812,7 @@ where
         preaccept_stall_hits: args.preaccept_stall_hits.max(1),
         execute_batch_max: args.accord_execute_batch_max.max(1),
         inline_command_in_accept_commit: args.accord_inline_command_in_accept_commit,
+        executed_command_cache_max_bytes: args.accord_executed_command_cache_max_bytes.max(1),
         commit_log_batch_max: args.commit_log_batch_max.max(1),
         commit_log_batch_wait: Duration::from_micros(args.commit_log_batch_wait_us),
         commit_durability_mode: args.commit_durability_mode.to_accord(),
@@ -5522,8 +7008,16 @@ where
     let client_batch_cfg = ClientBatchConfig {
         set_max: args.client_set_batch_max.max(1),
         get_max: args.client_get_batch_max.max(1),
-        wait: Duration::from_micros(args.client_batch_wait_us),
-        inflight: args.client_batch_inflight.max(1),
+        set_wait: Duration::from_micros(args.client_batch_wait_us),
+        get_wait: Duration::from_micros(
+            args.client_get_batch_wait_us
+                .unwrap_or(args.client_batch_wait_us),
+        ),
+        set_inflight: args.client_batch_inflight.max(1),
+        get_inflight: args
+            .client_get_batch_inflight
+            .unwrap_or(args.client_batch_inflight)
+            .max(1),
     };
     let range_write_batch_target = resolve_range_write_batch_target(args.range_write_batch_target);
     let range_write_batch_max_bytes =
@@ -5667,6 +7161,24 @@ where
 
     spawn_set_batcher(state.clone(), client_set_rx, client_batch_cfg);
     spawn_get_batcher(state.clone(), client_get_rx, client_batch_cfg);
+
+    if args.rpc_queue_stats_interval_ms > 0 {
+        // Periodically log client batcher behavior to correlate queueing policy
+        // with observed p50/p75/p95 changes.
+        let state = state.clone();
+        let interval = Duration::from_millis(args.rpc_queue_stats_interval_ms.max(1));
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            let mut prev = ClientBatchStatsSnapshot::default();
+            loop {
+                ticker.tick().await;
+                let current = state.client_batch_stats_snapshot_cumulative();
+                let delta = current.saturating_delta(&prev);
+                prev = current;
+                log_client_batch_stats(&delta);
+            }
+        });
+    }
 
     // Range manager (Cockroach-style) for dynamic splits.
     range_manager::spawn(
@@ -5883,6 +7395,46 @@ mod tests {
     use super::*;
     use crate::cluster::{ReplicaMove, ReplicaMovePhase};
 
+    /// Build a test `TxnId`.
+    ///
+    /// Purpose:
+    /// - Keep unit tests concise when constructing transaction identifiers.
+    ///
+    /// Design:
+    /// - Thin constructor wrapper around `TxnId` fields.
+    ///
+    /// Inputs:
+    /// - `node_id`: origin node id.
+    /// - `counter`: per-origin counter.
+    ///
+    /// Outputs:
+    /// - `TxnId` value used by assertions and fixtures.
+    fn txn(node_id: NodeId, counter: u64) -> TxnId {
+        TxnId { node_id, counter }
+    }
+
+    fn make_batch_get_work(keys: &[&[u8]]) -> BatchGetWork {
+        let (tx, _rx) = oneshot::channel();
+        BatchGetWork {
+            keys: keys.iter().map(|k| k.to_vec()).collect(),
+            tx,
+            enqueued_at: Instant::now(),
+        }
+    }
+
+    fn make_batch_set_work(keys: &[&[u8]]) -> BatchSetWork {
+        let (tx, _rx) = oneshot::channel();
+        let items = keys
+            .iter()
+            .map(|key| (key.to_vec(), b"v".to_vec()))
+            .collect::<Vec<_>>();
+        BatchSetWork {
+            items,
+            tx,
+            enqueued_at: Instant::now(),
+        }
+    }
+
     fn sample_state() -> ClusterState {
         ClusterState {
             epoch: 1,
@@ -5914,6 +7466,496 @@ mod tests {
             replicas: vec![1, 2, 3],
             leaseholder: 1,
         }
+    }
+
+    /// Verify replica merge updates per-key maxima and per-origin wait targets.
+    ///
+    /// Purpose:
+    /// - Validate normal-path behavior for `merge_last_committed_replica_checked`.
+    ///
+    /// Design:
+    /// - Merges two replica vectors where second response has mixed stronger and
+    ///   weaker entries.
+    ///
+    /// Inputs:
+    /// - Two well-formed replica vectors with matching key counts.
+    ///
+    /// Outputs:
+    /// - Per-key max-seq entries and per-origin max-counter wait targets.
+    #[test]
+    fn merge_last_committed_replica_checked_normal_path() {
+        let mut max_by_key = vec![None; 3];
+        let mut wait_targets = HashMap::<NodeId, TxnId>::new();
+
+        let r1 = vec![Some((txn(1, 5), 10)), None, Some((txn(2, 4), 7))];
+        merge_last_committed_replica_checked(&mut max_by_key, &r1, &mut wait_targets)
+            .expect("first merge");
+
+        let r2 = vec![
+            Some((txn(1, 9), 9)),
+            Some((txn(3, 1), 11)),
+            Some((txn(2, 8), 12)),
+        ];
+        merge_last_committed_replica_checked(&mut max_by_key, &r2, &mut wait_targets)
+            .expect("second merge");
+
+        assert_eq!(max_by_key[0], Some((txn(1, 5), 10)));
+        assert_eq!(max_by_key[1], Some((txn(3, 1), 11)));
+        assert_eq!(max_by_key[2], Some((txn(2, 8), 12)));
+        assert_eq!(wait_targets.get(&1), Some(&txn(1, 9)));
+        assert_eq!(wait_targets.get(&2), Some(&txn(2, 8)));
+        assert_eq!(wait_targets.get(&3), Some(&txn(3, 1)));
+    }
+
+    /// Verify merge helper rejects malformed replica vectors.
+    ///
+    /// Purpose:
+    /// - Validate failure-path behavior for malformed `last_committed` payloads.
+    ///
+    /// Design:
+    /// - Uses one replica vector with fewer items than expected.
+    ///
+    /// Inputs:
+    /// - Accumulator sized for three keys and a malformed two-item replica.
+    ///
+    /// Outputs:
+    /// - Error indicating count mismatch.
+    #[test]
+    fn merge_last_committed_replica_checked_failure_path_mismatched_len() {
+        let mut max_by_key = vec![None; 3];
+        let mut wait_targets = HashMap::<NodeId, TxnId>::new();
+        let malformed = vec![Some((txn(1, 1), 1)), None];
+        let err =
+            merge_last_committed_replica_checked(&mut max_by_key, &malformed, &mut wait_targets)
+                .expect_err("mismatched length should fail");
+        assert!(
+            err.to_string()
+                .contains("last_committed response count mismatch"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// Verify dependency builder deduplicates transaction ids with max sequence.
+    ///
+    /// Purpose:
+    /// - Validate compact dependency materialization for read barriers.
+    ///
+    /// Design:
+    /// - Supplies repeated transaction ids with different sequences.
+    ///
+    /// Inputs:
+    /// - Merged per-key maxima containing duplicate txn ids.
+    ///
+    /// Outputs:
+    /// - One dependency entry per txn id at the highest sequence.
+    #[test]
+    fn read_barrier_deps_from_max_by_key_deduplicates_txns() {
+        let deps = read_barrier_deps_from_max_by_key(&[
+            Some((txn(1, 10), 50)),
+            Some((txn(2, 7), 9)),
+            Some((txn(1, 10), 55)),
+        ]);
+        let deps_map = deps.into_iter().collect::<HashMap<_, _>>();
+        assert_eq!(deps_map.len(), 2);
+        assert_eq!(deps_map.get(&txn(1, 10)), Some(&55));
+        assert_eq!(deps_map.get(&txn(2, 7)), Some(&9));
+    }
+
+    /// Verify wait-target filtering skips already-satisfied origins.
+    ///
+    /// Purpose:
+    /// - Validate fast-path behavior for read barriers already covered by local
+    ///   executed prefixes.
+    ///
+    /// Design:
+    /// - One origin is already satisfied, one remains pending.
+    ///
+    /// Inputs:
+    /// - Wait-target map and executed-prefix snapshot.
+    ///
+    /// Outputs:
+    /// - Pending list contains only unsatisfied target.
+    #[test]
+    fn read_barrier_pending_wait_targets_filters_satisfied_origins() {
+        let wait_targets = HashMap::from([(1_u64, txn(1, 5)), (2_u64, txn(2, 9))]);
+        let executed = vec![
+            accord::ExecutedPrefix {
+                node_id: 1,
+                counter: 5,
+            },
+            accord::ExecutedPrefix {
+                node_id: 2,
+                counter: 3,
+            },
+        ];
+        let pending = read_barrier_pending_wait_targets(&wait_targets, &executed);
+        assert_eq!(pending, vec![txn(2, 9)]);
+    }
+
+    /// Verify progress-aware SET batch collection drains ready queue work up to
+    /// the configured item cap.
+    #[tokio::test]
+    async fn collect_set_batch_with_progress_collects_ready_items() {
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.send(make_batch_set_work(&[b"k1"]))
+            .await
+            .expect("queue second work");
+        tx.send(make_batch_set_work(&[b"k2"]))
+            .await
+            .expect("queue third work");
+        drop(tx);
+        let first = make_batch_set_work(&[b"k0"]);
+
+        let mut in_flight: FuturesUnordered<futures_util::future::Ready<()>> =
+            FuturesUnordered::new();
+        let collected = collect_set_batch_with_progress(
+            Vec::new(),
+            first,
+            &mut rx,
+            3,
+            Duration::ZERO,
+            &mut in_flight,
+            |_done| {},
+        )
+        .await;
+
+        let flattened = collected
+            .batch
+            .iter()
+            .map(|work| work.items[0].0.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            flattened,
+            vec![b"k0".to_vec(), b"k1".to_vec(), b"k2".to_vec()]
+        );
+        assert_eq!(collected.stop_reason, ClientSetCollectStopReason::MaxItems);
+    }
+
+    /// Verify progress-aware SET collection polls in-flight completions while
+    /// waiting for additional queue work.
+    #[tokio::test]
+    async fn collect_set_batch_with_progress_polls_in_flight_while_waiting() {
+        let (_tx, mut rx) = mpsc::channel::<BatchSetWork>(8);
+        let first = make_batch_set_work(&[b"k0"]);
+        let callback_hits = Arc::new(AtomicU64::new(0));
+        let callback_hits_clone = callback_hits.clone();
+        let mut in_flight: FuturesUnordered<BoxFuture<'static, ()>> = FuturesUnordered::new();
+        in_flight.push(Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            ()
+        }));
+
+        let collected = collect_set_batch_with_progress(
+            Vec::new(),
+            first,
+            &mut rx,
+            8,
+            Duration::from_millis(20),
+            &mut in_flight,
+            |_done| {
+                callback_hits_clone.fetch_add(1, Ordering::Relaxed);
+            },
+        )
+        .await;
+
+        assert_eq!(collected.batch.len(), 1);
+        assert_eq!(callback_hits.load(Ordering::Relaxed), 1);
+        assert_eq!(collected.stop_reason, ClientSetCollectStopReason::Deadline);
+    }
+
+    /// Verify fresh queue heads use configured SET wait.
+    #[test]
+    fn client_set_effective_batch_wait_uses_configured_wait_when_fresh() {
+        let now = Instant::now();
+        let effective = client_set_effective_batch_wait(
+            now,
+            now,
+            Duration::from_micros(200),
+            Duration::from_micros(800),
+        );
+        assert_eq!(effective, Duration::from_micros(200));
+    }
+
+    /// Verify stale queue heads are flushed immediately on SET path.
+    #[test]
+    fn client_set_effective_batch_wait_flushes_stale_head() {
+        let now = Instant::now();
+        let effective = client_set_effective_batch_wait(
+            now - Duration::from_millis(2),
+            now,
+            Duration::from_micros(200),
+            Duration::from_micros(250),
+        );
+        assert_eq!(effective, Duration::ZERO);
+    }
+
+    /// Verify queue-age capping applies when remaining budget is smaller than
+    /// configured wait.
+    #[test]
+    fn client_set_effective_batch_wait_clamps_to_remaining_queue_budget() {
+        let now = Instant::now();
+        let effective = client_set_effective_batch_wait(
+            now - Duration::from_micros(350),
+            now,
+            Duration::from_micros(300),
+            Duration::from_micros(500),
+        );
+        assert_eq!(effective, Duration::from_micros(150));
+    }
+
+    /// Verify progress-aware GET batch collection drains ready queue work up to
+    /// the configured key cap.
+    ///
+    /// Purpose:
+    /// - Validate normal-path behavior for `collect_get_batch_with_progress`.
+    ///
+    /// Design:
+    /// - Seeds two queued work items before calling collector.
+    /// - Uses zero wait so function relies on ready queue state only.
+    ///
+    /// Inputs:
+    /// - One dequeued head item and two ready queue items.
+    ///
+    /// Outputs:
+    /// - Returned batch contains three work items in dequeue order.
+    #[tokio::test]
+    async fn collect_get_batch_with_progress_collects_ready_items() {
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.send(make_batch_get_work(&[b"k1"]))
+            .await
+            .expect("queue second work");
+        tx.send(make_batch_get_work(&[b"k2"]))
+            .await
+            .expect("queue third work");
+        drop(tx);
+        let first = make_batch_get_work(&[b"k0"]);
+
+        let mut in_flight: FuturesUnordered<futures_util::future::Ready<ClientGetBatchRecycle>> =
+            FuturesUnordered::new();
+        let collected = collect_get_batch_with_progress(
+            Vec::new(),
+            first,
+            &mut rx,
+            3,
+            Duration::ZERO,
+            &mut in_flight,
+            |_recycle| {},
+        )
+        .await;
+
+        let flattened = collected
+            .batch
+            .iter()
+            .map(|work| work.keys[0].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            flattened,
+            vec![b"k0".to_vec(), b"k1".to_vec(), b"k2".to_vec()]
+        );
+        assert_eq!(collected.stop_reason, ClientGetCollectStopReason::MaxItems);
+    }
+
+    /// Verify progress-aware GET collection polls in-flight completions while
+    /// waiting for additional queue work.
+    ///
+    /// Purpose:
+    /// - Ensure in-flight batches keep draining even with sparse queue arrivals.
+    ///
+    /// Design:
+    /// - Configures non-zero wait and no additional queue item.
+    /// - Adds one delayed in-flight completion and asserts callback invocation.
+    ///
+    /// Inputs:
+    /// - One head item and one delayed in-flight future.
+    ///
+    /// Outputs:
+    /// - Returned batch contains one item and completion callback runs once.
+    #[tokio::test]
+    async fn collect_get_batch_with_progress_polls_in_flight_while_waiting() {
+        let (_tx, mut rx) = mpsc::channel::<BatchGetWork>(8);
+        let first = make_batch_get_work(&[b"k0"]);
+        let callback_hits = Arc::new(AtomicU64::new(0));
+        let callback_hits_clone = callback_hits.clone();
+        let mut in_flight: FuturesUnordered<BoxFuture<'static, ClientGetBatchRecycle>> =
+            FuturesUnordered::new();
+        in_flight.push(Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            ClientGetBatchRecycle {
+                responders: Vec::new(),
+                splits: Vec::new(),
+            }
+        }));
+
+        let collected = collect_get_batch_with_progress(
+            Vec::new(),
+            first,
+            &mut rx,
+            8,
+            Duration::from_millis(20),
+            &mut in_flight,
+            |_recycle| {
+                callback_hits_clone.fetch_add(1, Ordering::Relaxed);
+            },
+        )
+        .await;
+
+        assert_eq!(collected.batch.len(), 1);
+        assert_eq!(callback_hits.load(Ordering::Relaxed), 1);
+        assert_eq!(collected.stop_reason, ClientGetCollectStopReason::Deadline);
+    }
+
+    /// Verify progress-aware GET collection exits cleanly when queue sender is
+    /// disconnected.
+    ///
+    /// Purpose:
+    /// - Validate failure/edge handling for channel closure.
+    ///
+    /// Design:
+    /// - Drops sender before collection and uses non-zero wait.
+    ///
+    /// Inputs:
+    /// - One head item and disconnected receiver.
+    ///
+    /// Outputs:
+    /// - Returned batch contains only the head item.
+    #[tokio::test]
+    async fn collect_get_batch_with_progress_handles_disconnected_channel() {
+        let (tx, mut rx) = mpsc::channel::<BatchGetWork>(8);
+        drop(tx);
+        let first = make_batch_get_work(&[b"k0"]);
+        let mut in_flight: FuturesUnordered<futures_util::future::Ready<ClientGetBatchRecycle>> =
+            FuturesUnordered::new();
+
+        let collected = collect_get_batch_with_progress(
+            Vec::new(),
+            first,
+            &mut rx,
+            8,
+            Duration::from_millis(10),
+            &mut in_flight,
+            |_recycle| {},
+        )
+        .await;
+
+        assert_eq!(collected.batch.len(), 1);
+        assert_eq!(collected.batch[0].keys[0], b"k0".to_vec());
+        assert_eq!(
+            collected.stop_reason,
+            ClientGetCollectStopReason::QueueClosed
+        );
+    }
+
+    /// Verify tiny single-key reads dispatch immediately under shallow backlog.
+    ///
+    /// Purpose:
+    /// - Protect p50/p75 latency by avoiding unnecessary coalescing delay.
+    ///
+    /// Design:
+    /// - Uses one queued request with available in-flight capacity.
+    ///
+    /// Inputs:
+    /// - Queue-depth hint `1`, no in-flight batches, one-key head request.
+    ///
+    /// Outputs:
+    /// - Effective wait is zero.
+    #[test]
+    fn client_get_effective_batch_wait_fast_path_for_tiny_shallow_read() {
+        let now = Instant::now();
+        let decision = client_get_effective_batch_wait(
+            now,
+            now,
+            Duration::from_micros(200),
+            Duration::from_micros(800),
+            1,
+            0,
+            4,
+            1,
+        );
+        assert_eq!(decision.wait, Duration::ZERO);
+        assert_eq!(decision.reason, ClientGetWaitReason::ImmediateTinyFastPath);
+    }
+
+    /// Verify stale queue heads are flushed immediately.
+    ///
+    /// Purpose:
+    /// - Bound queue-age to prevent split-stall amplification.
+    ///
+    /// Design:
+    /// - Uses head age larger than strict queue-age cap.
+    ///
+    /// Inputs:
+    /// - `head_enqueued_at` older than `max_queue_wait`.
+    ///
+    /// Outputs:
+    /// - Effective wait is zero.
+    #[test]
+    fn client_get_effective_batch_wait_flushes_stale_head() {
+        let now = Instant::now();
+        let decision = client_get_effective_batch_wait(
+            now - Duration::from_millis(2),
+            now,
+            Duration::from_micros(200),
+            Duration::from_micros(250),
+            8,
+            1,
+            4,
+            2,
+        );
+        assert_eq!(decision.wait, Duration::ZERO);
+        assert_eq!(decision.reason, ClientGetWaitReason::StaleHeadFlush);
+    }
+
+    /// Verify low-backlog reads use a tiny bounded coalescing window.
+    ///
+    /// Purpose:
+    /// - Allow near-concurrent coalescing without paying full configured wait.
+    ///
+    /// Design:
+    /// - Uses one queued item but disables immediate fast-path by simulating
+    ///   in-flight saturation.
+    ///
+    /// Inputs:
+    /// - Queue-depth hint `1`, no free in-flight slots.
+    ///
+    /// Outputs:
+    /// - Effective wait is clamped to `CLIENT_GET_LOW_BACKLOG_WAIT_US`.
+    #[test]
+    fn client_get_effective_batch_wait_clamps_low_backlog_wait() {
+        let now = Instant::now();
+        let decision = client_get_effective_batch_wait(
+            now,
+            now,
+            Duration::from_micros(400),
+            Duration::from_micros(2_000),
+            1,
+            4,
+            4,
+            1,
+        );
+        assert_eq!(
+            decision.wait,
+            Duration::from_micros(CLIENT_GET_LOW_BACKLOG_WAIT_US)
+        );
+        assert_eq!(decision.reason, ClientGetWaitReason::LowBacklogClamp);
+    }
+
+    /// Verify queue-age capping reason is surfaced when remaining age budget
+    /// is smaller than configured wait.
+    #[test]
+    fn client_get_effective_batch_wait_reports_queue_age_clamp() {
+        let now = Instant::now();
+        let decision = client_get_effective_batch_wait(
+            now - Duration::from_micros(350),
+            now,
+            Duration::from_micros(300),
+            Duration::from_micros(500),
+            8,
+            0,
+            4,
+            2,
+        );
+        assert_eq!(decision.wait, Duration::from_micros(150));
+        assert_eq!(decision.reason, ClientGetWaitReason::QueueAgeClamp);
     }
 
     #[test]
@@ -6078,6 +8120,45 @@ mod tests {
         let chunks = chunk_batch_set_items_by_limits(items, 100, 16);
         let sizes = chunks.iter().map(Vec::len).collect::<Vec<_>>();
         assert_eq!(sizes, vec![1, 1]);
+    }
+
+    /// Validate read-mode fence policy for split vs non-split fences.
+    ///
+    /// Purpose:
+    /// - Ensure GET requests bypass split workflow fences but still block on any
+    ///   other fence reason.
+    ///
+    /// Design:
+    /// - Assert both split and non-split classifications for `Read`.
+    ///
+    /// Inputs:
+    /// - Representative split and non-split fence reason strings.
+    ///
+    /// Outputs:
+    /// - Boolean policy decisions from `KeyFenceWaitMode::blocks_on_fence`.
+    #[test]
+    fn key_fence_wait_mode_read_bypasses_only_split_fences() {
+        assert!(!KeyFenceWaitMode::Read.blocks_on_fence("split-op:n1-2-3:2"));
+        assert!(KeyFenceWaitMode::Read.blocks_on_fence("merge-op:n1-2-3:2"));
+    }
+
+    /// Validate write-mode fence policy remains strict.
+    ///
+    /// Purpose:
+    /// - Keep write behavior backward-compatible and conservative.
+    ///
+    /// Design:
+    /// - Assert writes block regardless of fence reason shape.
+    ///
+    /// Inputs:
+    /// - Representative split and non-split fence reason strings.
+    ///
+    /// Outputs:
+    /// - `true` for both policy decisions.
+    #[test]
+    fn key_fence_wait_mode_write_blocks_all_fences() {
+        assert!(KeyFenceWaitMode::Write.blocks_on_fence("split-op:n1-2-3:2"));
+        assert!(KeyFenceWaitMode::Write.blocks_on_fence("any-controller-fence"));
     }
 }
 
