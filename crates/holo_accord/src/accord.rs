@@ -8,7 +8,7 @@ mod group;
 mod state;
 mod types;
 
-pub use group::{DebugStats, Group, Handle, ProposalResult};
+pub use group::{CommitQuorumCloserStat, DebugStats, Group, Handle, ProposalResult};
 pub use types::{
     txn_group_id, AcceptRequest, AcceptResponse, Ballot, CommandKeys, CommitDurabilityMode,
     CommitLog, CommitLogAppendOptions, CommitLogCheckpointStatus, CommitLogEntry, CommitRequest,

@@ -1282,6 +1282,8 @@ impl QueryHook for DmlHook {
                 | Statement::Insert(_)
         ) {
             Some(dml_placeholder_plan(statement))
+        } else if matches!(statement, Statement::Explain { .. }) {
+            Some(explain_placeholder_plan(statement))
         } else {
             None
         }
@@ -5528,7 +5530,14 @@ fn build_explain_json_document(
     timeline: &[crate::metrics::QueryStageEvent],
 ) -> String {
     let timeline_json = build_explain_timeline_json(timeline);
-    let mut plan_json = serde_json::Map::new();
+    let mut plan_json = build_explain_plan_tree_json(plan_lines).unwrap_or_else(|| {
+        let mut fallback = serde_json::Map::new();
+        fallback.insert(
+            "Node Type".to_string(),
+            serde_json::Value::String("HoloFusionExplain".to_string()),
+        );
+        fallback
+    });
     plan_json.insert(
         "query_execution_id".to_string(),
         serde_json::Value::String(query_execution_id.to_string()),
@@ -5627,7 +5636,14 @@ fn build_explain_dist_json_document(
             })
         })
         .collect::<Vec<_>>();
-    let mut plan_json = serde_json::Map::new();
+    let mut plan_json = build_explain_plan_tree_json(plan_lines).unwrap_or_else(|| {
+        let mut fallback = serde_json::Map::new();
+        fallback.insert(
+            "Node Type".to_string(),
+            serde_json::Value::String("HoloFusionDistributedExplain".to_string()),
+        );
+        fallback
+    });
     plan_json.insert(
         "query_execution_id".to_string(),
         serde_json::Value::String(query_execution_id.to_string()),
@@ -5690,6 +5706,165 @@ fn build_explain_dist_json_document(
         }
     ])
     .to_string()
+}
+
+#[derive(Debug)]
+struct ExplainPlanTreeNode {
+    node_type: String,
+    detail: Option<String>,
+    raw_line: String,
+    children: Vec<ExplainPlanTreeNode>,
+}
+
+/// Builds one PostgreSQL-compatible `Plan` tree shape from textual DataFusion plan lines.
+///
+/// GUI tools key off `Plan` / `Node Type` / `Plans`, so we synthesize a structural tree from
+/// the textual explain output and keep HoloFusion-specific diagnostics alongside it.
+fn build_explain_plan_tree_json(
+    plan_lines: &[String],
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let root = parse_explain_plan_tree(plan_lines)?;
+    Some(explain_plan_tree_node_to_json(&root))
+}
+
+/// Parses the first executor plan section into a hierarchical tree.
+fn parse_explain_plan_tree(plan_lines: &[String]) -> Option<ExplainPlanTreeNode> {
+    let mut executor_lines = Vec::new();
+    let mut in_plan_section = false;
+    for line in plan_lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed == "Plan with Metrics" {
+            in_plan_section = true;
+            continue;
+        }
+        if trimmed == "Plan with Full Metrics" && !executor_lines.is_empty() {
+            break;
+        }
+        if !in_plan_section && !trimmed.contains("Exec") {
+            continue;
+        }
+        if trimmed.contains("Exec") {
+            in_plan_section = true;
+            executor_lines.push(line.clone());
+        } else if in_plan_section {
+            executor_lines.push(line.clone());
+        }
+    }
+
+    if executor_lines.is_empty() {
+        return None;
+    }
+
+    let mut stack = Vec::<(usize, ExplainPlanTreeNode)>::new();
+    let mut roots = Vec::<ExplainPlanTreeNode>::new();
+    for line in executor_lines {
+        let Some((depth, node)) = parse_explain_plan_tree_line(line.as_str()) else {
+            continue;
+        };
+        while stack
+            .last()
+            .is_some_and(|(last_depth, _)| *last_depth >= depth)
+        {
+            let (_, child) = stack.pop().expect("stack is not empty");
+            if let Some((_, parent)) = stack.last_mut() {
+                parent.children.push(child);
+            } else {
+                roots.push(child);
+            }
+        }
+        stack.push((depth, node));
+    }
+
+    while let Some((_, child)) = stack.pop() {
+        if let Some((_, parent)) = stack.last_mut() {
+            parent.children.push(child);
+        } else {
+            roots.push(child);
+        }
+    }
+
+    roots.reverse();
+    if roots.len() == 1 {
+        roots.pop()
+    } else if !roots.is_empty() {
+        Some(ExplainPlanTreeNode {
+            node_type: "HoloFusionPlan".to_string(),
+            detail: None,
+            raw_line: "HoloFusionPlan".to_string(),
+            children: roots,
+        })
+    } else {
+        None
+    }
+}
+
+/// Parses one textual explain line into `(depth, node)`.
+fn parse_explain_plan_tree_line(line: &str) -> Option<(usize, ExplainPlanTreeNode)> {
+    let leading_spaces = line
+        .chars()
+        .take_while(|ch| ch.is_ascii_whitespace())
+        .count();
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let (node_type_raw, detail_raw) = trimmed
+        .split_once(':')
+        .map(|(node, detail)| (node.trim(), Some(detail.trim())))
+        .unwrap_or((trimmed, None));
+    let node_type = node_type_raw.trim_end_matches(':').trim();
+    if node_type.is_empty() {
+        return None;
+    }
+
+    Some((
+        leading_spaces / 2,
+        ExplainPlanTreeNode {
+            node_type: node_type.to_string(),
+            detail: detail_raw
+                .filter(|detail| !detail.is_empty())
+                .map(|detail| detail.to_string()),
+            raw_line: trimmed.to_string(),
+            children: Vec::new(),
+        },
+    ))
+}
+
+/// Converts one parsed plan tree node into PostgreSQL-style JSON.
+fn explain_plan_tree_node_to_json(
+    node: &ExplainPlanTreeNode,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut json = serde_json::Map::new();
+    json.insert(
+        "Node Type".to_string(),
+        serde_json::Value::String(node.node_type.clone()),
+    );
+    if let Some(detail) = node.detail.as_ref() {
+        json.insert(
+            "Holo Details".to_string(),
+            serde_json::Value::String(detail.clone()),
+        );
+    }
+    json.insert(
+        "Holo Raw Line".to_string(),
+        serde_json::Value::String(node.raw_line.clone()),
+    );
+    if !node.children.is_empty() {
+        json.insert(
+            "Plans".to_string(),
+            serde_json::Value::Array(
+                node.children
+                    .iter()
+                    .map(|child| serde_json::Value::Object(explain_plan_tree_node_to_json(child)))
+                    .collect::<Vec<_>>(),
+            ),
+        );
+    }
+    json
 }
 
 /// Converts timeline events to JSON entries for EXPLAIN output.
@@ -6445,6 +6620,35 @@ fn dml_placeholder_plan(statement: &Statement) -> PgWireResult<LogicalPlan> {
     LogicalPlanBuilder::values(vec![exprs])
         .and_then(|builder| builder.build())
         .map_err(|err| api_error(err.to_string()))
+}
+
+/// Builds a placeholder logical plan for `EXPLAIN` in extended-query mode.
+///
+/// Prepared-statement clients describe `EXPLAIN` before execution. EXPLAIN is
+/// executed by the hook layer and always returns EXPLAIN-shaped rows, so the
+/// placeholder must advertise the EXPLAIN output schema rather than the schema
+/// of the explained query.
+fn explain_placeholder_plan(statement: &Statement) -> PgWireResult<LogicalPlan> {
+    let explain = parse_explain_request(statement)?;
+    placeholder_plan_for_schema(explain_output_schema(&explain))
+}
+
+/// Returns the externally visible output schema for one EXPLAIN request.
+fn explain_output_schema(explain: &ExplainRequest) -> Arc<Schema> {
+    match (explain.dist, explain.format) {
+        (true, ExplainOutputFormat::Text) => Arc::new(Schema::new(vec![
+            Field::new("stage", ArrowDataType::Utf8, false),
+            Field::new("placement", ArrowDataType::Utf8, false),
+            Field::new("detail", ArrowDataType::Utf8, false),
+            Field::new("query_execution_id", ArrowDataType::Utf8, false),
+            Field::new("stage_id", ArrowDataType::UInt64, false),
+        ])),
+        _ => Arc::new(Schema::new(vec![Field::new(
+            "QUERY PLAN",
+            ArrowDataType::Utf8,
+            false,
+        )])),
+    }
 }
 
 fn placeholder_plan_for_schema(schema: Arc<Schema>) -> PgWireResult<LogicalPlan> {
@@ -7880,6 +8084,58 @@ mod tests {
         assert!(!explain.analyze);
         assert!(!explain.dist);
         assert_eq!(explain.format, ExplainOutputFormat::Text);
+    }
+
+    #[test]
+    fn explain_output_schema_matches_json_and_dist_shapes() {
+        let json_schema = explain_output_schema(&ExplainRequest {
+            analyze: true,
+            verbose: true,
+            dist: true,
+            format: ExplainOutputFormat::Json,
+            explained_sql: "SELECT 1".to_string(),
+        });
+        assert_eq!(json_schema.fields().len(), 1);
+        assert_eq!(json_schema.field(0).name(), "QUERY PLAN");
+
+        let dist_text_schema = explain_output_schema(&ExplainRequest {
+            analyze: false,
+            verbose: false,
+            dist: true,
+            format: ExplainOutputFormat::Text,
+            explained_sql: "SELECT 1".to_string(),
+        });
+        assert_eq!(dist_text_schema.fields().len(), 5);
+        assert_eq!(dist_text_schema.field(0).name(), "stage");
+        assert_eq!(dist_text_schema.field(4).name(), "stage_id");
+    }
+
+    #[test]
+    fn build_explain_plan_tree_json_preserves_exec_hierarchy() {
+        let plan_lines = vec![
+            "Plan with Metrics".to_string(),
+            "SortExec: TopK(fetch=10)".to_string(),
+            "  ProjectionExec: expr=[x@0 as x]".to_string(),
+            "    DataSourceExec: partitions=1".to_string(),
+            "Plan with Full Metrics".to_string(),
+        ];
+
+        let plan = build_explain_plan_tree_json(plan_lines.as_slice()).expect("build plan tree");
+        assert_eq!(
+            plan.get("Node Type").and_then(|value| value.as_str()),
+            Some("SortExec")
+        );
+        let children = plan
+            .get("Plans")
+            .and_then(|value| value.as_array())
+            .expect("root child plans");
+        assert_eq!(children.len(), 1);
+        assert_eq!(
+            children[0]
+                .get("Node Type")
+                .and_then(|value| value.as_str()),
+            Some("ProjectionExec")
+        );
     }
 
     #[test]

@@ -1,7 +1,12 @@
-//! Write-ahead log (WAL) implementation for durable Accord commits.
+//! Write-ahead log (WAL) implementations for durable Accord commits.
 //!
-//! This module provides a file-backed `CommitLog` implementation that batches
-//! writes, optionally fsyncs, and supports compaction based on executed txns.
+//! This module provides two `CommitLog` backends:
+//! - `RaftEngineWal`: the default production path, backed by `raft-engine`.
+//! - `FileWal`: a simpler file-backed implementation kept for comparison and
+//!   crash-fault durability tests.
+//!
+//! Both backends persist committed entries, support replay/compaction, and
+//! share the same encoded `CommitLogEntry` format.
 
 use std::collections::HashSet;
 #[cfg(feature = "raft-engine")]
@@ -12,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 #[cfg(feature = "raft-engine")]
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::{env, str::FromStr};
@@ -37,6 +42,8 @@ const WAL_PERSIST_INTERVAL_US: u64 = 2_000;
 const WAL_COMMIT_BATCH_MAX: usize = 64;
 /// Default batching window for commits (microseconds).
 const WAL_COMMIT_BATCH_WAIT_US: u64 = 200;
+/// Default extra wait window for raft-engine append coalescing.
+const RAFT_WAL_COMMIT_BATCH_WAIT_US: u64 = 0;
 
 /// File name used for the WAL log within the WAL directory.
 const WAL_LOG_FILE: &str = "wal.log";
@@ -44,6 +51,8 @@ const WAL_LOG_FILE: &str = "wal.log";
 const WAL_SYNC_STATE_FILE: &str = "wal.synced";
 /// Fault-injection flag: truncate WAL to last synced offset when opening.
 const WAL_FAULT_TRUNCATE_UNSYNCED_ON_OPEN: &str = "HOLO_WAL_FAULT_TRUNCATE_UNSYNCED_ON_OPEN";
+/// Optional flag: keep the synced-offset sidecar even without crash fault injection.
+const WAL_TRACK_SYNC_STATE: &str = "HOLO_WAL_TRACK_SYNC_STATE";
 
 /// Snapshot of WAL performance statistics for logging/monitoring.
 #[derive(Default, Debug, Clone, Copy)]
@@ -51,6 +60,12 @@ pub struct WalStatsSnapshot {
     pub fsync_count: u64,
     pub fsync_total_us: u64,
     pub fsync_max_us: u64,
+    pub queue_wait_count: u64,
+    pub queue_wait_total_us: u64,
+    pub queue_wait_max_us: u64,
+    pub write_count: u64,
+    pub write_total_us: u64,
+    pub write_max_us: u64,
     pub batch_count: u64,
     pub batch_items: u64,
     pub batch_max_items: u64,
@@ -63,6 +78,12 @@ struct WalStats {
     fsync_count: AtomicU64,
     fsync_total_us: AtomicU64,
     fsync_max_us: AtomicU64,
+    queue_wait_count: AtomicU64,
+    queue_wait_total_us: AtomicU64,
+    queue_wait_max_us: AtomicU64,
+    write_count: AtomicU64,
+    write_total_us: AtomicU64,
+    write_max_us: AtomicU64,
     batch_count: AtomicU64,
     batch_items: AtomicU64,
     batch_max_items: AtomicU64,
@@ -77,6 +98,12 @@ impl WalStats {
             fsync_count: AtomicU64::new(0),
             fsync_total_us: AtomicU64::new(0),
             fsync_max_us: AtomicU64::new(0),
+            queue_wait_count: AtomicU64::new(0),
+            queue_wait_total_us: AtomicU64::new(0),
+            queue_wait_max_us: AtomicU64::new(0),
+            write_count: AtomicU64::new(0),
+            write_total_us: AtomicU64::new(0),
+            write_max_us: AtomicU64::new(0),
             batch_count: AtomicU64::new(0),
             batch_items: AtomicU64::new(0),
             batch_max_items: AtomicU64::new(0),
@@ -91,6 +118,22 @@ impl WalStats {
         self.fsync_count.fetch_add(1, Ordering::Relaxed);
         self.fsync_total_us.fetch_add(us, Ordering::Relaxed);
         self.fsync_max_us.fetch_max(us, Ordering::Relaxed);
+    }
+
+    /// Record how long a request waited in a WAL append queue before service.
+    fn record_queue_wait(&self, dur: Duration) {
+        let us = dur.as_micros().min(u128::from(u64::MAX)) as u64;
+        self.queue_wait_count.fetch_add(1, Ordering::Relaxed);
+        self.queue_wait_total_us.fetch_add(us, Ordering::Relaxed);
+        self.queue_wait_max_us.fetch_max(us, Ordering::Relaxed);
+    }
+
+    /// Record the time spent inside one WAL backend write call.
+    fn record_write(&self, dur: Duration) {
+        let us = dur.as_micros().min(u128::from(u64::MAX)) as u64;
+        self.write_count.fetch_add(1, Ordering::Relaxed);
+        self.write_total_us.fetch_add(us, Ordering::Relaxed);
+        self.write_max_us.fetch_max(us, Ordering::Relaxed);
     }
 
     /// Record batch sizing stats for a commit write.
@@ -108,6 +151,12 @@ impl WalStats {
             fsync_count: self.fsync_count.swap(0, Ordering::Relaxed),
             fsync_total_us: self.fsync_total_us.swap(0, Ordering::Relaxed),
             fsync_max_us: self.fsync_max_us.swap(0, Ordering::Relaxed),
+            queue_wait_count: self.queue_wait_count.swap(0, Ordering::Relaxed),
+            queue_wait_total_us: self.queue_wait_total_us.swap(0, Ordering::Relaxed),
+            queue_wait_max_us: self.queue_wait_max_us.swap(0, Ordering::Relaxed),
+            write_count: self.write_count.swap(0, Ordering::Relaxed),
+            write_total_us: self.write_total_us.swap(0, Ordering::Relaxed),
+            write_max_us: self.write_max_us.swap(0, Ordering::Relaxed),
             batch_count: self.batch_count.swap(0, Ordering::Relaxed),
             batch_items: self.batch_items.swap(0, Ordering::Relaxed),
             batch_max_items: self.batch_max_items.swap(0, Ordering::Relaxed),
@@ -176,6 +225,8 @@ impl FileWal {
     /// Design:
     /// - Reads env knobs for batching, persistence mode, and async fsync worker.
     /// - Optionally applies fault-injection truncation before writers start.
+    /// - Only maintains the synced-offset sidecar when crash-fault injection
+    ///   or explicit sync-state tracking is enabled.
     /// - Separates `persist_mode` (periodic background policy) from
     ///   `configured_persist_mode` (capability used for forced durable appends).
     pub fn open_dir(path: impl AsRef<Path>) -> anyhow::Result<Self> {
@@ -183,10 +234,16 @@ impl FileWal {
         fs::create_dir_all(&dir).context("create wal dir")?;
         let log_path = dir.join(WAL_LOG_FILE);
         let sync_state_path = dir.join(WAL_SYNC_STATE_FILE);
+        let truncate_unsynced_on_open = read_env_bool(WAL_FAULT_TRUNCATE_UNSYNCED_ON_OPEN, false);
+        let track_sync_state =
+            truncate_unsynced_on_open || read_env_bool(WAL_TRACK_SYNC_STATE, false);
+        let tracked_sync_state_path = track_sync_state.then_some(sync_state_path.clone());
 
         // Optional fault injection for crash tests: emulate power-loss behavior
         // by dropping any bytes not known to be fsync-confirmed.
-        maybe_fault_truncate_unsynced_tail(&log_path, &sync_state_path)?;
+        if truncate_unsynced_on_open {
+            maybe_fault_truncate_unsynced_tail(&log_path, &sync_state_path)?;
+        }
 
         // Read persistence and batching knobs from environment variables.
         let persist_every = read_env_u64("HOLO_WAL_PERSIST_EVERY", WAL_PERSIST_EVERY);
@@ -208,11 +265,16 @@ impl FileWal {
                 SyncMode::Data | SyncMode::All => {
                     let (tx, rx) = mpsc::channel();
                     let path = log_path.clone();
-                    let sync_state_path = sync_state_path.clone();
+                    let sync_state_path = tracked_sync_state_path.clone();
                     thread::Builder::new()
                         .name("wal-persist".to_string())
                         .spawn(move || {
-                            persist_loop(&path, &sync_state_path, configured_persist_mode, rx)
+                            persist_loop(
+                                &path,
+                                sync_state_path.as_deref(),
+                                configured_persist_mode,
+                                rx,
+                            )
                         })
                         .context("spawn wal persist thread")?;
                     // In async-persist mode the commit worker skips periodic fsync and
@@ -241,7 +303,7 @@ impl FileWal {
                     persist_mode,
                     persist_tx,
                     configured_persist_mode,
-                    sync_state_path,
+                    tracked_sync_state_path,
                     commit_batch_max,
                     Duration::from_micros(commit_batch_wait_us),
                 )
@@ -417,32 +479,143 @@ impl RaftWalState {
     }
 }
 
+/// Persistence policy used by the raft-engine append worker.
+#[cfg(feature = "raft-engine")]
+#[derive(Clone, Copy, Debug)]
+struct RaftAppendConfig {
+    /// Number of appended entries that triggers a periodic synced write.
+    persist_every: u64,
+    /// Maximum time between periodic synced writes.
+    persist_interval_us: u64,
+    /// Sync behavior used when a write crosses a persistence threshold.
+    persist_mode: SyncMode,
+}
+
+/// One append request sent to the raft-engine write worker.
+#[cfg(feature = "raft-engine")]
+struct RaftAppendWork {
+    /// Entries supplied by one `CommitLog` call.
+    entries: Vec<CommitLogEntry>,
+    /// Durability requirements for this call.
+    options: CommitLogAppendOptions,
+    /// One-shot response channel for the caller.
+    tx: mpsc::Sender<anyhow::Result<()>>,
+    /// Time when the request entered the worker queue.
+    enqueued_at: Instant,
+}
+
+#[cfg(feature = "raft-engine")]
+impl RaftAppendConfig {
+    /// Decide whether one raft-engine append batch must be synced.
+    ///
+    /// Inputs:
+    /// - `state`: current append/persist counters.
+    /// - `batch_len`: number of entries being appended now.
+    /// - `now`: current time in microseconds.
+    /// - `options`: durability requirements for this batch.
+    ///
+    /// Outputs:
+    /// - `(sync, pending_count, last_persist_us)` describing the write mode and
+    ///   updated persistence counters.
+    ///
+    /// Design:
+    /// - `require_durable` always forces `sync=true`.
+    /// - Non-durable appends still piggyback on periodic synced writes.
+    fn persist_should_sync(
+        self,
+        state: &RaftWalState,
+        batch_len: usize,
+        now: u64,
+        options: CommitLogAppendOptions,
+    ) -> anyhow::Result<(bool, u64, u64)> {
+        if options.require_durable {
+            anyhow::ensure!(
+                !matches!(self.persist_mode, SyncMode::None),
+                "durable append requested but wal persist mode is non-durable"
+            );
+            return Ok((true, 0, now));
+        }
+        if matches!(self.persist_mode, SyncMode::None) {
+            return Ok((false, state.pending_count, state.last_persist_us));
+        }
+        let mut pending = state.pending_count.saturating_add(batch_len as u64);
+        let mut last_persist_us = state.last_persist_us;
+        let hit_count = self.persist_every > 0 && pending >= self.persist_every;
+        let hit_interval = self.persist_interval_us > 0
+            && now.saturating_sub(state.last_persist_us) >= self.persist_interval_us;
+        let sync = hit_count || hit_interval;
+        if sync {
+            pending = 0;
+            last_persist_us = now;
+        }
+        Ok((sync, pending, last_persist_us))
+    }
+}
+
 /// Raft-engine backed WAL implementation (optional).
 #[cfg(feature = "raft-engine")]
 pub struct RaftEngineWal {
-    engine: RaftEngine,
-    state: Mutex<RaftWalState>,
-    persist_every: u64,
-    persist_interval_us: u64,
-    persist_mode: SyncMode,
+    engine: Arc<RaftEngine>,
+    state: Arc<Mutex<RaftWalState>>,
+    append_tx: mpsc::Sender<RaftAppendWork>,
+    append_thread: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 #[cfg(feature = "raft-engine")]
 impl RaftEngineWal {
-    /// Open or create a raft-engine WAL directory.
+    /// Open or create a raft-engine WAL directory using environment defaults.
     pub fn open_dir(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let append_config = RaftAppendConfig {
+            persist_every: read_env_u64("HOLO_WAL_PERSIST_EVERY", WAL_PERSIST_EVERY),
+            persist_interval_us: read_env_u64(
+                "HOLO_WAL_PERSIST_INTERVAL_US",
+                WAL_PERSIST_INTERVAL_US,
+            ),
+            persist_mode: parse_persist_mode(env::var("HOLO_WAL_PERSIST_MODE").ok().as_deref())
+                .unwrap_or(SyncMode::None),
+        };
+        let append_batch_max =
+            read_env_usize("HOLO_WAL_COMMIT_BATCH_MAX", WAL_COMMIT_BATCH_MAX).max(1);
+        let append_batch_wait = if env::var_os("HOLO_WAL_COMMIT_BATCH_WAIT_US").is_some() {
+            Duration::from_micros(read_env_u64(
+                "HOLO_WAL_COMMIT_BATCH_WAIT_US",
+                WAL_COMMIT_BATCH_WAIT_US,
+            ))
+        } else {
+            Duration::from_micros(RAFT_WAL_COMMIT_BATCH_WAIT_US)
+        };
+        Self::open_dir_with_config(path, append_config, append_batch_max, append_batch_wait)
+    }
+
+    /// Open or create a raft-engine WAL directory with an explicit worker config.
+    ///
+    /// Inputs:
+    /// - `path`: WAL root directory.
+    /// - `append_config`: persistence policy used by the append worker.
+    /// - `append_batch_max`: maximum number of entries to coalesce per worker write.
+    /// - `append_batch_wait`: maximum time the worker waits for more entries.
+    ///
+    /// Outputs:
+    /// - `RaftEngineWal` backed by a dedicated append worker.
+    ///
+    /// Design:
+    /// - All commit-log appends flow through one local worker so concurrent
+    ///   callers can share a single synced `raft-engine` write when they
+    ///   arrive close together.
+    /// - ACK semantics do not change: a durable request still waits for the
+    ///   shared synced write to complete successfully.
+    fn open_dir_with_config(
+        path: impl AsRef<Path>,
+        append_config: RaftAppendConfig,
+        append_batch_max: usize,
+        append_batch_wait: Duration,
+    ) -> anyhow::Result<Self> {
         let dir = path.as_ref().to_path_buf();
         fs::create_dir_all(&dir).context("create raft wal dir")?;
 
         let mut cfg = RaftConfig::default();
         cfg.dir = dir.to_string_lossy().to_string();
-        let engine = RaftEngine::open(cfg).context("open raft-engine")?;
-
-        let persist_every = read_env_u64("HOLO_WAL_PERSIST_EVERY", WAL_PERSIST_EVERY);
-        let persist_interval_us =
-            read_env_u64("HOLO_WAL_PERSIST_INTERVAL_US", WAL_PERSIST_INTERVAL_US);
-        let persist_mode = parse_persist_mode(env::var("HOLO_WAL_PERSIST_MODE").ok().as_deref())
-            .unwrap_or(SyncMode::None);
+        let engine = Arc::new(RaftEngine::open(cfg).context("open raft-engine")?);
 
         let mut state = RaftWalState::new();
         if let Some(buf) = engine.get(WAL_META_REGION_ID, WAL_META_GROUPS_KEY) {
@@ -460,61 +633,249 @@ impl RaftEngineWal {
                 }
             }
         }
+        let state = Arc::new(Mutex::new(state));
+        let (append_tx, append_rx) = mpsc::channel();
+        let worker_engine = engine.clone();
+        let worker_state = state.clone();
+        let append_thread = thread::Builder::new()
+            .name("raft-wal-append".to_string())
+            .spawn(move || {
+                raft_append_worker(
+                    worker_engine,
+                    worker_state,
+                    append_config,
+                    append_batch_max,
+                    append_batch_wait,
+                    append_rx,
+                )
+            })
+            .context("spawn raft wal append thread")?;
 
         Ok(Self {
             engine,
-            state: Mutex::new(state),
-            persist_every,
-            persist_interval_us,
-            persist_mode,
+            state,
+            append_tx,
+            append_thread: Mutex::new(Some(append_thread)),
         })
     }
+}
 
-    /// Decide persistence behavior for one raft-engine append call.
-    ///
-    /// Inputs:
-    /// - `state`: current persistence counters.
-    /// - `batch_len`: number of entries being appended now.
-    /// - `now`: current timestamp in microseconds.
-    /// - `options`: caller durability requirements.
-    ///
-    /// Output:
-    /// - `(sync, pending_count, last_persist_us)` persistence decision/state.
+#[cfg(feature = "raft-engine")]
+impl Drop for RaftEngineWal {
+    /// Stop the append worker before dropping the raft-engine handle.
     ///
     /// Design:
-    /// - `require_durable` forces `sync=true` and validates durability support.
-    /// - Otherwise uses periodic count/time thresholds.
-    fn persist_should_sync(
-        &self,
-        state: &RaftWalState,
-        batch_len: usize,
-        now: u64,
-        options: CommitLogAppendOptions,
-    ) -> anyhow::Result<(bool, u64, u64)> {
-        // Per-request durable ACK has priority over periodic thresholds.
-        if options.require_durable {
-            anyhow::ensure!(
-                !matches!(self.persist_mode, SyncMode::None),
-                "durable append requested but wal persist mode is non-durable"
-            );
-            return Ok((true, 0, now));
+    /// - Closing the sender lets the worker exit its blocking `recv`.
+    /// - Joining here avoids leaving the raft-engine directory locked across
+    ///   test teardown or process shutdown.
+    fn drop(&mut self) {
+        let (dummy_tx, _dummy_rx) = mpsc::channel();
+        let append_tx = std::mem::replace(&mut self.append_tx, dummy_tx);
+        drop(append_tx);
+        if let Ok(mut handle) = self.append_thread.lock() {
+            if let Some(handle) = handle.take() {
+                let _ = handle.join();
+            }
         }
-        // With non-durable mode there is no sync thresholding.
-        if matches!(self.persist_mode, SyncMode::None) {
-            return Ok((false, state.pending_count, state.last_persist_us));
-        }
-        let mut pending = state.pending_count.saturating_add(batch_len as u64);
-        let mut last_persist_us = state.last_persist_us;
-        let hit_count = self.persist_every > 0 && pending >= self.persist_every;
-        let hit_interval = self.persist_interval_us > 0
-            && now.saturating_sub(state.last_persist_us) >= self.persist_interval_us;
-        let sync = hit_count || hit_interval;
-        if sync {
-            pending = 0;
-            last_persist_us = now;
-        }
-        Ok((sync, pending, last_persist_us))
     }
+}
+
+/// Apply one or more raft-engine append requests in a single local worker batch.
+#[cfg(feature = "raft-engine")]
+fn raft_append_worker(
+    engine: Arc<RaftEngine>,
+    state: Arc<Mutex<RaftWalState>>,
+    append_config: RaftAppendConfig,
+    batch_max: usize,
+    batch_wait: Duration,
+    rx: mpsc::Receiver<RaftAppendWork>,
+) {
+    let batch_max = batch_max.max(1);
+    let mut disconnected = false;
+    while !disconnected {
+        let first = match rx.recv() {
+            Ok(work) => work,
+            Err(_) => break,
+        };
+
+        let mut works = Vec::with_capacity(batch_max);
+        let mut entry_count = first.entries.len();
+        works.push(first);
+
+        if batch_max > 1 {
+            let deadline = if batch_wait.is_zero() {
+                None
+            } else {
+                Some(Instant::now() + batch_wait)
+            };
+
+            while entry_count < batch_max {
+                match rx.try_recv() {
+                    Ok(work) => {
+                        entry_count = entry_count.saturating_add(work.entries.len());
+                        works.push(work);
+                        continue;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+
+                let Some(deadline) = deadline else {
+                    break;
+                };
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                match rx.recv_timeout(remaining) {
+                    Ok(work) => {
+                        entry_count = entry_count.saturating_add(work.entries.len());
+                        works.push(work);
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        let require_durable = works.iter().any(|work| work.options.require_durable);
+        let total_entries = works.iter().map(|work| work.entries.len()).sum();
+        let mut entries = Vec::with_capacity(total_entries);
+        let mut responses = Vec::with_capacity(works.len());
+        for mut work in works {
+            entries.append(&mut work.entries);
+            responses.push((work.tx, work.enqueued_at));
+        }
+
+        let append_result = {
+            let mut state = state.lock().expect("raft wal state lock");
+            let write_ready_at = Instant::now();
+            for (_, enqueued_at) in &responses {
+                WAL_STATS.record_queue_wait(write_ready_at.saturating_duration_since(*enqueued_at));
+            }
+            raft_append_commits_locked(
+                engine.as_ref(),
+                &mut state,
+                entries,
+                CommitLogAppendOptions { require_durable },
+                append_config,
+            )
+        };
+
+        let err_msg = append_result.err().map(|err| err.to_string());
+        for (tx, _) in responses {
+            let result = match &err_msg {
+                None => Ok(()),
+                Some(msg) => Err(anyhow::anyhow!(msg.clone())),
+            };
+            let _ = tx.send(result);
+        }
+    }
+}
+
+/// Append a batch of committed entries into raft-engine while holding WAL state.
+#[cfg(feature = "raft-engine")]
+fn raft_append_commits_locked(
+    engine: &RaftEngine,
+    state: &mut RaftWalState,
+    entries: Vec<CommitLogEntry>,
+    options: CommitLogAppendOptions,
+    append_config: RaftAppendConfig,
+) -> anyhow::Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    let now = epoch_micros();
+    let mut assigned = Vec::with_capacity(entries.len());
+    let mut per_group_last = HashMap::<GroupId, u64>::new();
+    let mut new_groups = Vec::new();
+    let mut prev_last = HashMap::<GroupId, u64>::new();
+    let mut batch_bytes = 0u64;
+
+    for entry in entries {
+        let group_id = txn_group_id(entry.txn_id);
+        let base_last = match state.last_index.get(&group_id).copied() {
+            Some(last) => last,
+            None => read_last_index(engine, group_id)?.unwrap_or(0),
+        };
+        prev_last.entry(group_id).or_insert(base_last);
+        let next_index = base_last.saturating_add(1);
+        state.last_index.insert(group_id, next_index);
+        per_group_last.insert(group_id, next_index);
+        if state.groups.insert(group_id) {
+            new_groups.push(group_id);
+        }
+        state.compacted_floor.entry(group_id).or_insert(0);
+        let compacted_floor = state.compacted_floor.get(&group_id).copied().unwrap_or(0);
+        state
+            .durable_floor
+            .entry(group_id)
+            .or_insert(compacted_floor);
+        batch_bytes = batch_bytes.saturating_add(encoded_len(&entry) as u64);
+        assigned.push((group_id, next_index, entry));
+    }
+
+    let (sync, pending_count, last_persist_us) =
+        append_config.persist_should_sync(state, assigned.len(), now, options)?;
+
+    let mut batch = LogBatch::with_capacity(assigned.len() + per_group_last.len() + 1);
+    for (group_id, index, entry) in &assigned {
+        let key = entry_key(*index);
+        let payload = encode_entry(entry);
+        batch
+            .put(*group_id, key.to_vec(), payload)
+            .context("raft wal batch put entry")?;
+    }
+    for (group_id, last_index) in &per_group_last {
+        let payload = last_index.to_be_bytes();
+        batch
+            .put(
+                *group_id,
+                WAL_META_LAST_INDEX_KEY.to_vec(),
+                payload.to_vec(),
+            )
+            .context("raft wal batch put last index")?;
+    }
+    if !new_groups.is_empty() {
+        let payload = encode_groups(&state.groups);
+        batch
+            .put(WAL_META_REGION_ID, WAL_META_GROUPS_KEY.to_vec(), payload)
+            .context("raft wal batch put group list")?;
+    }
+
+    WAL_STATS.record_batch(assigned.len() as u64, batch_bytes);
+    let write_start = Instant::now();
+    let write_result = engine.write(&mut batch, sync);
+    WAL_STATS.record_write(write_start.elapsed());
+    if let Err(err) = write_result {
+        for (group_id, last) in prev_last {
+            state.last_index.insert(group_id, last);
+        }
+        for group_id in new_groups {
+            state.groups.remove(&group_id);
+        }
+        return Err(err).context("raft wal write batch");
+    }
+
+    for (group_id, index, entry) in assigned {
+        state.txn_index.insert(entry.txn_id, (group_id, index));
+        state
+            .txn_by_index
+            .entry(group_id)
+            .or_default()
+            .insert(index, entry.txn_id);
+    }
+    state.pending_count = pending_count;
+    state.last_persist_us = last_persist_us;
+    Ok(())
 }
 
 #[cfg(feature = "raft-engine")]
@@ -542,7 +903,8 @@ impl CommitLog for RaftEngineWal {
     /// - `options`: durability requirements for this append batch.
     ///
     /// Output:
-    /// - `Ok(())` when metadata + entries are written consistently.
+    /// - `Ok(())` when the append worker has persisted metadata + entries
+    ///   consistently under the required sync mode.
     fn append_commits_with_options(
         &self,
         entries: Vec<CommitLogEntry>,
@@ -551,86 +913,16 @@ impl CommitLog for RaftEngineWal {
         if entries.is_empty() {
             return Ok(());
         }
-
-        let mut state = self.state.lock().expect("raft wal state lock");
-        let now = epoch_micros();
-
-        let mut assigned = Vec::with_capacity(entries.len());
-        let mut per_group_last = HashMap::<GroupId, u64>::new();
-        let mut new_groups = Vec::new();
-        let mut prev_last = HashMap::<GroupId, u64>::new();
-
-        for entry in entries {
-            let group_id = txn_group_id(entry.txn_id);
-            let base_last = match state.last_index.get(&group_id).copied() {
-                Some(last) => last,
-                None => read_last_index(&self.engine, group_id)?.unwrap_or(0),
-            };
-            prev_last.entry(group_id).or_insert(base_last);
-            let next_index = base_last.saturating_add(1);
-            state.last_index.insert(group_id, next_index);
-            per_group_last.insert(group_id, next_index);
-            if state.groups.insert(group_id) {
-                new_groups.push(group_id);
-            }
-            state.compacted_floor.entry(group_id).or_insert(0);
-            let compacted_floor = state.compacted_floor.get(&group_id).copied().unwrap_or(0);
-            state
-                .durable_floor
-                .entry(group_id)
-                .or_insert(compacted_floor);
-            assigned.push((group_id, next_index, entry));
-        }
-
-        let (sync, pending_count, last_persist_us) =
-            self.persist_should_sync(&state, assigned.len(), now, options)?;
-
-        let mut batch = LogBatch::with_capacity(assigned.len() + per_group_last.len() + 1);
-        for (group_id, index, entry) in &assigned {
-            let key = entry_key(*index);
-            let payload = encode_entry(entry);
-            batch
-                .put(*group_id, key.to_vec(), payload)
-                .context("raft wal batch put entry")?;
-        }
-        for (group_id, last_index) in &per_group_last {
-            let payload = last_index.to_be_bytes();
-            batch
-                .put(
-                    *group_id,
-                    WAL_META_LAST_INDEX_KEY.to_vec(),
-                    payload.to_vec(),
-                )
-                .context("raft wal batch put last index")?;
-        }
-        if !new_groups.is_empty() {
-            let payload = encode_groups(&state.groups);
-            batch
-                .put(WAL_META_REGION_ID, WAL_META_GROUPS_KEY.to_vec(), payload)
-                .context("raft wal batch put group list")?;
-        }
-
-        if let Err(err) = self.engine.write(&mut batch, sync) {
-            for (group_id, last) in prev_last {
-                state.last_index.insert(group_id, last);
-            }
-            for group_id in new_groups {
-                state.groups.remove(&group_id);
-            }
-            return Err(err).context("raft wal write batch");
-        }
-
-        for (group_id, index, entry) in assigned {
-            state.txn_index.insert(entry.txn_id, (group_id, index));
-            state
-                .txn_by_index
-                .entry(group_id)
-                .or_default()
-                .insert(index, entry.txn_id);
-        }
-        state.pending_count = pending_count;
-        state.last_persist_us = last_persist_us;
-        Ok(())
+        let (tx, rx) = mpsc::channel();
+        self.append_tx
+            .send(RaftAppendWork {
+                entries,
+                options,
+                tx,
+                enqueued_at: Instant::now(),
+            })
+            .map_err(|_| anyhow::anyhow!("raft wal append worker closed"))?;
+        rx.recv().context("raft wal append response dropped")?
     }
 
     fn mark_executed(&self, txn_id: TxnId) -> anyhow::Result<()> {
@@ -918,7 +1210,7 @@ impl CommitLog for RaftEngineWal {
 /// - `persist_every`/`persist_interval_us`: periodic sync thresholds.
 /// - `persist_mode`/`persist_tx`: periodic sync execution strategy.
 /// - `durable_sync_mode`: fsync capability used by `require_durable` requests.
-/// - `sync_state_path`: sidecar storing fsync-confirmed byte offset.
+/// - `sync_state_path`: optional sidecar storing fsync-confirmed byte offset.
 /// - `batch_max`/`batch_wait`: command coalescing controls.
 ///
 /// Output:
@@ -937,7 +1229,7 @@ fn wal_worker(
     persist_mode: SyncMode,
     persist_tx: Option<mpsc::Sender<()>>,
     durable_sync_mode: SyncMode,
-    sync_state_path: PathBuf,
+    sync_state_path: Option<PathBuf>,
     batch_max: usize,
     batch_wait: Duration,
 ) {
@@ -1070,7 +1362,7 @@ fn wal_worker(
                             "durable append requested but wal persist mode is non-durable"
                         ));
                     } else if let Err(err) =
-                        sync_file_with_state(&file, durable_sync_mode, &sync_state_path)
+                        sync_file_with_state(&file, durable_sync_mode, sync_state_path.as_deref())
                     {
                         // Capture sync errors so we can propagate to callers.
                         persist_error = Some(err.into());
@@ -1078,7 +1370,8 @@ fn wal_worker(
                 } else if let Some(tx) = &persist_tx {
                     // Signal the async persist thread.
                     let _ = tx.send(());
-                } else if let Err(err) = sync_file_with_state(&file, persist_mode, &sync_state_path)
+                } else if let Err(err) =
+                    sync_file_with_state(&file, persist_mode, sync_state_path.as_deref())
                 {
                     // Capture sync errors so we can propagate to callers.
                     persist_error = Some(err.into());
@@ -1243,10 +1536,15 @@ fn open_log_for_append(path: &Path) -> std::io::Result<File> {
 ///
 /// Inputs:
 /// - `path`: WAL file to fsync.
-/// - `sync_state_path`: sidecar file that tracks fsync-confirmed WAL offset.
+/// - `sync_state_path`: optional sidecar file that tracks fsync-confirmed WAL offset.
 /// - `mode`: sync strategy used for each persist signal.
 /// - `rx`: trigger channel fed by the WAL writer thread.
-fn persist_loop(path: &Path, sync_state_path: &Path, mode: SyncMode, rx: mpsc::Receiver<()>) {
+fn persist_loop(
+    path: &Path,
+    sync_state_path: Option<&Path>,
+    mode: SyncMode,
+    rx: mpsc::Receiver<()>,
+) {
     while rx.recv().is_ok() {
         // Drain any extra signals so we only sync once per burst.
         while rx.try_recv().is_ok() {}
@@ -1281,20 +1579,25 @@ fn sync_file(file: &File, mode: SyncMode) -> std::io::Result<()> {
 /// Inputs:
 /// - `file`: opened WAL file descriptor.
 /// - `mode`: fsync mode to apply.
-/// - `sync_state_path`: sidecar path storing last fsync-confirmed WAL length.
+/// - `sync_state_path`: optional sidecar path storing last fsync-confirmed WAL length.
 ///
 /// Design:
 /// - Only records an offset when real fsync work is requested.
+/// - Skips sidecar writes entirely when sync-state tracking is disabled, so
+///   normal durable commits avoid extra metadata fsync work.
 /// - `SyncMode::None` intentionally performs no sidecar update.
 fn sync_file_with_state(
     file: &File,
     mode: SyncMode,
-    sync_state_path: &Path,
+    sync_state_path: Option<&Path>,
 ) -> std::io::Result<()> {
     if matches!(mode, SyncMode::None) {
         return Ok(());
     }
     sync_file(file, mode)?;
+    let Some(sync_state_path) = sync_state_path else {
+        return Ok(());
+    };
     let synced_len = file.metadata()?.len();
     write_synced_offset(sync_state_path, synced_len)
 }
@@ -1569,14 +1872,142 @@ fn read_u32_at(data: &[u8], offset: &mut usize) -> anyhow::Result<u32> {
     Ok(u32::from_be_bytes(buf))
 }
 
+#[cfg(test)]
+mod file_wal_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_ID: AtomicU64 = AtomicU64::new(1);
+
+    fn temp_wal_dir(name: &str) -> PathBuf {
+        let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("holostore-file-wal-{name}-{id}"));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("create temp wal dir");
+        path
+    }
+
+    /// Verify sync-state tracking writes the durable offset sidecar when enabled.
+    ///
+    /// Purpose:
+    /// - Preserve crash-fault diagnostics that need a precise fsync-confirmed
+    ///   byte offset.
+    ///
+    /// Design:
+    /// - Write one WAL file, force `sync_data`, and confirm the sidecar records
+    ///   the exact synced length.
+    ///
+    /// Inputs:
+    /// - Temporary WAL file path and one sidecar path.
+    ///
+    /// Outputs:
+    /// - Sidecar file exists and stores the WAL's durable byte length.
+    #[test]
+    fn sync_file_with_state_writes_sidecar_when_tracking_enabled() {
+        let dir = temp_wal_dir("sync-state-enabled");
+        let log_path = dir.join("wal.log");
+        let sync_state_path = dir.join(WAL_SYNC_STATE_FILE);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .expect("open wal file");
+        file.write_all(b"abc123").expect("write wal bytes");
+
+        sync_file_with_state(&file, SyncMode::Data, Some(sync_state_path.as_path()))
+            .expect("sync with state");
+
+        let synced_len = read_synced_offset(&sync_state_path).expect("read synced offset");
+        assert_eq!(synced_len, file.metadata().expect("stat wal file").len());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Verify sync-state tracking can be disabled without affecting fsync.
+    ///
+    /// Purpose:
+    /// - Ensure normal durable commits no longer pay for test-only sidecar I/O.
+    ///
+    /// Design:
+    /// - Force a sync with `sync_state_path=None` and assert no sidecar file is
+    ///   created.
+    ///
+    /// Inputs:
+    /// - Temporary WAL file path with one appended payload.
+    ///
+    /// Outputs:
+    /// - Sync succeeds and the sidecar remains absent.
+    #[test]
+    fn sync_file_with_state_skips_sidecar_when_tracking_disabled() {
+        let dir = temp_wal_dir("sync-state-disabled");
+        let log_path = dir.join("wal.log");
+        let sync_state_path = dir.join(WAL_SYNC_STATE_FILE);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .expect("open wal file");
+        file.write_all(b"abc123").expect("write wal bytes");
+
+        sync_file_with_state(&file, SyncMode::Data, None).expect("sync without sidecar");
+
+        assert!(
+            !sync_state_path.exists(),
+            "sidecar should stay absent when tracking is disabled"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Verify sync-state write errors still surface to callers when tracking is enabled.
+    ///
+    /// Purpose:
+    /// - Cover the failure path for the optional sidecar bookkeeping.
+    ///
+    /// Design:
+    /// - Use a sidecar path whose parent directory does not exist and assert
+    ///   the post-fsync state write fails.
+    ///
+    /// Inputs:
+    /// - Temporary WAL file path and an invalid sidecar destination.
+    ///
+    /// Outputs:
+    /// - `sync_file_with_state` returns an error instead of silently dropping
+    ///   tracking failures.
+    #[test]
+    fn sync_file_with_state_surfaces_sidecar_write_failure() {
+        let dir = temp_wal_dir("sync-state-failure");
+        let log_path = dir.join("wal.log");
+        let sync_state_path = dir.join("missing").join(WAL_SYNC_STATE_FILE);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .expect("open wal file");
+        file.write_all(b"abc123").expect("write wal bytes");
+
+        let err = sync_file_with_state(&file, SyncMode::Data, Some(sync_state_path.as_path()))
+            .expect_err("missing sidecar parent should fail");
+        assert!(
+            err.kind() == std::io::ErrorKind::NotFound,
+            "unexpected error kind: {err:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 #[cfg(all(test, feature = "raft-engine"))]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::time::Duration;
 
     use holo_accord::accord::TXN_COUNTER_SHARD_SHIFT;
 
     static TEST_ID: AtomicU64 = AtomicU64::new(1);
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn temp_wal_dir(name: &str) -> PathBuf {
         let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
@@ -1602,8 +2033,119 @@ mod tests {
         }
     }
 
+    fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn test_append_config(persist_mode: SyncMode) -> RaftAppendConfig {
+        RaftAppendConfig {
+            persist_every: WAL_PERSIST_EVERY,
+            persist_interval_us: WAL_PERSIST_INTERVAL_US,
+            persist_mode,
+        }
+    }
+
+    #[test]
+    fn raft_wal_coalesces_concurrent_durable_appends() {
+        let _guard = test_guard();
+        let _ = stats_snapshot();
+        let dir = temp_wal_dir("raft-wal-coalesce");
+        let wal = Arc::new(
+            RaftEngineWal::open_dir_with_config(
+                &dir,
+                test_append_config(SyncMode::Data),
+                64,
+                Duration::from_millis(100),
+            )
+            .expect("open raft wal"),
+        );
+        let barrier = Arc::new(Barrier::new(3));
+        let mut joins = Vec::new();
+        for seq in 1..=2 {
+            let wal = wal.clone();
+            let barrier = barrier.clone();
+            joins.push(std::thread::spawn(move || {
+                barrier.wait();
+                wal.append_commit_with_options(
+                    make_entry(11, seq),
+                    CommitLogAppendOptions {
+                        require_durable: true,
+                    },
+                )
+            }));
+        }
+
+        barrier.wait();
+        for join in joins {
+            join.join().expect("append join").expect("durable append");
+        }
+
+        let stats = stats_snapshot();
+        assert_eq!(stats.batch_count, 1, "worker should collapse both calls");
+        assert_eq!(
+            stats.batch_items, 2,
+            "one synced batch should contain both entries"
+        );
+        assert_eq!(
+            stats.write_count, 1,
+            "coalesced append should issue one backend write"
+        );
+        assert_eq!(
+            stats.queue_wait_count, 2,
+            "each caller should contribute one queue-wait sample"
+        );
+
+        let loaded = wal.load().expect("load entries");
+        assert_eq!(loaded.len(), 2, "both entries must be durably visible");
+
+        drop(wal);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn raft_wal_rejects_durable_append_when_sync_mode_disabled() {
+        let _guard = test_guard();
+        let _ = stats_snapshot();
+        let dir = temp_wal_dir("raft-wal-no-sync");
+        let wal = RaftEngineWal::open_dir_with_config(
+            &dir,
+            test_append_config(SyncMode::None),
+            64,
+            Duration::from_millis(1),
+        )
+        .expect("open raft wal");
+
+        let err = wal
+            .append_commit_with_options(
+                make_entry(13, 1),
+                CommitLogAppendOptions {
+                    require_durable: true,
+                },
+            )
+            .expect_err("durable append should fail when sync is disabled");
+        assert!(
+            err.to_string().contains("non-durable"),
+            "unexpected durable-append error: {err:?}"
+        );
+
+        let stats = stats_snapshot();
+        assert_eq!(
+            stats.write_count, 0,
+            "failing before write should not report a backend write"
+        );
+        assert!(
+            wal.load().expect("load entries").is_empty(),
+            "failed durable append must not become visible on replay"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn raft_wal_persists_compaction_floor_across_restart() {
+        let _guard = test_guard();
         let dir = temp_wal_dir("wal-floor");
         let group_id = 7;
 

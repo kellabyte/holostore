@@ -4,13 +4,24 @@ This document describes how HoloStore persists data and how durability/recovery 
 
 ## WAL (Commit Log)
 
-HoloStore uses a **custom commit log** implementation (`crates/holo_store/src/wal.rs`).
-It acts as the authoritative durability source for committed commands.
+HoloStore uses `crates/holo_store/src/wal.rs` as the authoritative durability
+layer for committed commands.
+
+The primary backend is **`raft-engine`**:
+- It is the default `HOLO_WAL_ENGINE`.
+- It stores one logical log stream per Accord group.
+- A node-local append worker coalesces nearby commit-log appends into one
+  `raft-engine` write while preserving existing sync-commit ACK semantics.
+
+An alternate file-backed WAL remains available for comparison and crash-fault
+tests.
 
 Key points:
 - Commits are appended before execution.
-- Appends are batched to amortize syscalls and fsync.
+- Appends are batched to amortize storage sync cost.
 - Each record includes a CRC32 checksum for corruption detection.
+- The synced-offset sidecar (`wal.synced`) is maintained only for crash-fault
+  injection or when explicitly enabled.
 - Persistence mode is configurable:
   - `sync_data`: fsync data only (durable data)
   - `sync_all`: fsync data + metadata
@@ -22,6 +33,7 @@ Tuning:
 - `HOLO_WAL_PERSIST_EVERY`
 - `HOLO_WAL_PERSIST_INTERVAL_US`
 - `HOLO_WAL_PERSIST_MODE`
+- `HOLO_WAL_TRACK_SYNC_STATE`
 
 ## Storage Engine (Fjall)
 
@@ -63,6 +75,8 @@ WAL:
 - `HOLO_WAL_PERSIST_MODE=sync_data|sync_all|buffer`
 - `HOLO_WAL_PERSIST_EVERY` / `HOLO_WAL_PERSIST_INTERVAL_US`
 - `HOLO_WAL_COMMIT_BATCH_MAX` / `HOLO_WAL_COMMIT_BATCH_WAIT_US`
+- `HOLO_WAL_TRACK_SYNC_STATE=true|false`
+- `HOLO_WAL_FAULT_TRUNCATE_UNSYNCED_ON_OPEN=true|false`
 
 Fjall:
 - `HOLO_FJALL_MANUAL_JOURNAL_PERSIST=true|false`

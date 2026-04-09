@@ -457,7 +457,7 @@ async fn main() -> anyhow::Result<()> {
                         counts_by_node.insert(node_id, map);
                     }
                     Err(err) => {
-                        fetch_errors.insert(node_id, err.to_string());
+                        fetch_errors.insert(node_id, format_topology_fetch_error(&err.to_string()));
                     }
                 }
             }
@@ -505,7 +505,7 @@ async fn main() -> anyhow::Result<()> {
                         "replica"
                     };
                     let records = if let Some(err) = fetch_errors.get(&member.node_id) {
-                        format!("ERR ({err})")
+                        err.clone()
                     } else {
                         counts_by_node
                             .get(&member.node_id)
@@ -1163,6 +1163,47 @@ fn format_total_count(total: u64, complete: bool) -> String {
     }
 }
 
+fn format_topology_fetch_error(raw: &str) -> String {
+    let label = extract_client_error_kind(raw)
+        .or_else(|| extract_status_kind(raw))
+        .or_else(|| {
+            if raw.contains("invalid grpc address") {
+                Some("InvalidAddr")
+            } else {
+                None
+            }
+        })
+        .unwrap_or("Unknown");
+    format!("ERR({label})")
+}
+
+fn extract_client_error_kind(raw: &str) -> Option<&str> {
+    let marker = "client error (";
+    let start = raw.find(marker)? + marker.len();
+    let end = raw[start..].find(')')? + start;
+    let kind = raw[start..end].trim();
+    if kind.is_empty() {
+        None
+    } else {
+        Some(kind)
+    }
+}
+
+fn extract_status_kind(raw: &str) -> Option<&str> {
+    let marker = "status: ";
+    let start = raw.find(marker)? + marker.len();
+    let rest = &raw[start..];
+    let end = rest
+        .find(|c: char| c == ',' || c == ')' || c.is_whitespace())
+        .unwrap_or(rest.len());
+    let kind = rest[..end].trim();
+    if kind.is_empty() {
+        None
+    } else {
+        Some(kind)
+    }
+}
+
 fn format_top_reasons(reasons: &BTreeMap<String, u64>) -> String {
     if reasons.is_empty() {
         return "-".to_string();
@@ -1326,4 +1367,33 @@ fn print_ascii_table(headers: &[&str], rows: &[Vec<String>]) {
         println!();
     }
     println!("{separator}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_topology_fetch_error;
+
+    #[test]
+    fn topology_fetch_error_uses_short_client_error_kind() {
+        let raw = r#"status: Unknown, message: "client error (Connect)", details: [], metadata: MetadataMap { headers: {} }"#;
+        assert_eq!(format_topology_fetch_error(raw), "ERR(Connect)");
+    }
+
+    #[test]
+    fn topology_fetch_error_falls_back_to_status_kind() {
+        let raw = r#"status: DeadlineExceeded, message: "request timed out""#;
+        assert_eq!(format_topology_fetch_error(raw), "ERR(DeadlineExceeded)");
+    }
+
+    #[test]
+    fn topology_fetch_error_handles_invalid_grpc_addresses() {
+        let raw = "invalid grpc address: not-a-socket";
+        assert_eq!(format_topology_fetch_error(raw), "ERR(InvalidAddr)");
+    }
+
+    #[test]
+    fn topology_fetch_error_uses_unknown_when_no_known_marker_exists() {
+        let raw = "something unexpected happened";
+        assert_eq!(format_topology_fetch_error(raw), "ERR(Unknown)");
+    }
 }
