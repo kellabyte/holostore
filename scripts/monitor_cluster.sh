@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CLUSTER_DIR="${CLUSTER_DIR:-"$ROOT_DIR/.cluster"}"
+CLUSTER_DIR="${CLUSTER_DIR:-"$ROOT_DIR/.tmp/cluster"}"
 PIDS_FILE="$CLUSTER_DIR/pids"
 
 INTERVAL="${INTERVAL:-1}"

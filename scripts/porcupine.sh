@@ -22,6 +22,7 @@ FAIL_KILL_SIGNAL="${FAIL_KILL_SIGNAL:-KILL}"
 FAIL_KILL_RESTART="${FAIL_KILL_RESTART:-1}"
 
 OUT="${OUT:-$ROOT_DIR/.tmp/porcupine/history.json}"
+PORCUPINE_HOLO_STORE_FEATURES="${PORCUPINE_HOLO_STORE_FEATURES:-}"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
@@ -92,7 +93,16 @@ echo "==> cleaning cluster"
 "$ROOT_DIR/scripts/cleanup_cluster.sh"
 
 echo "==> building holo-store (release)"
-make -C "$ROOT_DIR" build-release
+build_holo_store=(cargo build -p holo_store --release --bin holo-store)
+if [[ -n "$PORCUPINE_HOLO_STORE_FEATURES" ]]; then
+  # Correctness runs default to the plain release build so the harness is not
+  # coupled to optional allocator features. Opt in explicitly when needed.
+  build_holo_store+=(--features "$PORCUPINE_HOLO_STORE_FEATURES")
+fi
+(
+  cd "$ROOT_DIR"
+  "${build_holo_store[@]}"
+)
 
 echo "==> starting cluster"
 HOLO_BIN="${HOLO_BIN:-$ROOT_DIR/target/release/holo-store}" \

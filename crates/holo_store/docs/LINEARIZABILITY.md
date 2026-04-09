@@ -38,6 +38,12 @@ By default, if any operation errored, the checker fails early; you can allow err
 - `./scripts/check_linearizability_stress.sh` (non-gating autosplit + autosplit/automerge stress suite)
 - `./scripts/check_read_minority.sh` (manual: read-only minority routing)
 
+The Porcupine harness now builds `holo-store` with a plain release profile by
+default (`cargo build -p holo_store --release --bin holo-store`). This keeps
+the correctness smoke path independent from optional allocator features. If you
+need to exercise a feature-gated build, set
+`PORCUPINE_HOLO_STORE_FEATURES=<feature-list>` when invoking the script.
+
 ## Suite scenarios
 
 The suite (`scripts/check_linearizability.sh`) runs multiple scenarios. Each scenario issues the same

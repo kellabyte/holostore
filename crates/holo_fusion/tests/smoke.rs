@@ -1980,6 +1980,106 @@ async fn phase9_explain_dist_json_includes_distribution_sections() -> Result<()>
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase9_explain_dist_verbose_json_reports_single_query_plan_column() -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    let rows = client
+        .query(
+            "EXPLAIN (ANALYZE, DIST, VERBOSE, FORMAT JSON) \
+             SELECT order_id, customer_id FROM orders WHERE order_id >= 1 ORDER BY order_id LIMIT 5",
+            &[],
+        )
+        .await
+        .context("run explain analyze dist verbose json query")?;
+    assert!(
+        !rows.is_empty(),
+        "expected explain analyze dist verbose json output rows"
+    );
+
+    let row = &rows[0];
+    assert_eq!(
+        row.columns().len(),
+        1,
+        "expected EXPLAIN JSON to expose one QUERY PLAN column even when the explained query has multiple output columns"
+    );
+    assert_eq!(row.columns()[0].name(), "QUERY PLAN");
+
+    let payload: String = row
+        .try_get(0)
+        .context("read verbose json explain payload from query plan column")?;
+    assert!(
+        payload.contains("\"distribution\""),
+        "expected distribution section in verbose JSON explain output: {payload}"
+    );
+    assert!(
+        payload.contains("\"verbose\":true"),
+        "expected verbose flag in JSON explain output: {payload}"
+    );
+    assert!(
+        payload.contains("\"Node Type\""),
+        "expected PostgreSQL-style plan tree node in JSON explain output: {payload}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase9_explain_dist_verbose_json_prepared_statement_reports_single_query_plan_column(
+) -> Result<()> {
+    let harness = TestHarness::start().await?;
+    let (client, _guard) = harness.connect_pg().await?;
+
+    let stmt = client
+        .prepare(
+            "EXPLAIN (ANALYZE, DIST, VERBOSE, FORMAT JSON) \
+             SELECT order_id, customer_id FROM orders WHERE order_id >= 1 ORDER BY order_id LIMIT 5",
+        )
+        .await
+        .context("prepare explain analyze dist verbose json statement")?;
+
+    assert_eq!(
+        stmt.columns().len(),
+        1,
+        "expected prepared EXPLAIN JSON statement metadata to expose one QUERY PLAN column"
+    );
+    assert_eq!(stmt.columns()[0].name(), "QUERY PLAN");
+
+    let rows = client
+        .query(&stmt, &[])
+        .await
+        .context("execute prepared explain analyze dist verbose json statement")?;
+    assert!(
+        !rows.is_empty(),
+        "expected prepared explain analyze dist verbose json output rows"
+    );
+
+    let row = &rows[0];
+    assert_eq!(
+        row.columns().len(),
+        1,
+        "expected prepared EXPLAIN JSON rows to expose one QUERY PLAN column"
+    );
+    assert_eq!(row.columns()[0].name(), "QUERY PLAN");
+
+    let payload: String = row
+        .try_get(0)
+        .context("read prepared verbose json explain payload from query plan column")?;
+    assert!(
+        payload.contains("\"distribution\""),
+        "expected distribution section in prepared verbose JSON explain output: {payload}"
+    );
+    assert!(
+        payload.contains("\"verbose\":true"),
+        "expected verbose flag in prepared JSON explain output: {payload}"
+    );
+    assert!(
+        payload.contains("\"Node Type\""),
+        "expected PostgreSQL-style plan tree node in prepared JSON explain output: {payload}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn phase12_optimizer_prefers_index_scan_for_selective_filter() -> Result<()> {
     let harness = TestHarness::start().await?;
     let (client, _guard) = harness.connect_pg().await?;

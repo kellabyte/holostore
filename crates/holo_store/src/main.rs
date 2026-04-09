@@ -1590,9 +1590,21 @@ struct RpcHandlerStats {
     commit_count: AtomicU64,
     commit_total_us: AtomicU64,
     commit_max_us: AtomicU64,
+    commit_prepare_total_us: AtomicU64,
+    commit_prepare_max_us: AtomicU64,
+    commit_group_total_us: AtomicU64,
+    commit_group_max_us: AtomicU64,
+    commit_reply_total_us: AtomicU64,
+    commit_reply_max_us: AtomicU64,
     commit_batch_count: AtomicU64,
     commit_batch_total_us: AtomicU64,
     commit_batch_max_us: AtomicU64,
+    commit_batch_decode_total_us: AtomicU64,
+    commit_batch_decode_max_us: AtomicU64,
+    commit_batch_group_total_us: AtomicU64,
+    commit_batch_group_max_us: AtomicU64,
+    commit_batch_encode_total_us: AtomicU64,
+    commit_batch_encode_max_us: AtomicU64,
     commit_inflight: AtomicU64,
     commit_inflight_max: AtomicU64,
 }
@@ -1614,8 +1626,14 @@ struct RpcHandlerStatsSnapshot {
     accept_inflight_peak: u64,
     commit_avg_ms: f64,
     commit_p99_ms: f64,
+    commit_prepare_avg_ms: f64,
+    commit_group_avg_ms: f64,
+    commit_reply_avg_ms: f64,
     commit_batch_avg_ms: f64,
     commit_batch_p99_ms: f64,
+    commit_batch_decode_avg_ms: f64,
+    commit_batch_group_avg_ms: f64,
+    commit_batch_encode_avg_ms: f64,
     commit_inflight: u64,
     commit_inflight_peak: u64,
 }
@@ -1688,11 +1706,43 @@ impl RpcHandlerStats {
         self.commit_max_us.fetch_max(us, Ordering::Relaxed);
     }
 
+    /// Record unary commit handler sub-phases.
+    fn record_commit_phases(&self, prepare_us: u64, group_us: u64, reply_us: u64) {
+        self.commit_prepare_total_us
+            .fetch_add(prepare_us, Ordering::Relaxed);
+        self.commit_prepare_max_us
+            .fetch_max(prepare_us, Ordering::Relaxed);
+        self.commit_group_total_us
+            .fetch_add(group_us, Ordering::Relaxed);
+        self.commit_group_max_us
+            .fetch_max(group_us, Ordering::Relaxed);
+        self.commit_reply_total_us
+            .fetch_add(reply_us, Ordering::Relaxed);
+        self.commit_reply_max_us
+            .fetch_max(reply_us, Ordering::Relaxed);
+    }
+
     /// Record the latency of a commit batch handler invocation.
     fn record_commit_batch(&self, us: u64) {
         self.commit_batch_count.fetch_add(1, Ordering::Relaxed);
         self.commit_batch_total_us.fetch_add(us, Ordering::Relaxed);
         self.commit_batch_max_us.fetch_max(us, Ordering::Relaxed);
+    }
+
+    /// Record packed commit-batch handler sub-phases.
+    fn record_commit_batch_phases(&self, decode_us: u64, group_us: u64, encode_us: u64) {
+        self.commit_batch_decode_total_us
+            .fetch_add(decode_us, Ordering::Relaxed);
+        self.commit_batch_decode_max_us
+            .fetch_max(decode_us, Ordering::Relaxed);
+        self.commit_batch_group_total_us
+            .fetch_add(group_us, Ordering::Relaxed);
+        self.commit_batch_group_max_us
+            .fetch_max(group_us, Ordering::Relaxed);
+        self.commit_batch_encode_total_us
+            .fetch_add(encode_us, Ordering::Relaxed);
+        self.commit_batch_encode_max_us
+            .fetch_max(encode_us, Ordering::Relaxed);
     }
 
     /// Snapshot and reset all handler stats.
@@ -1718,11 +1768,23 @@ impl RpcHandlerStats {
         let com_cnt = self.commit_count.swap(0, Ordering::Relaxed);
         let com_tot = self.commit_total_us.swap(0, Ordering::Relaxed);
         let com_max = self.commit_max_us.swap(0, Ordering::Relaxed);
+        let com_prepare_tot = self.commit_prepare_total_us.swap(0, Ordering::Relaxed);
+        let com_group_tot = self.commit_group_total_us.swap(0, Ordering::Relaxed);
+        let com_reply_tot = self.commit_reply_total_us.swap(0, Ordering::Relaxed);
         let com_batch_cnt = self.commit_batch_count.swap(0, Ordering::Relaxed);
         let com_batch_tot = self.commit_batch_total_us.swap(0, Ordering::Relaxed);
         let com_batch_max = self.commit_batch_max_us.swap(0, Ordering::Relaxed);
+        let com_batch_decode_tot = self.commit_batch_decode_total_us.swap(0, Ordering::Relaxed);
+        let com_batch_group_tot = self.commit_batch_group_total_us.swap(0, Ordering::Relaxed);
+        let com_batch_encode_tot = self.commit_batch_encode_total_us.swap(0, Ordering::Relaxed);
         let com_inflight = self.commit_inflight.load(Ordering::Relaxed);
         let com_inflight_peak = self.commit_inflight_max.swap(0, Ordering::Relaxed);
+        self.commit_prepare_max_us.swap(0, Ordering::Relaxed);
+        self.commit_group_max_us.swap(0, Ordering::Relaxed);
+        self.commit_reply_max_us.swap(0, Ordering::Relaxed);
+        self.commit_batch_decode_max_us.swap(0, Ordering::Relaxed);
+        self.commit_batch_group_max_us.swap(0, Ordering::Relaxed);
+        self.commit_batch_encode_max_us.swap(0, Ordering::Relaxed);
 
         RpcHandlerStatsSnapshot {
             pre_accept_avg_ms: avg_us_per(pre_tot, pre_cnt),
@@ -1739,8 +1801,14 @@ impl RpcHandlerStats {
             accept_inflight_peak: acc_inflight_peak,
             commit_avg_ms: avg_us_per(com_tot, com_cnt),
             commit_p99_ms: com_max as f64 / 1000.0,
+            commit_prepare_avg_ms: avg_us_per(com_prepare_tot, com_cnt),
+            commit_group_avg_ms: avg_us_per(com_group_tot, com_cnt),
+            commit_reply_avg_ms: avg_us_per(com_reply_tot, com_cnt),
             commit_batch_avg_ms: avg_us_per(com_batch_tot, com_batch_cnt),
             commit_batch_p99_ms: com_batch_max as f64 / 1000.0,
+            commit_batch_decode_avg_ms: avg_us_per(com_batch_decode_tot, com_batch_cnt),
+            commit_batch_group_avg_ms: avg_us_per(com_batch_group_tot, com_batch_cnt),
+            commit_batch_encode_avg_ms: avg_us_per(com_batch_encode_tot, com_batch_cnt),
             commit_inflight: com_inflight,
             commit_inflight_peak: com_inflight_peak,
         }
@@ -5527,6 +5595,49 @@ fn log_accord_stats(group_id: GroupId, stats: &accord::DebugStats) {
     let apply_batch_avg_ms = avg_us_per(stats.apply_batch_total_us, stats.apply_batch_count);
     let mark_visible_avg_ms = avg_us_per(stats.mark_visible_total_us, stats.mark_visible_count);
     let state_update_avg_ms = avg_us_per(stats.state_update_total_us, stats.state_update_count);
+    let commit_local_state_avg_ms = avg_us_per(
+        stats.commit_local_state_total_us,
+        stats.commit_local_state_count,
+    );
+    let commit_local_durable_avg_ms = avg_us_per(
+        stats.commit_local_durable_total_us,
+        stats.commit_local_durable_count,
+    );
+    let commit_local_log_queue_avg_ms = avg_us_per(
+        stats.commit_local_log_queue_total_us,
+        stats.commit_local_log_queue_count,
+    );
+    let commit_local_log_append_avg_ms = avg_us_per(
+        stats.commit_local_log_append_total_us,
+        stats.commit_local_log_append_count,
+    );
+    let commit_local_post_durable_state_avg_ms = avg_us_per(
+        stats.commit_local_post_durable_state_total_us,
+        stats.commit_local_post_durable_state_count,
+    );
+    let commit_remote_quorum_avg_ms = avg_us_per(
+        stats.commit_remote_quorum_total_us,
+        stats.commit_remote_quorum_count,
+    );
+    let commit_tail_avg_ms = avg_us_per(stats.commit_tail_total_us, stats.commit_tail_count);
+    let commit_quorum_closer_top = if stats.commit_quorum_closer_top.is_empty() {
+        "none".to_string()
+    } else {
+        stats
+            .commit_quorum_closer_top
+            .iter()
+            .map(|entry| {
+                let avg_ms = avg_us_per(entry.total_us, entry.count);
+                format!(
+                    "{}:{}@{avg_ms:.3}ms(max={:.3}ms)",
+                    entry.node_id,
+                    entry.count,
+                    entry.max_us as f64 / 1000.0
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    };
     tracing::info!(
         group_id = group_id,
         records = stats.records_len,
@@ -5558,6 +5669,22 @@ fn log_accord_stats(group_id: GroupId, stats: &accord::DebugStats) {
         mark_visible_max_ms = stats.mark_visible_max_us as f64 / 1000.0,
         state_update_avg_ms = state_update_avg_ms,
         state_update_max_ms = stats.state_update_max_us as f64 / 1000.0,
+        commit_local_state_avg_ms = commit_local_state_avg_ms,
+        commit_local_state_max_ms = stats.commit_local_state_max_us as f64 / 1000.0,
+        commit_local_durable_avg_ms = commit_local_durable_avg_ms,
+        commit_local_durable_max_ms = stats.commit_local_durable_max_us as f64 / 1000.0,
+        commit_local_log_queue_avg_ms = commit_local_log_queue_avg_ms,
+        commit_local_log_queue_max_ms = stats.commit_local_log_queue_max_us as f64 / 1000.0,
+        commit_local_log_append_avg_ms = commit_local_log_append_avg_ms,
+        commit_local_log_append_max_ms = stats.commit_local_log_append_max_us as f64 / 1000.0,
+        commit_local_post_durable_state_avg_ms = commit_local_post_durable_state_avg_ms,
+        commit_local_post_durable_state_max_ms =
+            stats.commit_local_post_durable_state_max_us as f64 / 1000.0,
+        commit_remote_quorum_avg_ms = commit_remote_quorum_avg_ms,
+        commit_remote_quorum_max_ms = stats.commit_remote_quorum_max_us as f64 / 1000.0,
+        commit_tail_avg_ms = commit_tail_avg_ms,
+        commit_tail_max_ms = stats.commit_tail_max_us as f64 / 1000.0,
+        commit_quorum_closer_top = %commit_quorum_closer_top,
         fast_path = stats.fast_path_count,
         slow_path = stats.slow_path_count,
         "accord stats"
@@ -5793,7 +5920,8 @@ fn log_peer_queue_stats(peer_id: NodeId, snap: &transport::PeerStatsSnapshot) {
 /// Log a short summary identifying the slowest peer.
 ///
 /// Purpose:
-/// - Surface the currently most-backlogged peer in a compact periodic log line.
+/// - Surface the currently most-backlogged peer and slowest commit peer in one
+///   compact periodic log line.
 ///
 /// Design:
 /// - Uses combined read + consensus queue depth for backlog ranking.
@@ -5811,6 +5939,9 @@ fn log_peer_summary(peers: &[(NodeId, transport::PeerStatsSnapshot)]) {
     let mut slow_peer = peers[0].0;
     let mut slow_queue = 0u64;
     let mut slow_sent = 0u64;
+    let mut slow_commit_peer = peers[0].0;
+    let mut slow_commit_p99_ms = 0.0f64;
+    let mut slow_commit_wait_max_ms = 0.0f64;
     for (peer_id, snap) in peers {
         let queue_total =
             snap.kv_get_queue + snap.pre_accept_queue + snap.accept_queue + snap.commit_queue;
@@ -5821,11 +5952,19 @@ fn log_peer_summary(peers: &[(NodeId, transport::PeerStatsSnapshot)]) {
             slow_sent =
                 snap.kv_get_sent + snap.pre_accept_sent + snap.accept_sent + snap.commit_sent;
         }
+        if snap.commit_latency.p99_ms > slow_commit_p99_ms {
+            slow_commit_p99_ms = snap.commit_latency.p99_ms;
+            slow_commit_wait_max_ms = snap.commit_wait_max_ms;
+            slow_commit_peer = *peer_id;
+        }
     }
     tracing::info!(
         slow_peer = slow_peer,
         slow_queue_total = slow_queue,
         slow_sent_total = slow_sent,
+        slow_commit_peer = slow_commit_peer,
+        slow_commit_p99_ms = slow_commit_p99_ms,
+        slow_commit_wait_max_ms = slow_commit_wait_max_ms,
         "rpc peer summary"
     );
 }
@@ -6699,8 +6838,14 @@ where
                     accept_inflight_peak = snap.accept_inflight_peak,
                     commit_avg_ms = snap.commit_avg_ms,
                     commit_p99_ms = snap.commit_p99_ms,
+                    commit_prepare_avg_ms = snap.commit_prepare_avg_ms,
+                    commit_group_avg_ms = snap.commit_group_avg_ms,
+                    commit_reply_avg_ms = snap.commit_reply_avg_ms,
                     commit_batch_avg_ms = snap.commit_batch_avg_ms,
                     commit_batch_p99_ms = snap.commit_batch_p99_ms,
+                    commit_batch_decode_avg_ms = snap.commit_batch_decode_avg_ms,
+                    commit_batch_group_avg_ms = snap.commit_batch_group_avg_ms,
+                    commit_batch_encode_avg_ms = snap.commit_batch_encode_avg_ms,
                     commit_inflight = snap.commit_inflight,
                     commit_inflight_peak = snap.commit_inflight_peak,
                     "rpc handler stats"

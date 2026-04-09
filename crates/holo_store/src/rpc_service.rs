@@ -722,7 +722,9 @@ impl rpc::HoloRpc for RpcService {
         } else {
             Bytes::new()
         };
+        let prepare_us = start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
 
+        let group_start = std::time::Instant::now();
         let resp = group
             .rpc_commit(accord::CommitRequest {
                 group_id: req.group_id,
@@ -741,9 +743,15 @@ impl rpc::HoloRpc for RpcService {
                 deps,
             })
             .await;
+        let group_us = group_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
 
+        let reply_start = std::time::Instant::now();
         let resp = volo_grpc::Response::new(rpc::CommitResponse { ok: resp.ok });
+        let reply_us = reply_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         let us = start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        self.state
+            .rpc_handler_stats
+            .record_commit_phases(prepare_us, group_us, reply_us);
         self.state.rpc_handler_stats.record_commit(us);
         Ok(resp)
     }
@@ -771,13 +779,16 @@ impl rpc::HoloRpc for RpcService {
         let start = std::time::Instant::now();
         let _inflight = self.state.rpc_handler_stats.track_commit();
         let req = req.into_inner();
+        let decode_start = std::time::Instant::now();
         let requests = decode_items_from_parts::<rpc::CommitRequest>(req.frame, &req.end_offsets)
             .map_err(|err| {
             volo_grpc::Status::invalid_argument(format!(
                 "invalid packed commit_batch_v2 request: {err}"
             ))
         })?;
+        let decode_us = decode_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         let mut responses = Vec::with_capacity(requests.len());
+        let mut group_us_total = 0u64;
 
         // Preserve request ordering to keep response fan-out alignment exact.
         for item in requests {
@@ -810,6 +821,7 @@ impl rpc::HoloRpc for RpcService {
                 Bytes::new()
             };
 
+            let group_start = std::time::Instant::now();
             let resp = group
                 .rpc_commit(accord::CommitRequest {
                     group_id: item.group_id,
@@ -828,16 +840,25 @@ impl rpc::HoloRpc for RpcService {
                     deps,
                 })
                 .await;
+            group_us_total = group_us_total
+                .saturating_add(group_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
 
             responses.push(rpc::CommitResponse { ok: resp.ok });
         }
 
+        let encode_start = std::time::Instant::now();
         let (frame, end_offsets) = encode_items_to_parts(&responses).map_err(|err| {
             volo_grpc::Status::internal(format!(
                 "failed to encode packed commit_batch_v2 response: {err}"
             ))
         })?;
+        let encode_us = encode_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         let us = start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        self.state.rpc_handler_stats.record_commit_batch_phases(
+            decode_us,
+            group_us_total,
+            encode_us,
+        );
         self.state.rpc_handler_stats.record_commit_batch(us);
         Ok(volo_grpc::Response::new(rpc::PackedBatchResponse {
             frame,

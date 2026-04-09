@@ -67,13 +67,23 @@ This lets replay discover all regions without external config.
 
 ## Write Path Mapping
 
-HoloStore batches commits at the Accord group level, then forwards batches into the WAL.
+HoloStore batches commits at two layers before they reach disk:
+- Accord groups already batch commits before calling the shared `CommitLog`.
+- `RaftEngineWal` then uses a short node-local append worker window to
+  coalesce concurrent `CommitLog` calls into one `raft-engine` write.
 
-In `RaftEngineWal::append_commits`:
-1. Compute per-group next indices.
-2. Add entries to a single `LogBatch`.
-3. Update `meta/last_index` and `meta/groups` in the same batch.
-4. Call `engine.write(batch, sync)`.
+In one `RaftEngineWal` worker batch:
+1. Collect nearby append requests for up to `HOLO_WAL_COMMIT_BATCH_WAIT_US`.
+2. Compute per-group next indices across the combined entry set.
+3. Add entries to a single `LogBatch`.
+4. Update `meta/last_index` and `meta/groups` in the same batch.
+5. Call `engine.write(batch, sync)`.
+6. Reply to each caller only after the shared write satisfies that caller's durability requirement.
+
+By default the raft-engine path uses **opportunistic immediate batching**
+(`HOLO_WAL_COMMIT_BATCH_WAIT_US=0` unless explicitly overridden). That keeps
+the worker from adding an extra fixed latency tax while still merging requests
+that are already queued together.
 
 ### Sync/Flush Behavior
 We map HoloStore’s existing persistence knobs to `raft-engine`’s `sync` flag:
@@ -84,6 +94,10 @@ We map HoloStore’s existing persistence knobs to `raft-engine`’s `sync` flag
 When a sync threshold is hit, we call `engine.write(..., sync = true)`; otherwise `sync = false`.
 
 Note: `raft-engine` exposes a single sync boolean per write. We map `sync_data` and `sync_all` to `sync = true` (conservative choice).
+
+If any request inside a worker batch requires strict durability, the entire
+shared write runs with `sync = true`. This preserves the existing meaning of
+`sync_commit` while letting nearby callers share one durable write.
 
 ## Replay Path
 

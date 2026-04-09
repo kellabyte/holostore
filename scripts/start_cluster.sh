@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CLUSTER_DIR="${CLUSTER_DIR:-"$ROOT_DIR/.cluster"}"
+CLUSTER_DIR="${CLUSTER_DIR:-"$ROOT_DIR/.tmp/cluster"}"
 
 REDIS_HOST="${REDIS_HOST:-127.0.0.1}"
 GRPC_HOST="${GRPC_HOST:-127.0.0.1}"

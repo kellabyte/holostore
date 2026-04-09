@@ -21,6 +21,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::RwLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -122,12 +123,130 @@ pub enum ProposalResult {
 }
 
 #[derive(Clone, Copy, Debug)]
+/// Coordinator-observed timing breakdown for one commit round.
+///
+/// Purpose:
+/// - Split commit critical-path latency into local handler work and remote
+///   quorum wait so benchmarks can identify the dominant safe optimization.
+///
+/// Design:
+/// - `local_state_update_us` covers coordinator-local `rpc_commit` work other
+///   than synchronous durable WAL waiting.
+/// - `local_durable_wait_us` isolates fsync/WAL wait when `SyncCommit` is
+///   enabled.
+/// - `local_log_queue_wait_us` / `local_log_append_us` split durable wait into
+///   group-local queueing and append execution.
+/// - `local_post_durable_state_update_us` captures the final state mutation
+///   after durable WAL completion.
+/// - `remote_quorum_wait_us` measures the extra wall time needed to collect
+///   remote voter quorum ACKs after the local member commits.
+///
+/// Inputs:
+/// - Populated inside `run_commit_round`.
+///
+/// Outputs:
+/// - One passive timing sample recorded into `GroupMetrics`.
+struct CommitRoundTimings {
+    local_state_update_us: u64,
+    local_durable_wait_us: u64,
+    local_log_queue_wait_us: u64,
+    local_log_append_us: u64,
+    local_post_durable_state_update_us: u64,
+    remote_quorum_wait_us: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+/// Timing breakdown for one local `rpc_commit` execution.
+///
+/// Purpose:
+/// - Let the coordinator distinguish durable WAL wait from other local commit
+///   bookkeeping without changing RPC semantics or wire format.
+///
+/// Design:
+/// - `total_us` is the full local handler wall time.
+/// - `durable_wait_us` covers synchronous commit-log queue wait plus append
+///   execution while waiting for durable ACK.
+/// - `durable_queue_wait_us` isolates time spent waiting in the group-local
+///   commit-log batcher queue.
+/// - `durable_append_us` isolates the storage append call itself.
+/// - `post_durable_state_update_us` captures the final committed-state updates
+///   that run after durable WAL completion.
+/// - `state_update_us` is derived as `total_us - durable_wait_us`.
+///
+/// Inputs:
+/// - Measured inside `rpc_commit_with_timings`.
+///
+/// Outputs:
+/// - Returned only to local callers such as `run_commit_round`; network callers
+///   still receive plain `CommitResponse`.
+struct CommitRpcTimings {
+    total_us: u64,
+    durable_wait_us: u64,
+    durable_queue_wait_us: u64,
+    durable_append_us: u64,
+    state_update_us: u64,
+    post_durable_state_update_us: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct PhaseTimings {
     pre_accept_us: u64,
     accept_us: u64,
     commit_us: u64,
+    commit_local_state_update_us: u64,
+    commit_local_durable_wait_us: u64,
+    commit_local_log_queue_wait_us: u64,
+    commit_local_log_append_us: u64,
+    commit_local_post_durable_state_update_us: u64,
+    commit_remote_quorum_wait_us: u64,
     execute_us: u64,
     visible_us: u64,
+}
+
+/// One synchronous commit-log append completion observed by the coordinator.
+///
+/// Purpose:
+/// - Attribute sync-commit latency into queueing inside the group-local
+///   commit-log worker and actual append execution time.
+///
+/// Design:
+/// - Produced by the group-local commit-log batcher, not by the storage engine.
+/// - `queue_wait_us` is measured from enqueue to batch-start.
+/// - `append_us` is the wall time spent inside `append_commits_with_options`.
+///
+/// Inputs:
+/// - Filled when the commit-log worker completes one queued append request.
+///
+/// Outputs:
+/// - Returned to `rpc_commit_with_timings` through the existing completion
+///   channel without changing protocol semantics.
+#[derive(Clone, Copy, Debug, Default)]
+struct CommitLogAppendCompletion {
+    queue_wait_us: u64,
+    append_us: u64,
+}
+
+/// Aggregated count/latency for the peer that most often closes commit quorum.
+///
+/// Purpose:
+/// - Surface which replica tends to be the quorum-closing responder on commit
+///   rounds so follow-up work can focus on that follower path.
+///
+/// Design:
+/// - Stored as raw counters so shard/group snapshots can merge losslessly.
+/// - `total_us` / `max_us` are measured at the moment quorum is satisfied.
+///
+/// Inputs:
+/// - Recorded only when one remote voter response increases `ok` to quorum.
+///
+/// Outputs:
+/// - Exported through `DebugStats` for `HOLOSTATS` and periodic logs.
+#[derive(Clone, Debug, Default)]
+pub struct CommitQuorumCloserStat {
+    pub node_id: NodeId,
+    pub count: u64,
+    pub total_us: u64,
+    pub max_us: u64,
 }
 
 /// Snapshot of group internals for debugging / metrics.
@@ -196,6 +315,28 @@ pub struct DebugStats {
     pub state_update_count: u64,
     pub state_update_total_us: u64,
     pub state_update_max_us: u64,
+    pub commit_local_state_count: u64,
+    pub commit_local_state_total_us: u64,
+    pub commit_local_state_max_us: u64,
+    pub commit_local_durable_count: u64,
+    pub commit_local_durable_total_us: u64,
+    pub commit_local_durable_max_us: u64,
+    pub commit_local_log_queue_count: u64,
+    pub commit_local_log_queue_total_us: u64,
+    pub commit_local_log_queue_max_us: u64,
+    pub commit_local_log_append_count: u64,
+    pub commit_local_log_append_total_us: u64,
+    pub commit_local_log_append_max_us: u64,
+    pub commit_local_post_durable_state_count: u64,
+    pub commit_local_post_durable_state_total_us: u64,
+    pub commit_local_post_durable_state_max_us: u64,
+    pub commit_remote_quorum_count: u64,
+    pub commit_remote_quorum_total_us: u64,
+    pub commit_remote_quorum_max_us: u64,
+    pub commit_tail_count: u64,
+    pub commit_tail_total_us: u64,
+    pub commit_tail_max_us: u64,
+    pub commit_quorum_closer_top: Vec<CommitQuorumCloserStat>,
     pub fast_path_count: u64,
     pub slow_path_count: u64,
 }
@@ -236,7 +377,7 @@ pub struct Group {
     execute_lock: Mutex<()>,
     executor_notify: Notify,
     executor_started: AtomicBool,
-    metrics: GroupMetrics,
+    metrics: Arc<GroupMetrics>,
     compact_counter: AtomicU64,
     peer_rr: AtomicU64,
     start_at: time::Instant,
@@ -262,7 +403,9 @@ struct ApplyWork {
 /// Inputs:
 /// - `entry`: commit record to append to the WAL.
 /// - `require_durable`: whether this caller requires fsync-on-ack semantics.
-/// - `done_tx`: completion channel that receives the final append result.
+/// - `done_tx`: completion channel that receives the final append result plus
+///   passive queue/append timing details.
+/// - `enqueued_at`: time when the request entered the group-local batcher.
 ///
 /// Design:
 /// - Multiple items can be batched together; if any item requires durable
@@ -270,7 +413,8 @@ struct ApplyWork {
 struct CommitLogWork {
     entry: CommitLogEntry,
     require_durable: bool,
-    done_tx: std_mpsc::Sender<anyhow::Result<()>>,
+    done_tx: std_mpsc::Sender<anyhow::Result<CommitLogAppendCompletion>>,
+    enqueued_at: std::time::Instant,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -325,6 +469,28 @@ struct GroupMetrics {
     state_update_count: AtomicU64,
     state_update_total_us: AtomicU64,
     state_update_max_us: AtomicU64,
+    commit_local_state_count: AtomicU64,
+    commit_local_state_total_us: AtomicU64,
+    commit_local_state_max_us: AtomicU64,
+    commit_local_durable_count: AtomicU64,
+    commit_local_durable_total_us: AtomicU64,
+    commit_local_durable_max_us: AtomicU64,
+    commit_local_log_queue_count: AtomicU64,
+    commit_local_log_queue_total_us: AtomicU64,
+    commit_local_log_queue_max_us: AtomicU64,
+    commit_local_log_append_count: AtomicU64,
+    commit_local_log_append_total_us: AtomicU64,
+    commit_local_log_append_max_us: AtomicU64,
+    commit_local_post_durable_state_count: AtomicU64,
+    commit_local_post_durable_state_total_us: AtomicU64,
+    commit_local_post_durable_state_max_us: AtomicU64,
+    commit_remote_quorum_count: AtomicU64,
+    commit_remote_quorum_total_us: AtomicU64,
+    commit_remote_quorum_max_us: AtomicU64,
+    commit_tail_count: AtomicU64,
+    commit_tail_total_us: AtomicU64,
+    commit_tail_max_us: AtomicU64,
+    commit_quorum_closer: StdMutex<HashMap<NodeId, CommitQuorumCloserStat>>,
     exec_stall_log_at_us: AtomicU64,
     exec_stall_recover_at_us: AtomicU64,
     fast_path_count: AtomicU64,
@@ -360,6 +526,27 @@ struct MetricsSnapshot {
     state_update_count: u64,
     state_update_total_us: u64,
     state_update_max_us: u64,
+    commit_local_state_count: u64,
+    commit_local_state_total_us: u64,
+    commit_local_state_max_us: u64,
+    commit_local_durable_count: u64,
+    commit_local_durable_total_us: u64,
+    commit_local_durable_max_us: u64,
+    commit_local_log_queue_count: u64,
+    commit_local_log_queue_total_us: u64,
+    commit_local_log_queue_max_us: u64,
+    commit_local_log_append_count: u64,
+    commit_local_log_append_total_us: u64,
+    commit_local_log_append_max_us: u64,
+    commit_local_post_durable_state_count: u64,
+    commit_local_post_durable_state_total_us: u64,
+    commit_local_post_durable_state_max_us: u64,
+    commit_remote_quorum_count: u64,
+    commit_remote_quorum_total_us: u64,
+    commit_remote_quorum_max_us: u64,
+    commit_tail_count: u64,
+    commit_tail_total_us: u64,
+    commit_tail_max_us: u64,
     fast_path_count: u64,
     slow_path_count: u64,
 }
@@ -394,9 +581,76 @@ impl GroupMetrics {
             state_update_count: self.state_update_count.load(Ordering::Relaxed),
             state_update_total_us: self.state_update_total_us.load(Ordering::Relaxed),
             state_update_max_us: self.state_update_max_us.load(Ordering::Relaxed),
+            commit_local_state_count: self.commit_local_state_count.load(Ordering::Relaxed),
+            commit_local_state_total_us: self.commit_local_state_total_us.load(Ordering::Relaxed),
+            commit_local_state_max_us: self.commit_local_state_max_us.load(Ordering::Relaxed),
+            commit_local_durable_count: self.commit_local_durable_count.load(Ordering::Relaxed),
+            commit_local_durable_total_us: self
+                .commit_local_durable_total_us
+                .load(Ordering::Relaxed),
+            commit_local_durable_max_us: self.commit_local_durable_max_us.load(Ordering::Relaxed),
+            commit_local_log_queue_count: self.commit_local_log_queue_count.load(Ordering::Relaxed),
+            commit_local_log_queue_total_us: self
+                .commit_local_log_queue_total_us
+                .load(Ordering::Relaxed),
+            commit_local_log_queue_max_us: self
+                .commit_local_log_queue_max_us
+                .load(Ordering::Relaxed),
+            commit_local_log_append_count: self
+                .commit_local_log_append_count
+                .load(Ordering::Relaxed),
+            commit_local_log_append_total_us: self
+                .commit_local_log_append_total_us
+                .load(Ordering::Relaxed),
+            commit_local_log_append_max_us: self
+                .commit_local_log_append_max_us
+                .load(Ordering::Relaxed),
+            commit_local_post_durable_state_count: self
+                .commit_local_post_durable_state_count
+                .load(Ordering::Relaxed),
+            commit_local_post_durable_state_total_us: self
+                .commit_local_post_durable_state_total_us
+                .load(Ordering::Relaxed),
+            commit_local_post_durable_state_max_us: self
+                .commit_local_post_durable_state_max_us
+                .load(Ordering::Relaxed),
+            commit_remote_quorum_count: self.commit_remote_quorum_count.load(Ordering::Relaxed),
+            commit_remote_quorum_total_us: self
+                .commit_remote_quorum_total_us
+                .load(Ordering::Relaxed),
+            commit_remote_quorum_max_us: self.commit_remote_quorum_max_us.load(Ordering::Relaxed),
+            commit_tail_count: self.commit_tail_count.load(Ordering::Relaxed),
+            commit_tail_total_us: self.commit_tail_total_us.load(Ordering::Relaxed),
+            commit_tail_max_us: self.commit_tail_max_us.load(Ordering::Relaxed),
             fast_path_count: self.fast_path_count.load(Ordering::Relaxed),
             slow_path_count: self.slow_path_count.load(Ordering::Relaxed),
         }
+    }
+
+    /// Snapshot the most frequent quorum-closing peers ordered by count.
+    ///
+    /// Purpose:
+    /// - Surface which follower most often closes commit quorum without
+    ///   exposing an unbounded map through metrics/logging.
+    ///
+    /// Inputs:
+    /// - `limit`: maximum number of peers to return.
+    ///
+    /// Outputs:
+    /// - Sorted vector of quorum-closing peer aggregates.
+    fn quorum_closer_top(&self, limit: usize) -> Vec<CommitQuorumCloserStat> {
+        let Ok(closers) = self.commit_quorum_closer.lock() else {
+            return Vec::new();
+        };
+        let mut top = closers.values().cloned().collect::<Vec<_>>();
+        top.sort_by(|a, b| {
+            b.count
+                .cmp(&a.count)
+                .then_with(|| b.total_us.cmp(&a.total_us))
+                .then_with(|| a.node_id.cmp(&b.node_id))
+        });
+        top.truncate(limit);
+        top
     }
 
     fn record_fast_path(&self, fast_path: bool) {
@@ -479,6 +733,147 @@ impl GroupMetrics {
         self.state_update_count.fetch_add(1, Ordering::Relaxed);
         self.state_update_total_us.fetch_add(us, Ordering::Relaxed);
         self.state_update_max_us.fetch_max(us, Ordering::Relaxed);
+    }
+
+    /// Record one coordinator-local commit handler sample excluding durable WAL wait.
+    ///
+    /// Inputs:
+    /// - `dur`: wall time spent in local `rpc_commit` bookkeeping/state updates.
+    ///
+    /// Outputs:
+    /// - Updates rolling count/total/max commit-local-state counters.
+    fn record_commit_local_state(&self, dur: Duration) {
+        let us = dur.as_micros().min(u128::from(u64::MAX)) as u64;
+        self.commit_local_state_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.commit_local_state_total_us
+            .fetch_add(us, Ordering::Relaxed);
+        self.commit_local_state_max_us
+            .fetch_max(us, Ordering::Relaxed);
+    }
+
+    /// Record one synchronous durable WAL wait sample from the commit path.
+    ///
+    /// Inputs:
+    /// - `dur`: wall time spent waiting for durable commit-log append/fsync.
+    ///
+    /// Outputs:
+    /// - Updates rolling count/total/max commit-durable-wait counters.
+    fn record_commit_local_durable(&self, dur: Duration) {
+        let us = dur.as_micros().min(u128::from(u64::MAX)) as u64;
+        self.commit_local_durable_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.commit_local_durable_total_us
+            .fetch_add(us, Ordering::Relaxed);
+        self.commit_local_durable_max_us
+            .fetch_max(us, Ordering::Relaxed);
+    }
+
+    /// Record queueing delay before the group-local commit-log worker starts an append.
+    ///
+    /// Inputs:
+    /// - `dur`: time spent from enqueue until the batcher begins processing.
+    ///
+    /// Outputs:
+    /// - Updates rolling queue-wait counters for sync commit diagnosis.
+    fn record_commit_local_log_queue(&self, dur: Duration) {
+        let us = dur.as_micros().min(u128::from(u64::MAX)) as u64;
+        self.commit_local_log_queue_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.commit_local_log_queue_total_us
+            .fetch_add(us, Ordering::Relaxed);
+        self.commit_local_log_queue_max_us
+            .fetch_max(us, Ordering::Relaxed);
+    }
+
+    /// Record append execution time spent inside the commit-log backend call.
+    ///
+    /// Inputs:
+    /// - `dur`: wall time inside `append_commits_with_options`.
+    ///
+    /// Outputs:
+    /// - Updates rolling append-execution counters for sync commit diagnosis.
+    fn record_commit_local_log_append(&self, dur: Duration) {
+        let us = dur.as_micros().min(u128::from(u64::MAX)) as u64;
+        self.commit_local_log_append_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.commit_local_log_append_total_us
+            .fetch_add(us, Ordering::Relaxed);
+        self.commit_local_log_append_max_us
+            .fetch_max(us, Ordering::Relaxed);
+    }
+
+    /// Record state-update work that occurs after a durable append completes.
+    ///
+    /// Inputs:
+    /// - `dur`: wall time spent re-locking state and finalizing commit metadata
+    ///   after durable WAL completion.
+    ///
+    /// Outputs:
+    /// - Updates rolling post-durable state-update counters.
+    fn record_commit_local_post_durable_state(&self, dur: Duration) {
+        let us = dur.as_micros().min(u128::from(u64::MAX)) as u64;
+        self.commit_local_post_durable_state_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.commit_local_post_durable_state_total_us
+            .fetch_add(us, Ordering::Relaxed);
+        self.commit_local_post_durable_state_max_us
+            .fetch_max(us, Ordering::Relaxed);
+    }
+
+    /// Record the coordinator wait needed to gather remote commit quorum ACKs.
+    ///
+    /// Inputs:
+    /// - `dur`: wall time spent after local commit until remote quorum is reached.
+    ///
+    /// Outputs:
+    /// - Updates rolling count/total/max remote-quorum-wait counters.
+    fn record_commit_remote_quorum(&self, dur: Duration) {
+        let us = dur.as_micros().min(u128::from(u64::MAX)) as u64;
+        self.commit_remote_quorum_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.commit_remote_quorum_total_us
+            .fetch_add(us, Ordering::Relaxed);
+        self.commit_remote_quorum_max_us
+            .fetch_max(us, Ordering::Relaxed);
+    }
+
+    /// Record tail-follower completion time after commit quorum is already satisfied.
+    ///
+    /// Inputs:
+    /// - `dur`: extra wall time to observe remaining follower commit RPCs finish.
+    ///
+    /// Outputs:
+    /// - Updates rolling count/total/max commit-tail counters.
+    fn record_commit_tail(&self, dur: Duration) {
+        let us = dur.as_micros().min(u128::from(u64::MAX)) as u64;
+        self.commit_tail_count.fetch_add(1, Ordering::Relaxed);
+        self.commit_tail_total_us.fetch_add(us, Ordering::Relaxed);
+        self.commit_tail_max_us.fetch_max(us, Ordering::Relaxed);
+    }
+
+    /// Record the remote peer whose ACK most often closes commit quorum.
+    ///
+    /// Inputs:
+    /// - `peer`: follower id that moved quorum from unsatisfied to satisfied.
+    /// - `dur`: total remote-quorum wait observed when that peer closed quorum.
+    ///
+    /// Outputs:
+    /// - Updates per-peer closer counters for exported debug stats.
+    fn record_commit_quorum_closer(&self, peer: NodeId, dur: Duration) {
+        let us = dur.as_micros().min(u128::from(u64::MAX)) as u64;
+        let Ok(mut closers) = self.commit_quorum_closer.lock() else {
+            return;
+        };
+        let entry = closers
+            .entry(peer)
+            .or_insert_with(|| CommitQuorumCloserStat {
+                node_id: peer,
+                ..CommitQuorumCloserStat::default()
+            });
+        entry.count = entry.count.saturating_add(1);
+        entry.total_us = entry.total_us.saturating_add(us);
+        entry.max_us = entry.max_us.max(us);
     }
 
     fn exec_progress_false_streak(&self) -> u64 {
@@ -568,23 +963,34 @@ impl Group {
                         // batch as durable so every caller in this batch sees correct semantics.
                         let require_durable = batch.iter().any(|work| work.require_durable);
                         let mut entries = Vec::with_capacity(batch.len());
-                        let mut done_txs = Vec::with_capacity(batch.len());
+                        let mut completions = Vec::with_capacity(batch.len());
                         for work in batch {
                             entries.push(work.entry);
-                            done_txs.push(work.done_tx);
+                            completions.push((work.done_tx, work.enqueued_at));
                         }
 
+                        let append_start = std::time::Instant::now();
                         let append_result = log.append_commits_with_options(
                             entries,
                             CommitLogAppendOptions { require_durable },
                         );
+                        let append_us =
+                            append_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
                         if let Err(err) = &append_result {
                             tracing::warn!(error = ?err, "commit log batch append failed");
                         }
                         let err_msg = append_result.err().map(|err| err.to_string());
-                        for done_tx in done_txs {
+                        for (done_tx, enqueued_at) in completions {
+                            let queue_wait_us = append_start
+                                .saturating_duration_since(enqueued_at)
+                                .as_micros()
+                                .min(u128::from(u64::MAX))
+                                as u64;
                             let result = match &err_msg {
-                                None => Ok(()),
+                                None => Ok(CommitLogAppendCompletion {
+                                    queue_wait_us,
+                                    append_us,
+                                }),
                                 Some(msg) => Err(anyhow::anyhow!(msg.clone())),
                             };
                             let _ = done_tx.send(result);
@@ -651,7 +1057,7 @@ impl Group {
             execute_lock: Mutex::new(()),
             executor_notify: Notify::new(),
             executor_started: AtomicBool::new(false),
-            metrics: GroupMetrics::default(),
+            metrics: Arc::new(GroupMetrics::default()),
             compact_counter: AtomicU64::new(0),
             peer_rr: AtomicU64::new(0),
             start_at: time::Instant::now(),
@@ -792,7 +1198,7 @@ impl Group {
         &self,
         entry: CommitLogEntry,
         require_durable: bool,
-    ) -> anyhow::Result<std_mpsc::Receiver<anyhow::Result<()>>> {
+    ) -> anyhow::Result<std_mpsc::Receiver<anyhow::Result<CommitLogAppendCompletion>>> {
         let Some(tx) = &self.commit_log_tx else {
             anyhow::bail!("commit log unavailable");
         };
@@ -801,6 +1207,7 @@ impl Group {
             entry,
             require_durable,
             done_tx,
+            enqueued_at: std::time::Instant::now(),
         })
         .map_err(|_| anyhow::anyhow!("commit log batcher closed"))?;
         Ok(done_rx)
@@ -813,12 +1220,12 @@ impl Group {
     /// - `timeout`: maximum wait to prevent unbounded request stalls.
     ///
     /// Output:
-    /// - `Ok(())` when append finished successfully.
+    /// - `Ok(CommitLogAppendCompletion)` when append finished successfully.
     /// - `Err(...)` on timeout, channel closure, or WAL append failure.
     fn wait_commit_log_append(
-        done_rx: std_mpsc::Receiver<anyhow::Result<()>>,
+        done_rx: std_mpsc::Receiver<anyhow::Result<CommitLogAppendCompletion>>,
         timeout: Duration,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<CommitLogAppendCompletion> {
         match tokio::task::block_in_place(|| done_rx.recv_timeout(timeout)) {
             Ok(res) => res,
             Err(std_mpsc::RecvTimeoutError::Timeout) => {
@@ -1177,6 +1584,7 @@ impl Group {
         }
         let executed_log_command_bytes = state.executed_log_bytes;
         let executed_log_deps_total = state.executed_log_deps_total;
+        let commit_quorum_closer_top = self.metrics.quorum_closer_top(3);
         let mut executed_log_max_command_bytes = 0usize;
         let mut executed_log_max_deps_len = 0usize;
         for entry in state.executed_log.values() {
@@ -1248,6 +1656,29 @@ impl Group {
             state_update_count: metrics.state_update_count,
             state_update_total_us: metrics.state_update_total_us,
             state_update_max_us: metrics.state_update_max_us,
+            commit_local_state_count: metrics.commit_local_state_count,
+            commit_local_state_total_us: metrics.commit_local_state_total_us,
+            commit_local_state_max_us: metrics.commit_local_state_max_us,
+            commit_local_durable_count: metrics.commit_local_durable_count,
+            commit_local_durable_total_us: metrics.commit_local_durable_total_us,
+            commit_local_durable_max_us: metrics.commit_local_durable_max_us,
+            commit_local_log_queue_count: metrics.commit_local_log_queue_count,
+            commit_local_log_queue_total_us: metrics.commit_local_log_queue_total_us,
+            commit_local_log_queue_max_us: metrics.commit_local_log_queue_max_us,
+            commit_local_log_append_count: metrics.commit_local_log_append_count,
+            commit_local_log_append_total_us: metrics.commit_local_log_append_total_us,
+            commit_local_log_append_max_us: metrics.commit_local_log_append_max_us,
+            commit_local_post_durable_state_count: metrics.commit_local_post_durable_state_count,
+            commit_local_post_durable_state_total_us: metrics
+                .commit_local_post_durable_state_total_us,
+            commit_local_post_durable_state_max_us: metrics.commit_local_post_durable_state_max_us,
+            commit_remote_quorum_count: metrics.commit_remote_quorum_count,
+            commit_remote_quorum_total_us: metrics.commit_remote_quorum_total_us,
+            commit_remote_quorum_max_us: metrics.commit_remote_quorum_max_us,
+            commit_tail_count: metrics.commit_tail_count,
+            commit_tail_total_us: metrics.commit_tail_total_us,
+            commit_tail_max_us: metrics.commit_tail_max_us,
+            commit_quorum_closer_top,
             fast_path_count: metrics.fast_path_count,
             slow_path_count: metrics.slow_path_count,
         }
@@ -1637,173 +2068,76 @@ impl Group {
     /// - In `AsyncCommit` mode we preserve historical behavior: update state and
     ///   ACK, then enqueue WAL append asynchronously.
     pub async fn rpc_commit(&self, req: CommitRequest) -> CommitResponse {
-        if !self.local_is_member() {
-            return CommitResponse { ok: false };
-        }
-        let CommitRequest {
-            group_id: _,
-            txn_id,
-            ballot,
-            command,
-            command_digest: expected_digest,
-            has_command,
-            seq,
-            deps,
-        } = req;
-        let mut incoming_command = if has_command { Some(command) } else { None };
-        let deps_vec = deps;
+        self.rpc_commit_with_timings(req).await.0
+    }
 
-        loop {
-            let now = time::Instant::now();
-            let mut state = self.state.lock().await;
-            if state.is_executed(&txn_id) {
-                return CommitResponse { ok: true };
-            }
-            state.records.entry(txn_id).or_insert_with(|| Record {
-                promised: Ballot::zero(),
-                accepted_ballot: None,
-                command: None,
-                command_digest: None,
-                keys: None,
-                seq: 0,
-                deps: BTreeSet::new(),
-                status: Status::None,
-                updated_at: now,
-            });
+    /// Execute local commit handling and return passive timing breakdown.
+    ///
+    /// Purpose:
+    /// - Let the coordinator attribute commit cost without changing the public
+    ///   RPC response or ACK semantics.
+    ///
+    /// Design:
+    /// - Reuses the exact `rpc_commit` logic and only accumulates wall-clock
+    ///   timing around the synchronous durable append wait.
+    ///
+    /// Inputs:
+    /// - `req`: commit metadata received locally or from the coordinator path.
+    ///
+    /// Outputs:
+    /// - Tuple of `CommitResponse` plus passive local timing breakdown.
+    async fn rpc_commit_with_timings(
+        &self,
+        req: CommitRequest,
+    ) -> (CommitResponse, CommitRpcTimings) {
+        let start = time::Instant::now();
+        let mut timings = CommitRpcTimings::default();
+        let response = if !self.local_is_member() {
+            CommitResponse { ok: false }
+        } else {
+            let CommitRequest {
+                group_id: _,
+                txn_id,
+                ballot,
+                command,
+                command_digest: expected_digest,
+                has_command,
+                seq,
+                deps,
+            } = req;
+            let mut incoming_command = if has_command { Some(command) } else { None };
+            let deps_vec = deps;
 
-            {
-                let rec = state.records.get_mut(&txn_id).expect("record must exist");
-                // Commit is final. Even if we've promised a higher ballot (e.g. due to a concurrent
-                // recovery), we still apply the commit as long as the command matches. Rejecting a
-                // late commit can strand replicas with long-lived PreAccepted records.
-                rec.promised = rec.promised.max(ballot);
-                rec.updated_at = now;
-            }
-
-            let (observed_status, committed_fast_path) = state
-                .records
-                .get(&txn_id)
-                .map(|r| {
-                    let cmd_matches = r
-                        .command
-                        .as_ref()
-                        .map(|cmd| command_digest(cmd) == expected_digest)
-                        .unwrap_or(false);
-                    let req_deps = deps_vec.iter().copied().collect::<BTreeSet<_>>();
-                    let same_commit = r.seq == seq && r.deps == req_deps && cmd_matches;
-                    (r.status, r.status >= Status::Committed && same_commit)
-                })
-                .expect("record must exist");
-
-            if observed_status >= Status::Executing {
-                // Already being applied (or done). A late commit must not downgrade the record or
-                // re-insert it into the committed queue.
-                return CommitResponse { ok: true };
-            }
-
-            if committed_fast_path {
-                return CommitResponse { ok: true };
-            }
-
-            {
-                let rec = state.records.get_mut(&txn_id).expect("record must exist");
-                if rec.command.is_none() {
-                    if let Some(cmd) = incoming_command.take() {
-                        if command_digest(&cmd) != expected_digest {
-                            return CommitResponse { ok: false };
-                        }
-                        let keys = if cmd.is_empty() {
-                            CommandKeys::default()
-                        } else {
-                            match self.sm.command_keys(&cmd) {
-                                Ok(keys) => keys,
-                                Err(_) => return CommitResponse { ok: false },
-                            }
-                        };
-                        rec.command = Some(detach_command_bytes(&cmd));
-                        rec.command_digest = Some(expected_digest);
-                        rec.keys = Some(keys);
-                    } else {
-                        drop(state);
-                        match self.fetch_command_from_peers(txn_id, expected_digest).await {
-                            Ok(Some(cmd)) => {
-                                incoming_command = Some(cmd);
-                                continue;
-                            }
-                            _ => return CommitResponse { ok: false },
-                        }
-                    }
-                } else {
-                    let cmd = rec.command.as_ref().expect("command exists");
-                    if command_digest(cmd) != expected_digest {
-                        return CommitResponse { ok: false };
-                    }
-                    if rec.command_digest.is_none() {
-                        rec.command_digest = Some(expected_digest);
-                    }
-                    if rec.keys.is_none() {
-                        let keys = if cmd.is_empty() {
-                            CommandKeys::default()
-                        } else {
-                            match self.sm.command_keys(cmd) {
-                                Ok(keys) => keys,
-                                Err(_) => return CommitResponse { ok: false },
-                            }
-                        };
-                        rec.keys = Some(keys);
-                    }
-                }
-            }
-
-            let require_durable_ack = self.config.commit_durability_mode.requires_durable_ack();
-            let req_deps = deps_vec.iter().copied().collect::<BTreeSet<_>>();
-            let seq = seq.max(1);
-            let req_deps_vec = req_deps.iter().copied().collect::<Vec<_>>();
-            let command_for_log = state
-                .records
-                .get(&txn_id)
-                .and_then(|r| r.command.clone())
-                .unwrap_or_default();
-
-            if require_durable_ack {
-                // Strict durability mode: force WAL append + sync before any
-                // committed-state transition that could be ACKed to coordinator.
-                let done_rx = match self.enqueue_commit_log_append(
-                    CommitLogEntry {
-                        txn_id,
-                        seq,
-                        deps: req_deps_vec.clone(),
-                        command: command_for_log.clone(),
-                    },
-                    true,
-                ) {
-                    Ok(done_rx) => done_rx,
-                    Err(err) => {
-                        tracing::warn!(
-                            error = ?err,
-                            txn_id = ?txn_id,
-                            "failed to enqueue durable commit-log append"
-                        );
-                        return CommitResponse { ok: false };
-                    }
-                };
-                drop(state);
-                if let Err(err) = Self::wait_commit_log_append(done_rx, self.config.propose_timeout)
-                {
-                    tracing::warn!(
-                        error = ?err,
-                        txn_id = ?txn_id,
-                        "durable commit-log append failed"
-                    );
-                    return CommitResponse { ok: false };
-                }
-                state = self.state.lock().await;
-                // Another task may have advanced this txn while we were waiting
-                // on WAL I/O; re-check terminal/committed status before mutating.
+            'commit: loop {
+                let now = time::Instant::now();
+                let mut state = self.state.lock().await;
                 if state.is_executed(&txn_id) {
-                    return CommitResponse { ok: true };
+                    break 'commit CommitResponse { ok: true };
                 }
-                let committed_after_wait = state
+                state.records.entry(txn_id).or_insert_with(|| Record {
+                    promised: Ballot::zero(),
+                    accepted_ballot: None,
+                    command: None,
+                    command_digest: None,
+                    keys: None,
+                    seq: 0,
+                    deps: BTreeSet::new(),
+                    status: Status::None,
+                    updated_at: now,
+                });
+
+                {
+                    let rec = state.records.get_mut(&txn_id).expect("record must exist");
+                    // Commit is final. Even if we've promised a higher ballot
+                    // (for example, due to a concurrent recovery), still apply
+                    // the commit as long as the command matches. Rejecting a
+                    // late commit can strand replicas with long-lived
+                    // PreAccepted records.
+                    rec.promised = rec.promised.max(ballot);
+                    rec.updated_at = now;
+                }
+
+                let (observed_status, committed_fast_path) = state
                     .records
                     .get(&txn_id)
                     .map(|r| {
@@ -1812,80 +2146,265 @@ impl Group {
                             .as_ref()
                             .map(|cmd| command_digest(cmd) == expected_digest)
                             .unwrap_or(false);
+                        let req_deps = deps_vec.iter().copied().collect::<BTreeSet<_>>();
                         let same_commit = r.seq == seq && r.deps == req_deps && cmd_matches;
                         (r.status, r.status >= Status::Committed && same_commit)
                     })
-                    .unwrap_or((Status::None, false));
-                if committed_after_wait.0 >= Status::Executing || committed_after_wait.1 {
-                    return CommitResponse { ok: true };
-                }
-            }
+                    .expect("record must exist");
 
-            let (prev_status, prev_seq) = state
-                .records
-                .get(&txn_id)
-                .map(|r| (r.status, r.seq))
-                .unwrap_or((Status::None, 0));
-            let keys = state
-                .records
-                .get(&txn_id)
-                .and_then(|r| r.keys.as_ref())
-                .cloned()
-                .unwrap_or_default();
-            if keys.is_write() {
-                for key in keys.keys() {
-                    match state.last_committed_write_by_key.get(key) {
-                        Some((_, cur_seq)) if *cur_seq >= seq => {}
-                        _ => {
-                            state
-                                .last_committed_write_by_key
-                                .insert(key.clone(), (txn_id, seq));
+                if observed_status >= Status::Executing {
+                    // Already being applied (or done). A late commit must not
+                    // downgrade the record or re-insert it into the committed
+                    // queue.
+                    break 'commit CommitResponse { ok: true };
+                }
+
+                if committed_fast_path {
+                    break 'commit CommitResponse { ok: true };
+                }
+
+                {
+                    let rec = state.records.get_mut(&txn_id).expect("record must exist");
+                    if rec.command.is_none() {
+                        if let Some(cmd) = incoming_command.take() {
+                            if command_digest(&cmd) != expected_digest {
+                                break 'commit CommitResponse { ok: false };
+                            }
+                            let keys = if cmd.is_empty() {
+                                CommandKeys::default()
+                            } else {
+                                match self.sm.command_keys(&cmd) {
+                                    Ok(keys) => keys,
+                                    Err(_) => break 'commit CommitResponse { ok: false },
+                                }
+                            };
+                            rec.command = Some(detach_command_bytes(&cmd));
+                            rec.command_digest = Some(expected_digest);
+                            rec.keys = Some(keys);
+                        } else {
+                            drop(state);
+                            match self.fetch_command_from_peers(txn_id, expected_digest).await {
+                                Ok(Some(cmd)) => {
+                                    incoming_command = Some(cmd);
+                                    continue 'commit;
+                                }
+                                _ => break 'commit CommitResponse { ok: false },
+                            }
+                        }
+                    } else {
+                        let cmd = rec.command.as_ref().expect("command exists");
+                        if command_digest(cmd) != expected_digest {
+                            break 'commit CommitResponse { ok: false };
+                        }
+                        if rec.command_digest.is_none() {
+                            rec.command_digest = Some(expected_digest);
+                        }
+                        if rec.keys.is_none() {
+                            let keys = if cmd.is_empty() {
+                                CommandKeys::default()
+                            } else {
+                                match self.sm.command_keys(cmd) {
+                                    Ok(keys) => keys,
+                                    Err(_) => break 'commit CommitResponse { ok: false },
+                                }
+                            };
+                            rec.keys = Some(keys);
                         }
                     }
                 }
-            }
-            state.update_frontier(txn_id, &keys, &req_deps);
 
-            {
-                let rec = state.records.get_mut(&txn_id).expect("record must exist");
-                rec.seq = seq;
-                rec.deps = req_deps;
-                rec.accepted_ballot = Some(rec.accepted_ballot.unwrap_or(ballot).max(ballot));
-                rec.status = rec.status.max(Status::Committed);
-            }
+                let require_durable_ack = self.config.commit_durability_mode.requires_durable_ack();
+                let req_deps = deps_vec.iter().copied().collect::<BTreeSet<_>>();
+                let seq = seq.max(1);
+                let req_deps_vec = req_deps.iter().copied().collect::<Vec<_>>();
+                let command_for_log = state
+                    .records
+                    .get(&txn_id)
+                    .and_then(|r| r.command.clone())
+                    .unwrap_or_default();
 
-            if prev_status >= Status::Committed && prev_seq != seq {
-                state.remove_committed(txn_id, prev_seq);
-            }
-            let should_notify = state.committed_queue.is_empty();
-            state.insert_committed(txn_id, seq);
-            drop(state);
-            if should_notify {
-                self.executor_notify.notify_one();
-            }
-            if !require_durable_ack && self.commit_log_tx.is_some() {
-                // Async mode preserves original ACK semantics: enqueue WAL append
-                // after state transition and return without waiting for fsync.
-                let enqueue_res = self.enqueue_commit_log_append(
-                    CommitLogEntry {
-                        txn_id,
-                        seq,
-                        deps: req_deps_vec,
-                        command: command_for_log,
-                    },
-                    false,
-                );
-                if let Err(err) = enqueue_res {
-                    tracing::warn!(
-                        error = ?err,
-                        txn_id = ?txn_id,
-                        "failed to enqueue commit-log append"
+                if require_durable_ack {
+                    // Strict durability mode: force WAL append + sync before
+                    // any committed-state transition that could be ACKed to the
+                    // coordinator.
+                    let done_rx = match self.enqueue_commit_log_append(
+                        CommitLogEntry {
+                            txn_id,
+                            seq,
+                            deps: req_deps_vec.clone(),
+                            command: command_for_log.clone(),
+                        },
+                        true,
+                    ) {
+                        Ok(done_rx) => done_rx,
+                        Err(err) => {
+                            tracing::warn!(
+                                error = ?err,
+                                txn_id = ?txn_id,
+                                "failed to enqueue durable commit-log append"
+                            );
+                            break 'commit CommitResponse { ok: false };
+                        }
+                    };
+                    drop(state);
+                    let wait_start = time::Instant::now();
+                    let append_completion =
+                        match Self::wait_commit_log_append(done_rx, self.config.propose_timeout) {
+                            Ok(completion) => completion,
+                            Err(err) => {
+                                timings.durable_wait_us = timings.durable_wait_us.saturating_add(
+                                    wait_start.elapsed().as_micros().min(u128::from(u64::MAX))
+                                        as u64,
+                                );
+                                tracing::warn!(
+                                    error = ?err,
+                                    txn_id = ?txn_id,
+                                    "durable commit-log append failed"
+                                );
+                                break 'commit CommitResponse { ok: false };
+                            }
+                        };
+                    timings.durable_queue_wait_us = timings
+                        .durable_queue_wait_us
+                        .saturating_add(append_completion.queue_wait_us);
+                    timings.durable_append_us = timings
+                        .durable_append_us
+                        .saturating_add(append_completion.append_us);
+                    timings.durable_wait_us = timings.durable_wait_us.saturating_add(
+                        append_completion
+                            .queue_wait_us
+                            .saturating_add(append_completion.append_us),
                     );
+                    let post_durable_state_start = time::Instant::now();
+                    state = self.state.lock().await;
+                    // Another task may have advanced this txn while we were
+                    // waiting on WAL I/O; re-check terminal/committed status
+                    // before mutating.
+                    if state.is_executed(&txn_id) {
+                        timings.post_durable_state_update_us =
+                            timings.post_durable_state_update_us.saturating_add(
+                                post_durable_state_start
+                                    .elapsed()
+                                    .as_micros()
+                                    .min(u128::from(u64::MAX))
+                                    as u64,
+                            );
+                        break 'commit CommitResponse { ok: true };
+                    }
+                    let committed_after_wait = state
+                        .records
+                        .get(&txn_id)
+                        .map(|r| {
+                            let cmd_matches = r
+                                .command
+                                .as_ref()
+                                .map(|cmd| command_digest(cmd) == expected_digest)
+                                .unwrap_or(false);
+                            let same_commit = r.seq == seq && r.deps == req_deps && cmd_matches;
+                            (r.status, r.status >= Status::Committed && same_commit)
+                        })
+                        .unwrap_or((Status::None, false));
+                    if committed_after_wait.0 >= Status::Executing || committed_after_wait.1 {
+                        timings.post_durable_state_update_us =
+                            timings.post_durable_state_update_us.saturating_add(
+                                post_durable_state_start
+                                    .elapsed()
+                                    .as_micros()
+                                    .min(u128::from(u64::MAX))
+                                    as u64,
+                            );
+                        break 'commit CommitResponse { ok: true };
+                    }
                 }
+
+                let post_state_start = if require_durable_ack {
+                    Some(time::Instant::now())
+                } else {
+                    None
+                };
+
+                let (prev_status, prev_seq) = state
+                    .records
+                    .get(&txn_id)
+                    .map(|r| (r.status, r.seq))
+                    .unwrap_or((Status::None, 0));
+                let keys = state
+                    .records
+                    .get(&txn_id)
+                    .and_then(|r| r.keys.as_ref())
+                    .cloned()
+                    .unwrap_or_default();
+                if keys.is_write() {
+                    for key in keys.keys() {
+                        match state.last_committed_write_by_key.get(key) {
+                            Some((_, cur_seq)) if *cur_seq >= seq => {}
+                            _ => {
+                                state
+                                    .last_committed_write_by_key
+                                    .insert(key.clone(), (txn_id, seq));
+                            }
+                        }
+                    }
+                }
+                state.update_frontier(txn_id, &keys, &req_deps);
+
+                {
+                    let rec = state.records.get_mut(&txn_id).expect("record must exist");
+                    rec.seq = seq;
+                    rec.deps = req_deps;
+                    rec.accepted_ballot = Some(rec.accepted_ballot.unwrap_or(ballot).max(ballot));
+                    rec.status = rec.status.max(Status::Committed);
+                }
+
+                if let Some(post_state_start) = post_state_start {
+                    timings.post_durable_state_update_us =
+                        timings.post_durable_state_update_us.saturating_add(
+                            post_state_start
+                                .elapsed()
+                                .as_micros()
+                                .min(u128::from(u64::MAX)) as u64,
+                        );
+                }
+
+                if prev_status >= Status::Committed && prev_seq != seq {
+                    state.remove_committed(txn_id, prev_seq);
+                }
+                let should_notify = state.committed_queue.is_empty();
+                state.insert_committed(txn_id, seq);
+                drop(state);
+                if should_notify {
+                    self.executor_notify.notify_one();
+                }
+                if !require_durable_ack && self.commit_log_tx.is_some() {
+                    // Async mode preserves original ACK semantics: enqueue WAL
+                    // append after state transition and return without waiting
+                    // for fsync.
+                    let enqueue_res = self.enqueue_commit_log_append(
+                        CommitLogEntry {
+                            txn_id,
+                            seq,
+                            deps: req_deps_vec,
+                            command: command_for_log,
+                        },
+                        false,
+                    );
+                    if let Err(err) = enqueue_res {
+                        tracing::warn!(
+                            error = ?err,
+                            txn_id = ?txn_id,
+                            "failed to enqueue commit-log append"
+                        );
+                    }
+                }
+                // Avoid per-commit wakeups; executor polls on a short interval
+                // already.
+                break 'commit CommitResponse { ok: true };
             }
-            // Avoid per-commit wakeups; executor polls on a short interval already.
-            return CommitResponse { ok: true };
-        }
+        };
+
+        timings.total_us = start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        timings.state_update_us = timings.total_us.saturating_sub(timings.durable_wait_us);
+        (response, timings)
     }
 
     pub async fn rpc_fetch_command(&self, txn_id: TxnId) -> Option<Bytes> {
@@ -2192,6 +2711,12 @@ impl Group {
                             pre_accept_us = phase.pre_accept_us,
                             accept_us = phase.accept_us,
                             commit_us = phase.commit_us,
+                            commit_local_state_update_us = phase.commit_local_state_update_us,
+                            commit_local_durable_wait_us = phase.commit_local_durable_wait_us,
+                            commit_local_log_queue_wait_us = phase.commit_local_log_queue_wait_us,
+                            commit_local_log_append_us = phase.commit_local_log_append_us,
+                            commit_local_post_durable_state_update_us = phase.commit_local_post_durable_state_update_us,
+                            commit_remote_quorum_wait_us = phase.commit_remote_quorum_wait_us,
                             execute_us = phase.execute_us,
                             visible_us = phase.visible_us,
                             "write propose phase timings"
@@ -2458,7 +2983,6 @@ impl Group {
         let log_phases = true;
         let mut pre_accept_us = 0u64;
         let mut accept_us = 0u64;
-        let mut commit_us = 0u64;
         let mut execute_us = 0u64;
         let visible_us = 0u64;
         let mut received = 0usize;
@@ -2642,17 +3166,18 @@ impl Group {
         }
 
         let commit_start = time::Instant::now();
-        self.run_commit_round(
-            txn_id,
-            ballot,
-            command,
-            command_digest,
-            merged.seq,
-            merged.deps,
-            self.config.inline_command_in_accept_commit,
-        )
-        .await?;
-        commit_us = commit_us.saturating_add(commit_start.elapsed().as_micros() as u64);
+        let commit_timings = self
+            .run_commit_round(
+                txn_id,
+                ballot,
+                command,
+                command_digest,
+                merged.seq,
+                merged.deps,
+                self.config.inline_command_in_accept_commit,
+            )
+            .await?;
+        let commit_us = commit_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         if needs_execution {
             let exec_start = time::Instant::now();
             if let Err(err) = self.execute_until(txn_id).await {
@@ -2664,6 +3189,12 @@ impl Group {
                         pre_accept_us = pre_accept_us,
                         accept_us = accept_us,
                         commit_us = commit_us,
+                        commit_local_state_update_us = commit_timings.local_state_update_us,
+                        commit_local_durable_wait_us = commit_timings.local_durable_wait_us,
+                        commit_local_log_queue_wait_us = commit_timings.local_log_queue_wait_us,
+                        commit_local_log_append_us = commit_timings.local_log_append_us,
+                        commit_local_post_durable_state_update_us = commit_timings.local_post_durable_state_update_us,
+                        commit_remote_quorum_wait_us = commit_timings.remote_quorum_wait_us,
                         execute_us = execute_us,
                         fast_path = fast_path,
                         merged_seq = merged_seq,
@@ -2702,6 +3233,12 @@ impl Group {
                     pre_accept_us = pre_accept_us,
                     accept_us = accept_us,
                     commit_us = commit_us,
+                    commit_local_state_update_us = commit_timings.local_state_update_us,
+                    commit_local_durable_wait_us = commit_timings.local_durable_wait_us,
+                    commit_local_log_queue_wait_us = commit_timings.local_log_queue_wait_us,
+                    commit_local_log_append_us = commit_timings.local_log_append_us,
+                    commit_local_post_durable_state_update_us = commit_timings.local_post_durable_state_update_us,
+                    commit_remote_quorum_wait_us = commit_timings.remote_quorum_wait_us,
                     execute_us = execute_us,
                     visible_us = visible_us,
                     total_us = total_us,
@@ -2716,6 +3253,13 @@ impl Group {
             pre_accept_us,
             accept_us,
             commit_us,
+            commit_local_state_update_us: commit_timings.local_state_update_us,
+            commit_local_durable_wait_us: commit_timings.local_durable_wait_us,
+            commit_local_log_queue_wait_us: commit_timings.local_log_queue_wait_us,
+            commit_local_log_append_us: commit_timings.local_log_append_us,
+            commit_local_post_durable_state_update_us: commit_timings
+                .local_post_durable_state_update_us,
+            commit_remote_quorum_wait_us: commit_timings.remote_quorum_wait_us,
             execute_us,
             visible_us,
         })
@@ -2980,7 +3524,7 @@ impl Group {
     /// - `inline_command`: whether Commit RPCs carry full command bytes.
     ///
     /// Outputs:
-    /// - `Ok(())` when voter quorum ACKs commit.
+    /// - `Ok(CommitRoundTimings)` when voter quorum ACKs commit.
     /// - `Err(ProposeOnceError::NoQuorum)` when quorum cannot be reached in time.
     async fn run_commit_round(
         &self,
@@ -2991,7 +3535,7 @@ impl Group {
         seq: u64,
         deps: Vec<TxnId>,
         inline_command: bool,
-    ) -> Result<(), ProposeOnceError> {
+    ) -> Result<CommitRoundTimings, ProposeOnceError> {
         let peers = self.peers_snapshot();
         let quorum = self.quorum();
         let local_is_member = self.local_is_member();
@@ -3008,9 +3552,17 @@ impl Group {
             (Bytes::new(), false)
         };
         let mut ok = 0usize;
+        let mut timings = CommitRoundTimings {
+            local_state_update_us: 0,
+            local_durable_wait_us: 0,
+            local_log_queue_wait_us: 0,
+            local_log_append_us: 0,
+            local_post_durable_state_update_us: 0,
+            remote_quorum_wait_us: 0,
+        };
         if local_is_member {
-            let local = self
-                .rpc_commit(CommitRequest {
+            let (local, local_timings) = self
+                .rpc_commit_with_timings(CommitRequest {
                     group_id: self.config.group_id,
                     txn_id,
                     ballot,
@@ -3026,13 +3578,40 @@ impl Group {
                     "local commit rejected"
                 )));
             }
+            timings.local_state_update_us = local_timings.state_update_us;
+            timings.local_durable_wait_us = local_timings.durable_wait_us;
+            timings.local_log_queue_wait_us = local_timings.durable_queue_wait_us;
+            timings.local_log_append_us = local_timings.durable_append_us;
+            timings.local_post_durable_state_update_us = local_timings.post_durable_state_update_us;
             if local_is_voter {
                 ok = 1;
             }
         }
 
         if ok >= quorum {
-            return Ok(());
+            if local_is_member {
+                self.metrics
+                    .record_commit_local_state(Duration::from_micros(
+                        timings.local_state_update_us,
+                    ));
+                self.metrics
+                    .record_commit_local_durable(Duration::from_micros(
+                        timings.local_durable_wait_us,
+                    ));
+                self.metrics
+                    .record_commit_local_log_queue(Duration::from_micros(
+                        timings.local_log_queue_wait_us,
+                    ));
+                self.metrics
+                    .record_commit_local_log_append(Duration::from_micros(
+                        timings.local_log_append_us,
+                    ));
+                self.metrics
+                    .record_commit_local_post_durable_state(Duration::from_micros(
+                        timings.local_post_durable_state_update_us,
+                    ));
+            }
+            return Ok(timings);
         }
 
         let mut in_flight = FuturesUnordered::new();
@@ -3050,15 +3629,18 @@ impl Group {
                 deps: deps.clone(),
             };
             in_flight.push(async move {
+                let rpc_start = time::Instant::now();
                 let peer_ok = match time::timeout(commit_timeout, transport.commit(peer, req)).await
                 {
                     Ok(res) => res.ok().is_some_and(|r| r.ok),
                     Err(_) => false,
                 };
-                (peer_ok, count_for_quorum)
+                let rpc_us = rpc_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                (peer, peer_ok, count_for_quorum, rpc_us)
             });
         }
 
+        let remote_quorum_start = time::Instant::now();
         let deadline = time::Instant::now() + self.config.rpc_timeout;
         while ok < quorum {
             let remaining = deadline.saturating_duration_since(time::Instant::now());
@@ -3070,13 +3652,56 @@ impl Group {
             // and are dropped once commit quorum is satisfied. This does not
             // wait for non-quorum followers after the decision point.
             let recv = time::timeout(remaining, in_flight.next()).await;
-            let Ok(Some((peer_ok, count_for_quorum))) = recv else {
+            let Ok(Some((peer, peer_ok, count_for_quorum, _rpc_us))) = recv else {
                 break;
             };
             if peer_ok && count_for_quorum {
                 ok += 1;
                 if ok >= quorum {
-                    return Ok(());
+                    timings.remote_quorum_wait_us = remote_quorum_start
+                        .elapsed()
+                        .as_micros()
+                        .min(u128::from(u64::MAX))
+                        as u64;
+                    if local_is_member {
+                        self.metrics
+                            .record_commit_local_state(Duration::from_micros(
+                                timings.local_state_update_us,
+                            ));
+                        self.metrics
+                            .record_commit_local_durable(Duration::from_micros(
+                                timings.local_durable_wait_us,
+                            ));
+                        self.metrics
+                            .record_commit_local_log_queue(Duration::from_micros(
+                                timings.local_log_queue_wait_us,
+                            ));
+                        self.metrics
+                            .record_commit_local_log_append(Duration::from_micros(
+                                timings.local_log_append_us,
+                            ));
+                        self.metrics
+                            .record_commit_local_post_durable_state(Duration::from_micros(
+                                timings.local_post_durable_state_update_us,
+                            ));
+                    }
+                    self.metrics
+                        .record_commit_remote_quorum(Duration::from_micros(
+                            timings.remote_quorum_wait_us,
+                        ));
+                    self.metrics.record_commit_quorum_closer(
+                        peer,
+                        Duration::from_micros(timings.remote_quorum_wait_us),
+                    );
+                    if !in_flight.is_empty() {
+                        let metrics = self.metrics.clone();
+                        let tail_start = time::Instant::now();
+                        tokio::spawn(async move {
+                            while in_flight.next().await.is_some() {}
+                            metrics.record_commit_tail(tail_start.elapsed());
+                        });
+                    }
+                    return Ok(timings);
                 }
             }
         }
@@ -5192,6 +5817,96 @@ mod tests {
         );
     }
 
+    /// Ensure commit-round metrics expose synchronous durable wait on the local path.
+    ///
+    /// Purpose:
+    /// - Prove the new passive breakdown isolates WAL/fsync wait without
+    ///   changing sync-commit ACK semantics.
+    ///
+    /// Design:
+    /// - Run a single-node commit round against the blocking durable commit log.
+    /// - Assert the returned timings and exported debug stats both report a
+    ///   non-zero durable-wait sample.
+    ///
+    /// Inputs:
+    /// - One blocking durable commit-log test double.
+    ///
+    /// Outputs:
+    /// - Non-zero local durable timing metrics and zero remote-quorum samples.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sync_commit_round_records_local_durable_wait_metrics() {
+        let (started_tx, started_rx) = std_mpsc::channel();
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let commit_log = Arc::new(BlockingDurableCommitLog::new(started_tx, release_rx));
+        let group = Arc::new(Group::new(
+            test_config(CommitDurabilityMode::SyncCommit),
+            Arc::new(NoopTransport::new()),
+            Arc::new(TestStateMachine),
+            Some(commit_log),
+        ));
+
+        let command = Bytes::from_static(b"sync-commit-round-metrics");
+        let group_task = group.clone();
+        let join = tokio::spawn(async move {
+            group_task
+                .run_commit_round(
+                    TxnId {
+                        node_id: 1,
+                        counter: 12,
+                    },
+                    Ballot::initial(1),
+                    command.clone(),
+                    command_digest(&command),
+                    1,
+                    Vec::new(),
+                    true,
+                )
+                .await
+        });
+
+        tokio::task::block_in_place(|| {
+            started_rx
+                .recv_timeout(StdDuration::from_secs(1))
+                .expect("durable append should start")
+        });
+        assert!(
+            !join.is_finished(),
+            "commit round returned before durable append completed"
+        );
+
+        release_tx.send(()).expect("release durable append");
+        let timings = tokio::time::timeout(StdDuration::from_secs(1), join)
+            .await
+            .expect("commit round should finish after release")
+            .expect("join should succeed")
+            .expect("commit round should succeed");
+
+        assert!(
+            timings.local_durable_wait_us > 0,
+            "commit round should report a durable wait sample"
+        );
+        assert_eq!(
+            timings.remote_quorum_wait_us, 0,
+            "single-node commit should not report remote quorum wait"
+        );
+
+        let stats = group.debug_stats().await;
+        assert_eq!(stats.commit_local_durable_count, 1);
+        assert!(
+            stats.commit_local_durable_total_us > 0,
+            "exported durable wait should be non-zero"
+        );
+        assert_eq!(stats.commit_local_log_queue_count, 1);
+        assert_eq!(stats.commit_local_log_append_count, 1);
+        assert!(
+            stats.commit_local_log_append_total_us > 0,
+            "exported append execution should be non-zero"
+        );
+        assert_eq!(stats.commit_local_post_durable_state_count, 1);
+        assert_eq!(stats.commit_remote_quorum_count, 0);
+        assert_eq!(stats.commit_tail_count, 0);
+    }
+
     /// Ensure sync-commit mode surfaces durable append failures to callers.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sync_commit_fails_when_durable_append_fails() {
@@ -5471,6 +6186,22 @@ mod tests {
             elapsed < StdDuration::from_millis(200),
             "commit round should return at quorum instead of waiting for 400ms slow peer (elapsed={elapsed:?})"
         );
+
+        time::sleep(StdDuration::from_millis(450)).await;
+        let stats = group.debug_stats().await;
+        assert_eq!(stats.commit_remote_quorum_count, 1);
+        assert!(
+            stats.commit_remote_quorum_total_us > 0,
+            "commit round should record remote quorum wait"
+        );
+        assert_eq!(stats.commit_tail_count, 1);
+        assert!(
+            stats.commit_tail_total_us > 0,
+            "commit round should record the follower tail after quorum"
+        );
+        assert_eq!(stats.commit_quorum_closer_top.len(), 1);
+        assert_eq!(stats.commit_quorum_closer_top[0].node_id, 2);
+        assert_eq!(stats.commit_quorum_closer_top[0].count, 1);
     }
 
     /// Verify Commit round returns a no-quorum error when enough voter ACKs are

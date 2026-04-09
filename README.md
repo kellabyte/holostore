@@ -39,6 +39,11 @@ In this repository we implement:
 make build-release
 ```
 
+For allocator-specific performance runs:
+```bash
+make build-release-mimalloc
+```
+
 **Meta-plane health**
 ```bash
 ./target/release/holoctl --target 127.0.0.1:15051 meta-status

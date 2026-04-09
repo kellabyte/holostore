@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::{FutureExt, SinkExt, StreamExt};
-use holo_accord::accord::DebugStats;
+use holo_accord::accord::{CommitQuorumCloserStat, DebugStats};
 use redis_protocol::codec::Resp2;
 use redis_protocol::resp2::types::BytesFrame;
 use redis_protocol::resp2::types::Resp2Frame;
@@ -94,8 +94,100 @@ fn merge_debug_stats(dst: &mut DebugStats, src: DebugStats) {
     dst.state_update_count += src.state_update_count;
     dst.state_update_total_us += src.state_update_total_us;
     dst.state_update_max_us = dst.state_update_max_us.max(src.state_update_max_us);
+    dst.commit_local_state_count += src.commit_local_state_count;
+    dst.commit_local_state_total_us += src.commit_local_state_total_us;
+    dst.commit_local_state_max_us = dst
+        .commit_local_state_max_us
+        .max(src.commit_local_state_max_us);
+    dst.commit_local_durable_count += src.commit_local_durable_count;
+    dst.commit_local_durable_total_us += src.commit_local_durable_total_us;
+    dst.commit_local_durable_max_us = dst
+        .commit_local_durable_max_us
+        .max(src.commit_local_durable_max_us);
+    dst.commit_local_log_queue_count += src.commit_local_log_queue_count;
+    dst.commit_local_log_queue_total_us += src.commit_local_log_queue_total_us;
+    dst.commit_local_log_queue_max_us = dst
+        .commit_local_log_queue_max_us
+        .max(src.commit_local_log_queue_max_us);
+    dst.commit_local_log_append_count += src.commit_local_log_append_count;
+    dst.commit_local_log_append_total_us += src.commit_local_log_append_total_us;
+    dst.commit_local_log_append_max_us = dst
+        .commit_local_log_append_max_us
+        .max(src.commit_local_log_append_max_us);
+    dst.commit_local_post_durable_state_count += src.commit_local_post_durable_state_count;
+    dst.commit_local_post_durable_state_total_us += src.commit_local_post_durable_state_total_us;
+    dst.commit_local_post_durable_state_max_us = dst
+        .commit_local_post_durable_state_max_us
+        .max(src.commit_local_post_durable_state_max_us);
+    dst.commit_remote_quorum_count += src.commit_remote_quorum_count;
+    dst.commit_remote_quorum_total_us += src.commit_remote_quorum_total_us;
+    dst.commit_remote_quorum_max_us = dst
+        .commit_remote_quorum_max_us
+        .max(src.commit_remote_quorum_max_us);
+    dst.commit_tail_count += src.commit_tail_count;
+    dst.commit_tail_total_us += src.commit_tail_total_us;
+    dst.commit_tail_max_us = dst.commit_tail_max_us.max(src.commit_tail_max_us);
+    merge_commit_quorum_closer_top(
+        &mut dst.commit_quorum_closer_top,
+        src.commit_quorum_closer_top,
+    );
     dst.fast_path_count += src.fast_path_count;
     dst.slow_path_count += src.slow_path_count;
+}
+
+/// Merge top-N quorum-closing peer aggregates across shards.
+fn merge_commit_quorum_closer_top(
+    dst: &mut Vec<CommitQuorumCloserStat>,
+    src: Vec<CommitQuorumCloserStat>,
+) {
+    let mut merged = dst
+        .drain(..)
+        .map(|entry| (entry.node_id, entry))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for entry in src {
+        let slot = merged
+            .entry(entry.node_id)
+            .or_insert_with(|| CommitQuorumCloserStat {
+                node_id: entry.node_id,
+                ..CommitQuorumCloserStat::default()
+            });
+        slot.count += entry.count;
+        slot.total_us += entry.total_us;
+        slot.max_us = slot.max_us.max(entry.max_us);
+    }
+    let mut top = merged.into_values().collect::<Vec<_>>();
+    top.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| b.total_us.cmp(&a.total_us))
+            .then_with(|| a.node_id.cmp(&b.node_id))
+    });
+    top.truncate(3);
+    *dst = top;
+}
+
+/// Format quorum-closing peer aggregates for log and `HOLOSTATS` output.
+fn format_commit_quorum_closer_top(entries: &[CommitQuorumCloserStat]) -> String {
+    if entries.is_empty() {
+        return "none".to_string();
+    }
+    entries
+        .iter()
+        .map(|entry| {
+            let avg_ms = if entry.count == 0 {
+                0.0
+            } else {
+                (entry.total_us as f64 / entry.count as f64) / 1000.0
+            };
+            format!(
+                "{}:{}@{avg_ms:.3}ms(max={:.3}ms)",
+                entry.node_id,
+                entry.count,
+                entry.max_us as f64 / 1000.0
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Logical key/value operation parsed from the Redis protocol.
@@ -273,6 +365,18 @@ async fn handle_conn(socket: TcpStream, state: Arc<NodeState>) -> anyhow::Result
                 } else {
                     wal_stats.fsync_total_us as f64 / wal_stats.fsync_count as f64
                 };
+                let wal_queue_avg_us = if wal_stats.queue_wait_count == 0 {
+                    // Avoid divide-by-zero when there are no queued WAL requests.
+                    0.0
+                } else {
+                    wal_stats.queue_wait_total_us as f64 / wal_stats.queue_wait_count as f64
+                };
+                let wal_write_avg_us = if wal_stats.write_count == 0 {
+                    // Avoid divide-by-zero when there are no backend writes.
+                    0.0
+                } else {
+                    wal_stats.write_total_us as f64 / wal_stats.write_count as f64
+                };
                 let wal_batch_avg_items = if wal_stats.batch_count == 0 {
                     // Avoid divide-by-zero when there are no batches.
                     0.0
@@ -285,8 +389,51 @@ async fn handle_conn(socket: TcpStream, state: Arc<NodeState>) -> anyhow::Result
                 } else {
                     wal_stats.batch_total_bytes as f64 / wal_stats.batch_count as f64
                 };
+                let commit_local_state_avg_us = if stats.commit_local_state_count == 0 {
+                    0.0
+                } else {
+                    stats.commit_local_state_total_us as f64 / stats.commit_local_state_count as f64
+                };
+                let commit_local_durable_avg_us = if stats.commit_local_durable_count == 0 {
+                    0.0
+                } else {
+                    stats.commit_local_durable_total_us as f64
+                        / stats.commit_local_durable_count as f64
+                };
+                let commit_local_log_queue_avg_us = if stats.commit_local_log_queue_count == 0 {
+                    0.0
+                } else {
+                    stats.commit_local_log_queue_total_us as f64
+                        / stats.commit_local_log_queue_count as f64
+                };
+                let commit_local_log_append_avg_us = if stats.commit_local_log_append_count == 0 {
+                    0.0
+                } else {
+                    stats.commit_local_log_append_total_us as f64
+                        / stats.commit_local_log_append_count as f64
+                };
+                let commit_local_post_durable_state_avg_us =
+                    if stats.commit_local_post_durable_state_count == 0 {
+                        0.0
+                    } else {
+                        stats.commit_local_post_durable_state_total_us as f64
+                            / stats.commit_local_post_durable_state_count as f64
+                    };
+                let commit_remote_quorum_avg_us = if stats.commit_remote_quorum_count == 0 {
+                    0.0
+                } else {
+                    stats.commit_remote_quorum_total_us as f64
+                        / stats.commit_remote_quorum_count as f64
+                };
+                let commit_tail_avg_us = if stats.commit_tail_count == 0 {
+                    0.0
+                } else {
+                    stats.commit_tail_total_us as f64 / stats.commit_tail_count as f64
+                };
+                let commit_quorum_closer_top =
+                    format_commit_quorum_closer_top(&stats.commit_quorum_closer_top);
                 let mut msg = format!(
-                    "records.len={} records.cap={} records.status.none={} records.status.preaccepted={} records.status.accepted={} records.status.committed={} records.status.executing={} records.status.executed={} records.missing.command={} records.missing.keys={} records.committed_missing.command={} records.committed_missing.keys={} committed_queue.len={} committed_queue.ghost={} frontier.keys={} frontier.entries={} executed_prefix_nodes={} executed_out_of_order.len={} executed_log.len={} executed_log.cap={} executed_log_order.cap={} executed_log.command_bytes={} executed_log.max_command_bytes={} executed_log.deps_total={} executed_log.max_deps_len={} reported_executed_peers={} recovering.len={} read_waiters.len={} proposal_timeouts={} execute_timeouts={} recovery.attempts={} recovery.successes={} recovery.failures={} recovery.timeouts={} recovery.noops={} recovery.last_ms={} exec.progress.count={} exec.progress.total_us={} exec.progress.max_us={} exec.progress.true={} exec.progress.false={} exec.progress.errors={} exec.recover.count={} exec.recover.total_us={} exec.recover.max_us={} exec.recover.true={} exec.recover.false={} exec.recover.errors={} apply.write.count={} apply.write.total_us={} apply.write.max_us={} apply.read.count={} apply.read.total_us={} apply.read.max_us={} apply.batch.count={} apply.batch.total_us={} apply.batch.max_us={} apply.visible.count={} apply.visible.total_us={} apply.visible.max_us={} apply.state.count={} apply.state.total_us={} apply.state.max_us={} fast_path.count={} slow_path.count={} rpc.pre_accept.batches={} rpc.pre_accept.items={} rpc.pre_accept.avg_batch={:.2} rpc.pre_accept.max_batch={} rpc.accept.batches={} rpc.accept.items={} rpc.accept.avg_batch={:.2} rpc.accept.max_batch={} rpc.commit.batches={} rpc.commit.items={} rpc.commit.avg_batch={:.2} rpc.commit.max_batch={} client.set.batches={} client.set.items={} client.set.avg_batch={:.2} client.set.max_batch={} client.set.avg_wait_us={:.2} client.set.max_wait_us={} client.get.batches={} client.get.items={} client.get.avg_batch={:.2} client.get.max_batch={} client.get.avg_wait_us={:.2} client.get.max_wait_us={} client.get.avg_effective_wait_us={:.2} client.get.max_effective_wait_us={} client.get.avg_collect_us={:.2} client.get.max_collect_us={} client.get.avg_queue_hint={:.2} client.get.max_queue_hint={} client.get.wait_reason.zero={} client.get.wait_reason.immediate={} client.get.wait_reason.stale={} client.get.wait_reason.low_backlog={} client.get.wait_reason.queue_age_cap={} client.get.wait_reason.configured={} client.get.collect_reason.max_items={} client.get.collect_reason.deadline={} client.get.collect_reason.idle={} client.get.collect_reason.closed={} wal.fsync.count={} wal.fsync.total_us={} wal.fsync.avg_us={:.2} wal.fsync.max_us={} wal.batch.count={} wal.batch.items={} wal.batch.avg_items={:.2} wal.batch.max_items={} wal.batch.total_bytes={} wal.batch.avg_bytes={:.2} wal.batch.max_bytes={}",
+                    "records.len={} records.cap={} records.status.none={} records.status.preaccepted={} records.status.accepted={} records.status.committed={} records.status.executing={} records.status.executed={} records.missing.command={} records.missing.keys={} records.committed_missing.command={} records.committed_missing.keys={} committed_queue.len={} committed_queue.ghost={} frontier.keys={} frontier.entries={} executed_prefix_nodes={} executed_out_of_order.len={} executed_log.len={} executed_log.cap={} executed_log_order.cap={} executed_log.command_bytes={} executed_log.max_command_bytes={} executed_log.deps_total={} executed_log.max_deps_len={} reported_executed_peers={} recovering.len={} read_waiters.len={} proposal_timeouts={} execute_timeouts={} recovery.attempts={} recovery.successes={} recovery.failures={} recovery.timeouts={} recovery.noops={} recovery.last_ms={} exec.progress.count={} exec.progress.total_us={} exec.progress.max_us={} exec.progress.true={} exec.progress.false={} exec.progress.errors={} exec.recover.count={} exec.recover.total_us={} exec.recover.max_us={} exec.recover.true={} exec.recover.false={} exec.recover.errors={} apply.write.count={} apply.write.total_us={} apply.write.max_us={} apply.read.count={} apply.read.total_us={} apply.read.max_us={} apply.batch.count={} apply.batch.total_us={} apply.batch.max_us={} apply.visible.count={} apply.visible.total_us={} apply.visible.max_us={} apply.state.count={} apply.state.total_us={} apply.state.max_us={} commit.local_state.count={} commit.local_state.total_us={} commit.local_state.avg_us={:.2} commit.local_state.max_us={} commit.local_durable.count={} commit.local_durable.total_us={} commit.local_durable.avg_us={:.2} commit.local_durable.max_us={} commit.local_log_queue.count={} commit.local_log_queue.total_us={} commit.local_log_queue.avg_us={:.2} commit.local_log_queue.max_us={} commit.local_log_append.count={} commit.local_log_append.total_us={} commit.local_log_append.avg_us={:.2} commit.local_log_append.max_us={} commit.local_post_durable_state.count={} commit.local_post_durable_state.total_us={} commit.local_post_durable_state.avg_us={:.2} commit.local_post_durable_state.max_us={} commit.remote_quorum.count={} commit.remote_quorum.total_us={} commit.remote_quorum.avg_us={:.2} commit.remote_quorum.max_us={} commit.tail.count={} commit.tail.total_us={} commit.tail.avg_us={:.2} commit.tail.max_us={} commit.quorum_closer.top={} fast_path.count={} slow_path.count={} rpc.pre_accept.batches={} rpc.pre_accept.items={} rpc.pre_accept.avg_batch={:.2} rpc.pre_accept.max_batch={} rpc.accept.batches={} rpc.accept.items={} rpc.accept.avg_batch={:.2} rpc.accept.max_batch={} rpc.commit.batches={} rpc.commit.items={} rpc.commit.avg_batch={:.2} rpc.commit.max_batch={} client.set.batches={} client.set.items={} client.set.avg_batch={:.2} client.set.max_batch={} client.set.avg_wait_us={:.2} client.set.max_wait_us={} client.get.batches={} client.get.items={} client.get.avg_batch={:.2} client.get.max_batch={} client.get.avg_wait_us={:.2} client.get.max_wait_us={} client.get.avg_effective_wait_us={:.2} client.get.max_effective_wait_us={} client.get.avg_collect_us={:.2} client.get.max_collect_us={} client.get.avg_queue_hint={:.2} client.get.max_queue_hint={} client.get.wait_reason.zero={} client.get.wait_reason.immediate={} client.get.wait_reason.stale={} client.get.wait_reason.low_backlog={} client.get.wait_reason.queue_age_cap={} client.get.wait_reason.configured={} client.get.collect_reason.max_items={} client.get.collect_reason.deadline={} client.get.collect_reason.idle={} client.get.collect_reason.closed={} wal.fsync.count={} wal.fsync.total_us={} wal.fsync.avg_us={:.2} wal.fsync.max_us={} wal.queue.count={} wal.queue.total_us={} wal.queue.avg_us={:.2} wal.queue.max_us={} wal.write.count={} wal.write.total_us={} wal.write.avg_us={:.2} wal.write.max_us={} wal.batch.count={} wal.batch.items={} wal.batch.avg_items={:.2} wal.batch.max_items={} wal.batch.total_bytes={} wal.batch.avg_bytes={:.2} wal.batch.max_bytes={}",
                     stats.records_len,
                     stats.records_capacity,
                     stats.records_status_none_len,
@@ -350,6 +497,35 @@ async fn handle_conn(socket: TcpStream, state: Arc<NodeState>) -> anyhow::Result
                     stats.state_update_count,
                     stats.state_update_total_us,
                     stats.state_update_max_us,
+                    stats.commit_local_state_count,
+                    stats.commit_local_state_total_us,
+                    commit_local_state_avg_us,
+                    stats.commit_local_state_max_us,
+                    stats.commit_local_durable_count,
+                    stats.commit_local_durable_total_us,
+                    commit_local_durable_avg_us,
+                    stats.commit_local_durable_max_us,
+                    stats.commit_local_log_queue_count,
+                    stats.commit_local_log_queue_total_us,
+                    commit_local_log_queue_avg_us,
+                    stats.commit_local_log_queue_max_us,
+                    stats.commit_local_log_append_count,
+                    stats.commit_local_log_append_total_us,
+                    commit_local_log_append_avg_us,
+                    stats.commit_local_log_append_max_us,
+                    stats.commit_local_post_durable_state_count,
+                    stats.commit_local_post_durable_state_total_us,
+                    commit_local_post_durable_state_avg_us,
+                    stats.commit_local_post_durable_state_max_us,
+                    stats.commit_remote_quorum_count,
+                    stats.commit_remote_quorum_total_us,
+                    commit_remote_quorum_avg_us,
+                    stats.commit_remote_quorum_max_us,
+                    stats.commit_tail_count,
+                    stats.commit_tail_total_us,
+                    commit_tail_avg_us,
+                    stats.commit_tail_max_us,
+                    commit_quorum_closer_top,
                     stats.fast_path_count,
                     stats.slow_path_count,
                     rpc_stats.pre_accept_batches,
@@ -396,6 +572,14 @@ async fn handle_conn(socket: TcpStream, state: Arc<NodeState>) -> anyhow::Result
                     wal_stats.fsync_total_us,
                     wal_fsync_avg_us,
                     wal_stats.fsync_max_us,
+                    wal_stats.queue_wait_count,
+                    wal_stats.queue_wait_total_us,
+                    wal_queue_avg_us,
+                    wal_stats.queue_wait_max_us,
+                    wal_stats.write_count,
+                    wal_stats.write_total_us,
+                    wal_write_avg_us,
+                    wal_stats.write_max_us,
                     wal_stats.batch_count,
                     wal_stats.batch_items,
                     wal_batch_avg_items,
