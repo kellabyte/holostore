@@ -3318,7 +3318,7 @@ impl StateMachine for ClusterStateMachine {
         })
     }
 
-    fn apply(&self, data: &[u8], _meta: ExecMeta) {
+    fn apply(&self, data: &[u8], _meta: ExecMeta) -> anyhow::Result<()> {
         if let Ok(cmd) = Self::decode_command(data) {
             // Split/Merge need the state-machine migrator path. Unwrap guarded
             // commands here so guarded split/merge dispatches to the correct
@@ -3337,7 +3337,7 @@ impl StateMachine for ClusterStateMachine {
                         };
                         if !is_current {
                             // Stale fenced command: no-op.
-                            return;
+                            return Ok(());
                         }
                         unwrapped = *command;
                     }
@@ -3369,11 +3369,10 @@ impl StateMachine for ClusterStateMachine {
                     .apply_merge_range(left_shard_id, self.migrator.as_deref()),
                 other => self.store.apply_command(other),
             };
-            if let Err(err) = res {
-                tracing::error!(error = ?err, "cluster state apply failed");
-            };
+            res.context("cluster state apply failed")?;
         } else {
-            tracing::error!("cluster command decode failed");
+            anyhow::bail!("cluster command decode failed");
         }
+        Ok(())
     }
 }

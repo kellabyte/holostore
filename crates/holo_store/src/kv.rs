@@ -23,6 +23,7 @@ use std::hash::{BuildHasher, Hasher};
 use std::sync::{Arc, RwLock};
 
 use ahash::RandomState;
+use anyhow::Context;
 use bytes::Bytes;
 use fjall::{Keyspace, PartitionCreateOptions};
 use holo_accord::accord::{txn_group_id, CommandKeys, ExecMeta, NodeId, StateMachine, TxnId};
@@ -40,18 +41,33 @@ pub trait KvEngine: Send + Sync + 'static {
     /// Batch variant of `get_latest` that preserves input ordering.
     fn get_latest_batch(&self, keys: &[&[u8]]) -> Vec<Option<(Vec<u8>, Version)>>;
     /// Persist a value for `key` at `version` (initially invisible).
-    fn set(&self, key: &[u8], value: &[u8], version: Version);
+    fn set(&self, key: &[u8], value: &[u8], version: Version) -> anyhow::Result<()>;
     /// Persist multiple values in one batch (initially invisible).
-    fn set_batch(&self, items: &[(&[u8], &[u8], Version)]) {
+    fn set_batch(&self, items: &[(&[u8], &[u8], Version)]) -> anyhow::Result<()> {
         for (key, value, version) in items {
-            self.set(key, value, *version);
+            self.set(key, value, *version)?;
         }
+        Ok(())
+    }
+    /// Persist committed values and publish their visible/latest state atomically.
+    ///
+    /// Returns the number of keys whose latest index transitioned from missing
+    /// to present.
+    fn apply_committed_batch(&self, items: &[(&[u8], &[u8], Version)]) -> anyhow::Result<u64> {
+        self.set_batch(items)?;
+        let mut inserted_latest = 0u64;
+        for (key, _, version) in items {
+            if self.mark_visible(key, *version)? {
+                inserted_latest = inserted_latest.saturating_add(1);
+            }
+        }
+        Ok(inserted_latest)
     }
     /// Mark a previously written `(key, version)` as visible to readers.
     ///
     /// Returns `true` when this update created a new latest index entry for
     /// the key (i.e. the key did not previously have a visible latest value).
-    fn mark_visible(&self, key: &[u8], version: Version) -> bool;
+    fn mark_visible(&self, key: &[u8], version: Version) -> anyhow::Result<bool>;
     /// Batch variant of `mark_visible`.
     ///
     /// Purpose:
@@ -68,14 +84,14 @@ pub trait KvEngine: Send + Sync + 'static {
     ///
     /// Outputs:
     /// - Count of keys whose latest index transitioned from missing to present.
-    fn mark_visible_batch(&self, keys: &[&[u8]], version: Version) -> u64 {
+    fn mark_visible_batch(&self, keys: &[&[u8]], version: Version) -> anyhow::Result<u64> {
         let mut inserted_latest = 0u64;
         for key in keys {
-            if self.mark_visible(key, version) {
+            if self.mark_visible(key, version)? {
                 inserted_latest = inserted_latest.saturating_add(1);
             }
         }
-        inserted_latest
+        Ok(inserted_latest)
     }
 }
 
@@ -136,69 +152,106 @@ impl KvEngine for KvStore {
     }
 
     /// Insert or update a versioned value (initially invisible).
-    fn set(&self, key: &[u8], value: &[u8], version: Version) {
-        if let Ok(mut guard) = self.inner.write() {
+    fn set(&self, key: &[u8], value: &[u8], version: Version) -> anyhow::Result<()> {
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| anyhow::anyhow!("kv store lock poisoned"))?;
+        let entry = guard.entry(key.to_vec()).or_default();
+        // Decide whether to replace an existing version or insert a new one in order.
+        match entry.binary_search_by(|v| v.version.cmp(&version)) {
+            // Existing version: overwrite the value in-place.
+            Ok(idx) => entry[idx].value = value.to_vec(),
+            // New version: insert in sorted order and mark invisible.
+            Err(idx) => entry.insert(
+                idx,
+                VersionedValue {
+                    version,
+                    value: value.to_vec(),
+                    visible: false,
+                },
+            ),
+        }
+        Ok(())
+    }
+
+    /// Batch variant of `set` with one write lock.
+    fn set_batch(&self, items: &[(&[u8], &[u8], Version)]) -> anyhow::Result<()> {
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| anyhow::anyhow!("kv store lock poisoned"))?;
+        for (key, value, version) in items {
             let entry = guard.entry(key.to_vec()).or_default();
             // Decide whether to replace an existing version or insert a new one in order.
-            match entry.binary_search_by(|v| v.version.cmp(&version)) {
+            match entry.binary_search_by(|v| v.version.cmp(version)) {
                 // Existing version: overwrite the value in-place.
                 Ok(idx) => entry[idx].value = value.to_vec(),
                 // New version: insert in sorted order and mark invisible.
                 Err(idx) => entry.insert(
                     idx,
                     VersionedValue {
-                        version,
+                        version: *version,
                         value: value.to_vec(),
                         visible: false,
                     },
                 ),
             }
         }
+        Ok(())
     }
 
-    /// Batch variant of `set` with one write lock.
-    fn set_batch(&self, items: &[(&[u8], &[u8], Version)]) {
-        if let Ok(mut guard) = self.inner.write() {
-            for (key, value, version) in items {
-                let entry = guard.entry(key.to_vec()).or_default();
-                // Decide whether to replace an existing version or insert a new one in order.
-                match entry.binary_search_by(|v| v.version.cmp(version)) {
-                    // Existing version: overwrite the value in-place.
-                    Ok(idx) => entry[idx].value = value.to_vec(),
-                    // New version: insert in sorted order and mark invisible.
-                    Err(idx) => entry.insert(
-                        idx,
-                        VersionedValue {
-                            version: *version,
-                            value: value.to_vec(),
-                            visible: false,
-                        },
-                    ),
+    /// Apply committed values as visible with one write lock.
+    fn apply_committed_batch(&self, items: &[(&[u8], &[u8], Version)]) -> anyhow::Result<u64> {
+        let mut inserted_latest = 0u64;
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| anyhow::anyhow!("kv store lock poisoned"))?;
+        for (key, value, version) in items {
+            let entry = guard.entry(key.to_vec()).or_default();
+            let had_visible = entry.iter().any(|v| v.visible);
+            match entry.binary_search_by(|v| v.version.cmp(version)) {
+                Ok(idx) => {
+                    entry[idx].value = value.to_vec();
+                    entry[idx].visible = true;
                 }
+                Err(idx) => entry.insert(
+                    idx,
+                    VersionedValue {
+                        version: *version,
+                        value: value.to_vec(),
+                        visible: true,
+                    },
+                ),
+            }
+            if !had_visible {
+                inserted_latest = inserted_latest.saturating_add(1);
             }
         }
+        Ok(inserted_latest)
     }
 
     /// Mark a version as visible so reads can observe it.
-    fn mark_visible(&self, key: &[u8], version: Version) -> bool {
-        if let Ok(mut guard) = self.inner.write() {
-            let Some(entry) = guard.get_mut(key) else {
-                // Nothing to mark if the key does not exist yet.
-                return false;
-            };
-            let had_visible = entry.iter().any(|v| v.visible);
-            // Only update visibility if the exact version is present.
-            if let Ok(idx) = entry.binary_search_by(|v| v.version.cmp(&version)) {
-                if entry[idx].visible {
-                    return false;
-                }
-                entry[idx].visible = true;
-                return !had_visible;
+    fn mark_visible(&self, key: &[u8], version: Version) -> anyhow::Result<bool> {
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| anyhow::anyhow!("kv store lock poisoned"))?;
+        let Some(entry) = guard.get_mut(key) else {
+            // Nothing to mark if the key does not exist yet.
+            return Ok(false);
+        };
+        let had_visible = entry.iter().any(|v| v.visible);
+        // Only update visibility if the exact version is present.
+        if let Ok(idx) = entry.binary_search_by(|v| v.version.cmp(&version)) {
+            if entry[idx].visible {
+                return Ok(false);
             }
-            false
-        } else {
-            false
+            entry[idx].visible = true;
+            return Ok(!had_visible);
         }
+        Ok(false)
     }
 
     /// Batch visibility update with one write lock.
@@ -215,11 +268,12 @@ impl KvEngine for KvStore {
     ///
     /// Outputs:
     /// - Count of keys that gained a latest entry.
-    fn mark_visible_batch(&self, keys: &[&[u8]], version: Version) -> u64 {
+    fn mark_visible_batch(&self, keys: &[&[u8]], version: Version) -> anyhow::Result<u64> {
         let mut inserted_latest = 0u64;
-        let Ok(mut guard) = self.inner.write() else {
-            return 0;
-        };
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| anyhow::anyhow!("kv store lock poisoned"))?;
         for key in keys {
             let Some(entry) = guard.get_mut(*key) else {
                 continue;
@@ -236,7 +290,7 @@ impl KvEngine for KvStore {
                 inserted_latest = inserted_latest.saturating_add(1);
             }
         }
-        inserted_latest
+        Ok(inserted_latest)
     }
 }
 
@@ -358,26 +412,25 @@ impl KvEngine for FjallEngine {
     }
 
     /// Insert a versioned value (initially invisible) into the versions partition.
-    fn set(&self, key: &[u8], value: &[u8], version: Version) {
-        let _guard = match self.lock.write() {
-            Ok(guard) => guard,
-            // If the lock is poisoned, skip the write rather than panic.
-            Err(_) => return,
-        };
+    fn set(&self, key: &[u8], value: &[u8], version: Version) -> anyhow::Result<()> {
+        let _guard = self
+            .lock
+            .write()
+            .map_err(|_| anyhow::anyhow!("fjall kv lock poisoned"))?;
         let entry_key = encode_version_key(key, version);
         let entry_value = encode_version_value(false, value);
-        if let Err(err) = self.versions.insert(entry_key, entry_value) {
-            warn!(error = ?err, "fjall kv write failed");
-        }
+        self.versions
+            .insert(entry_key, entry_value)
+            .map_err(|err| anyhow::anyhow!(err).context("fjall kv write failed"))?;
+        Ok(())
     }
 
     /// Batch insert multiple versioned values in one Fjall transaction.
-    fn set_batch(&self, items: &[(&[u8], &[u8], Version)]) {
-        let _guard = match self.lock.write() {
-            Ok(guard) => guard,
-            // If the lock is poisoned, skip the write rather than panic.
-            Err(_) => return,
-        };
+    fn set_batch(&self, items: &[(&[u8], &[u8], Version)]) -> anyhow::Result<()> {
+        let _guard = self
+            .lock
+            .write()
+            .map_err(|_| anyhow::anyhow!("fjall kv lock poisoned"))?;
 
         let mut batch = self.keyspace.batch();
         for (key, value, version) in items {
@@ -386,35 +439,108 @@ impl KvEngine for FjallEngine {
             batch.insert(&self.versions, entry_key, entry_value);
         }
 
-        if let Err(err) = batch.commit() {
-            warn!(error = ?err, "fjall kv batch write failed");
+        batch
+            .commit()
+            .map_err(|err| anyhow::anyhow!(err).context("fjall kv batch write failed"))?;
+        Ok(())
+    }
+
+    /// Apply committed values as visible and update the latest index in one Fjall batch.
+    fn apply_committed_batch(&self, items: &[(&[u8], &[u8], Version)]) -> anyhow::Result<u64> {
+        if items.is_empty() {
+            return Ok(0);
         }
+
+        let _guard = self
+            .lock
+            .write()
+            .map_err(|_| anyhow::anyhow!("fjall kv lock poisoned"))?;
+
+        struct LatestCandidate {
+            current: Option<Version>,
+            item_idx: usize,
+            version: Option<Version>,
+            had_latest: bool,
+        }
+
+        let mut batch = self.keyspace.batch();
+        let mut latest_by_key: HashMap<Vec<u8>, LatestCandidate> =
+            HashMap::with_capacity(items.len());
+
+        for (idx, (key, value, version)) in items.iter().enumerate() {
+            let entry_key = encode_version_key(key, *version);
+            let entry_value = encode_version_value(true, value);
+            batch.insert(&self.versions, entry_key, entry_value);
+
+            match latest_by_key.entry((*key).to_vec()) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let candidate = entry.get_mut();
+                    let base = candidate.version.or(candidate.current);
+                    if should_update_latest(base, *version) {
+                        candidate.item_idx = idx;
+                        candidate.version = Some(*version);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let current = match self.latest.get(*key) {
+                        Ok(Some(bytes)) => Some(decode_latest_version(&bytes)?),
+                        Ok(None) => None,
+                        Err(err) => {
+                            return Err(anyhow::anyhow!(err).context("fjall kv latest read failed"));
+                        }
+                    };
+                    let mut candidate = LatestCandidate {
+                        current,
+                        item_idx: idx,
+                        version: None,
+                        had_latest: current.is_some(),
+                    };
+                    if should_update_latest(current, *version) {
+                        candidate.version = Some(*version);
+                    }
+                    entry.insert(candidate);
+                }
+            }
+        }
+
+        let mut inserted_latest = 0u64;
+        for (key, candidate) in latest_by_key {
+            let Some(version) = candidate.version else {
+                continue;
+            };
+            let value = items[candidate.item_idx].1;
+            if !candidate.had_latest {
+                inserted_latest = inserted_latest.saturating_add(1);
+            }
+            batch.insert(&self.latest, key, encode_latest_value(version, value));
+        }
+
+        batch
+            .commit()
+            .map_err(|err| anyhow::anyhow!(err).context("fjall kv committed batch failed"))?;
+        Ok(inserted_latest)
     }
 
     /// Mark a version visible and update the latest index if needed.
-    fn mark_visible(&self, key: &[u8], version: Version) -> bool {
-        let _guard = match self.lock.write() {
-            Ok(guard) => guard,
-            // If the lock is poisoned, skip the update rather than panic.
-            Err(_) => return false,
-        };
+    fn mark_visible(&self, key: &[u8], version: Version) -> anyhow::Result<bool> {
+        let _guard = self
+            .lock
+            .write()
+            .map_err(|_| anyhow::anyhow!("fjall kv lock poisoned"))?;
         let entry_key = encode_version_key(key, version);
         let entry_value = match self.versions.get(&entry_key) {
             Ok(Some(bytes)) => bytes,
             // Nothing to mark if the version does not exist.
-            Ok(None) => return false,
+            Ok(None) => return Ok(false),
             Err(err) => {
-                warn!(error = ?err, "fjall kv read failed");
-                return false;
+                return Err(anyhow::anyhow!(err).context("fjall kv read failed"));
             }
         };
 
-        let Ok((visible, value)) = decode_version_value(&entry_value) else {
-            return false;
-        };
+        let (visible, value) = decode_version_value(&entry_value)?;
         // Skip updates if the entry is already visible.
         if visible {
-            return false;
+            return Ok(false);
         }
 
         let mut batch = self.keyspace.batch();
@@ -425,11 +551,10 @@ impl KvEngine for FjallEngine {
         );
 
         let latest_current = match self.latest.get(key) {
-            Ok(Some(bytes)) => decode_latest_value(&bytes).ok().map(|(cur, _)| cur),
+            Ok(Some(bytes)) => Some(decode_latest_version(&bytes)?),
             Ok(None) => None,
             Err(err) => {
-                warn!(error = ?err, "fjall kv latest read failed");
-                return false;
+                return Err(anyhow::anyhow!(err).context("fjall kv latest read failed"));
             }
         };
         let had_latest = latest_current.is_some();
@@ -443,13 +568,7 @@ impl KvEngine for FjallEngine {
         //
         // If group ids differ, treat the newly visible value as newer for the
         // purpose of the latest index.
-        let should_update_latest = latest_current.map_or(true, |cur| {
-            if txn_group_id(cur.txn_id) != txn_group_id(version.txn_id) {
-                true
-            } else {
-                version >= cur
-            }
-        });
+        let should_update_latest = should_update_latest(latest_current, version);
         let mut inserted_latest = false;
         if should_update_latest {
             inserted_latest = !had_latest;
@@ -460,11 +579,10 @@ impl KvEngine for FjallEngine {
             );
         }
 
-        if let Err(err) = batch.commit() {
-            warn!(error = ?err, "fjall kv mark visible failed");
-            return false;
-        }
-        inserted_latest
+        batch
+            .commit()
+            .map_err(|err| anyhow::anyhow!(err).context("fjall kv mark visible failed"))?;
+        Ok(inserted_latest)
     }
 
     /// Mark many keys visible with one Fjall batch commit.
@@ -474,7 +592,7 @@ impl KvEngine for FjallEngine {
     ///
     /// Design:
     /// - Deduplicates borrowed keys to avoid duplicate writes/counting.
-    /// - Falls back to per-key updates only if the batch commit fails.
+    /// - Returns storage errors so the executor can retry without advancing.
     ///
     /// Inputs:
     /// - `keys`: borrowed key slices.
@@ -482,9 +600,9 @@ impl KvEngine for FjallEngine {
     ///
     /// Outputs:
     /// - Count of keys that gained a latest entry.
-    fn mark_visible_batch(&self, keys: &[&[u8]], version: Version) -> u64 {
+    fn mark_visible_batch(&self, keys: &[&[u8]], version: Version) -> anyhow::Result<u64> {
         if keys.is_empty() {
-            return 0;
+            return Ok(0);
         }
 
         // Skip duplicate keys in the same command to avoid duplicate work and
@@ -499,95 +617,69 @@ impl KvEngine for FjallEngine {
             }
         }
         if unique_keys.is_empty() {
-            return 0;
+            return Ok(0);
         }
 
-        let mut fallback = false;
         let mut inserted_latest = 0u64;
-        {
-            let _guard = match self.lock.write() {
-                Ok(guard) => guard,
-                // If the lock is poisoned, skip the update rather than panic.
-                Err(_) => return 0,
+        let _guard = self
+            .lock
+            .write()
+            .map_err(|_| anyhow::anyhow!("fjall kv lock poisoned"))?;
+
+        let mut batch = self.keyspace.batch();
+        let mut updates = 0usize;
+        for &key in &unique_keys {
+            let entry_key = encode_version_key(key, version);
+            let entry_value = match self.versions.get(&entry_key) {
+                Ok(Some(bytes)) => bytes,
+                // Nothing to mark if the version does not exist.
+                Ok(None) => continue,
+                Err(err) => {
+                    return Err(anyhow::anyhow!(err).context("fjall kv read failed"));
+                }
             };
 
-            let mut batch = self.keyspace.batch();
-            let mut updates = 0usize;
-            for &key in &unique_keys {
-                let entry_key = encode_version_key(key, version);
-                let entry_value = match self.versions.get(&entry_key) {
-                    Ok(Some(bytes)) => bytes,
-                    // Nothing to mark if the version does not exist.
-                    Ok(None) => continue,
-                    Err(err) => {
-                        warn!(error = ?err, "fjall kv read failed");
-                        continue;
-                    }
-                };
+            let (visible, value) = decode_version_value(&entry_value)?;
+            // Skip updates if the entry is already visible.
+            if visible {
+                continue;
+            }
 
-                let Ok((visible, value)) = decode_version_value(&entry_value) else {
-                    continue;
-                };
-                // Skip updates if the entry is already visible.
-                if visible {
-                    continue;
+            let latest_current = match self.latest.get(key) {
+                Ok(Some(bytes)) => Some(decode_latest_version(&bytes)?),
+                Ok(None) => None,
+                Err(err) => {
+                    return Err(anyhow::anyhow!(err).context("fjall kv latest read failed"));
                 }
+            };
+            let had_latest = latest_current.is_some();
+            let should_update_latest = should_update_latest(latest_current, version);
 
-                let latest_current = match self.latest.get(key) {
-                    Ok(Some(bytes)) => decode_latest_value(&bytes).ok().map(|(cur, _)| cur),
-                    Ok(None) => None,
-                    Err(err) => {
-                        warn!(error = ?err, "fjall kv latest read failed");
-                        continue;
-                    }
-                };
-                let had_latest = latest_current.is_some();
-                let should_update_latest = latest_current.map_or(true, |cur| {
-                    if txn_group_id(cur.txn_id) != txn_group_id(version.txn_id) {
-                        true
-                    } else {
-                        version >= cur
-                    }
-                });
-
+            batch.insert(
+                &self.versions,
+                entry_key,
+                encode_version_value(true, &value),
+            );
+            if should_update_latest {
+                if !had_latest {
+                    inserted_latest = inserted_latest.saturating_add(1);
+                }
                 batch.insert(
-                    &self.versions,
-                    entry_key,
-                    encode_version_value(true, &value),
+                    &self.latest,
+                    key.to_vec(),
+                    encode_latest_value(version, &value),
                 );
-                if should_update_latest {
-                    if !had_latest {
-                        inserted_latest = inserted_latest.saturating_add(1);
-                    }
-                    batch.insert(
-                        &self.latest,
-                        key.to_vec(),
-                        encode_latest_value(version, &value),
-                    );
-                }
-                updates = updates.saturating_add(1);
             }
-
-            if updates == 0 {
-                return 0;
-            }
-            if let Err(err) = batch.commit() {
-                warn!(error = ?err, "fjall kv batch mark visible failed; falling back to per-key visibility updates");
-                fallback = true;
-            }
+            updates = updates.saturating_add(1);
         }
 
-        if !fallback {
-            return inserted_latest;
+        if updates == 0 {
+            return Ok(0);
         }
-
-        let mut recovered_inserted = 0u64;
-        for &key in &unique_keys {
-            if self.mark_visible(key, version) {
-                recovered_inserted = recovered_inserted.saturating_add(1);
-            }
-        }
-        recovered_inserted
+        batch
+            .commit()
+            .map_err(|err| anyhow::anyhow!(err).context("fjall kv batch mark visible failed"))?;
+        Ok(inserted_latest)
     }
 }
 
@@ -653,14 +745,14 @@ impl KvEngine for RoutedKvEngine {
         results
     }
 
-    fn set(&self, key: &[u8], value: &[u8], version: Version) {
+    fn set(&self, key: &[u8], value: &[u8], version: Version) -> anyhow::Result<()> {
         let shard = self.shard_for_key(key);
-        self.shards[shard].set(key, value, version);
+        self.shards[shard].set(key, value, version)
     }
 
-    fn set_batch(&self, items: &[(&[u8], &[u8], Version)]) {
+    fn set_batch(&self, items: &[(&[u8], &[u8], Version)]) -> anyhow::Result<()> {
         if items.is_empty() {
-            return;
+            return Ok(());
         }
         let mut by_shard: Vec<Vec<usize>> = vec![Vec::new(); self.shards.len()];
         for (idx, (key, _, _)) in items.iter().enumerate() {
@@ -676,11 +768,41 @@ impl KvEngine for RoutedKvEngine {
                 let (key, value, version) = items[idx];
                 batch.push((key, value, version));
             }
-            self.shards[shard].set_batch(&batch);
+            self.shards[shard].set_batch(&batch)?;
         }
+        Ok(())
     }
 
-    fn mark_visible(&self, key: &[u8], version: Version) -> bool {
+    fn apply_committed_batch(&self, items: &[(&[u8], &[u8], Version)]) -> anyhow::Result<u64> {
+        if items.is_empty() {
+            return Ok(0);
+        }
+        if self.shards.len() == 1 {
+            return self.shards[0].apply_committed_batch(items);
+        }
+
+        let mut by_shard: Vec<Vec<usize>> = vec![Vec::new(); self.shards.len()];
+        for (idx, (key, _, _)) in items.iter().enumerate() {
+            let shard = self.shard_for_key(key);
+            by_shard[shard].push(idx);
+        }
+
+        let mut inserted = 0u64;
+        for (shard, indices) in by_shard.into_iter().enumerate() {
+            if indices.is_empty() {
+                continue;
+            }
+            let mut batch = Vec::with_capacity(indices.len());
+            for idx in indices {
+                let (key, value, version) = items[idx];
+                batch.push((key, value, version));
+            }
+            inserted = inserted.saturating_add(self.shards[shard].apply_committed_batch(&batch)?);
+        }
+        Ok(inserted)
+    }
+
+    fn mark_visible(&self, key: &[u8], version: Version) -> anyhow::Result<bool> {
         let shard = self.shard_for_key(key);
         self.shards[shard].mark_visible(key, version)
     }
@@ -700,9 +822,9 @@ impl KvEngine for RoutedKvEngine {
     ///
     /// Outputs:
     /// - Total inserted-latest count across all shards.
-    fn mark_visible_batch(&self, keys: &[&[u8]], version: Version) -> u64 {
+    fn mark_visible_batch(&self, keys: &[&[u8]], version: Version) -> anyhow::Result<u64> {
         if keys.is_empty() {
-            return 0;
+            return Ok(0);
         }
         if self.shards.len() == 1 {
             return self.shards[0].mark_visible_batch(keys, version);
@@ -725,9 +847,9 @@ impl KvEngine for RoutedKvEngine {
                 shard_keys.push(keys[idx]);
             }
             inserted = inserted
-                .saturating_add(self.shards[shard].mark_visible_batch(&shard_keys, version));
+                .saturating_add(self.shards[shard].mark_visible_batch(&shard_keys, version)?);
         }
-        inserted
+        Ok(inserted)
     }
 }
 
@@ -796,16 +918,16 @@ impl KvEngine for ShardedKvEngine {
     }
 
     /// Delegate a write to the chosen shard.
-    fn set(&self, key: &[u8], value: &[u8], version: Version) {
+    fn set(&self, key: &[u8], value: &[u8], version: Version) -> anyhow::Result<()> {
         let shard = self.shard_for_key(key);
-        self.shards[shard].set(key, value, version);
+        self.shards[shard].set(key, value, version)
     }
 
     /// Batch writes across shards while preserving per-shard ordering.
-    fn set_batch(&self, items: &[(&[u8], &[u8], Version)]) {
+    fn set_batch(&self, items: &[(&[u8], &[u8], Version)]) -> anyhow::Result<()> {
         if items.is_empty() {
             // Nothing to write, so avoid shard work.
-            return;
+            return Ok(());
         }
         let mut by_shard: Vec<Vec<usize>> = vec![Vec::new(); self.shards.len()];
         for (idx, (key, _, _)) in items.iter().enumerate() {
@@ -822,12 +944,42 @@ impl KvEngine for ShardedKvEngine {
                 let (key, value, version) = items[idx];
                 batch.push((key, value, version));
             }
-            self.shards[shard].set_batch(&batch);
+            self.shards[shard].set_batch(&batch)?;
         }
+        Ok(())
+    }
+
+    fn apply_committed_batch(&self, items: &[(&[u8], &[u8], Version)]) -> anyhow::Result<u64> {
+        if items.is_empty() {
+            return Ok(0);
+        }
+        if self.shards.len() == 1 {
+            return self.shards[0].apply_committed_batch(items);
+        }
+
+        let mut by_shard: Vec<Vec<usize>> = vec![Vec::new(); self.shards.len()];
+        for (idx, (key, _, _)) in items.iter().enumerate() {
+            let shard = self.shard_for_key(key);
+            by_shard[shard].push(idx);
+        }
+
+        let mut inserted = 0u64;
+        for (shard, indices) in by_shard.into_iter().enumerate() {
+            if indices.is_empty() {
+                continue;
+            }
+            let mut batch = Vec::with_capacity(indices.len());
+            for idx in indices {
+                let (key, value, version) = items[idx];
+                batch.push((key, value, version));
+            }
+            inserted = inserted.saturating_add(self.shards[shard].apply_committed_batch(&batch)?);
+        }
+        Ok(inserted)
     }
 
     /// Delegate visibility updates to the chosen shard.
-    fn mark_visible(&self, key: &[u8], version: Version) -> bool {
+    fn mark_visible(&self, key: &[u8], version: Version) -> anyhow::Result<bool> {
         let shard = self.shard_for_key(key);
         self.shards[shard].mark_visible(key, version)
     }
@@ -848,9 +1000,9 @@ impl KvEngine for ShardedKvEngine {
     ///
     /// Outputs:
     /// - Total inserted-latest count across all shards.
-    fn mark_visible_batch(&self, keys: &[&[u8]], version: Version) -> u64 {
+    fn mark_visible_batch(&self, keys: &[&[u8]], version: Version) -> anyhow::Result<u64> {
         if keys.is_empty() {
-            return 0;
+            return Ok(0);
         }
         if self.shards.len() == 1 {
             return self.shards[0].mark_visible_batch(keys, version);
@@ -873,9 +1025,9 @@ impl KvEngine for ShardedKvEngine {
                 shard_keys.push(keys[idx]);
             }
             inserted = inserted
-                .saturating_add(self.shards[shard].mark_visible_batch(&shard_keys, version));
+                .saturating_add(self.shards[shard].mark_visible_batch(&shard_keys, version)?);
         }
-        inserted
+        Ok(inserted)
     }
 }
 
@@ -1085,6 +1237,30 @@ pub(crate) fn decode_latest_value(data: &[u8]) -> anyhow::Result<(Version, Vec<u
     ))
 }
 
+/// Decode only the version prefix from a latest-index value.
+fn decode_latest_version(data: &[u8]) -> anyhow::Result<Version> {
+    let mut offset = 0usize;
+    let seq = read_u64(data, &mut offset)?;
+    let node_id = read_u64(data, &mut offset)?;
+    let counter = read_u64(data, &mut offset)?;
+    let _len = read_u32(data, &mut offset)?;
+    Ok(Version {
+        seq,
+        txn_id: TxnId { node_id, counter },
+    })
+}
+
+/// Return whether `candidate` should replace the current latest index version.
+fn should_update_latest(current: Option<Version>, candidate: Version) -> bool {
+    current.map_or(true, |cur| {
+        if txn_group_id(cur.txn_id) != txn_group_id(candidate.txn_id) {
+            true
+        } else {
+            candidate >= cur
+        }
+    })
+}
+
 /// State machine that ignores commands (used for membership group).
 pub struct NoopStateMachine;
 
@@ -1095,7 +1271,9 @@ impl StateMachine for NoopStateMachine {
     }
 
     /// No-op apply for ignored commands.
-    fn apply(&self, _data: &[u8], _meta: ExecMeta) {}
+    fn apply(&self, _data: &[u8], _meta: ExecMeta) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// State machine that applies KV commands to a `KvEngine`.
@@ -1144,6 +1322,15 @@ impl KvStateMachine {
             visibility_hook,
         }
     }
+
+    fn emit_visibility_delta(&self, inserted_latest: u64) {
+        let visibility_delta = inserted_latest.min(i64::MAX as u64) as i64;
+        if visibility_delta != 0 {
+            if let Some(hook) = &self.visibility_hook {
+                hook(visibility_delta);
+            }
+        }
+    }
 }
 
 impl StateMachine for KvStateMachine {
@@ -1152,34 +1339,28 @@ impl StateMachine for KvStateMachine {
         command_keys(data)
     }
 
-    /// Apply a single command to the KV engine, logging on failure.
-    fn apply(&self, data: &[u8], meta: ExecMeta) {
+    /// Apply a single command to the KV engine.
+    fn apply(&self, data: &[u8], meta: ExecMeta) -> anyhow::Result<()> {
         let _guard = self.split_lock.as_ref().map(|l| l.read().unwrap());
         match decode_membership_reconfig_command(data) {
             Ok(Some(reconfig)) => {
                 if let Some(hook) = &self.membership_hook {
-                    if let Err(err) = hook(reconfig) {
-                        tracing::warn!(error = ?err, "failed to apply committed membership update");
-                    }
+                    hook(reconfig)?;
                 }
-                return;
+                return Ok(());
             }
             Ok(None) => {}
             Err(err) => {
-                tracing::warn!(
-                    error = ?err,
-                    "failed to decode membership reconfiguration command"
-                );
-                return;
+                return Err(err).context("failed to decode membership reconfiguration command")
             }
         }
-        if let Err(err) = apply_kv_command(self.kv.as_ref(), data, meta.into()) {
-            tracing::warn!(error = ?err, "failed to apply kv command");
-        }
+        let inserted_latest = apply_kv_command(self.kv.as_ref(), data, meta.into())?;
+        self.emit_visibility_delta(inserted_latest);
+        Ok(())
     }
 
     /// Apply a batch of commands, coalescing SETs for efficiency.
-    fn apply_batch(&self, items: &[(Bytes, ExecMeta)]) {
+    fn apply_batch(&self, items: &[(Bytes, ExecMeta)]) -> anyhow::Result<()> {
         let _guard = self.split_lock.as_ref().map(|l| l.read().unwrap());
         let mut sets: Vec<(&[u8], &[u8], Version)> = Vec::new();
         for (data, meta) in items {
@@ -1191,52 +1372,25 @@ impl StateMachine for KvStateMachine {
             match data[0] {
                 CMD_SET => {
                     let mut offset = 1;
-                    if let Ok(key_len) = read_u32(data, &mut offset) {
-                        let key_len = key_len as usize;
-                        if offset + key_len > data.len() {
-                            // Malformed command; skip this entry.
-                            continue;
-                        }
-                        let key = &data[offset..offset + key_len];
-                        offset += key_len;
-                        if let Ok(value_len) = read_u32(data, &mut offset) {
-                            let value_len = value_len as usize;
-                            if offset + value_len > data.len() {
-                                // Malformed command; skip this entry.
-                                continue;
-                            }
-                            let value = &data[offset..offset + value_len];
-                            sets.push((key, value, version));
-                        }
-                    }
+                    let key_len = read_u32(data, &mut offset)? as usize;
+                    anyhow::ensure!(offset + key_len <= data.len(), "short key");
+                    let key = &data[offset..offset + key_len];
+                    offset += key_len;
+                    let value_len = read_u32(data, &mut offset)? as usize;
+                    anyhow::ensure!(offset + value_len <= data.len(), "short value");
+                    let value = &data[offset..offset + value_len];
+                    sets.push((key, value, version));
                 }
                 CMD_BATCH_SET => {
                     let mut offset = 1;
-                    let Ok(count) = read_u32(data, &mut offset) else {
-                        // Malformed batch header; skip this entry.
-                        continue;
-                    };
+                    let count = read_u32(data, &mut offset)?;
                     for _ in 0..count {
-                        let Ok(key_len) = read_u32(data, &mut offset) else {
-                            // Truncated entry; stop scanning this batch.
-                            break;
-                        };
-                        let key_len = key_len as usize;
-                        if offset + key_len > data.len() {
-                            // Truncated entry; stop scanning this batch.
-                            break;
-                        }
+                        let key_len = read_u32(data, &mut offset)? as usize;
+                        anyhow::ensure!(offset + key_len <= data.len(), "short key");
                         let key = &data[offset..offset + key_len];
                         offset += key_len;
-                        let Ok(value_len) = read_u32(data, &mut offset) else {
-                            // Truncated entry; stop scanning this batch.
-                            break;
-                        };
-                        let value_len = value_len as usize;
-                        if offset + value_len > data.len() {
-                            // Truncated entry; stop scanning this batch.
-                            break;
-                        }
+                        let value_len = read_u32(data, &mut offset)? as usize;
+                        anyhow::ensure!(offset + value_len <= data.len(), "short value");
                         let value = &data[offset..offset + value_len];
                         offset += value_len;
                         sets.push((key, value, version));
@@ -1248,9 +1402,10 @@ impl StateMachine for KvStateMachine {
         }
 
         if !sets.is_empty() {
-            // Flush coalesced SETs in one engine batch.
-            self.kv.set_batch(&sets);
+            let inserted_latest = self.kv.apply_committed_batch(&sets)?;
+            self.emit_visibility_delta(inserted_latest);
         }
+        Ok(())
     }
 
     /// Execute a read command without mutating state.
@@ -1320,30 +1475,25 @@ impl StateMachine for KvStateMachine {
     ///
     /// Outputs:
     /// - Updates engine visibility state and emits optional visibility delta.
-    fn mark_visible(&self, data: &[u8], meta: ExecMeta) {
+    fn mark_visible(&self, data: &[u8], meta: ExecMeta) -> anyhow::Result<()> {
         let _guard = self.split_lock.as_ref().map(|l| l.read().unwrap());
         if data.is_empty() {
             // Ignore empty commands to avoid parsing errors.
-            return;
+            return Ok(());
         }
         let version = Version::from(meta);
-        let keys = match command_keys(data) {
-            Ok(keys) => keys,
-            Err(err) => {
-                tracing::warn!(error = ?err, "failed to parse command keys for mark_visible");
-                return;
-            }
-        };
+        let keys = command_keys(data).context("failed to parse command keys for mark_visible")?;
         let key_refs = keys.writes.iter().map(|k| k.as_slice()).collect::<Vec<_>>();
         let visibility_delta = self
             .kv
-            .mark_visible_batch(&key_refs, version)
+            .mark_visible_batch(&key_refs, version)?
             .min(i64::MAX as u64) as i64;
         if visibility_delta != 0 {
             if let Some(hook) = &self.visibility_hook {
                 hook(visibility_delta);
             }
         }
+        Ok(())
     }
 }
 
@@ -1492,7 +1642,7 @@ pub fn decode_batch_get_result(data: &[u8]) -> anyhow::Result<Vec<Option<Vec<u8>
 }
 
 /// Apply a KV command to a `KvEngine` (write-only operations).
-fn apply_kv_command(kv: &dyn KvEngine, data: &[u8], version: Version) -> anyhow::Result<()> {
+fn apply_kv_command(kv: &dyn KvEngine, data: &[u8], version: Version) -> anyhow::Result<u64> {
     anyhow::ensure!(!data.is_empty(), "empty command");
     match data[0] {
         CMD_SET => {
@@ -1506,12 +1656,12 @@ fn apply_kv_command(kv: &dyn KvEngine, data: &[u8], version: Version) -> anyhow:
             anyhow::ensure!(offset + value_len <= data.len(), "short value");
             let value = &data[offset..offset + value_len];
 
-            kv.set(key, value, version);
-            Ok(())
+            kv.apply_committed_batch(&[(key, value, version)])
         }
         CMD_BATCH_SET => {
             let mut offset = 1;
             let count = read_u32(data, &mut offset)? as usize;
+            let mut sets = Vec::with_capacity(count);
             for _ in 0..count {
                 let key_len = read_u32(data, &mut offset)? as usize;
                 anyhow::ensure!(offset + key_len <= data.len(), "short key");
@@ -1523,14 +1673,14 @@ fn apply_kv_command(kv: &dyn KvEngine, data: &[u8], version: Version) -> anyhow:
                 let value = &data[offset..offset + value_len];
                 offset += value_len;
 
-                kv.set(key, value, version);
+                sets.push((key, value, version));
             }
-            Ok(())
+            kv.apply_committed_batch(&sets)
         }
         // GET commands are no-ops for write application.
-        CMD_BATCH_GET => Ok(()),
-        CMD_GET => Ok(()),
-        CMD_MEMBERSHIP_RECONFIG => Ok(()),
+        CMD_BATCH_GET => Ok(0),
+        CMD_GET => Ok(0),
+        CMD_MEMBERSHIP_RECONFIG => Ok(0),
         // Reject unknown command tags to avoid corrupting state.
         other => anyhow::bail!("unknown command tag {other}"),
     }
@@ -1679,7 +1829,8 @@ mod tests {
                     counter: 1,
                 },
             },
-        );
+        )
+        .expect("apply membership");
 
         let guard = seen.lock().expect("lock");
         assert_eq!(guard.len(), 1);
@@ -1694,6 +1845,8 @@ mod tests {
 
     #[derive(Default)]
     struct BatchTrackingEngine {
+        apply_committed_batch_calls: AtomicU64,
+        apply_committed_batch_items: AtomicU64,
         mark_visible_calls: AtomicU64,
         mark_visible_batch_calls: AtomicU64,
         mark_visible_batch_items: AtomicU64,
@@ -1712,20 +1865,63 @@ mod tests {
             vec![None; keys.len()]
         }
 
-        fn set(&self, _key: &[u8], _value: &[u8], _version: Version) {}
-
-        fn mark_visible(&self, _key: &[u8], _version: Version) -> bool {
-            self.mark_visible_calls.fetch_add(1, Ordering::Relaxed);
-            true
+        fn set(&self, _key: &[u8], _value: &[u8], _version: Version) -> anyhow::Result<()> {
+            Ok(())
         }
 
-        fn mark_visible_batch(&self, keys: &[&[u8]], _version: Version) -> u64 {
+        fn apply_committed_batch(&self, items: &[(&[u8], &[u8], Version)]) -> anyhow::Result<u64> {
+            self.apply_committed_batch_calls
+                .fetch_add(1, Ordering::Relaxed);
+            self.apply_committed_batch_items
+                .fetch_add(items.len() as u64, Ordering::Relaxed);
+            Ok(items.len() as u64)
+        }
+
+        fn mark_visible(&self, _key: &[u8], _version: Version) -> anyhow::Result<bool> {
+            self.mark_visible_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(true)
+        }
+
+        fn mark_visible_batch(&self, keys: &[&[u8]], _version: Version) -> anyhow::Result<u64> {
             self.mark_visible_batch_calls
                 .fetch_add(1, Ordering::Relaxed);
             self.mark_visible_batch_items
                 .fetch_add(keys.len() as u64, Ordering::Relaxed);
-            keys.len() as u64
+            Ok(keys.len() as u64)
         }
+    }
+
+    #[test]
+    fn kv_state_machine_apply_batch_uses_committed_publish_api() {
+        let engine = Arc::new(BatchTrackingEngine::default());
+        let sm = KvStateMachine::new(engine.clone(), None);
+        let payload = Bytes::from(encode_batch_set(&[
+            (b"k1".to_vec(), b"v1".to_vec()),
+            (b"k2".to_vec(), b"v2".to_vec()),
+            (b"k3".to_vec(), b"v3".to_vec()),
+        ]));
+        sm.apply_batch(&[(
+            payload,
+            ExecMeta {
+                seq: 7,
+                txn_id: TxnId {
+                    node_id: 1,
+                    counter: 99,
+                },
+            },
+        )])
+        .expect("apply batch");
+
+        assert_eq!(
+            engine.apply_committed_batch_calls.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            engine.apply_committed_batch_items.load(Ordering::Relaxed),
+            3
+        );
+        assert_eq!(engine.mark_visible_batch_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(engine.mark_visible_calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -1746,7 +1942,8 @@ mod tests {
                     counter: 99,
                 },
             },
-        );
+        )
+        .expect("mark visible");
 
         assert_eq!(engine.mark_visible_batch_calls.load(Ordering::Relaxed), 1);
         assert_eq!(engine.mark_visible_batch_items.load(Ordering::Relaxed), 3);
@@ -1766,14 +1963,15 @@ mod tests {
                     counter: 1,
                 },
             },
-        );
+        )
+        .expect("mark visible empty");
 
         assert_eq!(engine.mark_visible_batch_calls.load(Ordering::Relaxed), 0);
         assert_eq!(engine.mark_visible_calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]
-    fn kv_state_machine_mark_visible_skips_malformed_batch_set() {
+    fn kv_state_machine_mark_visible_rejects_malformed_batch_set() {
         let engine = Arc::new(BatchTrackingEngine::default());
         let sm = KvStateMachine::new(engine.clone(), None);
 
@@ -1786,16 +1984,19 @@ mod tests {
         malformed.extend_from_slice(b"k1");
         malformed.extend_from_slice(&4u32.to_be_bytes()); // value len
 
-        sm.mark_visible(
-            &malformed,
-            ExecMeta {
-                seq: 2,
-                txn_id: TxnId {
-                    node_id: 1,
-                    counter: 2,
+        let err = sm
+            .mark_visible(
+                &malformed,
+                ExecMeta {
+                    seq: 2,
+                    txn_id: TxnId {
+                        node_id: 1,
+                        counter: 2,
+                    },
                 },
-            },
-        );
+            )
+            .expect_err("malformed mark_visible should fail");
+        assert!(err.to_string().contains("failed to parse command keys"));
 
         assert_eq!(engine.mark_visible_batch_calls.load(Ordering::Relaxed), 0);
         assert_eq!(engine.mark_visible_calls.load(Ordering::Relaxed), 0);

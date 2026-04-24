@@ -1140,20 +1140,17 @@ impl LocalRangeStats {
         } else {
             Arc::new(FjallEngine::open_shard(self.keyspace.clone(), shard_index)?)
         };
-        let mut applied = 0u64;
-        let mut inserted_latest = 0i64;
+        let mut items = Vec::with_capacity(entries.len());
         for entry in entries {
             let in_start = start_key.is_empty() || entry.key.as_slice() >= start_key;
             let in_end = end_key.is_empty() || entry.key.as_slice() < end_key;
             if !in_start || !in_end {
                 continue;
             }
-            engine.set(&entry.key, &entry.value, entry.version);
-            if engine.mark_visible(&entry.key, entry.version) {
-                inserted_latest += 1;
-            }
-            applied = applied.saturating_add(1);
+            items.push((entry.key.as_slice(), entry.value.as_slice(), entry.version));
         }
+        let applied = items.len() as u64;
+        let inserted_latest = engine.apply_committed_batch(&items)?.min(i64::MAX as u64) as i64;
         if inserted_latest != 0 {
             self.on_visible_insertions(shard_index, inserted_latest);
         }

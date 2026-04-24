@@ -417,10 +417,10 @@ struct CommitLogWork {
     enqueued_at: std::time::Instant,
 }
 
-#[derive(Clone, Copy, Debug)]
 struct ApplyResult {
     apply_us: u64,
     visible_us: u64,
+    result: anyhow::Result<()>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1011,23 +1011,14 @@ impl Group {
                     // Apply batches off the async runtime to avoid blocking.
                     while let Ok(work) = rx.recv() {
                         let apply_start = std::time::Instant::now();
-                        sm.apply_batch(&work.batch);
+                        let result = sm.apply_batch(&work.batch);
                         let apply_us =
                             apply_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
 
-                        let visible_start = std::time::Instant::now();
-                        for (command, meta) in &work.batch {
-                            sm.mark_visible(command, *meta);
-                        }
-                        let visible_us = visible_start
-                            .elapsed()
-                            .as_micros()
-                            .min(u128::from(u64::MAX))
-                            as u64;
-
                         let _ = work.tx.send(ApplyResult {
                             apply_us,
-                            visible_us,
+                            visible_us: 0,
+                            result,
                         });
                     }
                 })
@@ -1355,7 +1346,7 @@ impl Group {
                 txn_id,
                 seq: entry.seq,
             },
-        );
+        )?;
 
         Ok(true)
     }
@@ -4080,6 +4071,22 @@ impl Group {
         res
     }
 
+    async fn restore_apply_items_for_retry(&self, items: &[ApplyItem]) {
+        let mut state = self.state.lock().await;
+        for item in items {
+            let Some(rec) = state.records.get_mut(&item.id) else {
+                continue;
+            };
+            if rec.status != Status::Executing {
+                continue;
+            }
+            rec.status = Status::Committed;
+            rec.updated_at = time::Instant::now();
+            state.insert_committed(item.id, item.seq);
+        }
+        self.executor_notify.notify_one();
+    }
+
     async fn execute_progress_inner(&self) -> anyhow::Result<bool> {
         let _guard = self.execute_lock.lock().await;
 
@@ -4381,20 +4388,12 @@ impl Group {
             let write_batch_len = write_batch.len();
             let apply_inline = |batch: &[(Bytes, ExecMeta)]| -> ApplyResult {
                 let apply_start = time::Instant::now();
-                self.sm.apply_batch(batch);
+                let result = self.sm.apply_batch(batch);
                 let apply_us = apply_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-
-                let visible_start = time::Instant::now();
-                for (command, meta) in batch {
-                    self.sm.mark_visible(command, *meta);
-                }
-                let visible_us = visible_start
-                    .elapsed()
-                    .as_micros()
-                    .min(u128::from(u64::MAX)) as u64;
                 ApplyResult {
                     apply_us,
-                    visible_us,
+                    visible_us: 0,
+                    result,
                 }
             };
 
@@ -4412,6 +4411,7 @@ impl Group {
                             ApplyResult {
                                 apply_us: 0,
                                 visible_us: 0,
+                                result: Err(anyhow::anyhow!("apply worker response dropped")),
                             }
                         }
                     },
@@ -4428,6 +4428,10 @@ impl Group {
             for _ in 0..write_batch_len {
                 self.metrics.record_apply_write(apply_dur);
             }
+            if let Err(err) = result.result {
+                self.restore_apply_items_for_retry(&to_apply).await;
+                return Err(err.context("state machine apply failed"));
+            }
         }
 
         // Some commands intentionally have no read/write keys (for example,
@@ -4442,7 +4446,11 @@ impl Group {
                 txn_id: item.id,
             };
             let start = time::Instant::now();
-            self.sm.apply(&item.command, meta);
+            if let Err(err) = self.sm.apply(&item.command, meta) {
+                self.metrics.record_apply_write(start.elapsed());
+                self.restore_apply_items_for_retry(&to_apply).await;
+                return Err(err.context("state machine apply failed"));
+            }
             self.metrics.record_apply_write(start.elapsed());
         }
 
@@ -5592,7 +5600,9 @@ mod tests {
             })
         }
 
-        fn apply(&self, _data: &[u8], _meta: ExecMeta) {}
+        fn apply(&self, _data: &[u8], _meta: ExecMeta) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
     /// Commit log that blocks durable appends until the test releases it.
