@@ -1239,10 +1239,33 @@ impl Group {
         self.last_committed_for_key_slices(&key_refs).await
     }
 
+    /// Return per-key write barriers used by linearizable reads.
+    ///
+    /// Purpose:
+    /// - Report the highest write this replica knows a read must wait for on
+    ///   each key.
+    ///
+    /// Design:
+    /// - Normally returns committed write hints.
+    /// - In 1RTT fast-path mode, also scans PreAccepted/Accepted write records
+    ///   because such records may already have been ACKed by their coordinator
+    ///   while Commit dissemination is still asynchronous.
+    ///
+    /// Inputs:
+    /// - `keys`: borrowed storage-key slices.
+    ///
+    /// Outputs:
+    /// - One optional `(txn_id, seq)` barrier target per input key.
     pub async fn last_committed_for_key_slices(&self, keys: &[&[u8]]) -> Vec<Option<(TxnId, u64)>> {
         let state = self.state.lock().await;
         keys.iter()
-            .map(|k| state.last_committed_write_by_key.get(*k).copied())
+            .map(|key| {
+                let mut best = state.last_committed_write_by_key.get(*key).copied();
+                if self.config.fast_path_1rtt {
+                    best = fast_path_barrier_write_for_key(&state, key, best);
+                }
+                best
+            })
             .collect()
     }
 
@@ -2618,12 +2641,12 @@ impl Group {
         ReportExecutedResponse { ok: true }
     }
 
-    async fn propose(&self, command: Bytes) -> anyhow::Result<ProposalResult> {
+    async fn propose(self: &Arc<Self>, command: Bytes) -> anyhow::Result<ProposalResult> {
         self.propose_with_deps(command, None).await
     }
 
     async fn propose_read_with_deps(
-        &self,
+        self: &Arc<Self>,
         command: Bytes,
         deps: Vec<(TxnId, u64)>,
     ) -> anyhow::Result<ProposalResult> {
@@ -2631,7 +2654,7 @@ impl Group {
     }
 
     async fn propose_with_deps(
-        &self,
+        self: &Arc<Self>,
         command: Bytes,
         extra_deps: Option<Vec<(TxnId, u64)>>,
     ) -> anyhow::Result<ProposalResult> {
@@ -2946,7 +2969,7 @@ impl Group {
     }
 
     async fn propose_once(
-        &self,
+        self: &Arc<Self>,
         txn_id: TxnId,
         ballot: Ballot,
         command: Bytes,
@@ -3157,8 +3180,33 @@ impl Group {
         }
 
         let commit_start = time::Instant::now();
-        let commit_timings = self
-            .run_commit_round(
+        let fast_ack_1rtt =
+            !needs_execution && fast_path && self.config.fast_path_1rtt && local_is_voter;
+        let commit_timings = if fast_ack_1rtt {
+            let seq = merged.seq;
+            let deps = merged.deps;
+            let local_timings = self
+                .commit_locally_for_fast_ack(
+                    txn_id,
+                    ballot,
+                    command.clone(),
+                    command_digest,
+                    seq,
+                    deps.clone(),
+                )
+                .await?;
+            self.spawn_async_commit_dissemination(
+                txn_id,
+                ballot,
+                command,
+                command_digest,
+                seq,
+                deps,
+                self.config.inline_command_in_accept_commit,
+            );
+            local_timings
+        } else {
+            self.run_commit_round(
                 txn_id,
                 ballot,
                 command,
@@ -3167,7 +3215,8 @@ impl Group {
                 merged.deps,
                 self.config.inline_command_in_accept_commit,
             )
-            .await?;
+            .await?
+        };
         let commit_us = commit_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         if needs_execution {
             let exec_start = time::Instant::now();
@@ -3198,7 +3247,8 @@ impl Group {
             }
             execute_us = execute_us.saturating_add(exec_start.elapsed().as_micros() as u64);
         } else {
-            // Fast-ack writes: return after commit. Execution happens asynchronously.
+            // Write proposals return once the transaction is safely published
+            // for the selected path; execution continues asynchronously.
             self.executor_notify.notify_one();
         }
         if !needs_execution {
@@ -3364,6 +3414,205 @@ impl Group {
             }
 
             time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Publish a fast-path write locally before returning a 1RTT ACK.
+    ///
+    /// Purpose:
+    /// - Preserve the coordinator-side ordering boundary that clients observe:
+    ///   the write is locally `Committed`, present in read-barrier metadata, and
+    ///   queued for execution before the proposal returns success.
+    ///
+    /// Design:
+    /// - Reuses the normal commit RPC handler so WAL durability, command
+    ///   validation, `last_committed` maintenance, and executor notification
+    ///   stay identical to the regular Commit path.
+    /// - Records only local commit timing. Remote Commit fanout is handled by
+    ///   `spawn_async_commit_dissemination`.
+    ///
+    /// Inputs:
+    /// - Final transaction identity, ballot, command digest, sequence, and deps.
+    ///
+    /// Outputs:
+    /// - Local commit timing suitable for proposal metrics.
+    async fn commit_locally_for_fast_ack(
+        &self,
+        txn_id: TxnId,
+        ballot: Ballot,
+        command: Bytes,
+        command_digest: [u8; 32],
+        seq: u64,
+        deps: Vec<TxnId>,
+    ) -> Result<CommitRoundTimings, ProposeOnceError> {
+        let (local, local_timings) = self
+            .rpc_commit_with_timings(CommitRequest {
+                group_id: self.config.group_id,
+                txn_id,
+                ballot,
+                command,
+                command_digest,
+                has_command: true,
+                seq,
+                deps,
+            })
+            .await;
+        if !local.ok {
+            return Err(ProposeOnceError::NoQuorum(anyhow::anyhow!(
+                "local fast-path commit rejected"
+            )));
+        }
+
+        let timings = CommitRoundTimings {
+            local_state_update_us: local_timings.state_update_us,
+            local_durable_wait_us: local_timings.durable_wait_us,
+            local_log_queue_wait_us: local_timings.durable_queue_wait_us,
+            local_log_append_us: local_timings.durable_append_us,
+            local_post_durable_state_update_us: local_timings.post_durable_state_update_us,
+            remote_quorum_wait_us: 0,
+        };
+        self.metrics
+            .record_commit_local_state(Duration::from_micros(timings.local_state_update_us));
+        self.metrics
+            .record_commit_local_durable(Duration::from_micros(timings.local_durable_wait_us));
+        self.metrics
+            .record_commit_local_log_queue(Duration::from_micros(timings.local_log_queue_wait_us));
+        self.metrics
+            .record_commit_local_log_append(Duration::from_micros(timings.local_log_append_us));
+        self.metrics
+            .record_commit_local_post_durable_state(Duration::from_micros(
+                timings.local_post_durable_state_update_us,
+            ));
+        Ok(timings)
+    }
+
+    /// Disseminate a fast-path Commit decision after the client ACK.
+    ///
+    /// Purpose:
+    /// - Convert a locally published 1RTT fast-path write into the ordinary
+    ///   committed state on all reachable replicas without adding a client
+    ///   blocking round trip.
+    ///
+    /// Design:
+    /// - Sends Commit to every peer and waits only inside this detached task.
+    /// - Treats failure as a liveness event: read barriers and executor stall
+    ///   recovery can still force the value from surviving PreAccepted records.
+    ///
+    /// Inputs:
+    /// - Final transaction metadata and whether Commit RPCs should inline bytes.
+    ///
+    /// Outputs:
+    /// - None. Any failed dissemination is logged for diagnosis.
+    fn spawn_async_commit_dissemination(
+        self: &Arc<Self>,
+        txn_id: TxnId,
+        ballot: Ballot,
+        command: Bytes,
+        command_digest: [u8; 32],
+        seq: u64,
+        deps: Vec<TxnId>,
+        inline_command: bool,
+    ) {
+        let group = Arc::clone(self);
+        tokio::spawn(async move {
+            group
+                .disseminate_commit_to_peers(
+                    txn_id,
+                    ballot,
+                    command,
+                    command_digest,
+                    seq,
+                    deps,
+                    inline_command,
+                )
+                .await;
+        });
+    }
+
+    /// Send Commit to peers for an already locally published fast-path write.
+    ///
+    /// Purpose:
+    /// - Share the final Commit decision with peers after a 1RTT write ACK.
+    ///
+    /// Design:
+    /// - Excludes local commit work to avoid duplicate WAL appends and local
+    ///   timing samples.
+    /// - Sends to all peers, counts voter ACKs for observability, and leaves
+    ///   recovery responsible for peers that remain unavailable.
+    ///
+    /// Inputs:
+    /// - Final transaction metadata and commit payload policy.
+    ///
+    /// Outputs:
+    /// - None; failures are logged.
+    async fn disseminate_commit_to_peers(
+        &self,
+        txn_id: TxnId,
+        ballot: Ballot,
+        command: Bytes,
+        command_digest: [u8; 32],
+        seq: u64,
+        deps: Vec<TxnId>,
+        inline_command: bool,
+    ) {
+        let peers = self.peers_snapshot();
+        if peers.is_empty() {
+            return;
+        }
+
+        let quorum = self.quorum();
+        let voter_set = self.voters_snapshot().into_iter().collect::<HashSet<_>>();
+        let mut ok = if self.local_is_voter() { 1 } else { 0 };
+        let commit_timeout = self.config.propose_timeout;
+        let (command_payload, has_command) = if inline_command {
+            (command, true)
+        } else {
+            (Bytes::new(), false)
+        };
+
+        let mut in_flight = FuturesUnordered::new();
+        for peer in peers {
+            let transport = self.transport.clone();
+            let count_for_quorum = voter_set.contains(&peer);
+            let req = CommitRequest {
+                group_id: self.config.group_id,
+                txn_id,
+                ballot,
+                command: command_payload.clone(),
+                command_digest,
+                has_command,
+                seq,
+                deps: deps.clone(),
+            };
+            in_flight.push(async move {
+                let peer_ok = match time::timeout(commit_timeout, transport.commit(peer, req)).await
+                {
+                    Ok(res) => res.ok().is_some_and(|r| r.ok),
+                    Err(_) => false,
+                };
+                (peer, peer_ok, count_for_quorum)
+            });
+        }
+
+        while let Some((peer, peer_ok, count_for_quorum)) = in_flight.next().await {
+            if peer_ok && count_for_quorum {
+                ok += 1;
+            } else if !peer_ok {
+                tracing::debug!(
+                    txn_id = ?txn_id,
+                    peer = peer,
+                    "fast-path async commit dissemination failed for peer"
+                );
+            }
+        }
+
+        if ok < quorum {
+            tracing::warn!(
+                txn_id = ?txn_id,
+                ok = ok,
+                quorum = quorum,
+                "fast-path async commit dissemination did not reach quorum"
+            );
         }
     }
 
@@ -4808,6 +5057,58 @@ impl Group {
     }
 }
 
+/// Return the strongest fast-path write a read barrier must observe for a key.
+///
+/// Purpose:
+/// - Make quorum/all-peer read barriers safe for 1RTT writes by exposing
+///   PreAccepted/Accepted writes that may already have been ACKed by their
+///   coordinator but not yet received asynchronous Commit dissemination here.
+///
+/// Design:
+/// - Starts with the normal committed-key hint and scans the key frontier for
+///   non-final write records.
+/// - Chooses the highest sequence so callers can wait on one per-key target;
+///   Accord dependencies on that target carry earlier writes in the same chain.
+///
+/// Inputs:
+/// - `state`: locked group state.
+/// - `key`: storage key being read.
+/// - `best`: existing committed hint, if any.
+///
+/// Outputs:
+/// - Highest-sequence barrier target for the key.
+fn fast_path_barrier_write_for_key(
+    state: &State,
+    key: &[u8],
+    mut best: Option<(TxnId, u64)>,
+) -> Option<(TxnId, u64)> {
+    let Some(frontier) = state.frontier_by_key.get(key) else {
+        return best;
+    };
+
+    for txn_id in frontier {
+        let Some(rec) = state.records.get(txn_id) else {
+            continue;
+        };
+        if rec.status < Status::PreAccepted {
+            continue;
+        }
+        if !rec.keys.as_ref().is_some_and(|keys| keys.is_write()) {
+            continue;
+        }
+        let seq = rec.seq.max(1);
+        let replace = match best {
+            None => true,
+            Some((_, cur_seq)) => seq > cur_seq,
+        };
+        if replace {
+            best = Some((*txn_id, seq));
+        }
+    }
+
+    best
+}
+
 fn build_blocking_chain(state: &State) -> (Option<TxnId>, Vec<BlockedStep>) {
     const MAX_CHAIN: usize = 8;
     let root = state
@@ -5293,6 +5594,7 @@ mod tests {
     use super::*;
     use crate::accord::{CommitDurabilityMode, GroupId};
     use async_trait::async_trait;
+    use std::collections::BTreeSet as StdBTreeSet;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{mpsc as std_mpsc, Arc, Mutex};
@@ -5338,6 +5640,50 @@ mod tests {
         TransportError(&'static str),
     }
 
+    /// Scripted response for one `pre_accept` RPC target in proposal tests.
+    ///
+    /// Purpose:
+    /// - Control remote PreAccept replies so fast-path tests can exercise
+    ///   proposal code without live peer groups.
+    ///
+    /// Design:
+    /// - Optional delay simulates slow peers.
+    /// - Outcome captures either a concrete protocol response or a transport error.
+    ///
+    /// Inputs:
+    /// - Delay budget and response outcome.
+    ///
+    /// Outputs:
+    /// - Deterministic scripted `pre_accept` behavior in tests.
+    #[derive(Clone, Debug)]
+    struct PreAcceptPeerPlan {
+        delay: StdDuration,
+        outcome: PreAcceptPeerOutcome,
+    }
+
+    #[derive(Clone, Debug)]
+    /// Scripted PreAccept RPC outcome for one peer in tests.
+    ///
+    /// Purpose:
+    /// - Represent either a valid protocol response or an injected transport failure.
+    ///
+    /// Design:
+    /// - `Response` mirrors `PreAcceptResponse` fields used by fast-path merge.
+    ///
+    /// Inputs:
+    /// - `ok`/`promised` plus sequence/dependency metadata.
+    ///
+    /// Outputs:
+    /// - Deterministic PreAccept behavior for one target peer.
+    enum PreAcceptPeerOutcome {
+        Response {
+            ok: bool,
+            promised: Ballot,
+            seq: u64,
+            deps: Vec<TxnId>,
+        },
+    }
+
     /// Scripted response for one `commit` RPC target in round tests.
     ///
     /// Purpose:
@@ -5381,18 +5727,19 @@ mod tests {
     /// Scriptable transport used by group-round unit tests.
     ///
     /// Purpose:
-    /// - Provide deterministic per-peer behavior for Accept/Commit RPCs.
+    /// - Provide deterministic per-peer behavior for PreAccept/Accept/Commit RPCs.
     ///
     /// Design:
-    /// - Accept/Commit methods use configured per-peer plans.
+    /// - PreAccept/Accept/Commit methods use configured per-peer plans.
     /// - All other RPC methods fail loudly to catch accidental test misuse.
     ///
     /// Inputs:
-    /// - Optional accept and commit plans keyed by peer id.
+    /// - Optional preaccept, accept, and commit plans keyed by peer id.
     ///
     /// Outputs:
     /// - Transport behavior tailored to one test scenario.
     struct NoopTransport {
+        pre_accept_plans: Arc<Mutex<HashMap<NodeId, PreAcceptPeerPlan>>>,
         accept_plans: Arc<Mutex<HashMap<NodeId, AcceptPeerPlan>>>,
         commit_plans: Arc<Mutex<HashMap<NodeId, CommitPeerPlan>>>,
     }
@@ -5413,30 +5760,34 @@ mod tests {
         /// - `NoopTransport` where all RPC methods fail unless explicitly scripted.
         fn new() -> Self {
             Self {
+                pre_accept_plans: Arc::new(Mutex::new(HashMap::new())),
                 accept_plans: Arc::new(Mutex::new(HashMap::new())),
                 commit_plans: Arc::new(Mutex::new(HashMap::new())),
             }
         }
 
-        /// Build a transport with scripted Accept/Commit peer plans.
+        /// Build a transport with scripted PreAccept/Accept/Commit peer plans.
         ///
         /// Purpose:
-        /// - Configure deterministic remote behavior for quorum-round tests.
+        /// - Configure deterministic remote behavior for proposal/round tests.
         ///
         /// Design:
         /// - Stores per-peer plans in shared mutex maps for lightweight lookup.
         ///
         /// Inputs:
+        /// - `pre_accept_plans`: per-peer PreAccept behaviors.
         /// - `accept_plans`: per-peer Accept behaviors.
         /// - `commit_plans`: per-peer Commit behaviors.
         ///
         /// Outputs:
-        /// - `NoopTransport` with scripted Accept/Commit responses.
+        /// - `NoopTransport` with scripted PreAccept/Accept/Commit responses.
         fn with_plans(
+            pre_accept_plans: HashMap<NodeId, PreAcceptPeerPlan>,
             accept_plans: HashMap<NodeId, AcceptPeerPlan>,
             commit_plans: HashMap<NodeId, CommitPeerPlan>,
         ) -> Self {
             Self {
+                pre_accept_plans: Arc::new(Mutex::new(pre_accept_plans)),
                 accept_plans: Arc::new(Mutex::new(accept_plans)),
                 commit_plans: Arc::new(Mutex::new(commit_plans)),
             }
@@ -5447,10 +5798,32 @@ mod tests {
     impl Transport for NoopTransport {
         async fn pre_accept(
             &self,
-            _target: NodeId,
+            target: NodeId,
             _req: PreAcceptRequest,
         ) -> anyhow::Result<PreAcceptResponse> {
-            Err(anyhow::anyhow!("transport not used in this test"))
+            let plan = self
+                .pre_accept_plans
+                .lock()
+                .expect("pre_accept plan lock")
+                .get(&target)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("transport not used in this test"))?;
+            if !plan.delay.is_zero() {
+                time::sleep(plan.delay).await;
+            }
+            match plan.outcome {
+                PreAcceptPeerOutcome::Response {
+                    ok,
+                    promised,
+                    seq,
+                    deps,
+                } => Ok(PreAcceptResponse {
+                    ok,
+                    promised,
+                    seq,
+                    deps,
+                }),
+            }
         }
 
         /// Execute scripted `accept` behavior for one target peer.
@@ -5605,6 +5978,53 @@ mod tests {
         }
     }
 
+    /// Enumerate fixed-size subsets for small protocol model tests.
+    ///
+    /// Purpose:
+    /// - Keep quorum-intersection checks exhaustive without introducing a
+    ///   property-test dependency.
+    ///
+    /// Design:
+    /// - Depth-first combination generator over tiny test inputs.
+    ///
+    /// Inputs:
+    /// - `items`: candidate node ids.
+    /// - `size`: desired subset cardinality.
+    ///
+    /// Outputs:
+    /// - All subsets of `items` with exactly `size` elements.
+    fn subsets_of_size(items: &[usize], size: usize) -> Vec<StdBTreeSet<usize>> {
+        fn rec(
+            items: &[usize],
+            size: usize,
+            idx: usize,
+            cur: &mut StdBTreeSet<usize>,
+            out: &mut Vec<StdBTreeSet<usize>>,
+        ) {
+            if cur.len() == size {
+                out.push(cur.clone());
+                return;
+            }
+            if idx >= items.len() {
+                return;
+            }
+            let remaining_needed = size.saturating_sub(cur.len());
+            if items.len().saturating_sub(idx) < remaining_needed {
+                return;
+            }
+
+            cur.insert(items[idx]);
+            rec(items, size, idx + 1, cur, out);
+            cur.remove(&items[idx]);
+            rec(items, size, idx + 1, cur, out);
+        }
+
+        let mut out = Vec::new();
+        let mut cur = StdBTreeSet::new();
+        rec(items, size, 0, &mut cur, &mut out);
+        out
+    }
+
     /// Commit log that blocks durable appends until the test releases it.
     ///
     /// Design:
@@ -5721,6 +6141,7 @@ mod tests {
             commit_log_batch_max: 16,
             commit_log_batch_wait: StdDuration::from_micros(50),
             commit_durability_mode: mode,
+            fast_path_1rtt: false,
         }
     }
 
@@ -5762,6 +6183,7 @@ mod tests {
             commit_log_batch_max: 16,
             commit_log_batch_wait: StdDuration::from_micros(50),
             commit_durability_mode: CommitDurabilityMode::AsyncCommit,
+            fast_path_1rtt: false,
         }
     }
 
@@ -5960,6 +6382,7 @@ mod tests {
     async fn accept_round_reaches_quorum_without_waiting_for_slowest_peer() {
         let ballot = Ballot::initial(7);
         let transport = NoopTransport::with_plans(
+            HashMap::new(),
             HashMap::from([
                 (
                     1,
@@ -6053,6 +6476,7 @@ mod tests {
             node_id: 3,
         };
         let transport = NoopTransport::with_plans(
+            HashMap::new(),
             HashMap::from([
                 (
                     1,
@@ -6136,6 +6560,7 @@ mod tests {
     async fn commit_round_reaches_quorum_without_waiting_for_slowest_peer() {
         let ballot = Ballot::initial(7);
         let transport = NoopTransport::with_plans(
+            HashMap::new(),
             HashMap::new(),
             HashMap::from([
                 (
@@ -6233,6 +6658,7 @@ mod tests {
         let ballot = Ballot::initial(7);
         let transport = NoopTransport::with_plans(
             HashMap::new(),
+            HashMap::new(),
             HashMap::from([
                 (
                     1,
@@ -6288,6 +6714,326 @@ mod tests {
         match res {
             Err(ProposeOnceError::NoQuorum(_)) => {}
             other => panic!("expected no-quorum error, got {other:?}"),
+        }
+    }
+
+    /// Verify 1RTT fast-path writes do not wait for remote Commit quorum.
+    ///
+    /// Purpose:
+    /// - Protect the client-visible optimization: after identical PreAccept
+    ///   quorum and successful local publish, the proposal may return before
+    ///   slow remote Commit RPCs finish.
+    ///
+    /// Design:
+    /// - Script one fast PreAccept peer to close quorum.
+    /// - Script all Commit peers slower than the proposal RPC timeout; the old
+    ///   client-blocking Commit path would fail or wait, while the 1RTT path
+    ///   succeeds after local publish.
+    ///
+    /// Inputs:
+    /// - Three-voter group with `fast_path_1rtt=true` and async commit durability.
+    ///
+    /// Outputs:
+    /// - Applied proposal result and local committed/barrier-visible state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fast_path_1rtt_write_returns_after_local_publish_without_remote_commit_quorum() {
+        let ballot = Ballot::initial(1);
+        let transport = NoopTransport::with_plans(
+            HashMap::from([
+                (
+                    2,
+                    PreAcceptPeerPlan {
+                        delay: StdDuration::from_millis(5),
+                        outcome: PreAcceptPeerOutcome::Response {
+                            ok: true,
+                            promised: ballot,
+                            seq: 1,
+                            deps: Vec::new(),
+                        },
+                    },
+                ),
+                (
+                    3,
+                    PreAcceptPeerPlan {
+                        delay: StdDuration::from_millis(500),
+                        outcome: PreAcceptPeerOutcome::Response {
+                            ok: true,
+                            promised: ballot,
+                            seq: 1,
+                            deps: Vec::new(),
+                        },
+                    },
+                ),
+            ]),
+            HashMap::new(),
+            HashMap::from([
+                (
+                    2,
+                    CommitPeerPlan {
+                        delay: StdDuration::from_millis(500),
+                        outcome: CommitPeerOutcome::Response { ok: true },
+                    },
+                ),
+                (
+                    3,
+                    CommitPeerPlan {
+                        delay: StdDuration::from_millis(500),
+                        outcome: CommitPeerOutcome::Response { ok: true },
+                    },
+                ),
+            ]),
+        );
+        let mut cfg = round_test_config(
+            1,
+            vec![1, 2, 3],
+            StdDuration::from_millis(80),
+            StdDuration::from_secs(1),
+        );
+        cfg.fast_path_1rtt = true;
+        let group = Arc::new(Group::new(
+            cfg,
+            Arc::new(transport),
+            Arc::new(TestStateMachine),
+            None,
+        ));
+
+        let start = time::Instant::now();
+        let res = group
+            .propose(Bytes::from_static(b"fast-path-1rtt-write"))
+            .await
+            .expect("fast-path proposal should succeed without remote commit quorum");
+        let elapsed = start.elapsed();
+
+        assert!(matches!(res, ProposalResult::Applied));
+        assert!(
+            elapsed < StdDuration::from_millis(200),
+            "1RTT proposal should return before slow Commit RPCs finish (elapsed={elapsed:?})"
+        );
+
+        let key = b"unit-test-key".as_slice();
+        let barriers = group.last_committed_for_key_slices(&[key]).await;
+        let txn_id = barriers[0]
+            .map(|item| item.0)
+            .expect("fast-path write should be barrier-visible");
+        {
+            let state = group.state.lock().await;
+            let rec = state.records.get(&txn_id).expect("local committed record");
+            assert_eq!(rec.status, Status::Committed);
+        }
+    }
+
+    /// Verify read barriers expose uncommitted fast-path candidates.
+    ///
+    /// Purpose:
+    /// - Prevent linearizable reads from missing a write that may have already
+    ///   been ACKed by another coordinator while Commit dissemination is still
+    ///   in flight.
+    ///
+    /// Design:
+    /// - Insert a local PreAccepted write and query the per-key barrier helper
+    ///   with 1RTT mode enabled.
+    ///
+    /// Inputs:
+    /// - One PreAccept request for the test write key.
+    ///
+    /// Outputs:
+    /// - Barrier target includes the PreAccepted transaction.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fast_path_barrier_reports_preaccepted_write() {
+        let mut cfg = round_test_config(
+            1,
+            vec![1, 2, 3],
+            StdDuration::from_millis(80),
+            StdDuration::from_secs(1),
+        );
+        cfg.fast_path_1rtt = true;
+        let group = Group::new(
+            cfg,
+            Arc::new(NoopTransport::new()),
+            Arc::new(TestStateMachine),
+            None,
+        );
+        let txn_id = TxnId {
+            node_id: 2,
+            counter: (1u64 << TXN_COUNTER_SHARD_SHIFT) | 7,
+        };
+        let resp = group
+            .rpc_pre_accept(PreAcceptRequest {
+                group_id: 1,
+                txn_id,
+                ballot: Ballot::initial(2),
+                command: Bytes::from_static(b"preaccepted-write"),
+                seq: 0,
+                deps: Vec::new(),
+            })
+            .await;
+        assert!(resp.ok, "preaccept should succeed");
+
+        let key = b"unit-test-key".as_slice();
+        let barriers = group.last_committed_for_key_slices(&[key]).await;
+        assert_eq!(barriers[0].map(|item| item.0), Some(txn_id));
+        assert_eq!(barriers[0].map(|item| item.1), Some(resp.seq));
+    }
+
+    /// Verify recovery can force a fast-path value from quorum intersection.
+    ///
+    /// Purpose:
+    /// - Capture the core 1RTT recovery rule: if a recovery quorum intersects
+    ///   the ACKing fast quorum at one PreAccepted replica, the command bytes
+    ///   and metadata must be enough to continue recovery.
+    ///
+    /// Design:
+    /// - Merge one PreAccepted reply carrying the command with one Unknown reply.
+    ///
+    /// Inputs:
+    /// - Quorum replies representing the surviving intersection case.
+    ///
+    /// Outputs:
+    /// - Recovery choice keeps the PreAccepted command instead of choosing NOOP.
+    #[test]
+    fn choose_recovery_value_uses_preaccepted_fast_path_command() {
+        let cmd = Bytes::from_static(b"acked-fast-path-command");
+        let reply = RecoverResponse {
+            ok: true,
+            promised: Ballot::zero(),
+            status: TxnStatus::PreAccepted,
+            accepted_ballot: Some(Ballot::initial(1)),
+            command: cmd.clone(),
+            command_digest: Some(command_digest(&cmd)),
+            has_command: true,
+            seq: 11,
+            deps: Vec::new(),
+        };
+        let unknown = RecoverResponse {
+            ok: true,
+            promised: Ballot::zero(),
+            status: TxnStatus::Unknown,
+            accepted_ballot: None,
+            command: Bytes::new(),
+            command_digest: None,
+            has_command: false,
+            seq: 0,
+            deps: Vec::new(),
+        };
+
+        let choice =
+            choose_recovery_value(&[reply, unknown]).expect("preaccepted recovery should merge");
+        match choice {
+            RecoveryChoice::Ready(value) => {
+                assert_eq!(value.command, cmd);
+                assert_eq!(value.seq, 11);
+            }
+            other => panic!("expected ready recovery value, got {other:?}"),
+        }
+    }
+
+    /// Exhaustively check quorum intersections used by 1RTT recovery.
+    ///
+    /// Purpose:
+    /// - Provide a small model checker for the fast-path proof obligation:
+    ///   every recovery/read quorum must intersect the ACKing fast quorum, even
+    ///   after any tolerated crash-stop failures.
+    ///
+    /// Design:
+    /// - Enumerates majority quorums for 3, 5, and 7 voters.
+    /// - Enumerates every failure set up to `f=(n-1)/2` and every live recovery
+    ///   quorum that remains.
+    ///
+    /// Inputs:
+    /// - Synthetic node ids `0..n`.
+    ///
+    /// Outputs:
+    /// - Assertion failure if any recovery quorum can miss the fast quorum.
+    #[test]
+    fn fast_path_quorum_model_checks_recovery_and_read_intersections() {
+        for n in [3usize, 5, 7] {
+            let quorum = (n / 2) + 1;
+            let faults = (n - 1) / 2;
+            let nodes = (0..n).collect::<Vec<_>>();
+            let quorums = subsets_of_size(&nodes, quorum);
+
+            for fast_quorum in &quorums {
+                for recovery_quorum in &quorums {
+                    assert!(
+                        !fast_quorum.is_disjoint(recovery_quorum),
+                        "recovery quorum missed fast quorum for n={n}"
+                    );
+                }
+
+                for failure_count in 0..=faults {
+                    for failed in subsets_of_size(&nodes, failure_count) {
+                        let live = nodes
+                            .iter()
+                            .copied()
+                            .filter(|node| !failed.contains(node))
+                            .collect::<Vec<_>>();
+                        if live.len() < quorum {
+                            continue;
+                        }
+                        for recovery_quorum in subsets_of_size(&live, quorum) {
+                            assert!(
+                                !fast_quorum.is_disjoint(&recovery_quorum),
+                                "live recovery quorum missed fast quorum for n={n}, failed={failed:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Model-check conflicting fast-path quorum responses.
+    ///
+    /// Purpose:
+    /// - Cover the conflicting-write case for the 1RTT fast path: two writes on
+    ///   the same key cannot both fast-commit with incompatible dependency
+    ///   metadata because their fast quorums intersect at a serialized replica.
+    ///
+    /// Design:
+    /// - Simulates write A reaching its fast quorum first.
+    /// - Simulates write B reaching another fast quorum where intersection
+    ///   replicas report A as a dependency and non-intersection replicas do not.
+    /// - Asserts B can be fast only when every B response contains the same dep
+    ///   set, which means B depends on A at all responders.
+    ///
+    /// Inputs:
+    /// - Synthetic majority quorums for 3, 5, and 7 voters.
+    ///
+    /// Outputs:
+    /// - Assertion failure if two conflicting writes can both fast-commit
+    ///   without a dependency edge.
+    #[test]
+    fn fast_path_conflict_model_requires_intersection_dependency() {
+        const A: usize = 10_001;
+        for n in [3usize, 5, 7] {
+            let quorum = (n / 2) + 1;
+            let nodes = (0..n).collect::<Vec<_>>();
+            let quorums = subsets_of_size(&nodes, quorum);
+
+            for a_quorum in &quorums {
+                for b_quorum in &quorums {
+                    let mut b_response_deps = Vec::new();
+                    for node in b_quorum {
+                        let saw_a = a_quorum.contains(node);
+                        let deps = if saw_a {
+                            StdBTreeSet::from([A])
+                        } else {
+                            StdBTreeSet::new()
+                        };
+                        b_response_deps.push(deps);
+                    }
+
+                    let b_fast = b_response_deps
+                        .iter()
+                        .all(|deps| deps == &b_response_deps[0]);
+                    if b_fast {
+                        assert!(
+                            b_response_deps[0].contains(&A),
+                            "conflicting B fast-pathed without depending on A for n={n}"
+                        );
+                    }
+                }
+            }
         }
     }
 
