@@ -73,7 +73,6 @@ pub(super) struct State {
     pub(super) executed_log_order: VecDeque<TxnId>,
     pub(super) executed_log_bytes: usize,
     pub(super) executed_log_deps_total: usize,
-    pub(super) visible_txns: FastSet<TxnId>,
     pub(super) recovering: FastSet<TxnId>,
     pub(super) recovery_attempts_by_txn: FastMap<TxnId, u64>,
     pub(super) recovery_last_attempt: FastMap<TxnId, time::Instant>,
@@ -98,6 +97,13 @@ pub(super) struct ExecutedLogEntry {
     pub(super) command_digest: Option<[u8; 32]>,
     pub(super) seq: u64,
     pub(super) deps: Vec<TxnId>,
+    /// Whether the state-machine effects for this executed write are visible.
+    ///
+    /// Direct-published writes set this bit when `apply_batch` succeeds.
+    /// Compatibility `mark_visible` calls use it as their idempotency guard,
+    /// and executed-log GC only removes entries once they are both globally
+    /// executed and visible.
+    pub(super) visible: bool,
 }
 
 pub(super) fn is_monotonic_update(
@@ -142,7 +148,6 @@ impl State {
             executed_log_order: VecDeque::new(),
             executed_log_bytes: 0,
             executed_log_deps_total: 0,
-            visible_txns: HashSet::new(),
             recovering: HashSet::new(),
             recovery_attempts_by_txn: HashMap::new(),
             recovery_last_attempt: HashMap::new(),
@@ -275,9 +280,12 @@ impl State {
         }
     }
 
-    pub(super) fn record_executed_value(&mut self, txn_id: TxnId, value: ExecutedLogEntry) {
+    pub(super) fn record_executed_value(&mut self, txn_id: TxnId, mut value: ExecutedLogEntry) {
         let new_len = value.command.as_ref().map_or(0, Bytes::len);
         let new_deps = value.deps.len();
+        if let Some(old) = self.executed_log.get(&txn_id) {
+            value.visible |= old.visible;
+        }
         if let Some(old) = self.executed_log.insert(txn_id, value) {
             let old_len = old.command.as_ref().map_or(0, Bytes::len);
             self.executed_log_bytes = self.executed_log_bytes + new_len - old_len;

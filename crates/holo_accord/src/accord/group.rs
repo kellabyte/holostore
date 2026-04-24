@@ -1340,36 +1340,32 @@ impl Group {
         if !self.local_is_member() {
             return Ok(false);
         }
-        let entry = {
-            let mut state = self.state.lock().await;
-            if state.visible_txns.contains(&txn_id) {
-                return Ok(true);
-            }
-            let Some(entry) = state.executed_log.get(&txn_id).cloned() else {
+        let (command, seq) = {
+            let state = self.state.lock().await;
+            let Some(entry) = state.executed_log.get(&txn_id) else {
                 return Ok(false);
             };
-            state.visible_txns.insert(txn_id);
-            entry
+            if entry.visible {
+                return Ok(true);
+            }
+            (entry.command.clone(), entry.seq)
         };
 
-        let command = match entry.command {
+        let command = match command {
             Some(command) => command,
             None => self
                 .load_command_from_commit_log(txn_id)
                 .unwrap_or_default(),
         };
 
-        if command.is_empty() {
-            return Ok(true);
+        if !command.is_empty() {
+            self.sm.mark_visible(&command, ExecMeta { txn_id, seq })?;
         }
 
-        self.sm.mark_visible(
-            &command,
-            ExecMeta {
-                txn_id,
-                seq: entry.seq,
-            },
-        )?;
+        let mut state = self.state.lock().await;
+        if let Some(entry) = state.executed_log.get_mut(&txn_id) {
+            entry.visible = true;
+        }
 
         Ok(true)
     }
@@ -2906,7 +2902,11 @@ impl Group {
             let Some(id) = state.executed_log_order.pop_front() else {
                 break;
             };
-            if state.visible_txns.contains(&id) {
+            let visible = state
+                .executed_log
+                .get(&id)
+                .is_some_and(|entry| entry.visible);
+            if visible {
                 let min_prefix = global_min_by_node.get(&id.node_id).copied().unwrap_or(0);
                 if id.counter <= min_prefix {
                     if let Some(entry) = state.executed_log.remove(&id) {
@@ -2917,7 +2917,6 @@ impl Group {
                             .executed_log_deps_total
                             .saturating_sub(entry.deps.len());
                     }
-                    state.visible_txns.remove(&id);
                     removed = removed.saturating_add(1);
                     continue;
                 }
@@ -2939,7 +2938,11 @@ impl Group {
                 let Some(id) = state.executed_log_order.pop_front() else {
                     break;
                 };
-                if state.visible_txns.contains(&id) {
+                let visible = state
+                    .executed_log
+                    .get(&id)
+                    .is_some_and(|entry| entry.visible);
+                if visible {
                     let min_prefix = global_min_by_node.get(&id.node_id).copied().unwrap_or(0);
                     if id.counter > min_prefix {
                         // Do not shed command bytes for entries that are not
@@ -4777,6 +4780,7 @@ impl Group {
                             command_digest: Some(digest),
                             seq: rec.seq.max(1),
                             deps: rec.deps.into_iter().collect(),
+                            visible: true,
                         },
                     );
                 }
@@ -5978,6 +5982,44 @@ mod tests {
         }
     }
 
+    /// State-machine test double that counts direct apply and visibility calls.
+    ///
+    /// Purpose:
+    /// - Verify executor visibility bookkeeping without relying on KV storage.
+    ///
+    /// Design:
+    /// - Classifies non-empty commands as writes.
+    /// - Counts `apply` and `mark_visible` invocations independently so tests
+    ///   can assert direct-published writes do not re-enter compatibility
+    ///   visibility publication.
+    #[derive(Default)]
+    struct VisibilityTrackingStateMachine {
+        apply_count: AtomicU64,
+        mark_visible_count: AtomicU64,
+    }
+
+    impl StateMachine for VisibilityTrackingStateMachine {
+        fn command_keys(&self, data: &[u8]) -> anyhow::Result<CommandKeys> {
+            if data.is_empty() {
+                return Ok(CommandKeys::default());
+            }
+            Ok(CommandKeys {
+                reads: Vec::new(),
+                writes: vec![b"unit-test-key".to_vec()],
+            })
+        }
+
+        fn apply(&self, _data: &[u8], _meta: ExecMeta) -> anyhow::Result<()> {
+            self.apply_count.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn mark_visible(&self, _data: &[u8], _meta: ExecMeta) -> anyhow::Result<()> {
+            self.mark_visible_count.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
     /// Enumerate fixed-size subsets for small protocol model tests.
     ///
     /// Purpose:
@@ -6208,6 +6250,73 @@ mod tests {
             has_command: true,
             seq: 1,
             deps: Vec::new(),
+        }
+    }
+
+    /// Ensure direct-published executed writes are visible to GC bookkeeping.
+    ///
+    /// Purpose:
+    /// - Protect the collapsed apply+visibility path: once `apply_batch`
+    ///   succeeds, the executed-log entry must be considered visible even
+    ///   though no compatibility `mark_visible` call rewrote storage.
+    ///
+    /// Design:
+    /// - Commit and execute one local write with a tracking state machine.
+    /// - Verify `mark_visible` short-circuits without calling the state machine.
+    /// - Force the executed-log GC window and confirm the visible executed entry
+    ///   is reclaimable.
+    ///
+    /// Outputs:
+    /// - Assertion failure if direct-published writes stay invisible.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn direct_published_writes_are_marked_visible_for_gc() {
+        let sm = Arc::new(VisibilityTrackingStateMachine::default());
+        let group = Arc::new(Group::new(
+            test_config(CommitDurabilityMode::AsyncCommit),
+            Arc::new(NoopTransport::new()),
+            sm.clone(),
+            None,
+        ));
+        let req = test_commit_request(1);
+        let txn_id = req.txn_id;
+
+        let commit = group.rpc_commit(req).await;
+        assert!(commit.ok, "local commit should succeed");
+        assert!(
+            group.execute_progress().await.expect("execute progress"),
+            "executor should apply the committed write"
+        );
+        assert_eq!(sm.apply_count.load(Ordering::Relaxed), 1);
+
+        {
+            let state = group.state.lock().await;
+            let entry = state
+                .executed_log
+                .get(&txn_id)
+                .expect("executed log should keep the write");
+            assert!(entry.visible);
+        }
+
+        assert!(group.mark_visible(txn_id).await.expect("mark visible"));
+        assert_eq!(
+            sm.mark_visible_count.load(Ordering::Relaxed),
+            0,
+            "compatibility mark_visible should not republish direct-applied writes"
+        );
+
+        {
+            let mut state = group.state.lock().await;
+            let now = time::Instant::now();
+            state.last_executed_gc_at = now - StdDuration::from_secs(1);
+            let removed = Group::maybe_gc_executed_log_locked(
+                group.config.node_id,
+                &group.config.members,
+                &mut state,
+                now,
+                group.config.executed_command_cache_max_bytes,
+            );
+            assert_eq!(removed, 1);
+            assert!(!state.executed_log.contains_key(&txn_id));
         }
     }
 
