@@ -187,18 +187,21 @@ impl CommandKeys {
 /// storage semantics.
 pub trait StateMachine: Send + Sync + 'static {
     fn command_keys(&self, data: &[u8]) -> anyhow::Result<CommandKeys>;
-    fn apply(&self, data: &[u8], meta: ExecMeta);
-    fn apply_batch(&self, items: &[(Bytes, ExecMeta)]) {
+    fn apply(&self, data: &[u8], meta: ExecMeta) -> anyhow::Result<()>;
+    fn apply_batch(&self, items: &[(Bytes, ExecMeta)]) -> anyhow::Result<()> {
         for (data, meta) in items {
-            self.apply(data, *meta);
+            self.apply(data, *meta)?;
         }
+        Ok(())
     }
 
     fn read(&self, _data: &[u8], _meta: ExecMeta) -> anyhow::Result<Option<Vec<u8>>> {
         Ok(None)
     }
 
-    fn mark_visible(&self, _data: &[u8], _meta: ExecMeta) {}
+    fn mark_visible(&self, _data: &[u8], _meta: ExecMeta) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
