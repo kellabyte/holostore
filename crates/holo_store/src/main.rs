@@ -6942,8 +6942,19 @@ where
         .copied()
         .map(|id| accord::Member { id })
         .collect::<Vec<_>>();
+    let accord_fast_path_1rtt = should_enable_kv_fast_path_1rtt(
+        args.read_barrier_all_peers,
+        args.read_barrier_fallback_quorum,
+    );
+    if !accord_fast_path_1rtt {
+        tracing::warn!(
+            read_barrier_all_peers = args.read_barrier_all_peers,
+            read_barrier_fallback_quorum = args.read_barrier_fallback_quorum,
+            "Accord 1RTT fast-path ACKs disabled because read-barrier settings are not conservative"
+        );
+    }
 
-    let mk_cfg = |group_id: GroupId| accord::Config {
+    let mk_cfg = |group_id: GroupId, fast_path_1rtt: bool| accord::Config {
         group_id,
         node_id: args.node_id,
         members: accord_members.clone(),
@@ -6958,6 +6969,7 @@ where
         commit_log_batch_max: args.commit_log_batch_max.max(1),
         commit_log_batch_wait: Duration::from_micros(args.commit_log_batch_wait_us),
         commit_durability_mode: args.commit_durability_mode.to_accord(),
+        fast_path_1rtt,
     };
 
     let meta_wal_root = match args.wal_engine {
@@ -7018,7 +7030,7 @@ where
         let meta_wal = open_meta_wal(meta_index)?;
         checkpoint_wals.push(meta_wal.clone());
         let meta_group = Arc::new(accord::Group::new(
-            mk_cfg(group_id),
+            mk_cfg(group_id, false),
             transport.clone(),
             cluster_sm.clone(),
             Some(meta_wal),
@@ -7068,7 +7080,7 @@ where
             Some(visibility_hook),
         ));
         let data_group = Arc::new(accord::Group::new(
-            mk_cfg(group_id),
+            mk_cfg(group_id, accord_fast_path_1rtt),
             transport.clone(),
             kv_sm,
             Some(wal),
@@ -7425,11 +7437,25 @@ where
         redis = %redis_addr,
         grpc = %grpc_addr,
         commit_durability_mode = ?args.commit_durability_mode,
+        accord_fast_path_1rtt = accord_fast_path_1rtt,
         "node started"
     );
 
     shutdown.await?;
     Ok(())
+}
+
+/// Decide whether KV data groups can use Accord 1RTT fast-path ACKs.
+///
+/// Fast-path ACKs publish locally after a PreAccept quorum and disseminate
+/// Commit asynchronously. That is only safe for KV data groups when reads use
+/// all-peer Accord barriers and never fall back to quorum barriers, so a read
+/// cannot miss a coordinator-local publish during async Commit dissemination.
+fn should_enable_kv_fast_path_1rtt(
+    read_barrier_all_peers: bool,
+    read_barrier_fallback_quorum: bool,
+) -> bool {
+    read_barrier_all_peers && !read_barrier_fallback_quorum
 }
 
 /// Attempt to join a seed node, then fetch and return a converged control-plane
@@ -7553,6 +7579,14 @@ mod tests {
     /// - `TxnId` value used by assertions and fixtures.
     fn txn(node_id: NodeId, counter: u64) -> TxnId {
         TxnId { node_id, counter }
+    }
+
+    #[test]
+    fn kv_fast_path_1rtt_requires_conservative_read_barriers() {
+        assert!(should_enable_kv_fast_path_1rtt(true, false));
+        assert!(!should_enable_kv_fast_path_1rtt(false, false));
+        assert!(!should_enable_kv_fast_path_1rtt(true, true));
+        assert!(!should_enable_kv_fast_path_1rtt(false, true));
     }
 
     fn make_batch_get_work(keys: &[&[u8]]) -> BatchGetWork {

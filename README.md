@@ -7,10 +7,10 @@
                                                                             
 ```
 
-**HoloStore** is a distributed, strongly-consistent key/value store built on the
-**Accord** consensus algorithm. It exposes a Redis-compatible interface for
+**HoloStore** is a distributed, strongly consistent key/value store built on the
+**Accord** consensus algorithm. It exposes a Redis compatible interface for
 simple benchmarking and integrates a durable commit log (WAL) + storage engine
-to make writes correct and crash-safe.
+to make writes correct and crash safe.
 
 **What is Accord?**
 - Accord is a leaderless consensus protocol.
@@ -21,17 +21,17 @@ to make writes correct and crash-safe.
 - [Accord consensus protocol paper (CEP-15 draft whitepaper)](https://github.com/eatonphil/accord-protocol).
 
 In this repository we implement:
-- A per-partition Accord group with batched consensus RPCs.
+- A per partition Accord group with batched consensus RPCs.
 - A commit log (WAL) that persists committed entries and replays on restart.
 - An execution loop that applies committed commands to a state machine.
 - A Redis protocol surface for easy benchmarking.
 
 **Documentation**
 - [Design overview](crates/holo_store/docs/DESIGN.md)
+- [Cluster membership](crates/holo_store/docs/CLUSTER_MEMBERSHIP.md)
 - [Storage engine](crates/holo_store/docs/STORAGE.md)
 - [Read modes](crates/holo_store/docs/READ_MODES.md)
 - [Linearizability testing](crates/holo_store/docs/LINEARIZABILITY.md)
-- [Cluster membership](crates/holo_store/docs/CLUSTER_MEMBERSHIP.md)
 - [Testing TODOs](crates/holo_store/docs/TESTING_TODO.md)
 
 **Build**

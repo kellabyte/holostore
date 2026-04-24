@@ -137,6 +137,13 @@ pub struct Config {
     pub commit_log_batch_wait: Duration,
     /// Commit ACK durability policy for this group (`async` vs `sync` ACK).
     pub commit_durability_mode: CommitDurabilityMode,
+    /// Return successful fast-path writes after PreAccept quorum and local
+    /// publish, while disseminating Commit asynchronously.
+    ///
+    /// Read paths using this mode must include fast-path PreAccepted writes in
+    /// their visibility barrier, otherwise a read can miss a just-ACKed write
+    /// during the asynchronous Commit window.
+    pub fast_path_1rtt: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
