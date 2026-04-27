@@ -9,6 +9,9 @@
 //!   implementations.
 //! - Keep hot command apply/read paths zero-copy where possible by using
 //!   borrowed key/value slices.
+//! - Publish committed Fjall writes either directly or through a shared
+//!   non-sleeping publish worker that batches already queued shard publishes
+//!   into one keyspace commit.
 //!
 //! Inputs:
 //! - Encoded KV commands and membership commands from Accord apply/read hooks.
@@ -20,7 +23,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, RwLock};
+use std::thread;
 
 use ahash::RandomState;
 use anyhow::Context;
@@ -294,12 +299,637 @@ impl KvEngine for KvStore {
     }
 }
 
+/// Maximum number of queued publish requests folded into one Fjall commit.
+const FJALL_PUBLISH_MAX_REQUESTS_PER_BATCH: usize = 64;
+/// Maximum number of committed writes folded into one Fjall commit.
+const FJALL_PUBLISH_MAX_ITEMS_PER_BATCH: usize = 4096;
+/// Approximate key/value bytes folded into one Fjall commit before draining stops.
+const FJALL_PUBLISH_MAX_BYTES_PER_BATCH: usize = 8 * 1024 * 1024;
+
+static NEXT_FJALL_ENGINE_ID: AtomicUsize = AtomicUsize::new(1);
+
+/// One owned committed KV write handed to the Fjall publish worker.
+///
+/// Purpose:
+/// - Carry write data across the worker channel without borrowing from the
+///   Accord apply stack.
+///
+/// Design:
+/// - Stores key/value bytes and the committed version exactly once per queued
+///   publish request.
+///
+/// Inputs:
+/// - Borrowed `KvEngine::apply_committed_batch` items copied at the Fjall
+///   boundary when a shared publisher is enabled.
+///
+/// Outputs:
+/// - Visible version rows and latest-index candidates during worker commit.
+#[derive(Clone, Debug)]
+struct OwnedCommittedWrite {
+    key: Vec<u8>,
+    value: Vec<u8>,
+    version: Version,
+}
+
+/// Bounded drain limits for one Fjall publish worker commit.
+///
+/// Purpose:
+/// - Prevent one busy keyspace from building unbounded in-memory batches.
+///
+/// Design:
+/// - Uses fixed internal caps instead of public runtime knobs; the worker only
+///   drains requests that are already queued.
+///
+/// Inputs:
+/// - Queue contents observed by the worker after the first ready request.
+///
+/// Outputs:
+/// - Upper bounds on request count, item count, and approximate key/value bytes.
+#[derive(Clone, Copy, Debug)]
+struct FjallPublishBatchLimits {
+    max_requests: usize,
+    max_items: usize,
+    max_bytes: usize,
+}
+
+impl Default for FjallPublishBatchLimits {
+    /// Build the production default publish-drain limits.
+    ///
+    /// Purpose:
+    /// - Centralize the caps used by the publish worker.
+    ///
+    /// Design:
+    /// - Keeps caps large enough to amortize keyspace commits while small enough
+    ///   to bound latency and memory for one worker turn.
+    ///
+    /// Inputs:
+    /// - None.
+    ///
+    /// Outputs:
+    /// - A `FjallPublishBatchLimits` value used by worker drain logic.
+    fn default() -> Self {
+        Self {
+            max_requests: FJALL_PUBLISH_MAX_REQUESTS_PER_BATCH,
+            max_items: FJALL_PUBLISH_MAX_ITEMS_PER_BATCH,
+            max_bytes: FJALL_PUBLISH_MAX_BYTES_PER_BATCH,
+        }
+    }
+}
+
+/// Runtime counters for a shared Fjall publish worker.
+///
+/// Purpose:
+/// - Track whether the worker is actually combining publish requests and
+///   surface error activity in tests/diagnostics.
+///
+/// Design:
+/// - Uses atomics so producers and the worker can update/read without locks.
+///
+/// Inputs:
+/// - Worker batch completions and failed publish commits.
+///
+/// Outputs:
+/// - Snapshot values returned by `FjallPublishBatcher::snapshot`.
+#[derive(Default)]
+struct FjallPublishBatcherStatsInner {
+    batches: AtomicU64,
+    requests: AtomicU64,
+    items: AtomicU64,
+    max_requests_per_batch: AtomicU64,
+    max_items_per_batch: AtomicU64,
+    errors: AtomicU64,
+}
+
+impl FjallPublishBatcherStatsInner {
+    /// Record one publish worker turn.
+    ///
+    /// Purpose:
+    /// - Maintain aggregate and maximum batch sizes for observability.
+    ///
+    /// Design:
+    /// - Uses relaxed atomics because these counters are advisory and do not
+    ///   participate in correctness.
+    ///
+    /// Inputs:
+    /// - `request_count`: number of caller requests in the committed batch.
+    /// - `item_count`: number of committed writes in the committed batch.
+    /// - `error`: whether the worker failed the batch.
+    ///
+    /// Outputs:
+    /// - Updated stats visible through snapshots.
+    fn record_batch(&self, request_count: usize, item_count: usize, error: bool) {
+        self.batches.fetch_add(1, Ordering::Relaxed);
+        self.requests
+            .fetch_add(request_count as u64, Ordering::Relaxed);
+        self.items.fetch_add(item_count as u64, Ordering::Relaxed);
+        update_max_atomic(&self.max_requests_per_batch, request_count as u64);
+        update_max_atomic(&self.max_items_per_batch, item_count as u64);
+        if error {
+            self.errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Return a stable point-in-time view of publish worker counters.
+    ///
+    /// Purpose:
+    /// - Let tests and diagnostics inspect worker behavior without locking.
+    ///
+    /// Design:
+    /// - Loads each relaxed counter independently; exact simultaneity is not
+    ///   required for advisory stats.
+    ///
+    /// Inputs:
+    /// - None.
+    ///
+    /// Outputs:
+    /// - A `FjallPublishBatcherStats` snapshot.
+    #[allow(dead_code)]
+    fn snapshot(&self) -> FjallPublishBatcherStats {
+        FjallPublishBatcherStats {
+            batches: self.batches.load(Ordering::Relaxed),
+            requests: self.requests.load(Ordering::Relaxed),
+            items: self.items.load(Ordering::Relaxed),
+            max_requests_per_batch: self.max_requests_per_batch.load(Ordering::Relaxed),
+            max_items_per_batch: self.max_items_per_batch.load(Ordering::Relaxed),
+            errors: self.errors.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Public snapshot of a Fjall publish worker's batching counters.
+///
+/// Purpose:
+/// - Expose lightweight visibility into committed publish batching.
+///
+/// Design:
+/// - Contains copyable aggregate counters captured from atomics.
+///
+/// Inputs:
+/// - Worker stats maintained by `FjallPublishBatcherStatsInner`.
+///
+/// Outputs:
+/// - Read-only values for tests, diagnostics, or future metrics wiring.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct FjallPublishBatcherStats {
+    pub batches: u64,
+    pub requests: u64,
+    pub items: u64,
+    pub max_requests_per_batch: u64,
+    pub max_items_per_batch: u64,
+    pub errors: u64,
+}
+
+/// Shared per-keyspace Fjall publish worker.
+///
+/// Purpose:
+/// - Batch naturally queued committed KV publishes from multiple shard engines
+///   into one Fjall keyspace commit.
+///
+/// Design:
+/// - A single worker thread blocks for the first request, then drains only
+///   already-queued requests up to bounded caps; no artificial sleep is used.
+///
+/// Inputs:
+/// - Owned committed writes submitted by `FjallEngine` instances sharing a
+///   keyspace.
+///
+/// Outputs:
+/// - Per-request inserted-latest counts or storage errors returned to callers.
+#[derive(Clone)]
+pub struct FjallPublishBatcher {
+    tx: mpsc::Sender<FjallPublishRequest>,
+    #[allow(dead_code)]
+    stats: Arc<FjallPublishBatcherStatsInner>,
+}
+
+impl FjallPublishBatcher {
+    /// Start a publish worker for one Fjall keyspace.
+    ///
+    /// Purpose:
+    /// - Create the shared commit path used by multi-shard KV engines.
+    ///
+    /// Design:
+    /// - Spawns a named worker thread and shares only a sender plus atomic
+    ///   stats with producers; per-commit drain limits bound worker batches.
+    ///
+    /// Inputs:
+    /// - `keyspace`: Fjall keyspace whose partitions are committed by worker
+    ///   batches.
+    ///
+    /// Outputs:
+    /// - A cloneable `FjallPublishBatcher`.
+    pub fn new(keyspace: Arc<Keyspace>) -> Self {
+        Self::with_limits(keyspace, FjallPublishBatchLimits::default())
+    }
+
+    /// Return current publish worker counters.
+    ///
+    /// Purpose:
+    /// - Make batching behavior observable without exposing worker internals.
+    ///
+    /// Design:
+    /// - Delegates to the atomic stats snapshot.
+    ///
+    /// Inputs:
+    /// - None.
+    ///
+    /// Outputs:
+    /// - A `FjallPublishBatcherStats` snapshot.
+    #[allow(dead_code)]
+    pub fn snapshot(&self) -> FjallPublishBatcherStats {
+        self.stats.snapshot()
+    }
+
+    /// Start a publish worker with explicit drain limits.
+    ///
+    /// Purpose:
+    /// - Support production defaults and deterministic tests with the same
+    ///   worker implementation.
+    ///
+    /// Design:
+    /// - Private constructor keeps limit tuning internal to the storage layer.
+    ///
+    /// Inputs:
+    /// - `keyspace`: Fjall keyspace to commit.
+    /// - `limits`: max requests/items/bytes per worker turn.
+    ///
+    /// Outputs:
+    /// - A cloneable publisher.
+    fn with_limits(keyspace: Arc<Keyspace>, limits: FjallPublishBatchLimits) -> Self {
+        let (tx, rx) = mpsc::channel();
+        let stats = Arc::new(FjallPublishBatcherStatsInner::default());
+        let worker_stats = stats.clone();
+        thread::Builder::new()
+            .name("holo-fjall-publish".to_string())
+            .spawn(move || run_fjall_publish_worker(keyspace, rx, limits, worker_stats))
+            .expect("spawn fjall publish worker");
+        Self { tx, stats }
+    }
+
+    /// Publish owned committed writes through the worker.
+    ///
+    /// Purpose:
+    /// - Let callers wait for the durable Fjall batch before Accord marks a
+    ///   command executed.
+    ///
+    /// Design:
+    /// - Sends one request and blocks on its one-shot reply; send failure means
+    ///   the worker has stopped and apply must fail.
+    ///
+    /// Inputs:
+    /// - `request`: one engine's owned committed writes and partition handles.
+    ///
+    /// Outputs:
+    /// - Inserted-latest count on success, or a storage/worker error.
+    fn publish(
+        &self,
+        engine_id: usize,
+        versions: fjall::PartitionHandle,
+        latest: fjall::PartitionHandle,
+        lock: Arc<RwLock<()>>,
+        items: Vec<OwnedCommittedWrite>,
+        bytes: usize,
+    ) -> anyhow::Result<u64> {
+        let (done_tx, done_rx) = mpsc::channel();
+        let request = FjallPublishRequest {
+            engine_id,
+            versions,
+            latest,
+            lock,
+            items,
+            bytes,
+            done: done_tx,
+        };
+        self.tx
+            .send(request)
+            .map_err(|_| anyhow::anyhow!("fjall publish worker stopped"))?;
+        done_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("fjall publish worker stopped"))?
+    }
+}
+
+/// One caller request sent to the shared Fjall publish worker.
+///
+/// Purpose:
+/// - Preserve the partition/lock identity and owned writes needed for a
+///   keyspace-level commit.
+///
+/// Design:
+/// - Carries cloned Fjall partition handles plus the engine write lock so the
+///   worker maintains the same read/write exclusion as direct engine commits.
+///
+/// Inputs:
+/// - An engine id, Fjall partitions, lock, owned writes, and a reply sender.
+///
+/// Outputs:
+/// - A worker-committed batch contribution and one reply to the caller.
+struct FjallPublishRequest {
+    engine_id: usize,
+    versions: fjall::PartitionHandle,
+    latest: fjall::PartitionHandle,
+    lock: Arc<RwLock<()>>,
+    items: Vec<OwnedCommittedWrite>,
+    bytes: usize,
+    done: mpsc::Sender<anyhow::Result<u64>>,
+}
+
+/// Per-request latest-index candidate selected during a combined publish.
+///
+/// Purpose:
+/// - Track which item should update `kv_latest` for one `(engine, key)` pair.
+///
+/// Design:
+/// - Stores indexes back into the request/item arrays to avoid cloning values
+///   while deciding the latest write.
+///
+/// Inputs:
+/// - Existing latest version and committed writes in the combined publish.
+///
+/// Outputs:
+/// - One optional latest-index update and inserted-latest accounting owner.
+struct FjallLatestCandidate {
+    current: Option<Version>,
+    request_idx: usize,
+    item_idx: usize,
+    version: Option<Version>,
+    had_latest: bool,
+}
+
+/// Unique key for latest-index candidates in a combined Fjall publish.
+///
+/// Purpose:
+/// - Keep latest-index decisions separate for shard partitions that may contain
+///   the same user key bytes.
+///
+/// Design:
+/// - Combines the engine id with the user key bytes.
+///
+/// Inputs:
+/// - Engine id and user key from a publish request.
+///
+/// Outputs:
+/// - Hashable map key for candidate tracking.
+#[derive(Hash, PartialEq, Eq)]
+struct FjallLatestKey {
+    engine_id: usize,
+    key: Vec<u8>,
+}
+
+/// Update an atomic maximum counter.
+///
+/// Purpose:
+/// - Record peak batch sizes without locking.
+///
+/// Design:
+/// - Uses a compare/exchange loop and exits early when the current max is
+///   already greater than or equal to `value`.
+///
+/// Inputs:
+/// - `slot`: atomic maximum counter.
+/// - `value`: observed candidate max.
+///
+/// Outputs:
+/// - `slot` is increased if `value` is larger.
+fn update_max_atomic(slot: &AtomicU64, value: u64) {
+    let mut current = slot.load(Ordering::Relaxed);
+    while value > current {
+        match slot.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+/// Run the shared Fjall publish worker loop.
+///
+/// Purpose:
+/// - Serialize and opportunistically batch committed KV publishes for one
+///   Fjall keyspace.
+///
+/// Design:
+/// - Blocks for the first request, then drains only immediately available
+///   queued requests while under internal caps; it never sleeps to manufacture
+///   batching.
+///
+/// Inputs:
+/// - `keyspace`: keyspace used to create combined Fjall batches.
+/// - `rx`: request receiver owned by this worker.
+/// - `limits`: bounded drain limits per worker turn.
+/// - `stats`: shared advisory counters.
+///
+/// Outputs:
+/// - Sends one success/error reply per request and exits when all senders drop.
+fn run_fjall_publish_worker(
+    keyspace: Arc<Keyspace>,
+    rx: mpsc::Receiver<FjallPublishRequest>,
+    limits: FjallPublishBatchLimits,
+    stats: Arc<FjallPublishBatcherStatsInner>,
+) {
+    while let Ok(first) = rx.recv() {
+        let mut requests = Vec::with_capacity(limits.max_requests.clamp(1, 8));
+        let mut item_count = first.items.len();
+        let mut byte_count = first.bytes;
+        requests.push(first);
+
+        loop {
+            if requests.len() >= limits.max_requests
+                || item_count >= limits.max_items
+                || byte_count >= limits.max_bytes
+            {
+                // Stop draining once the current batch is large enough; this
+                // deliberately leaves later requests queued for the next turn
+                // instead of waiting for more work or growing memory further.
+                break;
+            }
+            match rx.try_recv() {
+                Ok(next) => {
+                    item_count = item_count.saturating_add(next.items.len());
+                    byte_count = byte_count.saturating_add(next.bytes);
+                    requests.push(next);
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    // No already-queued request is available, so commit now
+                    // rather than adding artificial latency.
+                    break;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // Finish the requests already collected; the outer loop
+                    // will exit after replying to callers.
+                    break;
+                }
+            }
+        }
+
+        let result = publish_fjall_requests(&keyspace, &requests);
+        let failed = result.is_err();
+        stats.record_batch(requests.len(), item_count, failed);
+        match result {
+            Ok(counts) => {
+                for (request, inserted_latest) in requests.into_iter().zip(counts.into_iter()) {
+                    let _ = request.done.send(Ok(inserted_latest));
+                }
+            }
+            Err(err) => {
+                let message = err.to_string();
+                for request in requests {
+                    let _ = request.done.send(Err(anyhow::anyhow!(message.clone())));
+                }
+            }
+        }
+    }
+}
+
+/// Commit a set of Fjall publish requests in one keyspace batch.
+///
+/// Purpose:
+/// - Share one Fjall commit across multiple shard-engine publish requests while
+///   preserving each caller's inserted-latest accounting.
+///
+/// Design:
+/// - Acquires participating engine write locks in engine-id order, writes all
+///   visible version rows, deduplicates latest-index decisions per
+///   `(engine_id, key)`, then commits once.
+///
+/// Inputs:
+/// - `keyspace`: keyspace used to allocate the Fjall batch.
+/// - `requests`: non-empty publish requests already selected by the worker.
+///
+/// Outputs:
+/// - Per-request inserted-latest counts or a storage error.
+fn publish_fjall_requests(
+    keyspace: &Keyspace,
+    requests: &[FjallPublishRequest],
+) -> anyhow::Result<Vec<u64>> {
+    if requests.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut lock_by_engine: HashMap<usize, Arc<RwLock<()>>> =
+        HashMap::with_capacity(requests.len());
+    for request in requests {
+        lock_by_engine
+            .entry(request.engine_id)
+            .or_insert_with(|| request.lock.clone());
+    }
+    let mut locks = lock_by_engine.into_iter().collect::<Vec<_>>();
+    locks.sort_unstable_by_key(|(engine_id, _)| *engine_id);
+
+    let mut guards = Vec::with_capacity(locks.len());
+    for (_, lock) in &locks {
+        // Hold every participating engine lock through latest reads and commit
+        // so direct reads cannot observe half-published rows. Lock ordering by
+        // engine id avoids multi-engine deadlocks; there is no attempt to merge
+        // or bypass the per-engine read/write exclusion contract.
+        guards.push(
+            lock.write()
+                .map_err(|_| anyhow::anyhow!("fjall kv lock poisoned"))?,
+        );
+    }
+
+    let total_items = requests
+        .iter()
+        .map(|request| request.items.len())
+        .sum::<usize>();
+    let mut batch = keyspace.batch();
+    let mut latest_by_key: HashMap<FjallLatestKey, FjallLatestCandidate> =
+        HashMap::with_capacity(total_items);
+
+    for (request_idx, request) in requests.iter().enumerate() {
+        for (item_idx, item) in request.items.iter().enumerate() {
+            let entry_key = encode_version_key(&item.key, item.version);
+            let entry_value = encode_version_value(true, &item.value);
+            batch.insert(&request.versions, entry_key, entry_value);
+
+            let latest_key = FjallLatestKey {
+                engine_id: request.engine_id,
+                key: item.key.clone(),
+            };
+            match latest_by_key.entry(latest_key) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let candidate = entry.get_mut();
+                    let base = candidate.version.or(candidate.current);
+                    if should_update_latest(base, item.version) {
+                        candidate.request_idx = request_idx;
+                        candidate.item_idx = item_idx;
+                        candidate.version = Some(item.version);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let current = match request.latest.get(&item.key) {
+                        Ok(Some(bytes)) => Some(decode_latest_version(&bytes)?),
+                        Ok(None) => None,
+                        Err(err) => {
+                            return Err(anyhow::anyhow!(err).context("fjall kv latest read failed"));
+                        }
+                    };
+                    let mut candidate = FjallLatestCandidate {
+                        current,
+                        request_idx,
+                        item_idx,
+                        version: None,
+                        had_latest: current.is_some(),
+                    };
+                    if should_update_latest(current, item.version) {
+                        candidate.version = Some(item.version);
+                    }
+                    entry.insert(candidate);
+                }
+            }
+        }
+    }
+
+    let mut inserted_by_request = vec![0u64; requests.len()];
+    for (latest_key, candidate) in latest_by_key {
+        let Some(version) = candidate.version else {
+            // The committed version row still exists; this write simply did not
+            // supersede the current latest index entry.
+            continue;
+        };
+        let request = &requests[candidate.request_idx];
+        let item = &request.items[candidate.item_idx];
+        if !candidate.had_latest {
+            inserted_by_request[candidate.request_idx] =
+                inserted_by_request[candidate.request_idx].saturating_add(1);
+        }
+        batch.insert(
+            &request.latest,
+            latest_key.key,
+            encode_latest_value(version, &item.value),
+        );
+    }
+
+    batch
+        .commit()
+        .map_err(|err| anyhow::anyhow!(err).context("fjall kv committed publish batch failed"))?;
+    drop(guards);
+    Ok(inserted_by_request)
+}
+
 /// Fjall-backed key/value engine that stores versions and a latest index.
+///
+/// Purpose:
+/// - Persist committed KV versions and serve latest/historical reads.
+///
+/// Design:
+/// - Owns one versions partition and one latest-index partition, guarded by a
+///   per-engine RW lock; committed publishes can run directly or through an
+///   optional shared keyspace publish worker.
+///
+/// Inputs:
+/// - Encoded command writes from the KV state machine and read keys from
+///   client/query paths.
+///
+/// Outputs:
+/// - Visible version rows, latest-index rows, and decoded read values.
 pub struct FjallEngine {
+    engine_id: usize,
     keyspace: Arc<Keyspace>,
     versions: fjall::PartitionHandle,
     latest: fjall::PartitionHandle,
-    lock: RwLock<()>,
+    lock: Arc<RwLock<()>>,
+    publish_batcher: Option<FjallPublishBatcher>,
 }
 
 // Deterministic, process-stable seeds for shard selection and peer ordering.
@@ -320,28 +950,79 @@ pub fn hash_key(bytes: &[u8]) -> u64 {
 impl FjallEngine {
     /// Open the default (single-shard) Fjall partitions.
     pub fn open(keyspace: Arc<Keyspace>) -> anyhow::Result<Self> {
+        Self::open_with_publisher(keyspace, None)
+    }
+
+    /// Open the default Fjall partitions with an optional shared publisher.
+    ///
+    /// Purpose:
+    /// - Allow production code to opt into keyspace-level publish batching while
+    ///   keeping direct single-shard operation allocation-light.
+    ///
+    /// Design:
+    /// - Creates the default version/latest partitions and stores a cloneable
+    ///   publisher used only by `apply_committed_batch`.
+    ///
+    /// Inputs:
+    /// - `keyspace`: Fjall keyspace containing KV partitions.
+    /// - `publish_batcher`: optional shared publish worker.
+    ///
+    /// Outputs:
+    /// - A ready `FjallEngine`.
+    pub fn open_with_publisher(
+        keyspace: Arc<Keyspace>,
+        publish_batcher: Option<FjallPublishBatcher>,
+    ) -> anyhow::Result<Self> {
         let versions = keyspace.open_partition("kv_versions", PartitionCreateOptions::default())?;
         let latest = keyspace.open_partition("kv_latest", PartitionCreateOptions::default())?;
         Ok(Self {
+            engine_id: NEXT_FJALL_ENGINE_ID.fetch_add(1, Ordering::Relaxed),
             keyspace,
             versions,
             latest,
-            lock: RwLock::new(()),
+            lock: Arc::new(RwLock::new(())),
+            publish_batcher,
         })
     }
 
     /// Open shard-specific Fjall partitions by suffixing partition names.
     pub fn open_shard(keyspace: Arc<Keyspace>, shard: usize) -> anyhow::Result<Self> {
+        Self::open_shard_with_publisher(keyspace, shard, None)
+    }
+
+    /// Open shard-specific Fjall partitions with an optional shared publisher.
+    ///
+    /// Purpose:
+    /// - Attach many shard engines to one keyspace-level publish worker.
+    ///
+    /// Design:
+    /// - Suffixes partition names by shard and shares only the publisher, not
+    ///   shard partition state.
+    ///
+    /// Inputs:
+    /// - `keyspace`: Fjall keyspace containing shard partitions.
+    /// - `shard`: shard index used in partition names.
+    /// - `publish_batcher`: optional shared publish worker.
+    ///
+    /// Outputs:
+    /// - A ready shard `FjallEngine`.
+    pub fn open_shard_with_publisher(
+        keyspace: Arc<Keyspace>,
+        shard: usize,
+        publish_batcher: Option<FjallPublishBatcher>,
+    ) -> anyhow::Result<Self> {
         let versions_name = format!("kv_versions_{shard}");
         let latest_name = format!("kv_latest_{shard}");
         let versions =
             keyspace.open_partition(&versions_name, PartitionCreateOptions::default())?;
         let latest = keyspace.open_partition(&latest_name, PartitionCreateOptions::default())?;
         Ok(Self {
+            engine_id: NEXT_FJALL_ENGINE_ID.fetch_add(1, Ordering::Relaxed),
             keyspace,
             versions,
             latest,
-            lock: RwLock::new(()),
+            lock: Arc::new(RwLock::new(())),
+            publish_batcher,
         })
     }
 }
@@ -445,10 +1126,46 @@ impl KvEngine for FjallEngine {
         Ok(())
     }
 
-    /// Apply committed values as visible and update the latest index in one Fjall batch.
+    /// Apply committed values as visible and update the latest index.
+    ///
+    /// Purpose:
+    /// - Publish committed writes atomically before Accord execution advances.
+    ///
+    /// Design:
+    /// - Uses the shared publish worker when configured, otherwise commits one
+    ///   direct Fjall batch for this engine.
+    ///
+    /// Inputs:
+    /// - Borrowed `(key, value, version)` tuples from the state-machine apply.
+    ///
+    /// Outputs:
+    /// - Count of keys whose latest index transitioned from missing to present.
     fn apply_committed_batch(&self, items: &[(&[u8], &[u8], Version)]) -> anyhow::Result<u64> {
         if items.is_empty() {
             return Ok(0);
+        }
+
+        if let Some(publisher) = &self.publish_batcher {
+            let mut owned = Vec::with_capacity(items.len());
+            let mut bytes = 0usize;
+            for (key, value, version) in items {
+                // Clone only at the asynchronous worker boundary; direct
+                // engines keep the borrowed zero-copy path.
+                bytes = bytes.saturating_add(key.len()).saturating_add(value.len());
+                owned.push(OwnedCommittedWrite {
+                    key: (*key).to_vec(),
+                    value: (*value).to_vec(),
+                    version: *version,
+                });
+            }
+            return publisher.publish(
+                self.engine_id,
+                self.versions.clone(),
+                self.latest.clone(),
+                self.lock.clone(),
+                owned,
+                bytes,
+            );
         }
 
         let _guard = self
@@ -1787,8 +2504,118 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use holo_accord::accord::StateMachine;
+
+    /// Build a unique temporary directory for a KV storage test.
+    ///
+    /// Purpose:
+    /// - Keep Fjall test keyspaces isolated from each other.
+    ///
+    /// Design:
+    /// - Uses process id plus nanosecond timestamp under the OS temp directory.
+    ///
+    /// Inputs:
+    /// - `name`: human-readable test name suffix.
+    ///
+    /// Outputs:
+    /// - Created temporary directory path.
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "holo_store_kv_{name}_{}_{}",
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    /// Open a temporary Fjall keyspace for a KV storage test.
+    ///
+    /// Purpose:
+    /// - Provide isolated Fjall state for direct and worker publish tests.
+    ///
+    /// Design:
+    /// - Creates a unique temp directory and opens a normal Fjall keyspace.
+    ///
+    /// Inputs:
+    /// - `name`: human-readable test name suffix.
+    ///
+    /// Outputs:
+    /// - Temporary directory path kept alive by the caller and keyspace handle.
+    fn open_test_keyspace(name: &str) -> (std::path::PathBuf, Arc<Keyspace>) {
+        let dir = temp_dir(name);
+        let keyspace = Arc::new(
+            fjall::Config::new(&dir)
+                .open()
+                .expect("open temporary keyspace"),
+        );
+        (dir, keyspace)
+    }
+
+    /// Build a deterministic test MVCC version.
+    ///
+    /// Purpose:
+    /// - Keep publish tests readable while constructing comparable versions.
+    ///
+    /// Design:
+    /// - Uses node id 1 and varies the sequence/counter supplied by the test.
+    ///
+    /// Inputs:
+    /// - `seq`: committed sequence number.
+    /// - `counter`: transaction counter.
+    ///
+    /// Outputs:
+    /// - A `Version` value.
+    fn test_version(seq: u64, counter: u64) -> Version {
+        Version {
+            seq,
+            txn_id: TxnId {
+                node_id: 1,
+                counter,
+            },
+        }
+    }
+
+    /// Build a worker request for direct combined-publish tests.
+    ///
+    /// Purpose:
+    /// - Exercise `publish_fjall_requests` without relying on scheduler timing.
+    ///
+    /// Design:
+    /// - Reuses the engine partition handles and supplies a reply channel that
+    ///   direct helper tests do not consume.
+    ///
+    /// Inputs:
+    /// - `engine`: target shard engine.
+    /// - `items`: owned committed writes for this request.
+    ///
+    /// Outputs:
+    /// - A `FjallPublishRequest` suitable for `publish_fjall_requests`.
+    fn test_publish_request(
+        engine: &FjallEngine,
+        items: Vec<OwnedCommittedWrite>,
+    ) -> FjallPublishRequest {
+        let bytes = items
+            .iter()
+            .map(|item| item.key.len().saturating_add(item.value.len()))
+            .sum();
+        let (done, _rx) = std::sync::mpsc::channel();
+        FjallPublishRequest {
+            engine_id: engine.engine_id,
+            versions: engine.versions.clone(),
+            latest: engine.latest.clone(),
+            lock: engine.lock.clone(),
+            items,
+            bytes,
+            done,
+        }
+    }
 
     #[test]
     fn membership_reconfig_roundtrip() {
@@ -2000,5 +2827,191 @@ mod tests {
 
         assert_eq!(engine.mark_visible_batch_calls.load(Ordering::Relaxed), 0);
         assert_eq!(engine.mark_visible_calls.load(Ordering::Relaxed), 0);
+    }
+
+    /// Verify the shared worker publishes data and records worker stats.
+    ///
+    /// Purpose:
+    /// - Cover the normal path through `FjallEngine::apply_committed_batch`
+    ///   when a publisher is configured.
+    ///
+    /// Design:
+    /// - Uses one shard engine with a small worker and waits on the blocking
+    ///   apply call, which only returns after the worker replies.
+    ///
+    /// Inputs:
+    /// - One committed key/value/version item.
+    ///
+    /// Outputs:
+    /// - Latest read returns the value and worker stats show one committed item.
+    #[test]
+    fn fjall_publish_batcher_applies_committed_batch_and_tracks_stats() {
+        let (_dir, keyspace) = open_test_keyspace("publish_worker_normal");
+        let publisher = FjallPublishBatcher::with_limits(
+            keyspace.clone(),
+            FjallPublishBatchLimits {
+                max_requests: 8,
+                max_items: 32,
+                max_bytes: 4096,
+            },
+        );
+        let engine = FjallEngine::open_shard_with_publisher(keyspace, 0, Some(publisher.clone()))
+            .expect("open shard engine");
+        let version = test_version(1, 1);
+
+        let inserted = engine
+            .apply_committed_batch(&[(b"k1".as_slice(), b"v1".as_slice(), version)])
+            .expect("apply committed batch");
+
+        assert_eq!(inserted, 1);
+        assert_eq!(engine.get_latest(b"k1"), Some((b"v1".to_vec(), version)));
+        let stats = publisher.snapshot();
+        assert_eq!(stats.batches, 1);
+        assert_eq!(stats.requests, 1);
+        assert_eq!(stats.items, 1);
+        assert_eq!(stats.errors, 0);
+    }
+
+    /// Verify combined publishes count duplicate-key latest insertion once.
+    ///
+    /// Purpose:
+    /// - Cover the edge case where two queued requests for the same shard/key
+    ///   publish different versions in one Fjall commit.
+    ///
+    /// Design:
+    /// - Calls the combined publish helper directly so the test is deterministic
+    ///   and independent of thread scheduling.
+    ///
+    /// Inputs:
+    /// - Two requests for one key with increasing versions.
+    ///
+    /// Outputs:
+    /// - One total inserted-latest count and the highest version in latest.
+    #[test]
+    fn fjall_combined_publish_counts_duplicate_key_latest_once() {
+        let (_dir, keyspace) = open_test_keyspace("publish_duplicate_key");
+        let engine = FjallEngine::open_shard(keyspace.clone(), 0).expect("open shard engine");
+        let old_version = test_version(1, 1);
+        let new_version = test_version(2, 2);
+
+        let req1 = test_publish_request(
+            &engine,
+            vec![OwnedCommittedWrite {
+                key: b"dup".to_vec(),
+                value: b"old".to_vec(),
+                version: old_version,
+            }],
+        );
+        let req2 = test_publish_request(
+            &engine,
+            vec![OwnedCommittedWrite {
+                key: b"dup".to_vec(),
+                value: b"new".to_vec(),
+                version: new_version,
+            }],
+        );
+
+        let counts = publish_fjall_requests(&keyspace, &[req1, req2]).expect("publish requests");
+
+        assert_eq!(counts, vec![0, 1]);
+        assert_eq!(
+            engine.get_latest(b"dup"),
+            Some((b"new".to_vec(), new_version))
+        );
+        assert_eq!(engine.get(b"dup", old_version), Some(b"old".to_vec()));
+    }
+
+    /// Verify combined publishes isolate same key bytes across shard engines.
+    ///
+    /// Purpose:
+    /// - Cover the edge case where two shard partitions contain identical user
+    ///   key bytes and both need latest-index updates.
+    ///
+    /// Design:
+    /// - Combines requests from two engines sharing a keyspace and checks each
+    ///   shard's latest partition separately.
+    ///
+    /// Inputs:
+    /// - Two requests with the same key bytes but different shard engines.
+    ///
+    /// Outputs:
+    /// - Each request receives its own inserted-latest count.
+    #[test]
+    fn fjall_combined_publish_keeps_shard_latest_candidates_separate() {
+        let (_dir, keyspace) = open_test_keyspace("publish_cross_shard_same_key");
+        let shard0 = FjallEngine::open_shard(keyspace.clone(), 0).expect("open shard 0");
+        let shard1 = FjallEngine::open_shard(keyspace.clone(), 1).expect("open shard 1");
+        let version0 = test_version(1, 1);
+        let version1 = test_version(1, 2);
+
+        let req0 = test_publish_request(
+            &shard0,
+            vec![OwnedCommittedWrite {
+                key: b"same".to_vec(),
+                value: b"s0".to_vec(),
+                version: version0,
+            }],
+        );
+        let req1 = test_publish_request(
+            &shard1,
+            vec![OwnedCommittedWrite {
+                key: b"same".to_vec(),
+                value: b"s1".to_vec(),
+                version: version1,
+            }],
+        );
+
+        let counts = publish_fjall_requests(&keyspace, &[req0, req1]).expect("publish requests");
+
+        assert_eq!(counts, vec![1, 1]);
+        assert_eq!(shard0.get_latest(b"same"), Some((b"s0".to_vec(), version0)));
+        assert_eq!(shard1.get_latest(b"same"), Some((b"s1".to_vec(), version1)));
+    }
+
+    /// Verify combined publish failures are returned instead of swallowed.
+    ///
+    /// Purpose:
+    /// - Cover the failure path that must stop Accord execution from advancing
+    ///   after an unapplied storage write.
+    ///
+    /// Design:
+    /// - Supplies a poisoned engine lock to the helper and checks for an error
+    ///   before any Fjall commit is attempted.
+    ///
+    /// Inputs:
+    /// - One publish request with a poisoned lock.
+    ///
+    /// Outputs:
+    /// - An error containing the storage lock failure.
+    #[test]
+    fn fjall_combined_publish_returns_lock_poison_error() {
+        let (_dir, keyspace) = open_test_keyspace("publish_poisoned_lock");
+        let engine = FjallEngine::open_shard(keyspace.clone(), 0).expect("open shard engine");
+        let poisoned_lock = Arc::new(RwLock::new(()));
+        let lock_for_panic = poisoned_lock.clone();
+        let previous_hook = std::panic::take_hook();
+        // Suppress the expected panic output; this poisons only the test lock
+        // and does not exercise Fjall or the engine's normal lock.
+        std::panic::set_hook(Box::new(|_| {}));
+        let poison_result = std::panic::catch_unwind(move || {
+            let _guard = lock_for_panic.write().expect("lock before poison");
+            panic!("poison test lock");
+        });
+        std::panic::set_hook(previous_hook);
+        assert!(poison_result.is_err());
+        let mut req = test_publish_request(
+            &engine,
+            vec![OwnedCommittedWrite {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                version: test_version(1, 1),
+            }],
+        );
+        req.lock = poisoned_lock;
+
+        let err = publish_fjall_requests(&keyspace, &[req]).expect_err("publish should fail");
+
+        assert!(err.to_string().contains("fjall kv lock poisoned"));
+        assert_eq!(engine.get_latest(b"k"), None);
     }
 }
