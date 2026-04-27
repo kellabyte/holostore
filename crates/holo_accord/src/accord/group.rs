@@ -7091,6 +7091,65 @@ mod tests {
         }
     }
 
+    /// Model-check read/recovery quorums after coordinator crash.
+    ///
+    /// Purpose:
+    /// - Make the 1RTT crash proof explicit: once a coordinator ACKs after a
+    ///   PreAccept quorum, later read/recovery quorums must still find at least
+    ///   one surviving PreAccepted record even if async Commit was lost.
+    ///
+    /// Design:
+    /// - Enumerates every fast quorum for 3/5/7 voters.
+    /// - Forces the coordinator to be in the failed set and then enumerates all
+    ///   tolerated crash sets and live read/recovery quorums.
+    ///
+    /// Inputs:
+    /// - Synthetic node ids `0..n`.
+    ///
+    /// Outputs:
+    /// - Assertion failure if a live quorum can miss the ACKing fast quorum.
+    #[test]
+    fn fast_path_quorum_model_survives_coordinator_crash_lost_async_commit() {
+        for n in [3usize, 5, 7] {
+            let quorum = (n / 2) + 1;
+            let faults = (n - 1) / 2;
+            let nodes = (0..n).collect::<Vec<_>>();
+            let quorums = subsets_of_size(&nodes, quorum);
+
+            for fast_quorum in &quorums {
+                let coordinator = *fast_quorum.iter().next().expect("non-empty fast quorum");
+                for failure_count in 1..=faults {
+                    for failed in subsets_of_size(&nodes, failure_count) {
+                        if !failed.contains(&coordinator) {
+                            continue;
+                        }
+                        let live = nodes
+                            .iter()
+                            .copied()
+                            .filter(|node| !failed.contains(node))
+                            .collect::<Vec<_>>();
+                        if live.len() < quorum {
+                            continue;
+                        }
+
+                        // Every live read/recovery quorum must retain a fast
+                        // quorum member. It intentionally does not require the
+                        // crashed coordinator because 1RTT safety must survive
+                        // losing coordinator-local volatile state.
+                        for live_quorum in subsets_of_size(&live, quorum) {
+                            let surviving_intersection =
+                                live_quorum.iter().any(|node| fast_quorum.contains(node));
+                            assert!(
+                                surviving_intersection,
+                                "live quorum missed fast quorum after coordinator crash for n={n}, failed={failed:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Model-check conflicting fast-path quorum responses.
     ///
     /// Purpose:
@@ -7144,6 +7203,181 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Verify recovery rejects conflicting fast-path command bytes.
+    ///
+    /// Purpose:
+    /// - Cover the failure path where a recovery quorum reports incompatible
+    ///   PreAccepted payloads for the same transaction id.
+    ///
+    /// Design:
+    /// - Builds two PreAccepted recover replies with distinct command bytes and
+    ///   matching ballots.
+    /// - `choose_recovery_value` must fail instead of choosing either value.
+    ///
+    /// Inputs:
+    /// - Two conflicting recover replies.
+    ///
+    /// Outputs:
+    /// - Error containing `conflicting command bytes`.
+    #[test]
+    fn choose_recovery_value_rejects_conflicting_preaccepted_commands() {
+        let a = Bytes::from_static(b"fast-path-a");
+        let b = Bytes::from_static(b"fast-path-b");
+        let reply_a = RecoverResponse {
+            ok: true,
+            promised: Ballot::zero(),
+            status: TxnStatus::PreAccepted,
+            accepted_ballot: Some(Ballot::initial(1)),
+            command: a.clone(),
+            command_digest: Some(command_digest(&a)),
+            has_command: true,
+            seq: 9,
+            deps: Vec::new(),
+        };
+        let reply_b = RecoverResponse {
+            ok: true,
+            promised: Ballot::zero(),
+            status: TxnStatus::PreAccepted,
+            accepted_ballot: Some(Ballot::initial(1)),
+            command: b.clone(),
+            command_digest: Some(command_digest(&b)),
+            has_command: true,
+            seq: 9,
+            deps: Vec::new(),
+        };
+
+        let err = choose_recovery_value(&[reply_a, reply_b])
+            .expect_err("conflicting preaccepted commands should fail");
+        assert!(
+            err.to_string().contains("conflicting command bytes"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// Verify barriers ignore PreAccepted writes when 1RTT is disabled.
+    ///
+    /// Purpose:
+    /// - Preserve legacy read-barrier semantics for groups that do not use 1RTT
+    ///   fast-path ACKs.
+    ///
+    /// Design:
+    /// - PreAccepts one write locally with `fast_path_1rtt=false`.
+    /// - Queries barrier state and expects no target until Commit occurs.
+    ///
+    /// Inputs:
+    /// - One local PreAccept request for the unit-test write key.
+    ///
+    /// Outputs:
+    /// - Empty barrier target for that key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fast_path_barrier_ignores_preaccepted_write_when_1rtt_disabled() {
+        let cfg = round_test_config(
+            1,
+            vec![1, 2, 3],
+            StdDuration::from_millis(80),
+            StdDuration::from_secs(1),
+        );
+        let group = Group::new(
+            cfg,
+            Arc::new(NoopTransport::new()),
+            Arc::new(TestStateMachine),
+            None,
+        );
+        let txn_id = TxnId {
+            node_id: 2,
+            counter: (1u64 << TXN_COUNTER_SHARD_SHIFT) | 8,
+        };
+        let resp = group
+            .rpc_pre_accept(PreAcceptRequest {
+                group_id: 1,
+                txn_id,
+                ballot: Ballot::initial(2),
+                command: Bytes::from_static(b"preaccepted-write-disabled"),
+                seq: 0,
+                deps: Vec::new(),
+            })
+            .await;
+        assert!(resp.ok, "preaccept should succeed");
+
+        let key = b"unit-test-key".as_slice();
+        let barriers = group.last_committed_for_key_slices(&[key]).await;
+        assert_eq!(barriers[0], None);
+    }
+
+    /// Verify barriers choose the highest-sequence fast-path candidate.
+    ///
+    /// Purpose:
+    /// - Ensure quorum read barriers wait on the strongest visible dependency
+    ///   when multiple PreAccepted/Accepted writes exist for the same key.
+    ///
+    /// Design:
+    /// - PreAccepts two writes on the same synthetic key with 1RTT enabled.
+    /// - The second write observes the first as a dependency and receives a
+    ///   higher sequence; the barrier must report the second transaction.
+    ///
+    /// Inputs:
+    /// - Two local PreAccept requests for the same key.
+    ///
+    /// Outputs:
+    /// - Barrier target points at the higher-sequence transaction.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fast_path_barrier_reports_highest_sequence_candidate() {
+        let mut cfg = round_test_config(
+            1,
+            vec![1, 2, 3],
+            StdDuration::from_millis(80),
+            StdDuration::from_secs(1),
+        );
+        cfg.fast_path_1rtt = true;
+        let group = Group::new(
+            cfg,
+            Arc::new(NoopTransport::new()),
+            Arc::new(TestStateMachine),
+            None,
+        );
+        let first = TxnId {
+            node_id: 2,
+            counter: (1u64 << TXN_COUNTER_SHARD_SHIFT) | 9,
+        };
+        let second = TxnId {
+            node_id: 3,
+            counter: (1u64 << TXN_COUNTER_SHARD_SHIFT) | 10,
+        };
+
+        let first_resp = group
+            .rpc_pre_accept(PreAcceptRequest {
+                group_id: 1,
+                txn_id: first,
+                ballot: Ballot::initial(2),
+                command: Bytes::from_static(b"preaccepted-write-first"),
+                seq: 0,
+                deps: Vec::new(),
+            })
+            .await;
+        assert!(first_resp.ok, "first preaccept should succeed");
+
+        let second_resp = group
+            .rpc_pre_accept(PreAcceptRequest {
+                group_id: 1,
+                txn_id: second,
+                ballot: Ballot::initial(3),
+                command: Bytes::from_static(b"preaccepted-write-second"),
+                seq: 0,
+                deps: Vec::new(),
+            })
+            .await;
+        assert!(second_resp.ok, "second preaccept should succeed");
+        assert!(
+            second_resp.seq > first_resp.seq,
+            "second conflicting write should receive higher sequence"
+        );
+
+        let key = b"unit-test-key".as_slice();
+        let barriers = group.last_committed_for_key_slices(&[key]).await;
+        assert_eq!(barriers[0].map(|item| item.0), Some(second));
+        assert_eq!(barriers[0].map(|item| item.1), Some(second_resp.seq));
     }
 
     /// Verify recovery merge accepts explicitly-encoded committed NOOP replies.
