@@ -6,6 +6,8 @@
 // Design:
 // - Wires Accord consensus groups, KV engine, WAL, transport, and Redis server.
 // - Keeps client routing, batching, and control-plane orchestration in one runtime.
+// - Shares a Fjall publish worker across multi-shard KV engines so naturally
+//   queued shard publishes can commit as one keyspace batch.
 //
 // Inputs:
 // - CLI/runtime configuration, client Redis commands, cluster metadata updates.
@@ -51,7 +53,7 @@ use cluster::{
     ClusterState, ClusterStateMachine, ClusterStateStore, ControllerDomain, ControllerFence,
     MemberInfo, MemberState, ReplicaRole, ShardDesc,
 };
-use kv::{FjallEngine, KvEngine};
+use kv::{FjallEngine, FjallPublishBatcher, KvEngine};
 use load::ShardLoadTracker;
 use meta_manager::MetaManagerConfig;
 use range_manager::RangeManagerConfig;
@@ -6668,7 +6670,6 @@ where
         }
     };
     let mut checkpoint_wals: Vec<Arc<dyn accord::CommitLog>> = vec![shared_wal.clone()];
-    let kv_engine_impl = Arc::new(FjallEngine::open(keyspace.clone())?);
 
     if args.bootstrap == args.join.is_some() {
         // Exactly one of --bootstrap or --join must be selected.
@@ -6708,6 +6709,11 @@ where
         .collect();
 
     let data_shards = resolve_data_shards(args.data_shards);
+    let kv_publish_batcher = if data_shards > 1 {
+        Some(FjallPublishBatcher::new(keyspace.clone()))
+    } else {
+        None
+    };
 
     let cluster_state_path = data_dir.join("meta").join("cluster_state.json");
     let cluster_store = ClusterStateStore::load_or_init(
@@ -6921,12 +6927,18 @@ where
 
     let mut kv_shards: Vec<Arc<dyn KvEngine>> = Vec::with_capacity(data_shards);
     if data_shards == 1 {
-        // Single shard: reuse the default Fjall engine.
-        kv_shards.push(kv_engine_impl.clone());
+        // Single shard: keep the direct Fjall path so a worker hop is not added
+        // when there is no cross-shard publish batching opportunity.
+        kv_shards.push(Arc::new(FjallEngine::open(keyspace.clone())?));
     } else {
-        // Multiple shards: open separate Fjall partitions per shard.
+        // Multiple shards: open separate Fjall partitions per shard and share
+        // one keyspace publisher across them.
         for shard in 0..data_shards {
-            let engine = Arc::new(FjallEngine::open_shard(keyspace.clone(), shard)?);
+            let engine = Arc::new(FjallEngine::open_shard_with_publisher(
+                keyspace.clone(),
+                shard,
+                kv_publish_batcher.clone(),
+            )?);
             kv_shards.push(engine);
         }
     }
