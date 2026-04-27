@@ -513,6 +513,9 @@ impl AdaptiveSplitStrategy {
             };
             let (target_replicas, target_leaseholder) =
                 plan_split_target_placement(cluster_state, shard);
+            // If the target already uses the source replica set, cutover migration
+            // is authoritative and a staged full-range copy only duplicates work.
+            let staged_backfill = !same_replica_set(&target_replicas, &shard.replicas);
             let decision = SplitDecision {
                 reason: "adaptive".to_string(),
                 shard: shard.clone(),
@@ -523,7 +526,7 @@ impl AdaptiveSplitStrategy {
                 // Keep authoritative per-node migration on cutover so source
                 // shards are cleaned up and replica-local key counts converge.
                 skip_migration: false,
-                staged_backfill: true,
+                staged_backfill,
             };
             match &best {
                 Some((best_score, _)) if *best_score >= score => {}
@@ -763,6 +766,17 @@ fn plan_split_target_placement(state: &ClusterState, source: &ShardDesc) -> (Vec
     (replicas, leaseholder)
 }
 
+/// Compare replica sets independent of descriptor ordering.
+fn same_replica_set(left: &[NodeId], right: &[NodeId]) -> bool {
+    let mut left = left.to_vec();
+    let mut right = right.to_vec();
+    left.sort_unstable();
+    left.dedup();
+    right.sort_unstable();
+    right.dedup();
+    left == right
+}
+
 /// Configuration for the range manager.
 ///
 /// Inputs:
@@ -925,9 +939,8 @@ async fn maybe_split_once(
         .iter()
         .map(|s| s.shard_id)
         .collect::<std::collections::BTreeSet<_>>();
-    split_failure_backoff
-        .retain(|shard_id, entry| live_shards.contains(shard_id) && entry.retry_after > now);
-    state.set_split_backoff_active(split_failure_backoff.len() as u64);
+    retain_split_failure_backoff(split_failure_backoff, &live_shards);
+    state.set_split_backoff_active(split_backoff_active_count(split_failure_backoff, now));
 
     let shard_limit = state.data_shards.max(1);
     let Some(target_idx) = state.cluster_store.first_free_shard_index(shard_limit) else {
@@ -1088,10 +1101,9 @@ async fn maybe_split_once(
                 },
             )
             .await?;
-            let split_local_timeout =
-                split_fence_budget_remaining(fence_phase_started)?.min(SPLIT_FENCE_SYNC_TIMEOUT);
+            split_fence_budget_remaining(fence_phase_started)?;
             let split_epoch =
-                wait_for_local_epoch(state.clone(), split_before_epoch, split_local_timeout)
+                wait_for_local_epoch(state.clone(), split_before_epoch, SPLIT_FENCE_SYNC_TIMEOUT)
                     .await?;
             state
                 .cluster_store
@@ -1106,15 +1118,13 @@ async fn maybe_split_once(
                     )
                 })?;
             let shard_count = state.cluster_store.state().shards.len();
-            let converge_timeout =
-                split_fence_budget_remaining(fence_phase_started)?.min(SPLIT_CLUSTER_SYNC_TIMEOUT);
             wait_for_cluster_converged(
                 state.clone(),
                 split_epoch,
                 Some(shard_count),
                 &required_fences,
                 &[],
-                converge_timeout,
+                SPLIT_CLUSTER_SYNC_TIMEOUT,
             )
             .await?;
             Ok::<(), anyhow::Error>(())
@@ -1130,10 +1140,11 @@ async fn maybe_split_once(
         .await;
         if let Err(err) = split_res {
             let reason = classify_split_failure(&err);
+            let failure_now = Instant::now();
             let (delay, failures) = schedule_split_failure_backoff(
                 split_failure_backoff,
                 split_decision.shard.shard_id,
-                now,
+                failure_now,
             );
             let transient = is_transient_split_failure(reason);
             if transient {
@@ -1141,14 +1152,17 @@ async fn maybe_split_once(
             } else {
                 state.record_split_failure(reason, &err.to_string());
             }
-            state.set_split_backoff_active(split_failure_backoff.len() as u64);
+            state.set_split_backoff_active(split_backoff_active_count(
+                split_failure_backoff,
+                failure_now,
+            ));
             if transient {
                 tracing::info!(
                     shard_id = split_decision.shard.shard_id,
                     reason = reason,
                     failures,
                     retry_after_ms = delay.as_millis(),
-                    "range split aborted by transient lease handoff; backoff scheduled"
+                    "range split transiently aborted; backoff scheduled"
                 );
             } else {
                 tracing::warn!(
@@ -1173,10 +1187,11 @@ async fn maybe_split_once(
         }
         if let Err(err) = clear_res {
             let reason = classify_split_failure(&err);
+            let failure_now = Instant::now();
             let (delay, failures) = schedule_split_failure_backoff(
                 split_failure_backoff,
                 split_decision.shard.shard_id,
-                now,
+                failure_now,
             );
             let transient = is_transient_split_failure(reason);
             if transient {
@@ -1184,14 +1199,17 @@ async fn maybe_split_once(
             } else {
                 state.record_split_failure(reason, &err.to_string());
             }
-            state.set_split_backoff_active(split_failure_backoff.len() as u64);
+            state.set_split_backoff_active(split_backoff_active_count(
+                split_failure_backoff,
+                failure_now,
+            ));
             if transient {
                 tracing::info!(
                     shard_id = split_decision.shard.shard_id,
                     reason = reason,
                     failures,
                     retry_after_ms = delay.as_millis(),
-                    "range split cleanup aborted by transient lease handoff; backoff scheduled"
+                    "range split cleanup transiently aborted; backoff scheduled"
                 );
             } else {
                 tracing::warn!(
@@ -1208,7 +1226,10 @@ async fn maybe_split_once(
             return Err(err);
         }
         split_failure_backoff.remove(&split_decision.shard.shard_id);
-        state.set_split_backoff_active(split_failure_backoff.len() as u64);
+        state.set_split_backoff_active(split_backoff_active_count(
+            split_failure_backoff,
+            Instant::now(),
+        ));
         state.record_split_success();
         split_strategy.on_split_success(
             &split_decision.shard,
@@ -2455,7 +2476,32 @@ fn classify_split_failure(err: &anyhow::Error) -> &'static str {
 
 /// Whether a classified failure should be tracked as transient abort.
 fn is_transient_split_failure(reason: &str) -> bool {
-    matches!(reason, "lease_lost" | "fence_budget_exceeded")
+    matches!(
+        reason,
+        "lease_lost"
+            | "fence_budget_exceeded"
+            | "shard_drain_timeout"
+            | "cluster_convergence_timeout"
+    )
+}
+
+/// Drop retry state only for shards that no longer exist.
+fn retain_split_failure_backoff(
+    split_failure_backoff: &mut std::collections::BTreeMap<u64, SplitFailureBackoff>,
+    live_shards: &std::collections::BTreeSet<u64>,
+) {
+    split_failure_backoff.retain(|shard_id, _| live_shards.contains(shard_id));
+}
+
+/// Count shards whose split retry window is currently active.
+fn split_backoff_active_count(
+    split_failure_backoff: &std::collections::BTreeMap<u64, SplitFailureBackoff>,
+    now: Instant,
+) -> u64 {
+    split_failure_backoff
+        .values()
+        .filter(|entry| entry.retry_after > now)
+        .count() as u64
 }
 
 /// Register a failure and compute its next retry delay for one shard.
@@ -2679,5 +2725,40 @@ mod tests {
         let reason = classify_split_failure(&err);
         assert_eq!(reason, "fence_budget_exceeded");
         assert!(is_transient_split_failure(reason));
+    }
+
+    #[test]
+    fn shard_drain_timeout_is_transient_failure() {
+        let err = anyhow::anyhow!(
+            "timed out waiting for shard 0 low-watermark drain (pending=100, watermark=8)"
+        );
+        let reason = classify_split_failure(&err);
+        assert_eq!(reason, "shard_drain_timeout");
+        assert!(is_transient_split_failure(reason));
+    }
+
+    #[test]
+    fn cluster_convergence_timeout_is_transient_failure() {
+        let err = anyhow::anyhow!("timed out waiting for cluster convergence: node 3 probe failed");
+        let reason = classify_split_failure(&err);
+        assert_eq!(reason, "cluster_convergence_timeout");
+        assert!(is_transient_split_failure(reason));
+    }
+
+    #[test]
+    fn split_backoff_keeps_failure_history_after_retry_window() {
+        let mut backoff = std::collections::BTreeMap::new();
+        let now = Instant::now();
+        let (first_delay, first_failures) = schedule_split_failure_backoff(&mut backoff, 7, now);
+        assert_eq!(first_failures, 1);
+
+        let later = now + first_delay + Duration::from_millis(1);
+        assert_eq!(split_backoff_active_count(&backoff, later), 0);
+
+        let live = std::collections::BTreeSet::from([7]);
+        retain_split_failure_backoff(&mut backoff, &live);
+        let (_second_delay, second_failures) =
+            schedule_split_failure_backoff(&mut backoff, 7, later);
+        assert_eq!(second_failures, 2);
     }
 }
