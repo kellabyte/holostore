@@ -623,8 +623,12 @@ pub struct NodeArgs {
     )]
     read_barrier_fallback_quorum: bool,
 
-    /// Require last-committed responses from all peers (stronger read barrier).
-    #[arg(long, env = "HOLO_READ_BARRIER_ALL_PEERS", default_value_t = true)]
+    /// Require last-committed responses from all peers instead of quorum.
+    ///
+    /// Quorum is the default because 1RTT write PreAccept quorums intersect
+    /// read-barrier quorums; every responding replica also reports fast-path
+    /// PreAccepted/Accepted candidates in its barrier response.
+    #[arg(long, env = "HOLO_READ_BARRIER_ALL_PEERS", default_value_t = false)]
     read_barrier_all_peers: bool,
 
     /// Log RPC batching stats every N milliseconds (0 disables).
@@ -6942,15 +6946,13 @@ where
         .copied()
         .map(|id| accord::Member { id })
         .collect::<Vec<_>>();
-    let accord_fast_path_1rtt = should_enable_kv_fast_path_1rtt(
-        args.read_barrier_all_peers,
-        args.read_barrier_fallback_quorum,
-    );
+    let accord_fast_path_1rtt =
+        should_enable_kv_fast_path_1rtt(accord_members.len(), args.read_barrier_fallback_quorum);
     if !accord_fast_path_1rtt {
         tracing::warn!(
-            read_barrier_all_peers = args.read_barrier_all_peers,
+            accord_member_count = accord_members.len(),
             read_barrier_fallback_quorum = args.read_barrier_fallback_quorum,
-            "Accord 1RTT fast-path ACKs disabled because read-barrier settings are not conservative"
+            "Accord 1RTT fast-path ACKs disabled because read-barrier settings are not quorum-safe"
         );
     }
 
@@ -7445,17 +7447,79 @@ where
     Ok(())
 }
 
+/// Return the majority quorum size used by KV read barriers.
+///
+/// Purpose:
+/// - Keep the startup 1RTT safety decision aligned with the read-barrier
+///   collection rule.
+///
+/// Design:
+/// - Uses the same majority formula as Accord data-group quorums.
+/// - Returns `0` for empty membership so callers can reject invalid startup
+///   states without underflow or accidental enablement.
+///
+/// Inputs:
+/// - `member_count`: number of configured Accord members.
+///
+/// Outputs:
+/// - Required response count for one read-barrier quorum.
+fn read_barrier_quorum_size(member_count: usize) -> usize {
+    if member_count == 0 {
+        return 0;
+    }
+    (member_count / 2) + 1
+}
+
+/// Check whether a read-barrier quorum intersects every 1RTT fast quorum.
+///
+/// Purpose:
+/// - Encode the safety condition that lets KV use quorum read barriers instead
+///   of all-peer barriers while 1RTT Commit dissemination is asynchronous.
+///
+/// Design:
+/// - HoloStore currently uses majority fast quorums for Accord 1RTT writes.
+/// - Two quorums must intersect when their sizes sum to more than membership.
+/// - Empty membership is rejected explicitly rather than relying on arithmetic.
+///
+/// Inputs:
+/// - `member_count`: number of configured Accord members.
+///
+/// Outputs:
+/// - `true` when every read quorum intersects every fast write quorum.
+fn read_barrier_quorum_intersects_fast_quorum(member_count: usize) -> bool {
+    let read_quorum = read_barrier_quorum_size(member_count);
+    if read_quorum == 0 {
+        return false;
+    }
+    let fast_quorum = read_quorum;
+    read_quorum + fast_quorum > member_count
+}
+
 /// Decide whether KV data groups can use Accord 1RTT fast-path ACKs.
 ///
-/// Fast-path ACKs publish locally after a PreAccept quorum and disseminate
-/// Commit asynchronously. That is only safe for KV data groups when reads use
-/// all-peer Accord barriers and never fall back to quorum barriers, so a read
-/// cannot miss a coordinator-local publish during async Commit dissemination.
+/// Purpose:
+/// - Enable 1RTT writes only when the read path can observe an ACKed fast-path
+///   write without waiting for all replicas.
+///
+/// Design:
+/// - Allows quorum read barriers because every read quorum intersects the
+///   ACKing PreAccept quorum and barrier replies include PreAccepted/Accepted
+///   write candidates in 1RTT mode.
+/// - Disallows quorum-read fallback because a plain KV quorum read does not
+///   carry PreAccepted barrier metadata and could miss an async-Commit window.
+///
+/// Inputs:
+/// - `member_count`: number of configured Accord members.
+/// - `read_barrier_fallback_quorum`: whether barrier timeouts may bypass Accord
+///   barrier metadata with a direct KV quorum read.
+///
+/// Outputs:
+/// - `true` when KV data groups may ACK fast-path writes after one RTT.
 fn should_enable_kv_fast_path_1rtt(
-    read_barrier_all_peers: bool,
+    member_count: usize,
     read_barrier_fallback_quorum: bool,
 ) -> bool {
-    read_barrier_all_peers && !read_barrier_fallback_quorum
+    !read_barrier_fallback_quorum && read_barrier_quorum_intersects_fast_quorum(member_count)
 }
 
 /// Attempt to join a seed node, then fetch and return a converged control-plane
@@ -7581,12 +7645,124 @@ mod tests {
         TxnId { node_id, counter }
     }
 
+    /// Enumerate fixed-size subsets for small quorum model tests.
+    ///
+    /// Purpose:
+    /// - Let tests exhaustively inspect read/write quorum intersections without
+    ///   pulling in a property-test dependency.
+    ///
+    /// Design:
+    /// - Uses a recursive depth-first enumeration over tiny synthetic node
+    ///   lists used only in unit tests.
+    ///
+    /// Inputs:
+    /// - `items`: candidate node ids.
+    /// - `size`: desired subset size.
+    ///
+    /// Outputs:
+    /// - Every subset with exactly `size` elements.
+    fn subsets_of_size(items: &[usize], size: usize) -> Vec<Vec<usize>> {
+        /// Extend one subset prefix during recursive test-only enumeration.
+        ///
+        /// Purpose:
+        /// - Keep `subsets_of_size` allocation-light while avoiding duplicate
+        ///   subset construction logic.
+        ///
+        /// Design:
+        /// - Mutates one prefix vector in place and clones only completed
+        ///   subsets into the output list.
+        ///
+        /// Inputs:
+        /// - Candidate items, target size, next index, current prefix, output.
+        ///
+        /// Outputs:
+        /// - Appends completed subsets to `out`.
+        fn go(
+            items: &[usize],
+            size: usize,
+            start: usize,
+            cur: &mut Vec<usize>,
+            out: &mut Vec<Vec<usize>>,
+        ) {
+            if cur.len() == size {
+                out.push(cur.clone());
+                return;
+            }
+            for idx in start..items.len() {
+                cur.push(items[idx]);
+                go(items, size, idx + 1, cur, out);
+                cur.pop();
+            }
+        }
+
+        let mut out = Vec::new();
+        let mut cur = Vec::new();
+        go(items, size, 0, &mut cur, &mut out);
+        out
+    }
+
+    /// Verify the startup safety gate accepts quorum-safe read barriers.
+    ///
+    /// Purpose:
+    /// - Ensure 1RTT KV writes no longer require all-peer read-barrier mode.
+    ///
+    /// Design:
+    /// - Checks valid majority memberships and the explicit empty-membership
+    ///   failure path.
+    /// - Keeps quorum-read fallback disabled because fallback bypasses Accord
+    ///   PreAccepted/Accepted barrier metadata.
+    ///
+    /// Inputs:
+    /// - Synthetic membership sizes and fallback settings.
+    ///
+    /// Outputs:
+    /// - Assertion failure if 1RTT enablement drifts from quorum-safe rules.
     #[test]
-    fn kv_fast_path_1rtt_requires_conservative_read_barriers() {
-        assert!(should_enable_kv_fast_path_1rtt(true, false));
-        assert!(!should_enable_kv_fast_path_1rtt(false, false));
-        assert!(!should_enable_kv_fast_path_1rtt(true, true));
-        assert!(!should_enable_kv_fast_path_1rtt(false, true));
+    fn kv_fast_path_1rtt_allows_quorum_safe_read_barriers() {
+        assert!(should_enable_kv_fast_path_1rtt(1, false));
+        assert!(should_enable_kv_fast_path_1rtt(3, false));
+        assert!(should_enable_kv_fast_path_1rtt(5, false));
+        assert!(!should_enable_kv_fast_path_1rtt(0, false));
+        assert!(!should_enable_kv_fast_path_1rtt(3, true));
+    }
+
+    /// Verify majority read quorums intersect majority fast quorums.
+    ///
+    /// Purpose:
+    /// - Model-check the quorum fact used by the 1RTT read-barrier startup
+    ///   decision.
+    ///
+    /// Design:
+    /// - Enumerates every read/write quorum pair for representative odd and
+    ///   even membership sizes.
+    /// - Uses the production quorum-size helper to keep the model tied to the
+    ///   actual startup rule.
+    ///
+    /// Inputs:
+    /// - Synthetic node ids `0..n`.
+    ///
+    /// Outputs:
+    /// - Assertion failure if any quorum pair can be disjoint.
+    #[test]
+    fn read_barrier_quorum_model_intersects_fast_quorum() {
+        for member_count in [1usize, 2, 3, 4, 5, 7] {
+            let quorum = read_barrier_quorum_size(member_count);
+            let nodes = (0..member_count).collect::<Vec<_>>();
+            let read_quorums = subsets_of_size(&nodes, quorum);
+            let fast_quorums = subsets_of_size(&nodes, quorum);
+
+            // Every pair must intersect; otherwise a read could miss an ACKed
+            // fast-path write whose async Commit dissemination was delayed.
+            for read_quorum in &read_quorums {
+                for fast_quorum in &fast_quorums {
+                    let intersects = read_quorum.iter().any(|node| fast_quorum.contains(node));
+                    assert!(
+                        intersects,
+                        "disjoint read/fast quorums for member_count={member_count}"
+                    );
+                }
+            }
+        }
     }
 
     fn make_batch_get_work(keys: &[&[u8]]) -> BatchGetWork {
