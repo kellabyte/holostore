@@ -1,0 +1,33 @@
+FROM --platform=linux/amd64 rust:1-bookworm AS rustbuild
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+RUN cargo build -p holo_workload --release --bin holo-workload
+
+FROM --platform=linux/amd64 golang:1-bookworm AS gobuild
+
+WORKDIR /src
+COPY tools/porcupine_check/ .
+RUN go build -o /porcupine-check .
+
+FROM --platform=linux/amd64 python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/antithesis/client
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    netcat-openbsd \
+ && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir antithesis
+
+COPY --from=rustbuild /src/target/release/holo-workload /usr/local/bin/holo-workload
+COPY --from=gobuild /porcupine-check /usr/local/bin/porcupine-check
+COPY client/ /antithesis/client/
+COPY client/main/ /opt/antithesis/test/v1/main/
+COPY client/recovery/ /opt/antithesis/test/v1/recovery/
+RUN chmod -R +x /opt/antithesis/test/v1
+
+ENTRYPOINT ["sleep", "infinity"]

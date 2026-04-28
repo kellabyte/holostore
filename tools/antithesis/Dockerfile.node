@@ -1,0 +1,23 @@
+FROM --platform=linux/amd64 rust:1-bookworm AS build
+
+WORKDIR /src
+RUN rustup component add rustfmt
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+RUN cargo build -p holo_store --release --bin holo-store
+
+FROM --platform=linux/amd64 debian:bookworm-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+    bash \
+    ca-certificates \
+    netcat-openbsd \
+    redis-tools \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /src/target/release/holo-store /usr/local/bin/holo-store
+COPY node/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]

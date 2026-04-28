@@ -5,7 +5,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use bytes::Bytes;
@@ -15,6 +15,7 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use redis_protocol::codec::Resp2;
 use redis_protocol::resp2::types::BytesFrame;
+use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio::time;
 use tokio_util::codec::Framed;
@@ -56,9 +57,13 @@ struct RunArgs {
     #[arg(long, default_value_t = 5)]
     keys: usize,
 
-    /// Key prefix/namespace. Keys are generated as `{key_prefix}{seed}_k{idx}`.
+    /// Key prefix/namespace. Keys are generated as `{key_prefix}k{idx}`.
     #[arg(long, default_value = "holo_")]
     key_prefix: String,
+
+    /// Value prefix/namespace. Values are generated as `{value_prefix}c{client}:{seq}`.
+    #[arg(long, default_value = "")]
+    value_prefix: String,
 
     /// Percent of operations that are SET (rest are GET).
     #[arg(long, default_value_t = 50)]
@@ -87,6 +92,14 @@ struct RunArgs {
     /// Write a JSON history to this path (Porcupine input).
     #[arg(long, default_value = ".tmp/porcupine/history.json")]
     out: PathBuf,
+
+    /// Optional sibling path for machine-readable workload summary JSON.
+    #[arg(long)]
+    summary_out: Option<PathBuf>,
+
+    /// Encode SET values with a key-bound checksum payload.
+    #[arg(long, default_value_t = false)]
+    checksum_values: bool,
 }
 
 /// Metadata embedded in the history file for reproducibility.
@@ -98,10 +111,13 @@ struct HistoryMeta {
     clients: usize,
     keys: usize,
     key_prefix: String,
+    value_prefix: String,
     set_pct: u8,
     duration_ms: u64,
     seed: u64,
+    start_unix_us: u64,
     fault_disconnect_pct: u8,
+    checksum_values: bool,
 }
 
 /// Full workload history serialized for Porcupine.
@@ -142,6 +158,19 @@ enum OpResult {
     Err { error: String },
 }
 
+/// Machine-readable operation summary written next to the history file.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+struct WorkloadSummary {
+    ops: usize,
+    ok_sets: usize,
+    value_gets: usize,
+    nil_gets: usize,
+    errors: usize,
+    seed: u64,
+    history_path: String,
+    checksum_values: bool,
+}
+
 #[tokio::main]
 /// Parse CLI args and dispatch to the selected subcommand.
 async fn main() -> anyhow::Result<()> {
@@ -177,11 +206,13 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         args.seed
     };
 
-    let keyspace = (0..args.keys)
-        .map(|i| format!("{}{}_k{i}", args.key_prefix, seed))
-        .collect::<Vec<_>>();
+    let keyspace = build_keyspace(&args.key_prefix, args.keys);
 
     let start = time::Instant::now();
+    let start_unix_us = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0);
     let deadline = start + duration;
 
     let mut tasks = Vec::with_capacity(args.clients);
@@ -191,10 +222,12 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         let write_node = write_nodes[client_id % write_nodes.len()];
         let write_node_str = write_node.to_string();
         let keyspace = keyspace.clone();
+        let value_prefix = args.value_prefix.clone();
         let op_timeout: Duration = args.op_timeout.into();
         let fail_fast = args.fail_fast;
         let set_pct = args.set_pct;
         let fault_disconnect_pct = args.fault_disconnect_pct;
+        let checksum_values = args.checksum_values;
         // Mix the base seed with the client id for deterministic per-client RNG.
         let seed = seed ^ (client_id as u64).wrapping_mul(0x9e3779b97f4a7c15);
         tasks.push(tokio::spawn(async move {
@@ -205,6 +238,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                 write_node,
                 write_node_str,
                 keyspace,
+                value_prefix,
                 set_pct,
                 seed,
                 start,
@@ -212,6 +246,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                 op_timeout,
                 fail_fast,
                 fault_disconnect_pct,
+                checksum_values,
             )
             .await
         }));
@@ -233,15 +268,22 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         clients: args.clients,
         keys: args.keys,
         key_prefix: args.key_prefix.clone(),
+        value_prefix: args.value_prefix.clone(),
         set_pct: args.set_pct,
         duration_ms: duration.as_millis() as u64,
         seed,
+        start_unix_us,
         fault_disconnect_pct: args.fault_disconnect_pct,
+        checksum_values: args.checksum_values,
     };
 
     let history = History { meta, ops: all_ops };
     write_history(&args.out, &history).context("write history")?;
+    let summary_path = resolve_summary_path(&args.out, args.summary_out.as_ref());
+    let summary = build_summary(&history.ops, seed, &args.out, args.checksum_values);
+    write_summary(&summary_path, &summary).context("write workload summary")?;
     eprintln!("wrote history: {}", args.out.display());
+    eprintln!("wrote summary: {}", summary_path.display());
     Ok(())
 }
 
@@ -253,6 +295,7 @@ async fn run_client(
     write_node: SocketAddr,
     write_node_str: String,
     keyspace: Vec<String>,
+    value_prefix: String,
     set_pct: u8,
     seed: u64,
     start: time::Instant,
@@ -260,6 +303,7 @@ async fn run_client(
     op_timeout: Duration,
     fail_fast: bool,
     fault_disconnect_pct: u8,
+    checksum_values: bool,
 ) -> anyhow::Result<Vec<OpRecord>> {
     let mut rng = SmallRng::seed_from_u64(seed);
     let mut ops = Vec::new();
@@ -275,117 +319,56 @@ async fn run_client(
 
         // Decide whether this operation is a SET or GET.
         let (kind, value, req) = if do_set {
-            let value = format!("c{client_id}:{seq}");
+            let value = build_value(&value_prefix, checksum_values, &key, client_id, seq);
             (OpKind::Set, Some(value.clone()), make_set(&key, &value))
         } else {
             (OpKind::Get, None, make_get(&key))
         };
 
         let call_us = start.elapsed().as_micros() as u64;
-        let (conn, node_str) = if kind == OpKind::Set {
+        let node_str = if kind == OpKind::Set {
             if should_inject_fault(&mut rng, fault_disconnect_pct) {
                 write_conn = connect(write_node).await?;
             }
-            (&mut write_conn, write_node_str.clone())
+            write_node_str.clone()
         } else {
             if should_inject_fault(&mut rng, fault_disconnect_pct) {
                 read_conn = connect(read_node).await?;
             }
-            (&mut read_conn, read_node_str.clone())
+            read_node_str.clone()
         };
 
-        // Enforce per-op timeouts for send.
-        let send_result = time::timeout(op_timeout, conn.send(req)).await;
-        let send_err = match send_result {
-            Ok(Ok(())) => None,
-            Ok(Err(err)) => Some(format!("{err}")),
-            Err(_) => Some("send timed out".to_string()),
+        // Execute each request with per-op send/receive timeouts.
+        let response = if kind == OpKind::Set {
+            execute_request(&mut write_conn, req, op_timeout).await
+        } else {
+            execute_request(&mut read_conn, req, op_timeout).await
         };
-
-        if let Some(error) = send_err {
-            let return_us = start.elapsed().as_micros() as u64;
-            ops.push(OpRecord {
-                client: client_id,
-                node: node_str.clone(),
-                op: kind,
-                key,
-                value,
-                call_us,
-                return_us,
-                result: OpResult::Err {
-                    error: error.clone(),
-                },
-            });
-            if fail_fast {
-                // Abort immediately on send failure when fail-fast is enabled.
-                anyhow::bail!("client {client_id} send failed: {error}");
-            }
-            break;
-        }
-
-        // Enforce per-op timeouts for receive.
-        let recv = time::timeout(op_timeout, conn.next()).await;
-        let resp = match recv {
-            Ok(Some(Ok(frame))) => frame,
-            Ok(Some(Err(err))) => {
+        let resp = match response {
+            Ok(frame) => frame,
+            Err(error) => {
                 let return_us = start.elapsed().as_micros() as u64;
                 ops.push(OpRecord {
                     client: client_id,
-                    node: node_str.clone(),
+                    node: node_str,
                     op: kind,
                     key,
                     value,
                     call_us,
                     return_us,
                     result: OpResult::Err {
-                        error: format!("recv failed: {err}"),
+                        error: error.clone(),
                     },
                 });
                 if fail_fast {
-                    // Abort immediately on receive failure when fail-fast is enabled.
-                    anyhow::bail!("client {client_id} recv failed: {err}");
+                    anyhow::bail!("client {client_id} operation failed: {error}");
                 }
-                break;
-            }
-            Ok(None) => {
-                let return_us = start.elapsed().as_micros() as u64;
-                ops.push(OpRecord {
-                    client: client_id,
-                    node: node_str.clone(),
-                    op: kind,
-                    key,
-                    value,
-                    call_us,
-                    return_us,
-                    result: OpResult::Err {
-                        error: "connection closed".to_string(),
-                    },
-                });
-                if fail_fast {
-                    // Abort when the connection is closed if fail-fast is enabled.
-                    anyhow::bail!("client {client_id} connection closed");
+                if kind == OpKind::Set {
+                    write_conn = connect(write_node).await?;
+                } else {
+                    read_conn = connect(read_node).await?;
                 }
-                break;
-            }
-            Err(_) => {
-                let return_us = start.elapsed().as_micros() as u64;
-                ops.push(OpRecord {
-                    client: client_id,
-                    node: node_str.clone(),
-                    op: kind,
-                    key,
-                    value,
-                    call_us,
-                    return_us,
-                    result: OpResult::Err {
-                        error: "recv timed out".to_string(),
-                    },
-                });
-                if fail_fast {
-                    // Abort on timeout if fail-fast is enabled.
-                    anyhow::bail!("client {client_id} recv timed out");
-                }
-                break;
+                continue;
             }
         };
 
@@ -419,11 +402,73 @@ async fn connect(node: SocketAddr) -> anyhow::Result<Framed<TcpStream, Resp2>> {
     Ok(Framed::new(socket, Resp2::default()))
 }
 
+/// Send one request and await the matching response with bounded timeouts.
+async fn execute_request(
+    conn: &mut Framed<TcpStream, Resp2>,
+    req: BytesFrame,
+    op_timeout: Duration,
+) -> Result<BytesFrame, String> {
+    let send_result = time::timeout(op_timeout, conn.send(req)).await;
+    match send_result {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => return Err(format!("send failed: {err}")),
+        Err(_) => return Err("send timed out".to_string()),
+    }
+
+    let recv = time::timeout(op_timeout, conn.next()).await;
+    match recv {
+        Ok(Some(Ok(frame))) => Ok(frame),
+        Ok(Some(Err(err))) => Err(format!("recv failed: {err}")),
+        Ok(None) => Err("connection closed".to_string()),
+        Err(_) => Err("recv timed out".to_string()),
+    }
+}
+
 fn should_inject_fault(rng: &mut SmallRng, pct: u8) -> bool {
     if pct == 0 {
         return false;
     }
     rng.gen_range(0..100) < pct as u32
+}
+
+/// Build the deterministic keyspace for a workload run.
+fn build_keyspace(key_prefix: &str, keys: usize) -> Vec<String> {
+    (0..keys).map(|i| format!("{key_prefix}k{i}")).collect()
+}
+
+/// Build the logical scenario label embedded in checksum-mode values.
+fn scenario_label(value_prefix: &str) -> String {
+    let trimmed = value_prefix.trim_matches('_');
+    if trimmed.is_empty() {
+        "default".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Construct the SET payload for one logical client operation.
+fn build_value(
+    value_prefix: &str,
+    checksum_values: bool,
+    key: &str,
+    client_id: usize,
+    seq: u64,
+) -> String {
+    if !checksum_values {
+        return format!("{value_prefix}c{client_id}:{seq}");
+    }
+
+    let prefix = format!(
+        "scenario={};key={key};client={client_id};seq={seq}",
+        scenario_label(value_prefix)
+    );
+    format!("{prefix};checksum={}", sha256_hex(prefix.as_bytes()))
+}
+
+/// Render a digest as lowercase hexadecimal without adding another dependency.
+fn sha256_hex(input: &[u8]) -> String {
+    let digest = Sha256::digest(input);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Parse a comma-separated list of `host:port` addresses.
@@ -494,4 +539,144 @@ fn write_history(path: &PathBuf, history: &History) -> anyhow::Result<()> {
     let data = serde_json::to_vec_pretty(history).context("serialize history")?;
     std::fs::write(path, data).with_context(|| format!("write {}", path.display()))?;
     Ok(())
+}
+
+/// Resolve the workload summary output path, defaulting to a sibling JSON file.
+fn resolve_summary_path(history_path: &PathBuf, explicit: Option<&PathBuf>) -> PathBuf {
+    explicit
+        .cloned()
+        .unwrap_or_else(|| history_path.with_extension("summary.json"))
+}
+
+/// Build a compact summary that Antithesis drivers can assert on directly.
+fn build_summary(
+    ops: &[OpRecord],
+    seed: u64,
+    history_path: &PathBuf,
+    checksum_values: bool,
+) -> WorkloadSummary {
+    let mut summary = WorkloadSummary {
+        ops: ops.len(),
+        seed,
+        history_path: history_path.display().to_string(),
+        checksum_values,
+        ..WorkloadSummary::default()
+    };
+
+    for op in ops {
+        match (&op.op, &op.result) {
+            (OpKind::Set, OpResult::Ok) => summary.ok_sets += 1,
+            (OpKind::Get, OpResult::Value { .. }) => summary.value_gets += 1,
+            (OpKind::Get, OpResult::Nil) => summary.nil_gets += 1,
+            (_, OpResult::Err { .. }) => summary.errors += 1,
+            _ => {}
+        }
+    }
+
+    summary
+}
+
+/// Serialize and write the workload summary JSON.
+fn write_summary(path: &PathBuf, summary: &WorkloadSummary) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create dir {}", parent.display()))?;
+    }
+    let data = serde_json::to_vec_pretty(summary).context("serialize summary")?;
+    std::fs::write(path, data).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_keyspace, build_summary, build_value, resolve_summary_path, sha256_hex, OpKind,
+        OpRecord, OpResult,
+    };
+    use std::path::PathBuf;
+
+    /// Checksum-mode values must be stable and key-bound.
+    #[test]
+    fn checksum_value_contains_expected_fields() {
+        let value = build_value("range_churn_", true, "antithesis_shared_k0", 2, 7);
+        let expected_prefix =
+            "scenario=range_churn;key=antithesis_shared_k0;client=2;seq=7".to_string();
+        let expected = format!(
+            "{expected_prefix};checksum={}",
+            sha256_hex(expected_prefix.as_bytes())
+        );
+        assert_eq!(value, expected);
+    }
+
+    /// Shared-key workloads should be able to opt out of seed-derived key names.
+    #[test]
+    fn keyspace_uses_literal_prefix() {
+        assert_eq!(
+            build_keyspace("antithesis_shared_", 3),
+            vec![
+                "antithesis_shared_k0".to_string(),
+                "antithesis_shared_k1".to_string(),
+                "antithesis_shared_k2".to_string(),
+            ]
+        );
+    }
+
+    /// Workload summaries should default to a sibling path next to the history.
+    #[test]
+    fn summary_path_defaults_to_sibling_file() {
+        let history = PathBuf::from("/tmp/history-singleton.json");
+        assert_eq!(
+            resolve_summary_path(&history, None),
+            PathBuf::from("/tmp/history-singleton.summary.json")
+        );
+    }
+
+    /// Summary counters should distinguish successful reads, writes, and errors.
+    #[test]
+    fn summary_counts_operations() {
+        let ops = vec![
+            OpRecord {
+                client: 0,
+                node: "n1".to_string(),
+                op: OpKind::Set,
+                key: "k0".to_string(),
+                value: Some("v0".to_string()),
+                call_us: 1,
+                return_us: 2,
+                result: OpResult::Ok,
+            },
+            OpRecord {
+                client: 0,
+                node: "n1".to_string(),
+                op: OpKind::Get,
+                key: "k0".to_string(),
+                value: None,
+                call_us: 3,
+                return_us: 4,
+                result: OpResult::Value {
+                    value: "v0".to_string(),
+                },
+            },
+            OpRecord {
+                client: 1,
+                node: "n2".to_string(),
+                op: OpKind::Get,
+                key: "k1".to_string(),
+                value: None,
+                call_us: 5,
+                return_us: 6,
+                result: OpResult::Err {
+                    error: "boom".to_string(),
+                },
+            },
+        ];
+
+        let summary = build_summary(&ops, 42, &PathBuf::from("/tmp/history.json"), true);
+        assert_eq!(summary.ops, 3);
+        assert_eq!(summary.ok_sets, 1);
+        assert_eq!(summary.value_gets, 1);
+        assert_eq!(summary.nil_gets, 0);
+        assert_eq!(summary.errors, 1);
+        assert!(summary.checksum_values);
+    }
 }

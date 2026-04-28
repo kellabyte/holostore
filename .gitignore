@@ -1,3 +1,5 @@
 /target/
 /.cluster/
 /.tmp/
+__pycache__/
+*.pyc

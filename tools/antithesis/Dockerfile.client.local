@@ -1,0 +1,21 @@
+FROM --platform=linux/amd64 python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/antithesis/client
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    netcat-openbsd \
+ && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir antithesis
+
+COPY holo-workload /usr/local/bin/holo-workload
+COPY porcupine-check /usr/local/bin/porcupine-check
+COPY client/ /antithesis/client/
+COPY client/main/ /opt/antithesis/test/v1/main/
+COPY client/recovery/ /opt/antithesis/test/v1/recovery/
+RUN chmod -R +x /opt/antithesis/test/v1
+
+ENTRYPOINT ["sleep", "infinity"]
+

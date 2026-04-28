@@ -1,0 +1,16 @@
+FROM --platform=linux/amd64 debian:bookworm-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+    bash \
+    ca-certificates \
+    netcat-openbsd \
+    redis-tools \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY holo-store /usr/local/bin/holo-store
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
+

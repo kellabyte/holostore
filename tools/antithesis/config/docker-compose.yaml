@@ -1,0 +1,99 @@
+services:
+  holo-node1:
+    image: ${HOLOSTORE_NODE_IMAGE:-holostore-node:antithesis}
+    container_name: holo-node1
+    hostname: holo-node1
+    init: true
+    environment:
+      NODE_ID: "1"
+      HOLO_MAX_SHARDS: ${HOLO_MAX_SHARDS:-4}
+      HOLO_INITIAL_RANGES: ${HOLO_INITIAL_RANGES:-1}
+      HOLO_RANGE_SPLIT_MIN_KEYS: ${HOLO_RANGE_SPLIT_MIN_KEYS:-1000000}
+      HOLO_RANGE_SPLIT_MIN_QPS: ${HOLO_RANGE_SPLIT_MIN_QPS:-0}
+      HOLO_WAL_ENGINE: ${HOLO_WAL_ENGINE:-raft-engine}
+    volumes:
+      - type: bind
+        source: ${HOLO_TMP_ROOT}/node1-data
+        target: /data
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 6379"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  holo-node2:
+    image: ${HOLOSTORE_NODE_IMAGE:-holostore-node:antithesis}
+    container_name: holo-node2
+    hostname: holo-node2
+    init: true
+    environment:
+      NODE_ID: "2"
+      HOLO_MAX_SHARDS: ${HOLO_MAX_SHARDS:-4}
+      HOLO_INITIAL_RANGES: ${HOLO_INITIAL_RANGES:-1}
+      HOLO_RANGE_SPLIT_MIN_KEYS: ${HOLO_RANGE_SPLIT_MIN_KEYS:-1000000}
+      HOLO_RANGE_SPLIT_MIN_QPS: ${HOLO_RANGE_SPLIT_MIN_QPS:-0}
+      HOLO_WAL_ENGINE: ${HOLO_WAL_ENGINE:-raft-engine}
+    volumes:
+      - type: bind
+        source: ${HOLO_TMP_ROOT}/node2-data
+        target: /data
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 6379"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  holo-node3:
+    image: ${HOLOSTORE_NODE_IMAGE:-holostore-node:antithesis}
+    container_name: holo-node3
+    hostname: holo-node3
+    init: true
+    environment:
+      NODE_ID: "3"
+      HOLO_MAX_SHARDS: ${HOLO_MAX_SHARDS:-4}
+      HOLO_INITIAL_RANGES: ${HOLO_INITIAL_RANGES:-1}
+      HOLO_RANGE_SPLIT_MIN_KEYS: ${HOLO_RANGE_SPLIT_MIN_KEYS:-1000000}
+      HOLO_RANGE_SPLIT_MIN_QPS: ${HOLO_RANGE_SPLIT_MIN_QPS:-0}
+      HOLO_WAL_ENGINE: ${HOLO_WAL_ENGINE:-raft-engine}
+    volumes:
+      - type: bind
+        source: ${HOLO_TMP_ROOT}/node3-data
+        target: /data
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 6379"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  health-checker:
+    image: ${HOLOSTORE_HEALTHCHECK_IMAGE:-holostore-health-checker:antithesis}
+    container_name: health-checker
+    hostname: health-checker
+    environment:
+      HOLO_HISTORY_DIR: /history
+    volumes:
+      - type: bind
+        source: ${HOLO_TMP_ROOT}/history
+        target: /history
+    depends_on:
+      holo-node1:
+        condition: service_healthy
+      holo-node2:
+        condition: service_healthy
+      holo-node3:
+        condition: service_healthy
+
+  client:
+    image: ${HOLOSTORE_CLIENT_IMAGE:-holostore-client:antithesis}
+    container_name: holostore-client
+    hostname: holostore-client
+    init: true
+    environment:
+      HOLO_HISTORY_DIR: /history
+    volumes:
+      - type: bind
+        source: ${HOLO_TMP_ROOT}/history
+        target: /history
+    depends_on:
+      health-checker:
+        condition: service_started
