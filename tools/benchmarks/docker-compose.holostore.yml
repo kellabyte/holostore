@@ -1,0 +1,81 @@
+services:
+  holostore1:
+    image: ${HOLOSTORE_BENCH_IMAGE:-holostore-bench-node:local}
+    hostname: holostore1
+    init: true
+    environment:
+      NODE_ID: "1"
+      HOLO_NODE_HOSTS: holostore1,holostore2,holostore3
+      HOLO_MAX_SHARDS: ${HOLO_MAX_SHARDS:-4}
+      HOLO_INITIAL_RANGES: ${HOLO_INITIAL_RANGES:-1}
+      HOLO_WAL_ENGINE: ${HOLO_WAL_ENGINE:-raft-engine}
+      HOLO_WAL_PERSIST_MODE: ${HOLO_WAL_PERSIST_MODE:-sync_data}
+      HOLO_WAL_PERSIST_EVERY: ${HOLO_WAL_PERSIST_EVERY:-1024}
+      HOLO_WAL_PERSIST_INTERVAL_US: ${HOLO_WAL_PERSIST_INTERVAL_US:-10000}
+      HOLO_COMMIT_DURABILITY_MODE: ${HOLO_COMMIT_DURABILITY_MODE:-sync_commit}
+      HOLO_REDIS_SET_BATCH_MAX: ${HOLO_REDIS_SET_BATCH_MAX:-128}
+      HOLO_REDIS_GET_BATCH_MAX: ${HOLO_REDIS_GET_BATCH_MAX:-256}
+    volumes:
+      - holostore1-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -h 127.0.0.1 -p 6379 PING | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+
+  holostore2:
+    image: ${HOLOSTORE_BENCH_IMAGE:-holostore-bench-node:local}
+    hostname: holostore2
+    init: true
+    environment:
+      NODE_ID: "2"
+      HOLO_NODE_HOSTS: holostore1,holostore2,holostore3
+      HOLO_MAX_SHARDS: ${HOLO_MAX_SHARDS:-4}
+      HOLO_INITIAL_RANGES: ${HOLO_INITIAL_RANGES:-1}
+      HOLO_WAL_ENGINE: ${HOLO_WAL_ENGINE:-raft-engine}
+      HOLO_WAL_PERSIST_MODE: ${HOLO_WAL_PERSIST_MODE:-sync_data}
+      HOLO_WAL_PERSIST_EVERY: ${HOLO_WAL_PERSIST_EVERY:-1024}
+      HOLO_WAL_PERSIST_INTERVAL_US: ${HOLO_WAL_PERSIST_INTERVAL_US:-10000}
+      HOLO_COMMIT_DURABILITY_MODE: ${HOLO_COMMIT_DURABILITY_MODE:-sync_commit}
+      HOLO_REDIS_SET_BATCH_MAX: ${HOLO_REDIS_SET_BATCH_MAX:-128}
+      HOLO_REDIS_GET_BATCH_MAX: ${HOLO_REDIS_GET_BATCH_MAX:-256}
+    volumes:
+      - holostore2-data:/data
+    depends_on:
+      - holostore1
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -h 127.0.0.1 -p 6379 PING | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+
+  holostore3:
+    image: ${HOLOSTORE_BENCH_IMAGE:-holostore-bench-node:local}
+    hostname: holostore3
+    init: true
+    environment:
+      NODE_ID: "3"
+      HOLO_NODE_HOSTS: holostore1,holostore2,holostore3
+      HOLO_MAX_SHARDS: ${HOLO_MAX_SHARDS:-4}
+      HOLO_INITIAL_RANGES: ${HOLO_INITIAL_RANGES:-1}
+      HOLO_WAL_ENGINE: ${HOLO_WAL_ENGINE:-raft-engine}
+      HOLO_WAL_PERSIST_MODE: ${HOLO_WAL_PERSIST_MODE:-sync_data}
+      HOLO_WAL_PERSIST_EVERY: ${HOLO_WAL_PERSIST_EVERY:-1024}
+      HOLO_WAL_PERSIST_INTERVAL_US: ${HOLO_WAL_PERSIST_INTERVAL_US:-10000}
+      HOLO_COMMIT_DURABILITY_MODE: ${HOLO_COMMIT_DURABILITY_MODE:-sync_commit}
+      HOLO_REDIS_SET_BATCH_MAX: ${HOLO_REDIS_SET_BATCH_MAX:-128}
+      HOLO_REDIS_GET_BATCH_MAX: ${HOLO_REDIS_GET_BATCH_MAX:-256}
+    volumes:
+      - holostore3-data:/data
+    depends_on:
+      - holostore1
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -h 127.0.0.1 -p 6379 PING | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+
+volumes:
+  holostore1-data:
+  holostore2-data:
+  holostore3-data:

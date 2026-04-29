@@ -1,0 +1,8 @@
+services:
+  bench-runner:
+    image: ${BENCH_RUNNER_IMAGE:-holostore-bench-runner:local}
+    init: true
+    volumes:
+      - type: bind
+        source: ${BENCH_RESULTS_DIR:-../../.tmp/benchmarks/results/manual}
+        target: /results

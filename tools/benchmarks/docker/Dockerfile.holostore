@@ -1,0 +1,15 @@
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+    bash \
+    ca-certificates \
+    netcat-openbsd \
+    redis-tools \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY holo-store /usr/local/bin/holo-store
+COPY holostore-entrypoint.sh /usr/local/bin/holostore-entrypoint.sh
+RUN chmod +x /usr/local/bin/holo-store /usr/local/bin/holostore-entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/holostore-entrypoint.sh"]
