@@ -153,6 +153,66 @@ class ReportOverloadTests(unittest.TestCase):
         self.assertIn("holostore:uniform errors", specs[1]["label"])
         self.assertNotEqual(specs[0]["color"], specs[1]["color"])
 
+    def test_target_throughput_rates_are_deduplicated(self) -> None:
+        runs = [
+            make_run(target="holostore", scheduled_throughput_per_second=5000.0),
+            make_run(target="etcd", scheduled_throughput_per_second=5000.0),
+            make_run(target="other", scheduled_throughput_per_second=10000.0),
+        ]
+
+        rates = bench_report.target_throughput_rates(runs)
+
+        self.assertEqual(rates, [5000.0, 10000.0])
+
+    def test_latency_percentile_label_strips_metric_suffix(self) -> None:
+        self.assertEqual(bench_report.latency_percentile_label("p99_ms"), "p99")
+        self.assertEqual(bench_report.latency_percentile_label("p99_9_ms"), "p99.9")
+
+    def test_graph_description_explains_start_lag(self) -> None:
+        description = bench_report.graph_description(Path("graphs/start_lag_p99.png"))
+
+        self.assertIn("p99 delay", description)
+        self.assertIn("scheduled an operation", description)
+        self.assertIn("client worker actually started", description)
+        self.assertIn("coordinated omission", description)
+
+    def test_load_events_normalizes_unix_millis_to_run_seconds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "events-node1.csv").write_text(
+                "\n".join(
+                    [
+                        "unix_ms,target,event,operation_id,node_id,shard_id,shard_index,target_shard_index,split_key,reason,metadata_only",
+                        "1500,holostore,split_start,op1,1,10,0,1,key:050,adaptive,true",
+                        "1750,holostore,split_end,op1,1,10,0,1,key:050,adaptive,true",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            events, event_files = bench_report.load_events(
+                run_dir,
+                {"scheduled_start_unix_ms": 1000},
+            )
+
+        self.assertEqual([path.name for path in event_files], ["events-node1.csv"])
+        self.assertEqual([event["second"] for event in events], [0.5, 0.75])
+
+    def test_split_event_windows_pair_start_and_end_by_operation(self) -> None:
+        run = {
+            "events": [
+                {"event": "split_end", "operation_id": "op1", "second": 2.0},
+                {"event": "split_start", "operation_id": "op1", "second": 1.0},
+            ]
+        }
+
+        windows = bench_report.split_event_windows([run])
+
+        self.assertEqual(len(windows), 1)
+        self.assertEqual(windows[0][0]["event"], "split_start")
+        self.assertEqual(windows[0][1]["event"], "split_end")
+
     def test_error_breakdown_section_lists_categories_and_samples(self) -> None:
         run = make_run(
             target="holostore",

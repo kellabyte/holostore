@@ -7,12 +7,17 @@
 //! - `SplitStrategyEngine` is the strategy interface boundary used by the loop.
 //! - `Loadops` preserves the original load-first/size-second behavior for baseline comparisons.
 //! - `Adaptive` consumes richer cluster telemetry (size/load/latency/hot-key signals),
-//!   selects weighted split points, and uses staged backfill-aware execution.
+//!   selects weighted split points, and defaults to metadata-only split cutovers.
 //!
 //! Runtime safety model:
-//! - All split cutovers are coordinated with shard fences in the range controller domain.
+//! - Metadata-only same-replica splits use a short descriptor cutover and avoid
+//!   foreground data movement.
+//! - Legacy physical split workflows are coordinated with shard fences in the
+//!   range controller domain.
 //! - Only affected shards are paused while metadata + migration converge.
 //! - Failure handling uses per-shard backoff and distinguishes transient lease-loss aborts.
+//! - Successful automatic splits enter a controller-wide pacing window so
+//!   foreground traffic does not pay for bursty split fanout.
 //!
 //! Inputs:
 //! - Cluster state snapshots, shard load telemetry, and manager config thresholds.
@@ -20,6 +25,8 @@
 //! Outputs:
 //! - At-most-one split/merge proposal attempt per manager tick plus health/backoff updates.
 
+use std::io::Write;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -29,7 +36,9 @@ use holo_accord::accord::NodeId;
 use serde::Deserialize;
 use volo::net::Address;
 
-use crate::cluster::{ClusterCommand, ClusterState, ControllerDomain, MemberState, ShardDesc};
+use crate::cluster::{
+    ClusterCommand, ClusterState, ControllerDomain, ControllerFence, MemberState, ShardDesc,
+};
 use crate::load::ShardLoadSnapshot;
 use crate::volo_gen::holo_store::rpc;
 use crate::NodeState;
@@ -47,6 +56,7 @@ const SPLIT_FAILURE_BACKOFF_BASE: Duration = Duration::from_millis(250);
 const SPLIT_FAILURE_BACKOFF_MAX: Duration = Duration::from_secs(15);
 const SPLIT_FAILURE_BACKOFF_MAX_SHIFT: u32 = 6;
 const SPLIT_KEY_SAMPLE_SIZE: usize = 256;
+const MIN_SPLIT_KEY_SAMPLES: usize = 16;
 static SPLIT_TOKEN_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy)]
@@ -124,6 +134,29 @@ struct SplitDecision {
     staged_backfill: bool,
 }
 
+impl SplitDecision {
+    /// Return whether this split is a descriptor-only cutover.
+    ///
+    /// Purpose:
+    /// - Keep high-percentile latency low by skipping fences, drains, snapshots,
+    ///   and physical key movement when the child range starts with the source
+    ///   replicas and storage index.
+    ///
+    /// Output:
+    /// - `true` for the Cockroach-style split-only path; `false` for legacy
+    ///   physical movement/staged backfill paths.
+    fn is_metadata_only(&self) -> bool {
+        self.skip_migration
+            && !self.staged_backfill
+            && self
+                .target_replicas
+                .as_ref()
+                .map(|replicas| same_replica_set(replicas, &self.shard.replicas))
+                .unwrap_or(true)
+            && self.target_leaseholder.unwrap_or(self.shard.leaseholder) == self.shard.leaseholder
+    }
+}
+
 #[derive(Debug, Default)]
 /// Result envelope returned by strategy evaluation.
 ///
@@ -151,6 +184,7 @@ struct LoadOpsSplitStrategy {
     baseline_set_ops: Vec<u64>,
     sustained: Vec<u8>,
     cooldown_until: Vec<Instant>,
+    global_cooldown_until: Instant,
     qps_by_idx: Vec<u64>,
 }
 
@@ -174,16 +208,17 @@ struct AdaptiveNodeTotals {
 ///
 /// Inputs:
 /// - Cluster telemetry cache and per-stream cumulative baselines.
-/// - Per-shard sustained-score streaks and cooldown deadlines.
+/// - Per-shard sustained-score streaks plus per-shard and global cooldown deadlines.
 ///
 /// Output:
-/// - Produces score-ranked split decisions with staged backfill enabled.
+/// - Produces score-ranked split decisions with metadata-only cutovers.
 struct AdaptiveSplitStrategy {
     last_refresh: Instant,
     last_totals_by_node_shard: std::collections::BTreeMap<(NodeId, u64), AdaptiveNodeTotals>,
     telemetry_cache: std::collections::BTreeMap<NodeId, Vec<crate::transport::RangeTelemetryStat>>,
     sustained: std::collections::BTreeMap<u64, u8>,
     cooldown_until: std::collections::BTreeMap<u64, Instant>,
+    global_cooldown_until: Instant,
     qps_by_idx: Vec<u64>,
 }
 
@@ -221,6 +256,7 @@ impl SplitStrategyEngine {
                     last,
                     sustained: vec![0; shards],
                     cooldown_until: vec![Instant::now(); shards],
+                    global_cooldown_until: Instant::now(),
                 })
             }
             crate::RangeSplitStrategy::Adaptive => Self::Adaptive(AdaptiveSplitStrategy {
@@ -231,6 +267,7 @@ impl SplitStrategyEngine {
                 telemetry_cache: std::collections::BTreeMap::new(),
                 sustained: std::collections::BTreeMap::new(),
                 cooldown_until: std::collections::BTreeMap::new(),
+                global_cooldown_until: Instant::now(),
                 qps_by_idx: vec![0; state.data_shards.max(1)],
             }),
         }
@@ -286,7 +323,7 @@ impl SplitStrategyEngine {
     ///
     /// Inputs:
     /// - `source_shard`: shard that was split.
-    /// - `target_idx`: newly allocated shard index.
+    /// - `target_shard`: committed child descriptor after the split.
     /// - `cfg`/`now`: used to apply cooldown and reset sustained counters.
     ///
     /// Output:
@@ -294,7 +331,7 @@ impl SplitStrategyEngine {
     fn on_split_success(
         &mut self,
         source_shard: &ShardDesc,
-        target_idx: usize,
+        target_shard: &ShardDesc,
         cfg: RangeManagerConfig,
         now: Instant,
     ) {
@@ -302,7 +339,12 @@ impl SplitStrategyEngine {
         // to its own state model.
         match self {
             SplitStrategyEngine::Loadops(loadops) => {
+                let target_idx = target_shard.shard_index;
+                loadops.global_cooldown_until = now + cfg.split_global_cooldown;
                 if let Some(slot) = loadops.cooldown_until.get_mut(source_shard.shard_index) {
+                    *slot = now + cfg.split_cooldown;
+                }
+                if let Some(slot) = loadops.cooldown_until.get_mut(target_idx) {
                     *slot = now + cfg.split_cooldown;
                 }
                 if source_shard.shard_index < loadops.baseline_set_ops.len() {
@@ -320,12 +362,20 @@ impl SplitStrategyEngine {
                 if source_shard.shard_index < loadops.sustained.len() {
                     loadops.sustained[source_shard.shard_index] = 0;
                 }
+                if target_idx < loadops.sustained.len() {
+                    loadops.sustained[target_idx] = 0;
+                }
             }
             SplitStrategyEngine::Adaptive(adaptive) => {
                 let deadline = now + cfg.split_cooldown;
+                adaptive.global_cooldown_until = now + cfg.split_global_cooldown;
                 adaptive
                     .cooldown_until
                     .insert(source_shard.shard_id, deadline);
+                adaptive
+                    .cooldown_until
+                    .insert(target_shard.shard_id, deadline);
+                adaptive.sustained.remove(&target_shard.shard_id);
                 adaptive.sustained.remove(&source_shard.shard_id);
             }
         }
@@ -341,7 +391,7 @@ impl LoadOpsSplitStrategy {
     /// - `shards`: current ordered range descriptors.
     /// - `cfg`: loadops thresholds/cooldowns.
     /// - `split_failure_backoff`: shards temporarily blocked from retry.
-    /// - `target_idx`: free shard index reserved for a possible split.
+    /// - `target_idx`: free consensus group index for the child range.
     /// - `now`: evaluation timestamp for cooldown checks.
     ///
     /// Output:
@@ -369,7 +419,9 @@ impl LoadOpsSplitStrategy {
             &mut qps_by_idx,
             now,
         )? {
-            if let Some(split_key) = pick_split_key_from_range(keyspace, &shard)? {
+            if now < self.global_cooldown_until {
+                None
+            } else if let Some(split_key) = pick_split_key_from_range(keyspace, &shard)? {
                 Some(SplitDecision {
                     reason: reason.to_string(),
                     shard,
@@ -377,7 +429,7 @@ impl LoadOpsSplitStrategy {
                     target_shard_index: target_idx,
                     target_replicas: None,
                     target_leaseholder: None,
-                    skip_migration: false,
+                    skip_migration: true,
                     staged_backfill: false,
                 })
             } else {
@@ -414,6 +466,9 @@ struct AdaptiveShardSignals {
     write_tail_latency_ms: f64,
     hot_key_concentration_bps: u32,
     hot_bucket_weights: Vec<u64>,
+    observed_min_key: Vec<u8>,
+    observed_max_key: Vec<u8>,
+    sampled_keys: Vec<Vec<u8>>,
 }
 
 impl AdaptiveSplitStrategy {
@@ -451,6 +506,14 @@ impl AdaptiveSplitStrategy {
         }
         self.qps_by_idx = qps_by_idx.clone();
 
+        if now < self.global_cooldown_until {
+            self.cooldown_until.retain(|_, until| *until > now);
+            return Ok(SplitStrategyEvaluation {
+                decision: None,
+                qps_by_idx,
+            });
+        }
+
         let mut best: Option<(f64, SplitDecision)> = None;
         let clear_threshold =
             cfg.adaptive_score_threshold * (1.0 - (cfg.adaptive_hysteresis_pct as f64 / 100.0));
@@ -480,6 +543,10 @@ impl AdaptiveSplitStrategy {
                 self.sustained.remove(&shard.shard_id);
                 continue;
             }
+            if adaptive_foreground_overloaded(signals, cfg) {
+                self.sustained.remove(&shard.shard_id);
+                continue;
+            }
             let approx_bytes = estimate_shard_logical_bytes(signals, cfg);
             let score = adaptive_stress_score(signals, approx_bytes, cfg);
 
@@ -505,28 +572,24 @@ impl AdaptiveSplitStrategy {
                 keyspace,
                 shard,
                 signals.hot_bucket_weights.as_slice(),
+                signals.observed_min_key.as_slice(),
+                signals.observed_max_key.as_slice(),
+                signals.sampled_keys.as_slice(),
                 min_side_keys,
             )?
             else {
                 self.sustained.remove(&shard.shard_id);
                 continue;
             };
-            let (target_replicas, target_leaseholder) =
-                plan_split_target_placement(cluster_state, shard);
-            // If the target already uses the source replica set, cutover migration
-            // is authoritative and a staged full-range copy only duplicates work.
-            let staged_backfill = !same_replica_set(&target_replicas, &shard.replicas);
             let decision = SplitDecision {
                 reason: "adaptive".to_string(),
                 shard: shard.clone(),
                 split_key,
                 target_shard_index: target_idx,
-                target_replicas: Some(target_replicas),
-                target_leaseholder: Some(target_leaseholder),
-                // Keep authoritative per-node migration on cutover so source
-                // shards are cleaned up and replica-local key counts converge.
-                skip_migration: false,
-                staged_backfill,
+                target_replicas: None,
+                target_leaseholder: None,
+                skip_migration: true,
+                staged_backfill: false,
             };
             match &best {
                 Some((best_score, _)) if *best_score >= score => {}
@@ -600,6 +663,19 @@ impl AdaptiveSplitStrategy {
 
                 let entry = out.entry(stat.shard_id).or_default();
                 entry.record_count = entry.record_count.max(stat.record_count);
+                if !stat.observed_min_key.is_empty()
+                    && (entry.observed_min_key.is_empty()
+                        || stat.observed_min_key < entry.observed_min_key)
+                {
+                    entry.observed_min_key = stat.observed_min_key.clone();
+                }
+                if !stat.observed_max_key.is_empty()
+                    && (entry.observed_max_key.is_empty()
+                        || stat.observed_max_key > entry.observed_max_key)
+                {
+                    entry.observed_max_key = stat.observed_max_key.clone();
+                }
+                merge_sampled_keys(&mut entry.sampled_keys, &stat.sampled_keys);
                 entry.write_qps = entry.write_qps.saturating_add(write_qps);
                 entry.read_qps = entry.read_qps.saturating_add(read_qps);
                 entry.write_bps = entry.write_bps.saturating_add(write_bps);
@@ -668,6 +744,19 @@ fn adaptive_stress_score(
         + (hot * 0.02)
 }
 
+/// Return whether foreground pressure is too high to start another split.
+///
+/// Inputs:
+/// - Current shard signals and adaptive latency/queue targets.
+///
+/// Output:
+/// - `true` when the controller should wait instead of adding metadata churn.
+fn adaptive_foreground_overloaded(signals: &AdaptiveShardSignals, cfg: RangeManagerConfig) -> bool {
+    let queue_limit = cfg.adaptive_target_queue_depth.saturating_mul(8).max(1_024);
+    let latency_limit_ms = (cfg.adaptive_target_p99_ms * 25.0).max(250.0);
+    signals.queue_depth > queue_limit || signals.write_tail_latency_ms > latency_limit_ms
+}
+
 /// Compute the minimum allowed key count on both sides of a split.
 ///
 /// Inputs:
@@ -697,73 +786,6 @@ fn estimate_shard_logical_bytes(signals: &AdaptiveShardSignals, cfg: RangeManage
         (cfg.adaptive_target_bytes / cfg.split_min_keys.max(1) as u64).max(32)
     };
     signals.record_count.saturating_mul(avg_bytes_per_write)
-}
-
-/// Choose target replicas/leaseholder for the split RHS at split planning time.
-///
-/// Inputs:
-/// - `state`: current cluster membership and shard placement.
-/// - `source`: source shard descriptor being split.
-///
-/// Output:
-/// - `(replicas, leaseholder)` for the target shard, biased toward lower load.
-fn plan_split_target_placement(state: &ClusterState, source: &ShardDesc) -> (Vec<NodeId>, NodeId) {
-    let mut active = state
-        .members
-        .iter()
-        .filter_map(|(id, member)| (member.state == MemberState::Active).then_some(*id))
-        .collect::<Vec<_>>();
-    active.sort_unstable();
-    if active.is_empty() {
-        return (source.replicas.clone(), source.leaseholder);
-    }
-
-    let desired = state.replication_factor.min(active.len()).max(1);
-    let mut replica_counts = std::collections::BTreeMap::<NodeId, usize>::new();
-    let mut lease_counts = std::collections::BTreeMap::<NodeId, usize>::new();
-    for node in &active {
-        replica_counts.insert(*node, 0);
-        lease_counts.insert(*node, 0);
-    }
-    for shard in &state.shards {
-        for replica in &shard.replicas {
-            if let Some(v) = replica_counts.get_mut(replica) {
-                *v += 1;
-            }
-        }
-        if let Some(v) = lease_counts.get_mut(&shard.leaseholder) {
-            *v += 1;
-        }
-    }
-
-    let mut ordered = active.clone();
-    ordered.sort_by_key(|node| {
-        (
-            replica_counts.get(node).copied().unwrap_or(usize::MAX),
-            lease_counts.get(node).copied().unwrap_or(usize::MAX),
-            *node,
-        )
-    });
-    let mut replicas = ordered.into_iter().take(desired).collect::<Vec<_>>();
-    if replicas.is_empty() {
-        replicas = source
-            .replicas
-            .iter()
-            .copied()
-            .take(desired)
-            .collect::<Vec<_>>();
-    }
-    if replicas.is_empty() {
-        replicas.push(source.leaseholder);
-    }
-    replicas.sort_unstable();
-    replicas.dedup();
-    let leaseholder = replicas
-        .iter()
-        .copied()
-        .min_by_key(|node| lease_counts.get(node).copied().unwrap_or(usize::MAX))
-        .unwrap_or(source.leaseholder);
-    (replicas, leaseholder)
 }
 
 /// Compare replica sets independent of descriptor ordering.
@@ -806,6 +828,12 @@ pub struct RangeManagerConfig {
     pub split_qps_sustain: u8,
     /// Cooldown between splits for the same shard index.
     pub split_cooldown: Duration,
+    /// Controller-wide cooldown after a successful automatic split.
+    ///
+    /// This is intentionally separate from per-shard cooldown: metadata-only
+    /// cutovers are cheap, but allowing many child ranges to split immediately
+    /// can fragment write batching and move the cost back onto foreground traffic.
+    pub split_global_cooldown: Duration,
     /// Adaptive strategy: sustained score threshold intervals.
     pub adaptive_sustain: u8,
     /// Adaptive strategy: stress score threshold.
@@ -934,6 +962,10 @@ async fn maybe_split_once(
     if !cluster_state.shard_rebalances.is_empty() || !cluster_state.shard_merges.is_empty() {
         return Ok(());
     }
+    let wall_now_ms = now_unix_ms();
+    if cluster_state.range_split_cooldown_until_ms > wall_now_ms {
+        return Ok(());
+    }
     let live_shards = cluster_state
         .shards
         .iter()
@@ -942,11 +974,12 @@ async fn maybe_split_once(
     retain_split_failure_backoff(split_failure_backoff, &live_shards);
     state.set_split_backoff_active(split_backoff_active_count(split_failure_backoff, now));
 
-    let shard_limit = state.data_shards.max(1);
-    let Some(target_idx) = state.cluster_store.first_free_shard_index(shard_limit) else {
+    let Some(target_idx) = state
+        .cluster_store
+        .first_free_shard_index(state.data_shards.max(1))
+    else {
         return Ok(());
     };
-
     let eval = split_strategy
         .evaluate(
             state.clone(),
@@ -960,6 +993,7 @@ async fn maybe_split_once(
         .await?;
     let qps_by_idx = eval.qps_by_idx;
     if let Some(split_decision) = eval.decision {
+        let metadata_only_split = split_decision.is_metadata_only();
         let inflight_split_ops = cluster_state
             .shard_fences
             .values()
@@ -990,118 +1024,154 @@ async fn maybe_split_once(
             .await?;
         }
 
-        let split_fence_op = SplitFenceOp::new(state.node_id, split_decision.shard.shard_id);
-        let fenced_shards = vec![split_fence_op.source_shard_id];
+        let split_fence_op = (!metadata_only_split)
+            .then(|| SplitFenceOp::new(state.node_id, split_decision.shard.shard_id));
+        let split_event_id = split_fence_op
+            .as_ref()
+            .map(|op| op.token.clone())
+            .unwrap_or_else(|| {
+                let seq = SPLIT_TOKEN_SEQ.fetch_add(1, Ordering::Relaxed);
+                format!("metadata-only-n{}-{}-{seq}", state.node_id, now_unix_ms())
+            });
+        let fenced_shards = split_fence_op
+            .as_ref()
+            .map(|op| vec![op.source_shard_id])
+            .unwrap_or_default();
+        let required_fences = split_fence_op
+            .as_ref()
+            .map(|op| fenced_shards_to_expectations(&fenced_shards, &op.reason))
+            .unwrap_or_default();
 
         tracing::info!(
             shard_id = split_decision.shard.shard_id,
             shard_index = split_decision.shard.shard_index,
             reason = split_decision.reason,
             target_shard_index = split_decision.target_shard_index,
-            split_token = %split_fence_op.token,
-            split_started_ms = split_fence_op.started_ms,
+            metadata_only = metadata_only_split,
+            split_token = split_fence_op.as_ref().map(|op| op.token.as_str()).unwrap_or("metadata-only"),
+            split_started_ms = split_fence_op.as_ref().map(|op| op.started_ms).unwrap_or(0),
             split_key = %String::from_utf8_lossy(&split_decision.split_key),
             "range manager proposing split"
+        );
+        record_split_event(
+            state.as_ref(),
+            &split_decision,
+            &split_event_id,
+            "split_start",
         );
         state.record_split_attempt(split_decision.reason.as_str());
 
         let split_res = run_split_with_controller_lease_heartbeat(state.clone(), async {
             ensure_range_controller_leader(state.clone()).await?;
-            // Start fence-hold accounting before publishing fenced metadata so
-            // every under-fence stage shares one strict latency budget.
-            let fence_phase_started = Instant::now();
-            let fence_before_epoch = state.cluster_store.epoch();
-            for shard_id in &fenced_shards {
-                propose_meta(
+            let fence_phase_started = if metadata_only_split {
+                None
+            } else {
+                // Start fence-hold accounting before publishing fenced metadata
+                // so every under-fence stage shares one strict latency budget.
+                Some(Instant::now())
+            };
+
+            if let (Some(op), Some(started)) = (split_fence_op.as_ref(), fence_phase_started) {
+                let fence_before_epoch = state.cluster_store.epoch();
+                for shard_id in &fenced_shards {
+                    propose_meta(
+                        state.clone(),
+                        ClusterCommand::SetShardFence {
+                            shard_id: *shard_id,
+                            fenced: true,
+                            reason: op.reason.clone(),
+                        },
+                    )
+                    .await?;
+                }
+                let local_fence_timeout =
+                    split_fence_budget_remaining(started)?.min(SPLIT_FENCE_SYNC_TIMEOUT);
+                let fence_epoch = wait_for_local_fences(
                     state.clone(),
-                    ClusterCommand::SetShardFence {
-                        shard_id: *shard_id,
-                        fenced: true,
-                        reason: split_fence_op.reason.clone(),
-                    },
+                    fence_before_epoch,
+                    &required_fences,
+                    &[],
+                    local_fence_timeout,
                 )
                 .await?;
-            }
-            let required_fences =
-                fenced_shards_to_expectations(&fenced_shards, &split_fence_op.reason);
-            let local_fence_timeout =
-                split_fence_budget_remaining(fence_phase_started)?.min(SPLIT_FENCE_SYNC_TIMEOUT);
-            let fence_epoch = wait_for_local_fences(
-                state.clone(),
-                fence_before_epoch,
-                &required_fences,
-                &[],
-                local_fence_timeout,
-            )
-            .await?;
-            let cluster_fence_timeout =
-                split_fence_budget_remaining(fence_phase_started)?.min(SPLIT_CLUSTER_SYNC_TIMEOUT);
-            wait_for_cluster_converged(
-                state.clone(),
-                fence_epoch,
-                None,
-                &required_fences,
-                &[],
-                cluster_fence_timeout,
-            )
-            .await?;
-
-            // Drain only the source shard to a low watermark; global client
-            // drains under sustained ingest can starve split progress.
-            let drain_timeout =
-                split_fence_budget_remaining(fence_phase_started)?.min(SPLIT_SHARD_DRAIN_TIMEOUT);
-            wait_for_shard_low_watermark(
-                state.clone(),
-                split_decision.shard.shard_index,
-                SPLIT_SHARD_DRAIN_LOW_WATERMARK,
-                SPLIT_SHARD_DRAIN_STABLE_FOR,
-                drain_timeout,
-            )
-            .await?;
-
-            if split_decision.staged_backfill {
-                // Keep the second staged backfill strictly within the remaining
-                // fence budget. If it cannot complete quickly, abort and retry
-                // later instead of holding a split fence for seconds.
-                let backfill_budget = split_fence_budget_remaining(fence_phase_started)?;
-                tokio::time::timeout(
-                    backfill_budget,
-                    staged_split_backfill(
-                        state.clone(),
-                        split_decision.shard.shard_index,
-                        split_decision.target_shard_index,
-                        split_decision.shard.leaseholder,
-                        backfill_targets.as_slice(),
-                        split_decision.split_key.as_slice(),
-                        split_decision.shard.end_key.as_slice(),
-                        cfg.adaptive_backfill_page_limit,
-                        cfg.adaptive_backfill_max_pages,
-                        cfg.adaptive_backfill_max_bps,
-                    ),
+                let cluster_fence_timeout =
+                    split_fence_budget_remaining(started)?.min(SPLIT_CLUSTER_SYNC_TIMEOUT);
+                wait_for_cluster_converged(
+                    state.clone(),
+                    fence_epoch,
+                    None,
+                    &required_fences,
+                    &[],
+                    cluster_fence_timeout,
                 )
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "{SPLIT_FENCE_BUDGET_ERR_MARKER}: staged_backfill_timed_out budget_ms={}",
-                        backfill_budget.as_millis()
+                .await?;
+
+                // Drain only the source shard to a low watermark; global client
+                // drains under sustained ingest can starve split progress.
+                let drain_timeout =
+                    split_fence_budget_remaining(started)?.min(SPLIT_SHARD_DRAIN_TIMEOUT);
+                wait_for_shard_low_watermark(
+                    state.clone(),
+                    split_decision.shard.shard_index,
+                    SPLIT_SHARD_DRAIN_LOW_WATERMARK,
+                    SPLIT_SHARD_DRAIN_STABLE_FOR,
+                    drain_timeout,
+                )
+                .await?;
+
+                if split_decision.staged_backfill {
+                    // Keep the second staged backfill strictly within the
+                    // remaining fence budget. If it cannot complete quickly,
+                    // abort and retry later instead of holding a split fence
+                    // for seconds.
+                    let backfill_budget = split_fence_budget_remaining(started)?;
+                    tokio::time::timeout(
+                        backfill_budget,
+                        staged_split_backfill(
+                            state.clone(),
+                            split_decision.shard.shard_index,
+                            split_decision.target_shard_index,
+                            split_decision.shard.leaseholder,
+                            backfill_targets.as_slice(),
+                            split_decision.split_key.as_slice(),
+                            split_decision.shard.end_key.as_slice(),
+                            cfg.adaptive_backfill_page_limit,
+                            cfg.adaptive_backfill_max_pages,
+                            cfg.adaptive_backfill_max_bps,
+                        ),
                     )
-                })??;
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "{SPLIT_FENCE_BUDGET_ERR_MARKER}: staged_backfill_timed_out budget_ms={}",
+                            backfill_budget.as_millis()
+                        )
+                    })??;
+                }
             }
 
             ensure_range_controller_leader(state.clone()).await?;
             let split_before_epoch = state.cluster_store.epoch();
-            propose_meta(
-                state.clone(),
-                ClusterCommand::SplitRange {
-                    split_key: split_decision.split_key.clone(),
-                    target_shard_index: split_decision.target_shard_index,
-                    target_replicas: split_decision.target_replicas.clone(),
-                    target_leaseholder: split_decision.target_leaseholder,
-                    skip_migration: split_decision.skip_migration,
-                },
-            )
-            .await?;
-            split_fence_budget_remaining(fence_phase_started)?;
+            let requested_at_ms = now_unix_ms();
+            let cooldown_until_ms =
+                requested_at_ms.saturating_add(duration_millis_u64(cfg.split_global_cooldown));
+            let split_command = ClusterCommand::SplitRange {
+                split_key: split_decision.split_key.clone(),
+                target_shard_index: split_decision.target_shard_index,
+                target_replicas: split_decision.target_replicas.clone(),
+                target_leaseholder: split_decision.target_leaseholder,
+                skip_migration: split_decision.skip_migration,
+                requested_at_ms,
+                cooldown_until_ms,
+            };
+            let guarded_split = ClusterCommand::Guarded {
+                fence: current_range_controller_fence(state.as_ref())?,
+                command: Box::new(split_command),
+            };
+            propose_meta(state.clone(), guarded_split).await?;
+            if let Some(started) = fence_phase_started {
+                split_fence_budget_remaining(started)?;
+            }
             let split_epoch =
                 wait_for_local_epoch(state.clone(), split_before_epoch, SPLIT_FENCE_SYNC_TIMEOUT)
                     .await?;
@@ -1110,11 +1180,11 @@ async fn maybe_split_once(
                 .state()
                 .shards
                 .iter()
-                .find(|s| s.shard_index == split_decision.target_shard_index)
+                .find(|s| s.start_key == split_decision.split_key)
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "split finished without target shard index {}",
-                        split_decision.target_shard_index
+                        "split finished without target range at boundary {}",
+                        String::from_utf8_lossy(&split_decision.split_key)
                     )
                 })?;
             let shard_count = state.cluster_store.state().shards.len();
@@ -1131,13 +1201,17 @@ async fn maybe_split_once(
         })
         .await;
 
-        let clear_res = clear_split_fences(
-            state.clone(),
-            &fenced_shards,
-            &split_fence_op.reason,
-            SPLIT_FENCE_SYNC_TIMEOUT,
-        )
-        .await;
+        let clear_res = if let Some(op) = split_fence_op.as_ref() {
+            clear_split_fences(
+                state.clone(),
+                &fenced_shards,
+                &op.reason,
+                SPLIT_FENCE_SYNC_TIMEOUT,
+            )
+            .await
+        } else {
+            Ok(())
+        };
         if let Err(err) = split_res {
             let reason = classify_split_failure(&err);
             let failure_now = Instant::now();
@@ -1231,11 +1305,27 @@ async fn maybe_split_once(
             Instant::now(),
         ));
         state.record_split_success();
-        split_strategy.on_split_success(
-            &split_decision.shard,
-            split_decision.target_shard_index,
-            cfg,
-            now,
+        let post_split_state = state.cluster_store.state();
+        let merge_cooldown_deadline = now + cfg.merge_cooldown;
+        merge_cooldown_until.insert(split_decision.shard.shard_id, merge_cooldown_deadline);
+        let Some(target_shard) = post_split_state
+            .shards
+            .iter()
+            .find(|shard| shard.start_key == split_decision.split_key)
+            .cloned()
+        else {
+            anyhow::bail!(
+                "split succeeded without child descriptor at boundary {}",
+                String::from_utf8_lossy(&split_decision.split_key)
+            );
+        };
+        merge_cooldown_until.insert(target_shard.shard_id, merge_cooldown_deadline);
+        split_strategy.on_split_success(&split_decision.shard, &target_shard, cfg, now);
+        record_split_event(
+            state.as_ref(),
+            &split_decision,
+            &split_event_id,
+            "split_end",
         );
         return Ok(());
     }
@@ -1356,6 +1446,109 @@ fn now_unix_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(0)
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+/// Record optional benchmark split telemetry as append-only CSV.
+///
+/// Purpose:
+/// - Give benchmark reports a cheap source of split start/end marker events.
+///
+/// Inputs:
+/// - `state`: node identity for per-node event files.
+/// - `decision`: split metadata to include in the event row.
+/// - `operation_id`: stable id shared by the start and end event.
+/// - `event`: event name such as `split_start` or `split_end`.
+///
+/// Output:
+/// - Appends one row to `$HOLO_BENCH_EVENTS_DIR/events-node<N>.csv` when that
+///   environment variable is set. Failures are logged and ignored because this
+///   is benchmark observability, not protocol state.
+fn record_split_event(
+    state: &NodeState,
+    decision: &SplitDecision,
+    operation_id: &str,
+    event: &str,
+) {
+    let Ok(dir) = std::env::var("HOLO_BENCH_EVENTS_DIR") else {
+        return;
+    };
+    if dir.trim().is_empty() {
+        return;
+    }
+    if let Err(err) = write_split_event_row(Path::new(&dir), state, decision, operation_id, event) {
+        tracing::warn!(error = ?err, "failed to write benchmark split event");
+    }
+}
+
+fn write_split_event_row(
+    dir: &Path,
+    state: &NodeState,
+    decision: &SplitDecision,
+    operation_id: &str,
+    event: &str,
+) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(format!("events-node{}.csv", state.node_id));
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    if file.metadata()?.len() == 0 {
+        writeln!(
+            file,
+            "unix_ms,target,event,operation_id,node_id,shard_id,shard_index,target_shard_index,split_key,reason,metadata_only"
+        )?;
+    }
+    writeln!(
+        file,
+        "{},holostore,{},{},{},{},{},{},{},{},{}",
+        now_unix_ms(),
+        csv_escape(event),
+        csv_escape(operation_id),
+        state.node_id,
+        decision.shard.shard_id,
+        decision.shard.shard_index,
+        decision.target_shard_index,
+        csv_escape(&String::from_utf8_lossy(&decision.split_key)),
+        csv_escape(&decision.reason),
+        decision.is_metadata_only(),
+    )?;
+    Ok(())
+}
+
+fn csv_escape(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+fn current_range_controller_fence(state: &NodeState) -> anyhow::Result<ControllerFence> {
+    let now_ms = now_unix_ms();
+    let Some(lease) = state
+        .cluster_store
+        .controller_lease(ControllerDomain::Range)
+    else {
+        anyhow::bail!("range controller lease is not installed");
+    };
+    if lease.holder != state.node_id || lease.lease_until_ms <= now_ms {
+        anyhow::bail!(
+            "lost range controller lease before guarded command: holder={} term={} until_ms={}",
+            lease.holder,
+            lease.term,
+            lease.lease_until_ms
+        );
+    }
+    Ok(ControllerFence {
+        domain: ControllerDomain::Range,
+        holder: lease.holder,
+        term: lease.term,
+    })
 }
 
 /// Encode split fence metadata for storage in cluster shard fences.
@@ -2019,6 +2212,146 @@ async fn sleep_with_controller_lease_heartbeat(
     Ok(())
 }
 
+/// Pick a metadata-only split key without scanning storage.
+///
+/// The range descriptor keyspace does not require split keys to exist as rows.
+/// For a shared physical partition, observed logical min/max keys give a cheap
+/// finite domain for unbounded descriptors and avoid foreground index scans.
+fn pick_split_key_from_observed_bounds(
+    shard: &ShardDesc,
+    observed_min_key: &[u8],
+    observed_max_key: &[u8],
+) -> Option<Vec<u8>> {
+    let mut low = shard.start_key.as_slice();
+    let mut high = shard.end_key.as_slice();
+    let has_finite_high = !high.is_empty() || !observed_max_key.is_empty();
+
+    if !has_finite_high {
+        return None;
+    }
+
+    if low.is_empty() && !observed_min_key.is_empty() {
+        low = observed_min_key;
+    }
+    if high.is_empty() && !observed_max_key.is_empty() {
+        high = observed_max_key;
+    }
+
+    if !shard.start_key.is_empty() && low <= shard.start_key.as_slice() {
+        low = shard.start_key.as_slice();
+    }
+    if !shard.end_key.is_empty() && high >= shard.end_key.as_slice() {
+        high = shard.end_key.as_slice();
+    }
+
+    let candidate = key_between(low, high)?;
+    let after_start =
+        shard.start_key.is_empty() || candidate.as_slice() > shard.start_key.as_slice();
+    let before_end = shard.end_key.is_empty() || candidate.as_slice() < shard.end_key.as_slice();
+    (after_start && before_end).then_some(candidate)
+}
+
+fn merge_sampled_keys(target: &mut Vec<Vec<u8>>, incoming: &[Vec<u8>]) {
+    let cap = crate::load::LOGICAL_KEY_SAMPLE_CAP.saturating_mul(4).max(1);
+    for key in incoming {
+        if target.len() < cap {
+            target.push(key.clone());
+            continue;
+        }
+        let idx = (crate::kv::hash_key(key) as usize) % cap;
+        target[idx] = key.clone();
+    }
+}
+
+fn key_in_shard_bounds(key: &[u8], shard: &ShardDesc) -> bool {
+    (shard.start_key.is_empty() || key >= shard.start_key.as_slice())
+        && (shard.end_key.is_empty() || key < shard.end_key.as_slice())
+}
+
+fn pick_split_key_from_sampled_keys(
+    shard: &ShardDesc,
+    sampled_keys: &[Vec<u8>],
+) -> Option<Vec<u8>> {
+    if sampled_keys.len() < MIN_SPLIT_KEY_SAMPLES {
+        return None;
+    }
+    let mut keys = sampled_keys
+        .iter()
+        .filter(|key| key_in_shard_bounds(key, shard))
+        .cloned()
+        .collect::<Vec<_>>();
+    if keys.len() < MIN_SPLIT_KEY_SAMPLES {
+        return None;
+    }
+    keys.sort();
+    keys.dedup();
+    if keys.len() < 2 {
+        return None;
+    }
+
+    let mid = keys.len() / 2;
+    for offset in 0..keys.len() {
+        let idx = if offset % 2 == 0 {
+            mid.saturating_add(offset / 2)
+        } else {
+            mid.saturating_sub((offset + 1) / 2)
+        };
+        let Some(candidate) = keys.get(idx) else {
+            continue;
+        };
+        let after_start =
+            shard.start_key.is_empty() || candidate.as_slice() > shard.start_key.as_slice();
+        let before_end =
+            shard.end_key.is_empty() || candidate.as_slice() < shard.end_key.as_slice();
+        if after_start && before_end {
+            return Some(candidate.clone());
+        }
+    }
+    None
+}
+
+/// Return a finite byte string strictly between `low` and `high`.
+///
+/// `high=[]` means unbounded. Returns `None` for adjacent prefix ranges such as
+/// `a..a\0`, where no finite separator exists.
+fn key_between(low: &[u8], high: &[u8]) -> Option<Vec<u8>> {
+    if high.is_empty() {
+        let mut out = low.to_vec();
+        out.push(0);
+        return (out.as_slice() > low).then_some(out);
+    }
+    if low >= high {
+        return None;
+    }
+
+    let common_len = low
+        .iter()
+        .zip(high.iter())
+        .take_while(|(left, right)| left == right)
+        .count();
+
+    if common_len < low.len() && common_len < high.len() {
+        let low_byte = low[common_len];
+        let high_byte = high[common_len];
+        if low_byte.saturating_add(1) < high_byte {
+            let mut out = low[..common_len].to_vec();
+            out.push(low_byte + ((high_byte - low_byte) / 2));
+            return Some(out);
+        }
+        let mut out = low.to_vec();
+        out.push(0);
+        return (out.as_slice() > low && out.as_slice() < high).then_some(out);
+    }
+
+    if common_len == low.len() {
+        let mut out = low.to_vec();
+        out.push(0);
+        return (out.as_slice() > low && out.as_slice() < high).then_some(out);
+    }
+
+    None
+}
+
 /// Choose a split key using load-weighted sampling when hot-bucket data exists.
 ///
 /// Design:
@@ -2035,14 +2368,27 @@ fn pick_split_key_load_weighted(
     keyspace: &Keyspace,
     shard: &ShardDesc,
     bucket_weights: &[u64],
+    observed_min_key: &[u8],
+    observed_max_key: &[u8],
+    sampled_keys: &[Vec<u8>],
     min_side_keys: u64,
 ) -> anyhow::Result<Option<Vec<u8>>> {
+    if let Some(split_key) = pick_split_key_from_sampled_keys(shard, sampled_keys) {
+        return Ok(Some(split_key));
+    }
+
+    if let Some(split_key) =
+        pick_split_key_from_observed_bounds(shard, observed_min_key, observed_max_key)
+    {
+        return Ok(Some(split_key));
+    }
+
     let use_weighted = bucket_weights.iter().any(|w| *w > 0);
     if !use_weighted {
         return pick_split_key_from_range(keyspace, shard);
     }
 
-    let latest_name = format!("kv_latest_{}", shard.shard_index);
+    let latest_name = format!("kv_latest_{}", shard.storage_index());
     let latest = keyspace.open_partition(&latest_name, PartitionCreateOptions::default())?;
 
     let sample_cap = SPLIT_KEY_SAMPLE_SIZE.saturating_mul(2).max(64);
@@ -2327,11 +2673,15 @@ fn pick_merge_candidate(
             continue;
         }
 
-        let left_count =
-            count_keys_in_range(keyspace, left.shard_index, &left.start_key, &left.end_key)?;
+        let left_count = count_keys_in_range(
+            keyspace,
+            left.storage_index(),
+            &left.start_key,
+            &left.end_key,
+        )?;
         let right_count = count_keys_in_range(
             keyspace,
-            right.shard_index,
+            right.storage_index(),
             &right.start_key,
             &right.end_key,
         )?;
@@ -2392,7 +2742,7 @@ fn pick_split_key_from_range(
     keyspace: &Keyspace,
     shard: &ShardDesc,
 ) -> anyhow::Result<Option<Vec<u8>>> {
-    let latest_name = format!("kv_latest_{}", shard.shard_index);
+    let latest_name = format!("kv_latest_{}", shard.storage_index());
     let latest = keyspace.open_partition(&latest_name, PartitionCreateOptions::default())?;
 
     // Approximate median with one-pass reservoir sampling. This avoids a full
@@ -2456,6 +2806,8 @@ fn classify_split_failure(err: &anyhow::Error) -> &'static str {
     let text = err.to_string().to_lowercase();
     if text.contains(SPLIT_FENCE_BUDGET_ERR_MARKER) {
         "fence_budget_exceeded"
+    } else if text.contains("range split cooldown active") {
+        "split_cooldown_active"
     } else if text.contains("controller lease") {
         "lease_lost"
     } else if text.contains("cluster convergence") {
@@ -2479,6 +2831,7 @@ fn is_transient_split_failure(reason: &str) -> bool {
     matches!(
         reason,
         "lease_lost"
+            | "split_cooldown_active"
             | "fence_budget_exceeded"
             | "shard_drain_timeout"
             | "cluster_convergence_timeout"
@@ -2588,6 +2941,58 @@ fn latest_range(
 mod tests {
     use super::*;
 
+    fn test_range_manager_config() -> RangeManagerConfig {
+        RangeManagerConfig {
+            split_strategy: crate::RangeSplitStrategy::Adaptive,
+            interval: Duration::from_millis(100),
+            split_min_keys: 1,
+            split_min_qps: 1,
+            split_qps_sustain: 1,
+            split_cooldown: Duration::from_secs(10),
+            split_global_cooldown: Duration::from_secs(120),
+            adaptive_sustain: 1,
+            adaptive_score_threshold: 1.0,
+            adaptive_hysteresis_pct: 10,
+            adaptive_hot_key_bps: 9_000,
+            adaptive_target_bytes: 1,
+            adaptive_target_write_qps: 1,
+            adaptive_target_read_qps: 1,
+            adaptive_target_write_bps: 1,
+            adaptive_target_queue_depth: 1,
+            adaptive_target_p99_ms: 1.0,
+            adaptive_backfill_max_bps: 0,
+            adaptive_backfill_page_limit: 128,
+            adaptive_backfill_max_pages: 1,
+            adaptive_stats_refresh: Duration::from_millis(100),
+            adaptive_max_concurrent_splits: 1,
+            merge_max_keys: 0,
+            merge_cooldown: Duration::from_secs(60),
+            merge_max_qps: 0,
+            merge_qps_sustain: 1,
+            merge_key_hysteresis_pct: 50,
+        }
+    }
+
+    fn test_shard(
+        shard_id: u64,
+        shard_index: usize,
+        start_key: &[u8],
+        end_key: &[u8],
+    ) -> ShardDesc {
+        ShardDesc {
+            shard_id,
+            shard_index,
+            storage_index: Some(shard_index),
+            fallback_storage_index: None,
+            start_hash: 0,
+            end_hash: 0,
+            start_key: start_key.to_vec(),
+            end_key: end_key.to_vec(),
+            replicas: vec![1],
+            leaseholder: 1,
+        }
+    }
+
     fn temp_dir(name: &str) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2598,6 +3003,75 @@ mod tests {
             std::process::id(),
             nanos
         ))
+    }
+
+    #[test]
+    fn split_success_cools_parent_child_and_controller() {
+        let now = Instant::now();
+        let cfg = test_range_manager_config();
+        let source = test_shard(10, 0, b"", b"m");
+        let child = test_shard(11, 0, b"m", b"");
+        let mut strategy = SplitStrategyEngine::Adaptive(AdaptiveSplitStrategy {
+            last_refresh: now,
+            last_totals_by_node_shard: std::collections::BTreeMap::new(),
+            telemetry_cache: std::collections::BTreeMap::new(),
+            sustained: std::collections::BTreeMap::from([
+                (source.shard_id, 3),
+                (child.shard_id, 3),
+            ]),
+            cooldown_until: std::collections::BTreeMap::new(),
+            global_cooldown_until: now,
+            qps_by_idx: vec![0; 2],
+        });
+
+        strategy.on_split_success(&source, &child, cfg, now);
+
+        let SplitStrategyEngine::Adaptive(adaptive) = strategy else {
+            panic!("test constructed the adaptive split strategy");
+        };
+        assert_eq!(
+            adaptive.global_cooldown_until,
+            now + cfg.split_global_cooldown
+        );
+        assert_eq!(
+            adaptive.cooldown_until.get(&source.shard_id).copied(),
+            Some(now + cfg.split_cooldown)
+        );
+        assert_eq!(
+            adaptive.cooldown_until.get(&child.shard_id).copied(),
+            Some(now + cfg.split_cooldown)
+        );
+        assert!(!adaptive.sustained.contains_key(&source.shard_id));
+        assert!(!adaptive.sustained.contains_key(&child.shard_id));
+    }
+
+    #[test]
+    fn adaptive_foreground_overload_blocks_split_work() {
+        let cfg = test_range_manager_config();
+        let mut signals = AdaptiveShardSignals {
+            record_count: 10_000,
+            write_qps: 10_000,
+            write_bps: 10 * 1024 * 1024,
+            ..Default::default()
+        };
+
+        assert!(
+            !adaptive_foreground_overloaded(&signals, cfg),
+            "normal foreground pressure should still allow split evaluation"
+        );
+
+        signals.queue_depth = cfg.adaptive_target_queue_depth.saturating_mul(8).max(1_024) + 1;
+        assert!(
+            adaptive_foreground_overloaded(&signals, cfg),
+            "large foreground queues should pause split evaluation"
+        );
+
+        signals.queue_depth = 0;
+        signals.write_tail_latency_ms = (cfg.adaptive_target_p99_ms * 25.0).max(250.0) + 1.0;
+        assert!(
+            adaptive_foreground_overloaded(&signals, cfg),
+            "high foreground tail latency should pause split evaluation"
+        );
     }
 
     #[test]
@@ -2620,6 +3094,8 @@ mod tests {
         let shard = ShardDesc {
             shard_id: 1,
             shard_index: 0,
+            storage_index: Some(0),
+            fallback_storage_index: None,
             start_hash: 0,
             end_hash: 0,
             start_key: Vec::new(),
@@ -2629,16 +3105,17 @@ mod tests {
         };
         let buckets = vec![1u64; 64];
 
-        let blocked = pick_split_key_load_weighted(&keyspace, &shard, &buckets, 600)
+        let blocked = pick_split_key_load_weighted(&keyspace, &shard, &buckets, &[], &[], &[], 600)
             .expect("split-key selection should not error");
         assert!(
             blocked.is_none(),
             "min-side guard should block split when both sides cannot keep enough keys"
         );
 
-        let selected = pick_split_key_load_weighted(&keyspace, &shard, &buckets, 200)
-            .expect("split-key selection should not error")
-            .expect("split should be possible with relaxed min-side guard");
+        let selected =
+            pick_split_key_load_weighted(&keyspace, &shard, &buckets, &[], &[], &[], 200)
+                .expect("split-key selection should not error")
+                .expect("split should be possible with relaxed min-side guard");
         let mut left_count = 0usize;
         for item in latest_range(&latest, &shard.start_key, &shard.end_key) {
             let (k, _) = item.expect("read key");
@@ -2760,5 +3237,74 @@ mod tests {
         let (_second_delay, second_failures) =
             schedule_split_failure_backoff(&mut backoff, 7, later);
         assert_eq!(second_failures, 2);
+    }
+
+    #[test]
+    fn observed_bounds_choose_split_without_storage_scan() {
+        let shard = ShardDesc {
+            shard_id: 1,
+            shard_index: 0,
+            storage_index: Some(0),
+            fallback_storage_index: None,
+            start_hash: 0,
+            end_hash: 0,
+            start_key: Vec::new(),
+            end_key: Vec::new(),
+            replicas: vec![1],
+            leaseholder: 1,
+        };
+        let split =
+            pick_split_key_from_observed_bounds(&shard, b"bench_0000000000", b"bench_0001000000")
+                .expect("observed range should produce a finite separator");
+        assert!(split.as_slice() > b"bench_0000000000".as_slice());
+        assert!(split.as_slice() < b"bench_0001000000".as_slice());
+
+        let no_observation = pick_split_key_from_observed_bounds(&shard, &[], &[]);
+        assert!(
+            no_observation.is_none(),
+            "fully unbounded ranges need observed bounds or storage sampling"
+        );
+    }
+
+    #[test]
+    fn sampled_keys_choose_balanced_split_without_storage_scan() {
+        let shard = ShardDesc {
+            shard_id: 1,
+            shard_index: 0,
+            storage_index: Some(0),
+            fallback_storage_index: None,
+            start_hash: 0,
+            end_hash: 0,
+            start_key: Vec::new(),
+            end_key: Vec::new(),
+            replicas: vec![1],
+            leaseholder: 1,
+        };
+        let sampled_keys = (0..100)
+            .map(|idx| format!("bench_{idx:06}").into_bytes())
+            .collect::<Vec<_>>();
+
+        let split = pick_split_key_from_sampled_keys(&shard, &sampled_keys)
+            .expect("sampled median should produce a split key");
+
+        assert!(
+            (b"bench_000045".as_slice()..=b"bench_000055".as_slice()).contains(&split.as_slice()),
+            "sampled split should be near the median, got {:?}",
+            String::from_utf8_lossy(&split)
+        );
+    }
+
+    #[test]
+    fn key_between_handles_adjacent_and_prefix_ranges() {
+        assert_eq!(key_between(b"a", b"c").as_deref(), Some(b"b".as_slice()));
+        assert_eq!(key_between(b"a", b"b").as_deref(), Some(b"a\0".as_slice()));
+        assert!(
+            key_between(b"a", b"a\0").is_none(),
+            "there is no finite key between a prefix and its immediate NUL child"
+        );
+        assert_eq!(
+            key_between(b"prefix", &[]).as_deref(),
+            Some(b"prefix\0".as_slice())
+        );
     }
 }

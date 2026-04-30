@@ -25,6 +25,13 @@ Results are written under `.tmp/benchmarks/results/<timestamp>-<scenario>/`.
 For `--target both`, the top-level `report.md` compares both stores and embeds
 PNG graphs for throughput and corrected latency over time.
 
+Before starting a run, the wrapper removes stale Docker Compose benchmark
+projects named `holobench_holostore_*` or `holobench_etcd_*`, including their
+containers, networks, and volumes. This prevents kept or interrupted clusters
+from consuming memory, ports, disk, or Docker DNS state during a later run. Use
+`--no-clean-stale` only when intentionally preserving an older benchmark
+cluster for debugging.
+
 On Apple Silicon, use a Docker server that reports `arm64` and force the
 benchmark platform to `linux/arm64` if you want to avoid stale amd64 images:
 
@@ -202,6 +209,9 @@ Each run directory contains:
   failures by type and sampled message.
 - `failure.json`: written when a target phase fails before the normal artifacts
   are complete. It records the phase, exit code, timestamp, and a short reason.
+- `events-node*.csv`: optional HoloStore timeline events emitted by benchmark
+  nodes, such as range split start/end markers. Reports convert these wall-clock
+  timestamps to benchmark-relative seconds and overlay them on timeline graphs.
 - `timing.json`: wrapper wall-clock timing with total, build, and benchmark
   run durations.
 - `report.md`: Markdown report with embedded PNG graphs.

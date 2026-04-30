@@ -10,9 +10,12 @@ mod types;
 
 pub use group::{CommitQuorumCloserStat, DebugStats, Group, Handle, ProposalResult};
 pub use types::{
-    txn_group_id, AcceptRequest, AcceptResponse, Ballot, CommandKeys, CommitDurabilityMode,
-    CommitLog, CommitLogAppendOptions, CommitLogCheckpointStatus, CommitLogEntry, CommitRequest,
+    make_txn_counter, txn_epoch, txn_group_id, txn_id_with_seq, txn_progress_key, txn_seq,
+    AcceptRequest, AcceptResponse, Ballot, CommandKeys, CommitDurabilityMode, CommitLog,
+    CommitLogAppendOptions, CommitLogCheckpointStatus, CommitLogEntry, CommitRequest,
     CommitResponse, Config, ExecMeta, ExecutedPrefix, GroupId, Member, NodeId, PreAcceptRequest,
     PreAcceptResponse, RecoverRequest, RecoverResponse, ReportExecutedRequest,
-    ReportExecutedResponse, StateMachine, Transport, TxnId, TxnStatus, TXN_COUNTER_SHARD_SHIFT,
+    ReportExecutedResponse, StateMachine, Transport, TxnId, TxnProgressKey, TxnStatus,
+    MAX_TXN_EPOCH, MAX_TXN_GROUP_ID, MAX_TXN_SEQ, TXN_COUNTER_EPOCH_BITS, TXN_COUNTER_SEQ_BITS,
+    TXN_COUNTER_SHARD_SHIFT,
 };

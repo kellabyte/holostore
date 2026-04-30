@@ -15,7 +15,7 @@
 // Outputs:
 // - Linearizable command execution, RPC services, and operational metrics/logs.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{BufWriter, IsTerminal, Write};
 use std::net::SocketAddr;
@@ -90,6 +90,70 @@ pub(crate) fn unregister_local_node_state(grpc_addr: SocketAddr) {
     if let Ok(mut registry) = local_node_state_registry().write() {
         registry.remove(&grpc_addr);
     }
+}
+
+fn load_and_bump_txn_epoch(data_dir: &Path) -> anyhow::Result<u64> {
+    let path = data_dir.join("meta").join("txn_epoch");
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("txn epoch path has no parent"))?;
+    fs::create_dir_all(parent).context("create txn epoch metadata dir")?;
+
+    let previous = match fs::read_to_string(&path) {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                0
+            } else {
+                trimmed
+                    .parse::<u64>()
+                    .with_context(|| format!("parse txn epoch from {}", path.display()))?
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(err) => {
+            return Err(err).with_context(|| format!("read txn epoch from {}", path.display()));
+        }
+    };
+
+    let epoch = previous
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("txn epoch overflow"))?;
+    anyhow::ensure!(
+        epoch <= accord::MAX_TXN_EPOCH,
+        "txn epoch {} exceeds encoded max {}; run a TxnId format migration before restarting this node again",
+        epoch,
+        accord::MAX_TXN_EPOCH
+    );
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp = parent.join(format!("txn_epoch.{}.{}.tmp", std::process::id(), nonce));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .with_context(|| format!("create temporary txn epoch file {}", tmp.display()))?;
+    writeln!(file, "{epoch}").context("write txn epoch")?;
+    file.sync_all().context("fsync txn epoch file")?;
+    drop(file);
+
+    fs::rename(&tmp, &path).with_context(|| {
+        format!(
+            "atomically install txn epoch file {} -> {}",
+            tmp.display(),
+            path.display()
+        )
+    })?;
+    OpenOptions::new()
+        .read(true)
+        .open(parent)
+        .and_then(|dir| dir.sync_all())
+        .with_context(|| format!("fsync txn epoch metadata dir {}", parent.display()))?;
+
+    Ok(epoch)
 }
 
 #[allow(dead_code)]
@@ -329,10 +393,21 @@ pub struct NodeArgs {
     #[arg(long, env = "HOLO_RANGE_SPLIT_COOLDOWN_MS", default_value_t = 10_000)]
     range_split_cooldown_ms: u64,
 
+    /// Controller-wide cooldown after a successful automatic split (ms).
+    ///
+    /// Metadata-only splits are cheap, but pacing the controller prevents split
+    /// fanout from fragmenting foreground write batches under sustained load.
+    #[arg(
+        long,
+        env = "HOLO_RANGE_SPLIT_GLOBAL_COOLDOWN_MS",
+        default_value_t = 300_000
+    )]
+    range_split_global_cooldown_ms: u64,
+
     /// Split-strategy planner used by the range manager.
     ///
     /// - `loadops`: existing load-first/size-second strategy.
-    /// - `adaptive`: cluster-aware score-based strategy with staged split workflow.
+    /// - `adaptive`: cluster-aware score-based strategy with metadata-only split cutover.
     #[arg(long, env = "HOLO_RANGE_SPLIT_STRATEGY", default_value = "adaptive")]
     range_split_strategy: RangeSplitStrategy,
 
@@ -882,6 +957,9 @@ struct LocalRangeStat {
     hot_key_concentration_bps: u32,
     write_hot_buckets: Vec<u64>,
     read_hot_buckets: Vec<u64>,
+    observed_min_key: Vec<u8>,
+    observed_max_key: Vec<u8>,
+    sampled_keys: Vec<Vec<u8>>,
 }
 
 /// One latest-visible KV entry used for replica backfill.
@@ -987,12 +1065,38 @@ impl LocalRangeStats {
 
     /// Count all latest-index entries for one shard partition.
     fn scan_partition_count(&self, shard_index: usize) -> anyhow::Result<u64> {
+        self.scan_range_count(shard_index, &[], &[])
+    }
+
+    /// Count latest-index entries for one key span in a shard partition.
+    ///
+    /// Purpose:
+    /// - Share the ordered scan implementation used by startup partition
+    ///   accounting and maintenance callers that can tolerate a bounded scan.
+    ///
+    /// Inputs:
+    /// - `shard_index`: physical partition index.
+    /// - `start_key`/`end_key`: logical range bounds, end-exclusive.
+    ///
+    /// Output:
+    /// - Number of latest-visible keys inside the requested logical range.
+    fn scan_range_count(
+        &self,
+        shard_index: usize,
+        start_key: &[u8],
+        end_key: &[u8],
+    ) -> anyhow::Result<u64> {
         let latest_name = self.latest_partition_name(shard_index);
         let latest = self
             .keyspace
             .open_partition(&latest_name, PartitionCreateOptions::default())?;
-        let mut iter: Box<dyn Iterator<Item = fjall::Result<fjall::KvPair>>> =
-            Box::new(latest.range(Vec::<u8>::new()..));
+        let start = start_key.to_vec();
+        let mut iter: Box<dyn Iterator<Item = fjall::Result<fjall::KvPair>>> = if end_key.is_empty()
+        {
+            Box::new(latest.range(start..))
+        } else {
+            Box::new(latest.range(start..end_key.to_vec()))
+        };
         let mut count = 0u64;
         while let Some(item) = iter.next() {
             let _ = item?;
@@ -1001,6 +1105,7 @@ impl LocalRangeStats {
         Ok(count)
     }
 
+    /// Return the approximate latest-entry count for one physical shard index.
     fn record_count(&self, shard_index: usize) -> u64 {
         self.record_counts
             .get(shard_index)
@@ -2897,6 +3002,20 @@ impl NodeState {
         }
     }
 
+    /// Return the current write fanout used to size client SET collection.
+    fn active_write_shard_fanout_hint(&self) -> usize {
+        match self.routing_mode {
+            RoutingMode::Hash => self.data_shards.max(1),
+            RoutingMode::Range => {
+                let mut shard_indexes = BTreeSet::new();
+                for shard in self.cluster_store.shards_snapshot() {
+                    shard_indexes.insert(shard.shard_index);
+                }
+                shard_indexes.len().max(1).min(self.data_shards.max(1))
+            }
+        }
+    }
+
     /// Resolve the Accord handle for a shard index.
     fn handle_for_shard(&self, shard: usize) -> accord::Handle {
         let idx = shard.min(self.data_handles.len().saturating_sub(1));
@@ -2973,51 +3092,105 @@ impl NodeState {
         self.kv_engine.get_latest_batch(keys)
     }
 
-    /// Collect local per-range record counts for ranges this node serves.
+    /// Collect local range telemetry for ranges this node serves.
+    ///
+    /// Metadata-only split children can share one physical partition. In that
+    /// case, physical counters are divided across logical siblings and
+    /// descriptor-local write counters are used when available.
     pub(crate) fn local_range_stats(&self) -> anyhow::Result<Vec<LocalRangeStat>> {
         let shards = self.cluster_store.shards_snapshot();
         let load = self.shard_load.snapshot();
+        let mut physical_siblings = BTreeMap::<usize, u64>::new();
+        for shard in &shards {
+            *physical_siblings.entry(shard.storage_index()).or_insert(0) += 1;
+        }
         let mut out = Vec::new();
         for shard in shards {
             if !shard.replicas.contains(&self.node_id) {
                 continue;
             }
-            let write_hot_buckets = load
-                .write_hot_buckets
-                .get(shard.shard_index)
-                .cloned()
-                .unwrap_or_else(|| vec![0; crate::load::HOT_KEY_BUCKETS]);
-            let read_hot_buckets = load
-                .read_hot_buckets
-                .get(shard.shard_index)
-                .cloned()
-                .unwrap_or_else(|| vec![0; crate::load::HOT_KEY_BUCKETS]);
-            let record_count = self.range_stats.record_count(shard.shard_index);
+            let logical = load.logical_ranges.get(&shard.shard_id);
+            let storage_index = shard.storage_index();
+            let sibling_count = physical_siblings
+                .get(&storage_index)
+                .copied()
+                .unwrap_or(1)
+                .max(1);
+            let record_count = self
+                .range_stats
+                .record_count(storage_index)
+                .saturating_add(sibling_count - 1)
+                / sibling_count;
+            let write_ops_total = logical
+                .map(|stat| stat.set_ops)
+                .unwrap_or_else(|| load.set_ops.get(shard.shard_index).copied().unwrap_or(0));
+            let read_ops_total = logical
+                .map(|stat| stat.get_ops)
+                .unwrap_or_else(|| load.get_ops.get(shard.shard_index).copied().unwrap_or(0));
+            let write_bytes_total = logical.map(|stat| stat.write_bytes).unwrap_or_else(|| {
+                load.write_bytes
+                    .get(shard.shard_index)
+                    .copied()
+                    .unwrap_or(0)
+            });
+            let write_tail_latency_ms = logical
+                .map(|stat| stat.write_tail_latency_ms)
+                .filter(|value| *value > 0.0)
+                .unwrap_or_else(|| {
+                    load.write_tail_latency_ms
+                        .get(shard.shard_index)
+                        .copied()
+                        .unwrap_or(0.0)
+                });
+            let hot_key_concentration_bps = logical
+                .map(|stat| stat.hot_key_concentration_bps)
+                .unwrap_or_else(|| {
+                    load.hot_key_concentration_bps
+                        .get(shard.shard_index)
+                        .copied()
+                        .unwrap_or(0)
+                });
+            let write_hot_buckets = logical
+                .map(|stat| stat.write_hot_buckets.clone())
+                .unwrap_or_else(|| {
+                    load.write_hot_buckets
+                        .get(shard.shard_index)
+                        .cloned()
+                        .unwrap_or_else(|| vec![0; crate::load::HOT_KEY_BUCKETS])
+                });
+            let read_hot_buckets = logical
+                .map(|stat| stat.read_hot_buckets.clone())
+                .unwrap_or_else(|| {
+                    load.read_hot_buckets
+                        .get(shard.shard_index)
+                        .cloned()
+                        .unwrap_or_else(|| vec![0; crate::load::HOT_KEY_BUCKETS])
+                });
+            let observed_min_key = logical
+                .map(|stat| stat.observed_min_key.clone())
+                .unwrap_or_default();
+            let observed_max_key = logical
+                .map(|stat| stat.observed_max_key.clone())
+                .unwrap_or_default();
+            let sampled_keys = logical
+                .map(|stat| stat.sampled_keys.clone())
+                .unwrap_or_default();
             out.push(LocalRangeStat {
                 shard_id: shard.shard_id,
                 shard_index: shard.shard_index,
                 record_count,
                 is_leaseholder: shard.leaseholder == self.node_id,
-                write_ops_total: load.set_ops.get(shard.shard_index).copied().unwrap_or(0),
-                read_ops_total: load.get_ops.get(shard.shard_index).copied().unwrap_or(0),
-                write_bytes_total: load
-                    .write_bytes
-                    .get(shard.shard_index)
-                    .copied()
-                    .unwrap_or(0),
+                write_ops_total,
+                read_ops_total,
+                write_bytes_total,
                 queue_depth: 0,
-                write_tail_latency_ms: load
-                    .write_tail_latency_ms
-                    .get(shard.shard_index)
-                    .copied()
-                    .unwrap_or(0.0),
-                hot_key_concentration_bps: load
-                    .hot_key_concentration_bps
-                    .get(shard.shard_index)
-                    .copied()
-                    .unwrap_or(0),
+                write_tail_latency_ms,
+                hot_key_concentration_bps,
                 write_hot_buckets,
                 read_hot_buckets,
+                observed_min_key,
+                observed_max_key,
+                sampled_keys,
             });
         }
         Ok(out)
@@ -3090,6 +3263,9 @@ impl NodeState {
                         hot_key_concentration_bps: item.hot_key_concentration_bps,
                         write_hot_buckets: item.write_hot_buckets,
                         read_hot_buckets: item.read_hot_buckets,
+                        observed_min_key: item.observed_min_key,
+                        observed_max_key: item.observed_max_key,
+                        sampled_keys: item.sampled_keys,
                     })
                     .collect::<Vec<_>>();
                 futs.push(Box::pin(async move { (node_id, Some(local)) }));
@@ -3643,6 +3819,7 @@ impl NodeState {
             .await;
         let _inflight_guard = self.enter_client_op();
         let mut by_shard: Vec<Vec<(Vec<u8>, Vec<u8>)>> = vec![Vec::new(); self.data_shards];
+        let mut logical_deltas = BTreeMap::<u64, crate::load::LogicalWriteDelta>::new();
         {
             // Take split lock and range snapshot once for the whole routing pass.
             let _guard = self.split_lock.read().unwrap();
@@ -3654,8 +3831,18 @@ impl NodeState {
             let ranges = range_snapshot.as_deref();
             for (key, value) in items {
                 let shard = self.shard_for_key_with_snapshot(&key, ranges);
+                if let Some(ranges) = ranges {
+                    let shard_id = shard_id_for_key_in_ranges(&key, ranges);
+                    logical_deltas
+                        .entry(shard_id)
+                        .or_default()
+                        .record(&key, value.len());
+                }
                 by_shard[shard].push((key, value));
             }
+        }
+        for (shard_id, delta) in logical_deltas {
+            self.shard_load.record_logical_write_delta(shard_id, delta);
         }
 
         let target = max_ops_per_proposal.max(1);
@@ -3731,6 +3918,7 @@ impl NodeState {
         let keys = keys.into_iter().map(Bytes::from).collect::<Vec<_>>();
         let _inflight_guard = self.enter_client_op();
         let mut by_shard: Vec<Vec<usize>> = vec![Vec::new(); self.data_shards];
+        let mut logical_read_deltas = BTreeMap::<u64, crate::load::LogicalReadDelta>::new();
         {
             // Take split lock and range snapshot once for the whole routing pass.
             let _guard = self.split_lock.read().unwrap();
@@ -3742,8 +3930,18 @@ impl NodeState {
             let ranges = range_snapshot.as_deref();
             for (idx, key) in keys.iter().enumerate() {
                 let shard = self.shard_for_key_with_snapshot(key.as_ref(), ranges);
+                if let Some(ranges) = ranges {
+                    let shard_id = shard_id_for_key_in_ranges(key.as_ref(), ranges);
+                    logical_read_deltas
+                        .entry(shard_id)
+                        .or_default()
+                        .record(key.as_ref());
+                }
                 by_shard[shard].push(idx);
             }
+        }
+        for (shard_id, delta) in logical_read_deltas {
+            self.shard_load.record_logical_read_delta(shard_id, delta);
         }
 
         if matches!(self.read_mode, ReadMode::Local) {
@@ -3994,7 +4192,7 @@ impl NodeState {
             .group(group_id)
             .ok_or_else(|| anyhow::anyhow!("data group missing"))?;
         let mut max_by_key = vec![None; keys.len()];
-        let mut wait_targets = HashMap::<NodeId, TxnId>::new();
+        let mut wait_targets = HashMap::<accord::TxnProgressKey, TxnId>::new();
         let local = group.last_committed_for_key_slices(keys).await;
         merge_last_committed_replica_checked(&mut max_by_key, &local, &mut wait_targets)?;
 
@@ -4438,6 +4636,22 @@ fn client_set_effective_batch_wait(
     }
     let remaining = max_queue_wait - head_age;
     batch_wait.min(remaining)
+}
+
+/// Scale SET collection capacity by active write fanout.
+///
+/// Purpose:
+/// - Preserve roughly the same per-range proposal size after metadata-only
+///   range splits create multiple active consensus groups.
+///
+/// Design:
+/// - Hard-caps growth by the pre-created shard group count, so memory remains
+///   bounded by existing topology.
+/// - Keeps the single-range path identical to the configured batch size.
+fn scaled_set_batch_max(base_max: usize, active_shards: usize, max_shards: usize) -> usize {
+    let base = base_max.max(1);
+    let fanout = active_shards.max(1).min(max_shards.max(1));
+    base.saturating_mul(fanout)
 }
 
 /// Collect a client SET batch while still polling in-flight completion futures.
@@ -5036,7 +5250,7 @@ fn spawn_set_batcher(
     mut rx: mpsc::Receiver<BatchSetWork>,
     cfg: ClientBatchConfig,
 ) {
-    let max_items = cfg.set_max.max(1);
+    let base_max_items = cfg.set_max.max(1);
     let configured_wait = cfg.set_wait;
     let max_queue_wait = client_set_max_queue_wait(configured_wait);
     let max_inflight = cfg.set_inflight.max(1);
@@ -5051,6 +5265,11 @@ fn spawn_set_batcher(
                 max_queue_wait,
             );
 
+            let max_items = scaled_set_batch_max(
+                base_max_items,
+                state.active_write_shard_fanout_hint(),
+                state.data_shards,
+            );
             let batch = collect_set_batch(first, &mut rx, max_items, effective_wait).await;
             let permit = match inflight.clone().acquire_owned().await {
                 Ok(permit) => permit,
@@ -5386,7 +5605,7 @@ fn merge_quorum_results(
 ///
 /// Design:
 /// - `max_by_key` stores one highest-seq `(txn_id, seq)` per input key.
-/// - `wait_targets` stores one max-counter transaction per origin node so wait
+/// - `wait_targets` stores one max-sequence transaction per origin stream so wait
 ///   checks are coalesced to prefix waits instead of per-key waits.
 ///
 /// Inputs:
@@ -5397,7 +5616,7 @@ fn merge_quorum_results(
 #[derive(Debug)]
 struct ReadBarrierShardState {
     max_by_key: Vec<Option<(TxnId, u64)>>,
-    wait_targets: HashMap<NodeId, TxnId>,
+    wait_targets: HashMap<accord::TxnProgressKey, TxnId>,
 }
 
 /// Merge one replica's `last_committed` vector into barrier accumulators.
@@ -5413,7 +5632,7 @@ struct ReadBarrierShardState {
 /// Inputs:
 /// - `max_by_key`: mutable accumulator sized to input key count.
 /// - `replica`: one replica response vector.
-/// - `wait_targets`: mutable per-origin max-counter accumulator.
+/// - `wait_targets`: mutable per-origin-stream max-sequence accumulator.
 ///
 /// Outputs:
 /// - `Ok(())` on successful merge.
@@ -5421,7 +5640,7 @@ struct ReadBarrierShardState {
 fn merge_last_committed_replica_checked(
     max_by_key: &mut [Option<(TxnId, u64)>],
     replica: &[Option<(TxnId, u64)>],
-    wait_targets: &mut HashMap<NodeId, TxnId>,
+    wait_targets: &mut HashMap<accord::TxnProgressKey, TxnId>,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         max_by_key.len() == replica.len(),
@@ -5442,12 +5661,13 @@ fn merge_last_committed_replica_checked(
             max_by_key[idx] = Some((*txn_id, *seq));
         }
 
-        // Track one wait target per origin. Prefix execution by counter means
-        // waiting on the max counter implies all lower counters are executed.
+        // Track one wait target per origin stream. Prefix execution by dense
+        // sequence means waiting on the max sequence covers lower sequences.
+        let stream = accord::txn_progress_key(*txn_id);
         wait_targets
-            .entry(txn_id.node_id)
+            .entry(stream)
             .and_modify(|cur| {
-                if txn_id.counter > cur.counter {
+                if accord::txn_seq(*txn_id) > accord::txn_seq(*cur) {
                     *cur = *txn_id;
                 }
             })
@@ -5490,32 +5710,41 @@ fn read_barrier_deps_from_max_by_key(max_by_key: &[Option<(TxnId, u64)>]) -> Vec
 ///   satisfied before the wait phase starts.
 ///
 /// Design:
-/// - Reads one executed-prefix snapshot for all origins.
-/// - Returns only origin targets whose counter is above local executed prefix.
-/// - Keeps evaluation independent per origin node; it does not enforce global
+/// - Reads one executed-prefix snapshot for all origin streams.
+/// - Returns only stream targets whose sequence is above local executed prefix.
+/// - Keeps evaluation independent per origin stream; it does not enforce global
 ///   ordering beyond Accord's per-origin prefix semantics.
 ///
 /// Inputs:
-/// - `wait_targets`: per-origin max-counter wait targets.
+/// - `wait_targets`: per-origin-stream max-sequence wait targets.
 /// - `executed`: local executed prefix snapshot.
 ///
 /// Outputs:
 /// - Pending wait targets that still require `wait_executed`.
 fn read_barrier_pending_wait_targets(
-    wait_targets: &HashMap<NodeId, TxnId>,
+    wait_targets: &HashMap<accord::TxnProgressKey, TxnId>,
     executed: &[accord::ExecutedPrefix],
 ) -> Vec<TxnId> {
-    let mut executed_by_node = HashMap::<NodeId, u64>::new();
-    // Snapshot each origin's executed counter once so per-target checks are
+    let mut executed_by_stream = HashMap::<accord::TxnProgressKey, u64>::new();
+    // Snapshot each origin stream's executed sequence once so per-target checks are
     // O(1) map reads, not repeated scans over executed prefixes.
     for prefix in executed {
-        executed_by_node.insert(prefix.node_id, prefix.counter);
+        executed_by_stream.insert(
+            accord::TxnProgressKey {
+                node_id: prefix.node_id,
+                epoch: prefix.epoch,
+            },
+            prefix.counter,
+        );
     }
 
     let mut pending = Vec::with_capacity(wait_targets.len());
     for txn_id in wait_targets.values().copied() {
-        let executed_counter = executed_by_node.get(&txn_id.node_id).copied().unwrap_or(0);
-        if executed_counter < txn_id.counter {
+        let executed_counter = executed_by_stream
+            .get(&accord::txn_progress_key(txn_id))
+            .copied()
+            .unwrap_or(0);
+        if executed_counter < accord::txn_seq(txn_id) {
             pending.push(txn_id);
         }
     }
@@ -6637,6 +6866,8 @@ where
     fs::create_dir_all(&storage_dir).context("create storage dir")?;
     let wal_dir = data_dir.join("wal");
     fs::create_dir_all(&wal_dir).context("create wal dir")?;
+    let txn_epoch = load_and_bump_txn_epoch(&data_dir).context("allocate durable txn epoch")?;
+    tracing::info!(txn_epoch, "allocated durable transaction epoch");
 
     let mut fjall_cfg = fjall::Config::new(&storage_dir);
     if args.fjall_manual_journal_persist {
@@ -6971,6 +7202,7 @@ where
     let mk_cfg = |group_id: GroupId, fast_path_1rtt: bool| accord::Config {
         group_id,
         node_id: args.node_id,
+        txn_epoch,
         members: accord_members.clone(),
         rpc_timeout,
         propose_timeout,
@@ -7083,12 +7315,14 @@ where
         });
         let visibility_hook: Arc<kv::VisibilityDeltaHook> = {
             let range_stats = range_stats.clone();
+            let cluster_store = cluster_store.clone();
             Arc::new(move |delta| {
-                range_stats.on_visible_insertions(shard, delta);
+                let storage_index = cluster_store.storage_index_for_shard_index(shard);
+                range_stats.on_visible_insertions(storage_index, delta);
             })
         };
         let kv_sm = Arc::new(kv::KvStateMachine::with_membership_hook(
-            kv_shards[shard].clone(),
+            kv_engine.clone(),
             Some(split_lock.clone()),
             Some(membership_hook),
             Some(visibility_hook),
@@ -7359,6 +7593,7 @@ where
             split_min_qps: args.range_split_min_qps,
             split_qps_sustain: args.range_split_qps_sustain.max(1),
             split_cooldown: Duration::from_millis(args.range_split_cooldown_ms.max(1)),
+            split_global_cooldown: Duration::from_millis(args.range_split_global_cooldown_ms),
             adaptive_sustain: args.range_adaptive_sustain.max(1),
             adaptive_score_threshold: args.range_adaptive_score_threshold.max(0.01),
             adaptive_hysteresis_pct: args.range_adaptive_hysteresis_pct.clamp(1, 90),
@@ -7816,6 +8051,7 @@ mod tests {
             meta_rebalances: BTreeMap::new(),
             controller_leases: BTreeMap::new(),
             meta_controller_lease: None,
+            range_split_cooldown_until_ms: 0,
         }
     }
 
@@ -7823,6 +8059,8 @@ mod tests {
         ShardDesc {
             shard_id: 10,
             shard_index: 2,
+            storage_index: Some(2),
+            fallback_storage_index: None,
             start_hash: 0,
             end_hash: 0,
             start_key: vec![],
@@ -7849,7 +8087,7 @@ mod tests {
     #[test]
     fn merge_last_committed_replica_checked_normal_path() {
         let mut max_by_key = vec![None; 3];
-        let mut wait_targets = HashMap::<NodeId, TxnId>::new();
+        let mut wait_targets = HashMap::<accord::TxnProgressKey, TxnId>::new();
 
         let r1 = vec![Some((txn(1, 5), 10)), None, Some((txn(2, 4), 7))];
         merge_last_committed_replica_checked(&mut max_by_key, &r1, &mut wait_targets)
@@ -7866,9 +8104,18 @@ mod tests {
         assert_eq!(max_by_key[0], Some((txn(1, 5), 10)));
         assert_eq!(max_by_key[1], Some((txn(3, 1), 11)));
         assert_eq!(max_by_key[2], Some((txn(2, 8), 12)));
-        assert_eq!(wait_targets.get(&1), Some(&txn(1, 9)));
-        assert_eq!(wait_targets.get(&2), Some(&txn(2, 8)));
-        assert_eq!(wait_targets.get(&3), Some(&txn(3, 1)));
+        assert_eq!(
+            wait_targets.get(&accord::txn_progress_key(txn(1, 9))),
+            Some(&txn(1, 9))
+        );
+        assert_eq!(
+            wait_targets.get(&accord::txn_progress_key(txn(2, 8))),
+            Some(&txn(2, 8))
+        );
+        assert_eq!(
+            wait_targets.get(&accord::txn_progress_key(txn(3, 1))),
+            Some(&txn(3, 1))
+        );
     }
 
     /// Verify merge helper rejects malformed replica vectors.
@@ -7887,7 +8134,7 @@ mod tests {
     #[test]
     fn merge_last_committed_replica_checked_failure_path_mismatched_len() {
         let mut max_by_key = vec![None; 3];
-        let mut wait_targets = HashMap::<NodeId, TxnId>::new();
+        let mut wait_targets = HashMap::<accord::TxnProgressKey, TxnId>::new();
         let malformed = vec![Some((txn(1, 1), 1)), None];
         let err =
             merge_last_committed_replica_checked(&mut max_by_key, &malformed, &mut wait_targets)
@@ -7941,14 +8188,19 @@ mod tests {
     /// - Pending list contains only unsatisfied target.
     #[test]
     fn read_barrier_pending_wait_targets_filters_satisfied_origins() {
-        let wait_targets = HashMap::from([(1_u64, txn(1, 5)), (2_u64, txn(2, 9))]);
+        let wait_targets = HashMap::from([
+            (accord::txn_progress_key(txn(1, 5)), txn(1, 5)),
+            (accord::txn_progress_key(txn(2, 9)), txn(2, 9)),
+        ]);
         let executed = vec![
             accord::ExecutedPrefix {
                 node_id: 1,
+                epoch: 0,
                 counter: 5,
             },
             accord::ExecutedPrefix {
                 node_id: 2,
+                epoch: 0,
                 counter: 3,
             },
         ];
@@ -8065,6 +8317,14 @@ mod tests {
             Duration::from_micros(500),
         );
         assert_eq!(effective, Duration::from_micros(150));
+    }
+
+    /// Verify SET collection capacity scales with active shard fanout.
+    #[test]
+    fn scaled_set_batch_max_preserves_per_shard_batch_target() {
+        assert_eq!(scaled_set_batch_max(128, 1, 4), 128);
+        assert_eq!(scaled_set_batch_max(128, 2, 4), 256);
+        assert_eq!(scaled_set_batch_max(128, 8, 4), 512);
     }
 
     /// Verify progress-aware GET batch collection drains ready queue work up to

@@ -633,7 +633,7 @@ async fn seed_meta_learner_prefixes_if_needed(
     let target_prefixes = state.transport.last_executed_prefix(target, gid).await?;
     let needs_seed = source_prefixes
         .iter()
-        .any(|src| prefix_counter(&target_prefixes, src.node_id) < src.counter);
+        .any(|src| prefix_counter(&target_prefixes, src.node_id, src.epoch) < src.counter);
     if !needs_seed {
         return Ok(true);
     }
@@ -711,14 +711,16 @@ async fn meta_group_prefix_lag(
     range: &MetaRangeDesc,
 ) -> anyhow::Result<u64> {
     let gid = crate::meta_group_id_for_index(range.meta_index);
-    let mut by_prefix = BTreeMap::<NodeId, (u64, u64)>::new();
+    let mut by_prefix = BTreeMap::<(NodeId, u64), (u64, u64)>::new();
     for node in &range.replicas {
         let prefixes = match state.transport.last_executed_prefix(*node, gid).await {
             Ok(p) => p,
             Err(_) => return Ok(0),
         };
         for p in prefixes {
-            let entry = by_prefix.entry(p.node_id).or_insert((p.counter, p.counter));
+            let entry = by_prefix
+                .entry((p.node_id, p.epoch))
+                .or_insert((p.counter, p.counter));
             entry.0 = entry.0.min(p.counter);
             entry.1 = entry.1.max(p.counter);
         }
@@ -730,19 +732,19 @@ async fn meta_group_prefix_lag(
     Ok(lag)
 }
 
-fn normalize_prefixes(prefixes: Vec<ExecutedPrefix>) -> Vec<(NodeId, u64)> {
+fn normalize_prefixes(prefixes: Vec<ExecutedPrefix>) -> Vec<(NodeId, u64, u64)> {
     let mut out = prefixes
         .into_iter()
-        .map(|p| (p.node_id, p.counter))
+        .map(|p| (p.node_id, p.epoch, p.counter))
         .collect::<Vec<_>>();
-    out.sort_unstable_by_key(|(node_id, counter)| (*node_id, *counter));
+    out.sort_unstable_by_key(|(node_id, epoch, counter)| (*node_id, *epoch, *counter));
     out
 }
 
-fn prefix_counter(prefixes: &[ExecutedPrefix], node_id: NodeId) -> u64 {
+fn prefix_counter(prefixes: &[ExecutedPrefix], node_id: NodeId, epoch: u64) -> u64 {
     prefixes
         .iter()
-        .find(|p| p.node_id == node_id)
+        .find(|p| p.node_id == node_id && p.epoch == epoch)
         .map(|p| p.counter)
         .unwrap_or(0)
 }
@@ -808,6 +810,7 @@ mod tests {
             )]),
             controller_leases: BTreeMap::new(),
             meta_controller_lease: None,
+            range_split_cooldown_until_ms: 0,
         }
     }
 

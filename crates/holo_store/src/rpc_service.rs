@@ -1094,6 +1094,7 @@ impl rpc::HoloRpc for RpcService {
             .into_iter()
             .map(|p| accord::ExecutedPrefix {
                 node_id: p.node_id,
+                epoch: p.epoch,
                 counter: p.counter,
             })
             .collect();
@@ -1169,6 +1170,7 @@ impl rpc::HoloRpc for RpcService {
             .into_iter()
             .map(|p| rpc::ExecutedPrefix {
                 node_id: p.node_id,
+                epoch: p.epoch,
                 counter: p.counter,
             })
             .collect();
@@ -1193,6 +1195,7 @@ impl rpc::HoloRpc for RpcService {
             .into_iter()
             .map(|p| accord::ExecutedPrefix {
                 node_id: p.node_id,
+                epoch: p.epoch,
                 counter: p.counter,
             })
             .collect::<Vec<_>>();
@@ -1586,6 +1589,8 @@ impl rpc::HoloRpc for RpcService {
             target_replicas: None,
             target_leaseholder: None,
             skip_migration: false,
+            requested_at_ms: 0,
+            cooldown_until_ms: 0,
         };
         self.state
             .propose_meta_command(cmd)
@@ -1804,6 +1809,9 @@ impl rpc::HoloRpc for RpcService {
                 hot_key_concentration_bps: item.hot_key_concentration_bps,
                 write_hot_buckets: item.write_hot_buckets,
                 read_hot_buckets: item.read_hot_buckets,
+                observed_min_key: item.observed_min_key.into(),
+                observed_max_key: item.observed_max_key.into(),
+                sampled_keys: item.sampled_keys.into_iter().map(Into::into).collect(),
             })
             .collect();
         Ok(volo_grpc::Response::new(rpc::RangeStatsResponse {
@@ -2348,11 +2356,11 @@ async fn wait_for_shard_prefix_converged(
 fn shard_prefixes_converged(prefixes_by_node: &[(NodeId, Vec<ExecutedPrefix>)]) -> bool {
     use std::collections::BTreeMap;
 
-    let mut required: BTreeMap<NodeId, u64> = BTreeMap::new();
+    let mut required: BTreeMap<(NodeId, u64), u64> = BTreeMap::new();
     for (_, prefixes) in prefixes_by_node {
         for p in prefixes {
             required
-                .entry(p.node_id)
+                .entry((p.node_id, p.epoch))
                 .and_modify(|counter| *counter = (*counter).max(p.counter))
                 .or_insert(p.counter);
         }
@@ -2361,14 +2369,14 @@ fn shard_prefixes_converged(prefixes_by_node: &[(NodeId, Vec<ExecutedPrefix>)]) 
     prefixes_by_node.iter().all(|(_, prefixes)| {
         required
             .iter()
-            .all(|(origin, req)| prefix_counter(prefixes, *origin) >= *req)
+            .all(|((origin, epoch), req)| prefix_counter(prefixes, *origin, *epoch) >= *req)
     })
 }
 
-fn prefix_counter(prefixes: &[ExecutedPrefix], node_id: NodeId) -> u64 {
+fn prefix_counter(prefixes: &[ExecutedPrefix], node_id: NodeId, epoch: u64) -> u64 {
     prefixes
         .iter()
-        .find(|p| p.node_id == node_id)
+        .find(|p| p.node_id == node_id && p.epoch == epoch)
         .map(|p| p.counter)
         .unwrap_or(0)
 }

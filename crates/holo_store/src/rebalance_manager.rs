@@ -977,9 +977,9 @@ async fn learner_caught_up(
         .last_executed_prefix(target, group_id)
         .await?;
     // Learner is considered caught up when it has executed at least everything
-    // the source has executed for every origin node in this group.
+    // the source has executed for every origin stream in this group.
     for src in &source_prefixes {
-        let target_counter = prefix_counter(&target_prefixes, src.node_id);
+        let target_counter = prefix_counter(&target_prefixes, src.node_id, src.epoch);
         if target_counter < src.counter {
             tracing::debug!(
                 shard_id = shard.shard_id,
@@ -987,28 +987,15 @@ async fn learner_caught_up(
                 source,
                 target,
                 origin = src.node_id,
+                epoch = src.epoch,
                 source_counter = src.counter,
                 target_counter,
-                "learner catch-up lagging for origin"
+                "learner catch-up lagging for origin stream"
             );
             return Ok(false);
         }
     }
-    // Also keep the explicit source-origin check for clearer intent.
-    let source_counter = prefix_counter(&source_prefixes, source);
-    let target_seen_source = prefix_counter(&target_prefixes, source);
-    if target_seen_source < source_counter {
-        tracing::debug!(
-            shard_id = shard.shard_id,
-            shard_index = shard.shard_index,
-            source,
-            target,
-            source_counter,
-            target_counter = target_seen_source,
-            "learner catch-up lagging on source-origin prefix"
-        );
-    }
-    Ok(target_seen_source >= source_counter)
+    Ok(true)
 }
 
 async fn local_shard_quiesced(state: Arc<NodeState>, shard_index: usize) -> anyhow::Result<bool> {
@@ -1068,19 +1055,19 @@ async fn shard_replica_prefix_lag(state: Arc<NodeState>, shard: &ShardDesc) -> a
     let Some(prefixes_by_node) = shard_prefixes_by_replica(state, shard).await? else {
         return Ok(u64::MAX);
     };
-    let mut required: BTreeMap<NodeId, u64> = BTreeMap::new();
+    let mut required: BTreeMap<(NodeId, u64), u64> = BTreeMap::new();
     for (_, prefixes) in &prefixes_by_node {
         for p in prefixes {
             required
-                .entry(p.node_id)
+                .entry((p.node_id, p.epoch))
                 .and_modify(|counter| *counter = (*counter).max(p.counter))
                 .or_insert(p.counter);
         }
     }
     let mut max_lag = 0u64;
     for (_, prefixes) in &prefixes_by_node {
-        for (origin, req) in &required {
-            let have = prefix_counter(prefixes, *origin);
+        for ((origin, epoch), req) in &required {
+            let have = prefix_counter(prefixes, *origin, *epoch);
             max_lag = max_lag.max(req.saturating_sub(have));
         }
     }
@@ -1120,11 +1107,11 @@ async fn shard_replica_record_count_converged(
 }
 
 fn prefix_sets_converged(prefixes_by_node: &[(NodeId, Vec<ExecutedPrefix>)]) -> bool {
-    let mut required: BTreeMap<NodeId, u64> = BTreeMap::new();
+    let mut required: BTreeMap<(NodeId, u64), u64> = BTreeMap::new();
     for (_, prefixes) in prefixes_by_node {
         for p in prefixes {
             required
-                .entry(p.node_id)
+                .entry((p.node_id, p.epoch))
                 .and_modify(|counter| *counter = (*counter).max(p.counter))
                 .or_insert(p.counter);
         }
@@ -1132,14 +1119,14 @@ fn prefix_sets_converged(prefixes_by_node: &[(NodeId, Vec<ExecutedPrefix>)]) -> 
     prefixes_by_node.iter().all(|(_, prefixes)| {
         required
             .iter()
-            .all(|(origin, req)| prefix_counter(prefixes, *origin) >= *req)
+            .all(|((origin, epoch), req)| prefix_counter(prefixes, *origin, *epoch) >= *req)
     })
 }
 
-fn prefix_counter(prefixes: &[ExecutedPrefix], node_id: NodeId) -> u64 {
+fn prefix_counter(prefixes: &[ExecutedPrefix], node_id: NodeId, epoch: u64) -> u64 {
     prefixes
         .iter()
-        .find(|p| p.node_id == node_id)
+        .find(|p| p.node_id == node_id && p.epoch == epoch)
         .map(|p| p.counter)
         .unwrap_or(0)
 }
@@ -1149,17 +1136,23 @@ fn plan_decommission_step(state: &ClusterState) -> Option<ClusterCommand> {
     if active.is_empty() {
         return None;
     }
+    let shared_physical_indexes = shared_physical_shard_indexes(state);
 
     for (node_id, member) in &state.members {
         if member.state != MemberState::Decommissioning {
             continue;
         }
-        // Move one shard at a time off the decommissioning node.
-        if let Some(shard) = state
+        // Move one shard at a time off the decommissioning node. Shared storage
+        // groups are intentionally skipped until range materialization can move
+        // all logical siblings together.
+        let still_hosts_replica = state
             .shards
             .iter()
-            .find(|s| s.replicas.iter().any(|id| *id == *node_id))
-        {
+            .any(|s| s.replicas.iter().any(|id| *id == *node_id));
+        if let Some(shard) = state.shards.iter().find(|s| {
+            !shared_physical_indexes.contains(&s.storage_index())
+                && s.replicas.iter().any(|id| *id == *node_id)
+        }) {
             // If this shard already has an in-flight move, wait for the phase machine.
             if state.shard_rebalances.contains_key(&shard.shard_id) {
                 return None;
@@ -1178,6 +1171,10 @@ fn plan_decommission_step(state: &ClusterState) -> Option<ClusterCommand> {
                 to_node: target,
                 target_leaseholder: None,
             });
+        }
+
+        if still_hosts_replica {
+            return None;
         }
 
         // Drained from every shard: finalize removal.
@@ -1200,6 +1197,7 @@ fn plan_replica_balance_step(state: &ClusterState) -> Option<ClusterCommand> {
     }
 
     let counts = replica_counts(state, &active);
+    let shared_physical_indexes = shared_physical_shard_indexes(state);
     let (most_loaded, most) = max_count(&counts)?;
     let (least_loaded, least) = min_count(&counts)?;
     if most <= least + 1 {
@@ -1207,6 +1205,9 @@ fn plan_replica_balance_step(state: &ClusterState) -> Option<ClusterCommand> {
     }
 
     for shard in &state.shards {
+        if shared_physical_indexes.contains(&shard.storage_index()) {
+            continue;
+        }
         if !shard.replicas.contains(&most_loaded) || shard.replicas.contains(&least_loaded) {
             continue;
         }
@@ -1228,6 +1229,7 @@ fn plan_lease_balance_step(state: &ClusterState) -> Option<ClusterCommand> {
     if active.is_empty() || state.shards.is_empty() {
         return None;
     }
+    let shared_physical_indexes = shared_physical_shard_indexes(state);
     let mut lease_counts = BTreeMap::new();
     for id in &active {
         lease_counts.insert(*id, 0usize);
@@ -1244,6 +1246,9 @@ fn plan_lease_balance_step(state: &ClusterState) -> Option<ClusterCommand> {
     }
 
     for shard in &state.shards {
+        if shared_physical_indexes.contains(&shard.storage_index()) {
+            continue;
+        }
         if shard.leaseholder != most_loaded {
             continue;
         }
@@ -1285,6 +1290,34 @@ fn replica_counts(state: &ClusterState, active: &[NodeId]) -> BTreeMap<NodeId, u
     counts
 }
 
+/// Return storage indexes that still have descriptor-level storage dependencies.
+///
+/// Purpose:
+/// - Metadata-only splits can make multiple range descriptors share one local
+///   storage partition. Until background materialization gives each descriptor
+///   independent physical storage, moving one descriptor's replicas or lease
+///   would make metadata disagree with where bytes live.
+///
+/// Output:
+/// - Set of `storage_index` values whose automatic balancing must be skipped.
+fn shared_physical_shard_indexes(state: &ClusterState) -> std::collections::BTreeSet<usize> {
+    let mut counts = BTreeMap::<usize, usize>::new();
+    let mut dependent = std::collections::BTreeSet::new();
+    for shard in &state.shards {
+        *counts.entry(shard.storage_index()).or_default() += 1;
+        if let Some(fallback) = shard.fallback_storage_index() {
+            dependent.insert(shard.storage_index());
+            dependent.insert(fallback);
+        }
+    }
+    for (idx, count) in counts {
+        if count > 1 {
+            dependent.insert(idx);
+        }
+    }
+    dependent
+}
+
 fn max_count(counts: &BTreeMap<NodeId, usize>) -> Option<(NodeId, usize)> {
     counts
         .iter()
@@ -1320,6 +1353,8 @@ mod tests {
         ShardDesc {
             shard_id,
             shard_index: (shard_id - 1) as usize,
+            storage_index: Some((shard_id - 1) as usize),
+            fallback_storage_index: None,
             start_hash: 0,
             end_hash: 0,
             start_key: vec![],
@@ -1367,6 +1402,7 @@ mod tests {
             meta_rebalances: BTreeMap::new(),
             controller_leases: BTreeMap::new(),
             meta_controller_lease: None,
+            range_split_cooldown_until_ms: 0,
         };
 
         let cmd = plan_decommission_step(&state).expect("expected decommission step");
@@ -1420,6 +1456,7 @@ mod tests {
             meta_rebalances: BTreeMap::new(),
             controller_leases: BTreeMap::new(),
             meta_controller_lease: None,
+            range_split_cooldown_until_ms: 0,
         };
 
         let cmd = plan_replica_balance_step(&state).expect("expected rebalance");
@@ -1461,6 +1498,7 @@ mod tests {
             meta_rebalances: BTreeMap::new(),
             controller_leases: BTreeMap::new(),
             meta_controller_lease: None,
+            range_split_cooldown_until_ms: 0,
         };
 
         let cmd = plan_lease_balance_step(&state).expect("expected lease rebalance");
@@ -1470,6 +1508,80 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn balancers_skip_logical_ranges_sharing_one_physical_group() {
+        let mut members = BTreeMap::new();
+        members.insert(1, member(1, MemberState::Active));
+        members.insert(2, member(2, MemberState::Active));
+        members.insert(3, member(3, MemberState::Active));
+        let (roles, moves) = empty_control_plane();
+        let left = shard(1, vec![1, 2], 1);
+        let mut right = shard(2, vec![1, 2], 1);
+        right.storage_index = Some(left.storage_index());
+        let state = ClusterState {
+            epoch: 1,
+            frozen: false,
+            replication_factor: 2,
+            members,
+            shards: vec![left, right],
+            shard_replica_roles: roles,
+            shard_rebalances: moves,
+            shard_merges: BTreeMap::new(),
+            shard_fences: BTreeMap::new(),
+            retired_ranges: BTreeMap::new(),
+            meta_ranges: Vec::new(),
+            meta_replica_roles: BTreeMap::new(),
+            meta_rebalances: BTreeMap::new(),
+            controller_leases: BTreeMap::new(),
+            meta_controller_lease: None,
+            range_split_cooldown_until_ms: 0,
+        };
+
+        assert!(
+            plan_replica_balance_step(&state).is_none(),
+            "replica balancer must not move one descriptor from a shared physical group"
+        );
+        assert!(
+            plan_lease_balance_step(&state).is_none(),
+            "lease balancer must not transfer one descriptor from a shared physical group"
+        );
+    }
+
+    #[test]
+    fn decommission_waits_when_only_remaining_replicas_are_shared_physical_ranges() {
+        let mut members = BTreeMap::new();
+        members.insert(1, member(1, MemberState::Active));
+        members.insert(2, member(2, MemberState::Decommissioning));
+        members.insert(3, member(3, MemberState::Active));
+        let (roles, moves) = empty_control_plane();
+        let left = shard(1, vec![1, 2], 1);
+        let mut right = shard(2, vec![1, 2], 1);
+        right.storage_index = Some(left.storage_index());
+        let state = ClusterState {
+            epoch: 1,
+            frozen: false,
+            replication_factor: 2,
+            members,
+            shards: vec![left, right],
+            shard_replica_roles: roles,
+            shard_rebalances: moves,
+            shard_merges: BTreeMap::new(),
+            shard_fences: BTreeMap::new(),
+            retired_ranges: BTreeMap::new(),
+            meta_ranges: Vec::new(),
+            meta_replica_roles: BTreeMap::new(),
+            meta_rebalances: BTreeMap::new(),
+            controller_leases: BTreeMap::new(),
+            meta_controller_lease: None,
+            range_split_cooldown_until_ms: 0,
+        };
+
+        assert!(
+            plan_decommission_step(&state).is_none(),
+            "decommission must not finalize while shared physical ranges still reference the node"
+        );
     }
 
     #[test]
@@ -1522,6 +1634,7 @@ mod tests {
             meta_rebalances: BTreeMap::new(),
             controller_leases: BTreeMap::new(),
             meta_controller_lease: None,
+            range_split_cooldown_until_ms: 0,
         };
 
         let cmd = plan_stalled_move_step(&state, Duration::from_millis(1_000))
@@ -1571,6 +1684,7 @@ mod tests {
             meta_rebalances: BTreeMap::new(),
             controller_leases: BTreeMap::new(),
             meta_controller_lease: None,
+            range_split_cooldown_until_ms: 0,
         };
 
         let cmd = plan_stalled_move_step(&state, Duration::from_millis(1_000))

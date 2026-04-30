@@ -23,7 +23,7 @@ use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::RwLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::Context;
 use bytes::Bytes;
@@ -35,36 +35,15 @@ use super::state::{
     is_monotonic_update, status_to_txn_status, ExecutedLogEntry, Record, State, Status,
 };
 use super::types::{
-    txn_group_id, AcceptRequest, AcceptResponse, Ballot, CommandKeys, CommitLog,
-    CommitLogAppendOptions, CommitLogEntry, CommitRequest, CommitResponse, Config, ExecMeta,
-    ExecutedPrefix, Member, NodeId, PreAcceptRequest, PreAcceptResponse, RecoverRequest,
-    RecoverResponse, ReportExecutedRequest, ReportExecutedResponse, StateMachine, Transport, TxnId,
-    TxnStatus, TXN_COUNTER_SHARD_SHIFT,
+    make_txn_counter, txn_epoch, txn_group_id, txn_progress_key, txn_seq, AcceptRequest,
+    AcceptResponse, Ballot, CommandKeys, CommitLog, CommitLogAppendOptions, CommitLogEntry,
+    CommitRequest, CommitResponse, Config, ExecMeta, ExecutedPrefix, Member, NodeId,
+    PreAcceptRequest, PreAcceptResponse, RecoverRequest, RecoverResponse, ReportExecutedRequest,
+    ReportExecutedResponse, StateMachine, Transport, TxnId, TxnProgressKey, TxnStatus,
 };
 
 const COMPACT_EVERY_APPLIED: u64 = 1024;
 const COMPACT_MAX_DELETE: usize = 4096;
-
-fn txn_local_mask() -> u64 {
-    if TXN_COUNTER_SHARD_SHIFT >= 64 {
-        u64::MAX
-    } else {
-        (1u64 << TXN_COUNTER_SHARD_SHIFT) - 1
-    }
-}
-
-fn txn_local_counter(counter: u64) -> u64 {
-    counter & txn_local_mask()
-}
-
-fn initial_txn_counter_seed() -> u64 {
-    let now_us = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros()
-        .min(u128::from(u64::MAX)) as u64;
-    txn_local_counter(now_us)
-}
 
 fn command_digest(command: &[u8]) -> [u8; 32] {
     *blake3::hash(command).as_bytes()
@@ -1030,11 +1009,6 @@ impl Group {
         initial_voters.sort_unstable();
         initial_voters.dedup();
 
-        let mut state = State::new();
-        // Seed txn counters from wall-clock lower bits so restarts do not
-        // immediately reuse low txns before replay can advance the floor.
-        state.next_txn_counter = initial_txn_counter_seed();
-
         Self {
             members: RwLock::new(config.members.clone()),
             voters: RwLock::new(initial_voters),
@@ -1044,7 +1018,7 @@ impl Group {
             commit_log,
             commit_log_tx,
             apply_tx,
-            state: Mutex::new(state),
+            state: Mutex::new(State::new()),
             execute_lock: Mutex::new(()),
             executor_notify: Notify::new(),
             executor_started: AtomicBool::new(false),
@@ -1296,10 +1270,11 @@ impl Group {
     pub async fn executed_prefixes(&self) -> Vec<ExecutedPrefix> {
         let state = self.state.lock().await;
         state
-            .executed_prefix_by_node
+            .executed_prefix_by_stream
             .iter()
-            .map(|(node_id, counter)| ExecutedPrefix {
-                node_id: *node_id,
+            .map(|(stream, counter)| ExecutedPrefix {
+                node_id: stream.node_id,
+                epoch: stream.epoch,
                 counter: *counter,
             })
             .collect()
@@ -1314,17 +1289,21 @@ impl Group {
         let mut state = self.state.lock().await;
         let mut changed = false;
         for p in prefixes {
-            let entry = state.executed_prefix_by_node.entry(p.node_id).or_insert(0);
+            let stream = TxnProgressKey {
+                node_id: p.node_id,
+                epoch: p.epoch,
+            };
+            let entry = state.executed_prefix_by_stream.entry(stream).or_insert(0);
             if p.counter > *entry {
                 *entry = p.counter;
                 changed = true;
             }
         }
         if changed {
-            let floors = state.executed_prefix_by_node.clone();
+            let floors = state.executed_prefix_by_stream.clone();
             state.executed_out_of_order.retain(|txn_id| {
-                let floor = floors.get(&txn_id.node_id).copied().unwrap_or(0);
-                txn_id.counter > floor
+                let floor = floors.get(&txn_progress_key(*txn_id)).copied().unwrap_or(0);
+                txn_seq(*txn_id) > floor
             });
         }
     }
@@ -1391,9 +1370,10 @@ impl Group {
                 if txn_group_id(entry.txn_id) != self.config.group_id {
                     continue;
                 }
-                if entry.txn_id.node_id == self.config.node_id {
-                    max_local_counter_seen =
-                        max_local_counter_seen.max(txn_local_counter(entry.txn_id.counter));
+                if entry.txn_id.node_id == self.config.node_id
+                    && txn_epoch(entry.txn_id) == self.config.txn_epoch
+                {
+                    max_local_counter_seen = max_local_counter_seen.max(txn_seq(entry.txn_id));
                 }
                 let deps = entry.deps.iter().copied().collect::<BTreeSet<_>>();
                 let keys = if entry.command.is_empty() {
@@ -1520,34 +1500,9 @@ impl Group {
     }
 
     fn compose_txn_id(&self, local_counter: u64) -> anyhow::Result<TxnId> {
-        let shard_bits = 64u32.saturating_sub(TXN_COUNTER_SHARD_SHIFT);
-        let max_group_id = if shard_bits >= 64 {
-            u64::MAX
-        } else {
-            (1u64 << shard_bits) - 1
-        };
-        anyhow::ensure!(
-            self.config.group_id <= max_group_id,
-            "group_id {} exceeds max {}",
-            self.config.group_id,
-            max_group_id
-        );
-
-        let local_mask = if TXN_COUNTER_SHARD_SHIFT >= 64 {
-            u64::MAX
-        } else {
-            (1u64 << TXN_COUNTER_SHARD_SHIFT) - 1
-        };
-        anyhow::ensure!(
-            local_counter <= local_mask,
-            "txn counter overflow (counter={}, max={})",
-            local_counter,
-            local_mask
-        );
-
         Ok(TxnId {
             node_id: self.config.node_id,
-            counter: (self.config.group_id << TXN_COUNTER_SHARD_SHIFT) | local_counter,
+            counter: make_txn_counter(self.config.group_id, self.config.txn_epoch, local_counter)?,
         })
     }
 
@@ -1619,7 +1574,7 @@ impl Group {
             committed_queue_ghost_len,
             frontier_keys_len: state.frontier_by_key.len(),
             frontier_entries_len: state.frontier_by_key.values().map(|v| v.len()).sum(),
-            executed_prefix_nodes: state.executed_prefix_by_node.len(),
+            executed_prefix_nodes: state.executed_prefix_by_stream.len(),
             executed_out_of_order_len: state.executed_out_of_order.len(),
             executed_log_len: state.executed_log.len(),
             executed_log_capacity: state.executed_log.capacity(),
@@ -2614,7 +2569,13 @@ impl Group {
             .remove(&req.from_node_id)
             .unwrap_or_default();
         for p in req.prefixes {
-            prefixes.insert(p.node_id, p.counter);
+            prefixes.insert(
+                TxnProgressKey {
+                    node_id: p.node_id,
+                    epoch: p.epoch,
+                },
+                p.counter,
+            );
         }
         state
             .reported_executed_prefix_by_peer
@@ -2768,10 +2729,11 @@ impl Group {
         let prefixes = {
             let state = self.state.lock().await;
             state
-                .executed_prefix_by_node
+                .executed_prefix_by_stream
                 .iter()
-                .map(|(node_id, counter)| ExecutedPrefix {
-                    node_id: *node_id,
+                .map(|(stream, counter)| ExecutedPrefix {
+                    node_id: stream.node_id,
+                    epoch: stream.epoch,
                     counter: *counter,
                 })
                 .collect::<Vec<_>>()
@@ -2866,15 +2828,9 @@ impl Group {
             return 0;
         }
 
-        let mut global_min_by_node: HashMap<NodeId, u64> = HashMap::new();
-        for member in members {
-            let origin = member.id;
-            let mut min_prefix = state
-                .executed_prefix_by_node
-                .get(&origin)
-                .copied()
-                .unwrap_or(0);
-
+        let mut global_min_by_stream: HashMap<TxnProgressKey, u64> = HashMap::new();
+        for (stream, local_prefix) in &state.executed_prefix_by_stream {
+            let mut min_prefix = *local_prefix;
             for peer in members {
                 let peer_id = peer.id;
                 if peer_id == node_id {
@@ -2885,14 +2841,14 @@ impl Group {
                     min_prefix = 0;
                     break;
                 };
-                let reported = peer_prefixes.get(&origin).copied().unwrap_or(0);
+                let reported = peer_prefixes.get(stream).copied().unwrap_or(0);
                 min_prefix = min_prefix.min(reported);
                 if min_prefix == 0 {
                     break;
                 }
             }
 
-            global_min_by_node.insert(origin, min_prefix);
+            global_min_by_stream.insert(*stream, min_prefix);
         }
 
         let mut removed = 0usize;
@@ -2907,8 +2863,11 @@ impl Group {
                 .get(&id)
                 .is_some_and(|entry| entry.visible);
             if visible {
-                let min_prefix = global_min_by_node.get(&id.node_id).copied().unwrap_or(0);
-                if id.counter <= min_prefix {
+                let min_prefix = global_min_by_stream
+                    .get(&txn_progress_key(id))
+                    .copied()
+                    .unwrap_or(0);
+                if txn_seq(id) <= min_prefix {
                     if let Some(entry) = state.executed_log.remove(&id) {
                         state.executed_log_bytes = state
                             .executed_log_bytes
@@ -2916,6 +2875,7 @@ impl Group {
                         state.executed_log_deps_total = state
                             .executed_log_deps_total
                             .saturating_sub(entry.deps.len());
+                        state.remove_stable_key_indexes(id, &entry.keys);
                     }
                     removed = removed.saturating_add(1);
                     continue;
@@ -2943,8 +2903,11 @@ impl Group {
                     .get(&id)
                     .is_some_and(|entry| entry.visible);
                 if visible {
-                    let min_prefix = global_min_by_node.get(&id.node_id).copied().unwrap_or(0);
-                    if id.counter > min_prefix {
+                    let min_prefix = global_min_by_stream
+                        .get(&txn_progress_key(id))
+                        .copied()
+                        .unwrap_or(0);
+                    if txn_seq(id) > min_prefix {
                         // Do not shed command bytes for entries that are not
                         // globally visible yet; lagging replicas may still
                         // need fetch/recovery payloads for these txns.
@@ -4470,8 +4433,8 @@ impl Group {
                         deps,
                         status,
                         seq,
-                        executed_prefix_by_node: state
-                            .executed_prefix_by_node
+                        executed_prefix_by_stream: state
+                            .executed_prefix_by_stream
                             .iter()
                             .map(|(k, v)| (*k, *v))
                             .collect(),
@@ -4537,7 +4500,7 @@ impl Group {
                         root = ?root,
                         chain = ?chain,
                         committed_queue_len = state.committed_queue.len(),
-                        executed_prefix_by_node = ?state.executed_prefix_by_node,
+                        executed_prefix_by_stream = ?state.executed_prefix_by_stream,
                         executed_out_of_order_len = state.executed_out_of_order.len(),
                         "execute stalled (no ready committed txn)"
                     );
@@ -4570,7 +4533,7 @@ impl Group {
                         root = ?root,
                         chain = ?chain,
                         committed_queue_len = state.committed_queue.len(),
-                        executed_prefix_by_node = ?state.executed_prefix_by_node,
+                        executed_prefix_by_stream = ?state.executed_prefix_by_stream,
                         executed_out_of_order_len = state.executed_out_of_order.len(),
                         "execute stalled (no applicable committed txn)"
                     );
@@ -4615,7 +4578,7 @@ impl Group {
                     root = ?root,
                     chain = ?chain,
                     committed_queue_len = state.committed_queue.len(),
-                    executed_prefix_by_node = ?state.executed_prefix_by_node,
+                    executed_prefix_by_stream = ?state.executed_prefix_by_stream,
                     executed_out_of_order_len = state.executed_out_of_order.len(),
                     "execute stalled (no applicable committed txn)"
                 );
@@ -4778,6 +4741,7 @@ impl Group {
                         ExecutedLogEntry {
                             command: Some(command),
                             command_digest: Some(digest),
+                            keys: item.keys.writes.clone(),
                             seq: rec.seq.max(1),
                             deps: rec.deps.into_iter().collect(),
                             visible: true,
@@ -4877,14 +4841,25 @@ impl Group {
         txn_id: TxnId,
         now: time::Instant,
     ) -> bool {
-        const RECOVERY_MIN_INTERVAL: Duration = Duration::from_secs(1);
+        let min_interval = self.recovery_retry_interval();
         if let Some(last) = state.recovery_last_attempt.get(&txn_id) {
-            if now.duration_since(*last) < RECOVERY_MIN_INTERVAL {
+            if now.duration_since(*last) < min_interval {
                 return false;
             }
         }
         state.recovery_last_attempt.insert(txn_id, now);
         true
+    }
+
+    /// Minimum per-transaction spacing between recovery attempts.
+    ///
+    /// This keeps duplicate executor probes bounded, while avoiding a fixed
+    /// one-second hole in the latency tail after a transient recovery failure.
+    fn recovery_retry_interval(&self) -> Duration {
+        self.config
+            .stall_recover_interval
+            .min(Duration::from_millis(250))
+            .max(Duration::from_millis(50))
     }
 
     async fn recover_txn_inner(&self, txn_id: TxnId) -> anyhow::Result<RecoveryKind> {
@@ -5353,16 +5328,17 @@ fn merge_preaccept(oks: &[PreAcceptResponse]) -> RecoveryValue {
 /// - `RecoveryChoice::MissingCommittedCommand` when digest is known but bytes
 ///   are absent from all committed/executed replies.
 fn choose_recovery_value(replies: &[RecoverResponse]) -> anyhow::Result<RecoveryChoice> {
+    let has_committed_value = replies
+        .iter()
+        .any(|r| matches!(r.status, TxnStatus::Committed | TxnStatus::Executed));
     let mut command: Option<Bytes> = None;
     let mut digest: Option<[u8; 32]> = None;
     let mut seq = 0u64;
     let mut deps = BTreeSet::new();
-    let mut saw_committed = false;
 
-    for r in replies {
-        if matches!(r.status, TxnStatus::Committed | TxnStatus::Executed) {
-            saw_committed = true;
-        }
+    for r in replies.iter().filter(|r| {
+        !has_committed_value || matches!(r.status, TxnStatus::Committed | TxnStatus::Executed)
+    }) {
         if r.has_command && !r.command.is_empty() {
             if let Some(cmd) = &command {
                 anyhow::ensure!(
@@ -5389,7 +5365,7 @@ fn choose_recovery_value(replies: &[RecoverResponse]) -> anyhow::Result<Recovery
         deps.extend(r.deps.iter().copied());
     }
 
-    if command.is_none() && saw_committed {
+    if command.is_none() && has_committed_value {
         if let Some(digest) = digest {
             if digest == command_digest(&[]) {
                 return Ok(RecoveryChoice::Ready(RecoveryValue {
@@ -5449,17 +5425,17 @@ struct ExecSnapshot {
     deps: HashMap<TxnId, Vec<TxnId>>,
     status: HashMap<TxnId, Status>,
     seq: HashMap<TxnId, u64>,
-    executed_prefix_by_node: HashMap<NodeId, u64>,
+    executed_prefix_by_stream: HashMap<TxnProgressKey, u64>,
     executed_out_of_order: HashSet<TxnId>,
 }
 
 fn is_executed_snapshot(snapshot: &ExecSnapshot, txn_id: &TxnId) -> bool {
     let prefix = snapshot
-        .executed_prefix_by_node
-        .get(&txn_id.node_id)
+        .executed_prefix_by_stream
+        .get(&txn_progress_key(*txn_id))
         .copied()
         .unwrap_or(0);
-    txn_id.counter <= prefix || snapshot.executed_out_of_order.contains(txn_id)
+    txn_seq(*txn_id) <= prefix || snapshot.executed_out_of_order.contains(txn_id)
 }
 
 fn scc_ready_snapshot(snapshot: &ExecSnapshot, scc: &[TxnId], id: TxnId) -> bool {
@@ -5596,7 +5572,7 @@ fn kosaraju_scc_from_deps(nodes: &[TxnId], deps: &HashMap<TxnId, Vec<TxnId>>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::accord::{CommitDurabilityMode, GroupId};
+    use crate::accord::{CommitDurabilityMode, GroupId, TXN_COUNTER_SHARD_SHIFT};
     use async_trait::async_trait;
     use std::collections::BTreeSet as StdBTreeSet;
     use std::collections::HashMap;
@@ -6171,6 +6147,7 @@ mod tests {
         Config {
             group_id: 1,
             node_id: 1,
+            txn_epoch: 1,
             members: vec![Member { id: 1 }],
             rpc_timeout: StdDuration::from_millis(200),
             propose_timeout: StdDuration::from_secs(2),
@@ -6213,6 +6190,7 @@ mod tests {
         Config {
             group_id: 1,
             node_id,
+            txn_epoch: 1,
             members: members.into_iter().map(|id| Member { id }).collect(),
             rpc_timeout,
             propose_timeout,
@@ -6250,6 +6228,13 @@ mod tests {
             has_command: true,
             seq: 1,
             deps: Vec::new(),
+        }
+    }
+
+    fn encoded_txn(node_id: NodeId, epoch: u64, seq: u64) -> TxnId {
+        TxnId {
+            node_id,
+            counter: make_txn_counter(1, epoch, seq).expect("encode txn counter"),
         }
     }
 
@@ -6318,6 +6303,148 @@ mod tests {
             assert_eq!(removed, 1);
             assert!(!state.executed_log.contains_key(&txn_id));
         }
+    }
+
+    #[test]
+    fn encoded_counter_execution_advances_dense_epoch_prefix() {
+        let mut state = State::new();
+        let stream = TxnProgressKey {
+            node_id: 2,
+            epoch: 7,
+        };
+        let first = encoded_txn(2, 7, 1);
+        let second = encoded_txn(2, 7, 2);
+        let third = encoded_txn(2, 7, 3);
+
+        state.mark_executed(third);
+        assert_eq!(
+            state.executed_prefix_by_stream.get(&stream).copied(),
+            Some(0)
+        );
+        assert!(state.executed_out_of_order.contains(&third));
+
+        state.mark_executed(first);
+        assert_eq!(
+            state.executed_prefix_by_stream.get(&stream).copied(),
+            Some(1)
+        );
+        assert!(state.executed_out_of_order.contains(&third));
+
+        state.mark_executed(second);
+        assert_eq!(
+            state.executed_prefix_by_stream.get(&stream).copied(),
+            Some(3)
+        );
+        assert!(state.executed_out_of_order.is_empty());
+        assert!(state.is_executed(&third));
+    }
+
+    #[test]
+    fn executed_log_gc_uses_epoch_sequence_prefix_not_raw_counter() {
+        let now = time::Instant::now();
+        let txn_id = encoded_txn(2, 7, 1);
+        let stream = txn_progress_key(txn_id);
+        let mut state = State::new();
+        state.mark_executed(txn_id);
+        state.record_executed_value(
+            txn_id,
+            ExecutedLogEntry {
+                command: Some(Bytes::from_static(b"set unit-test-key value")),
+                command_digest: None,
+                keys: vec![b"unit-test-key".to_vec()],
+                seq: 1,
+                deps: Vec::new(),
+                visible: true,
+            },
+        );
+        state
+            .reported_executed_prefix_by_peer
+            .entry(2)
+            .or_default()
+            .insert(stream, 1);
+        state
+            .reported_executed_prefix_by_peer
+            .entry(3)
+            .or_default()
+            .insert(stream, 1);
+        state.last_executed_gc_at = now - StdDuration::from_secs(1);
+
+        let members = vec![Member { id: 1 }, Member { id: 2 }, Member { id: 3 }];
+        let removed = Group::maybe_gc_executed_log_locked(1, &members, &mut state, now, 1);
+
+        assert_eq!(removed, 1);
+        assert!(!state.executed_log.contains_key(&txn_id));
+        assert_eq!(state.executed_log_bytes, 0);
+    }
+
+    #[test]
+    fn executed_log_gc_prunes_stable_key_indexes() {
+        let now = time::Instant::now();
+        let txn_id = encoded_txn(2, 7, 1);
+        let stream = txn_progress_key(txn_id);
+        let key = b"unit-test-key".to_vec();
+        let mut state = State::new();
+        state.mark_executed(txn_id);
+        state.last_write_by_key.insert(key.clone(), txn_id);
+        state
+            .last_committed_write_by_key
+            .insert(key.clone(), (txn_id, 42));
+        state.record_executed_value(
+            txn_id,
+            ExecutedLogEntry {
+                command: Some(Bytes::from_static(b"set unit-test-key value")),
+                command_digest: None,
+                keys: vec![key.clone()],
+                seq: 1,
+                deps: Vec::new(),
+                visible: true,
+            },
+        );
+        state
+            .reported_executed_prefix_by_peer
+            .entry(2)
+            .or_default()
+            .insert(stream, 1);
+        state
+            .reported_executed_prefix_by_peer
+            .entry(3)
+            .or_default()
+            .insert(stream, 1);
+        state.last_executed_gc_at = now - StdDuration::from_secs(1);
+
+        let members = vec![Member { id: 1 }, Member { id: 2 }, Member { id: 3 }];
+        let removed = Group::maybe_gc_executed_log_locked(1, &members, &mut state, now, 1);
+
+        assert_eq!(removed, 1);
+        assert!(!state.executed_log.contains_key(&txn_id));
+        assert!(!state.last_write_by_key.contains_key(&key));
+        assert!(!state.last_committed_write_by_key.contains_key(&key));
+    }
+
+    #[test]
+    fn stable_committed_key_hint_is_not_reintroduced_as_dependency() {
+        let config = test_config(CommitDurabilityMode::AsyncCommit);
+        let committed = encoded_txn(1, config.txn_epoch, 1);
+        let next = encoded_txn(1, config.txn_epoch, 2);
+        let key = b"unit-test-key".to_vec();
+        let keys = CommandKeys {
+            reads: Vec::new(),
+            writes: vec![key.clone()],
+        };
+        let mut state = State::new();
+        state.mark_executed(committed);
+        state
+            .last_committed_write_by_key
+            .insert(key.clone(), (committed, 7));
+        state.last_write_by_key.insert(key, committed);
+
+        let (seq, deps) = state.compute_seq_deps(&config, next, &keys);
+
+        assert_eq!(seq, 1);
+        assert!(
+            deps.is_empty(),
+            "globally stable committed hints should not extend dependency chains"
+        );
     }
 
     /// Ensure sync-commit mode never ACKs before the durable append completes.
@@ -7414,6 +7541,62 @@ mod tests {
             RecoveryChoice::Ready(value) => {
                 assert!(value.command.is_empty(), "expected merged NOOP command");
                 assert_eq!(value.seq, 7);
+            }
+            other => panic!("expected ready recovery value, got {other:?}"),
+        }
+    }
+
+    /// Verify committed recovery values dominate stale lower-status preaccepts.
+    ///
+    /// Purpose:
+    /// - Prevent recovery from getting pinned forever when a previous recovery
+    ///   already committed a value but a lagging replica still reports a
+    ///   different PreAccepted command for the same txn id.
+    ///
+    /// Design:
+    /// - Mix one committed NOOP reply with one stale PreAccepted write reply.
+    /// - Assert the committed value wins and the stale digest is ignored.
+    ///
+    /// Inputs:
+    /// - One committed reply and one conflicting preaccepted reply.
+    ///
+    /// Outputs:
+    /// - `RecoveryChoice::Ready` containing the committed NOOP.
+    #[test]
+    fn choose_recovery_value_committed_dominates_stale_preaccepted_digest() {
+        let stale = Bytes::from_static(b"stale-preaccepted-command");
+        let committed = RecoverResponse {
+            ok: true,
+            promised: Ballot::zero(),
+            status: TxnStatus::Committed,
+            accepted_ballot: Some(Ballot {
+                counter: 1,
+                node_id: 1,
+            }),
+            command: Bytes::new(),
+            command_digest: Some(command_digest(&[])),
+            has_command: true,
+            seq: 4,
+            deps: Vec::new(),
+        };
+        let preaccepted = RecoverResponse {
+            ok: true,
+            promised: Ballot::zero(),
+            status: TxnStatus::PreAccepted,
+            accepted_ballot: Some(Ballot::initial(1)),
+            command: stale.clone(),
+            command_digest: Some(command_digest(&stale)),
+            has_command: true,
+            seq: 9,
+            deps: Vec::new(),
+        };
+
+        let choice = choose_recovery_value(&[committed, preaccepted])
+            .expect("committed value should dominate stale preaccept");
+        match choice {
+            RecoveryChoice::Ready(value) => {
+                assert!(value.command.is_empty(), "expected committed NOOP");
+                assert_eq!(value.seq, 4);
             }
             other => panic!("expected ready recovery value, got {other:?}"),
         }

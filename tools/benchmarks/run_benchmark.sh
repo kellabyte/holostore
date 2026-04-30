@@ -31,6 +31,7 @@ PRELOAD_WORKERS="${PRELOAD_WORKERS:-0}"
 PRELOAD_TIMEOUT="${PRELOAD_TIMEOUT:-30s}"
 PRELOAD_RETRIES="${PRELOAD_RETRIES:-3}"
 KEEP_CLUSTER="${KEEP_CLUSTER:-0}"
+CLEAN_STALE="${CLEAN_STALE:-1}"
 BUILD="${BUILD:-1}"
 RESULTS_ROOT="${RESULTS_ROOT:-$BENCHMARK_TMP_DIR/results}"
 
@@ -70,6 +71,7 @@ Options:
   --holostore-target TARGET
   --no-preload
   --keep
+  --no-clean-stale  Do not remove older holobench Docker Compose projects before running
   --no-build          Reuse existing benchmark images instead of rebuilding them
 EOF
 }
@@ -134,6 +136,7 @@ write_timing_json() {
     "$PRELOAD_RETRIES" \
     "$BUILD" \
     "$KEEP_CLUSTER" \
+    "$CLEAN_STALE" \
     "$BENCHMARK_HOLOSTORE_BUILD_MODE" \
     "$BENCHMARK_HOLOSTORE_TARGET" <<'PY'
 import json
@@ -174,6 +177,7 @@ arg_names = [
     "--preload-retries",
     "--build",
     "--keep",
+    "--clean-stale",
     "--holostore-build-mode",
     "--holostore-target",
 ]
@@ -398,6 +402,92 @@ write_platform_compose_override() {
   } >"$path"
 }
 
+is_benchmark_project() {
+  [[ "$1" =~ ^holobench_(holostore|etcd)_[0-9]{8}-[0-9]{6}$ ]]
+}
+
+list_labeled_benchmark_projects() {
+  local resource="$1"
+  local project
+  case "$resource" in
+    containers)
+      docker ps -a \
+        --filter label=com.docker.compose.project \
+        --format '{{.Label "com.docker.compose.project"}}' 2>/dev/null || true
+      ;;
+    networks)
+      docker network ls \
+        --filter label=com.docker.compose.project \
+        --format '{{.Label "com.docker.compose.project"}}' 2>/dev/null || true
+      ;;
+    volumes)
+      docker volume ls \
+        --filter label=com.docker.compose.project \
+        --format '{{.Label "com.docker.compose.project"}}' 2>/dev/null || true
+      ;;
+    *) return 2 ;;
+  esac | while IFS= read -r project; do
+    if is_benchmark_project "$project"; then
+      printf '%s\n' "$project"
+    fi
+  done
+}
+
+list_stale_benchmark_projects() {
+  {
+    list_labeled_benchmark_projects containers
+    list_labeled_benchmark_projects networks
+    list_labeled_benchmark_projects volumes
+  } | sort -u
+}
+
+remove_labeled_resources() {
+  local resource="$1"
+  local project="$2"
+  local id
+  local -a command
+
+  case "$resource" in
+    containers)
+      command=(docker ps -a --filter "label=com.docker.compose.project=$project" --format '{{.ID}}')
+      ;;
+    networks)
+      command=(docker network ls --filter "label=com.docker.compose.project=$project" --format '{{.ID}}')
+      ;;
+    volumes)
+      command=(docker volume ls --filter "label=com.docker.compose.project=$project" --format '{{.Name}}')
+      ;;
+    *) return 2 ;;
+  esac
+
+  "${command[@]}" 2>/dev/null | while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    case "$resource" in
+      containers) docker rm -f "$id" >/dev/null 2>&1 || true ;;
+      networks) docker network rm "$id" >/dev/null 2>&1 || true ;;
+      volumes) docker volume rm "$id" >/dev/null 2>&1 || true ;;
+    esac
+  done
+}
+
+cleanup_stale_benchmark_projects() {
+  local project
+  local found=0
+
+  while IFS= read -r project; do
+    [[ -n "$project" ]] || continue
+    found=1
+    echo "removing stale Docker Compose benchmark project: $project"
+    remove_labeled_resources containers "$project"
+    remove_labeled_resources networks "$project"
+    remove_labeled_resources volumes "$project"
+  done < <(list_stale_benchmark_projects)
+
+  if [[ "$found" == "0" ]]; then
+    echo "no stale Docker Compose benchmark projects found"
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --target) TARGET="$2"; shift 2 ;;
@@ -425,6 +515,7 @@ while [[ $# -gt 0 ]]; do
     --holostore-target) BENCHMARK_HOLOSTORE_TARGET="$2"; shift 2 ;;
     --no-preload) PRELOAD="0"; shift ;;
     --keep) KEEP_CLUSTER="1"; shift ;;
+    --no-clean-stale) CLEAN_STALE="0"; shift ;;
     --no-build) BUILD="0"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -449,6 +540,11 @@ resolve_benchmark_platform
 warn_if_benchmark_platform_is_not_native
 echo "benchmark platform: ${BENCHMARK_PLATFORM:-docker default}"
 echo "benchmark clients: workers=$WORKERS connections=$CONNECTIONS queue_cap=$QUEUE_CAP"
+if [[ "$CLEAN_STALE" == "1" ]]; then
+  cleanup_stale_benchmark_projects
+else
+  echo "stale Docker Compose benchmark project cleanup disabled"
+fi
 
 mkdir -p "$RESULTS_ROOT"
 RESULTS_ROOT="$(cd "$RESULTS_ROOT" && pwd)"

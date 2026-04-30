@@ -257,6 +257,8 @@ pub struct RangeStat {
     pub hot_key_concentration_bps: u32,
     pub write_hot_buckets: Vec<u64>,
     pub read_hot_buckets: Vec<u64>,
+    pub observed_min_key: Vec<u8>,
+    pub observed_max_key: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -347,6 +349,8 @@ impl HoloStoreClient {
                         hot_key_concentration_bps: item.hot_key_concentration_bps,
                         write_hot_buckets: item.write_hot_buckets,
                         read_hot_buckets: item.read_hot_buckets,
+                        observed_min_key: item.observed_min_key,
+                        observed_max_key: item.observed_max_key,
                     });
                 }
                 Ok(out)
@@ -376,6 +380,8 @@ impl HoloStoreClient {
                         hot_key_concentration_bps: item.hot_key_concentration_bps,
                         write_hot_buckets: item.write_hot_buckets,
                         read_hot_buckets: item.read_hot_buckets,
+                        observed_min_key: item.observed_min_key.to_vec(),
+                        observed_max_key: item.observed_max_key.to_vec(),
                     });
                 }
                 Ok(out)
@@ -773,6 +779,8 @@ impl HoloStoreClient {
                         target_replicas: None,
                         target_leaseholder: None,
                         skip_migration: false,
+                        requested_at_ms: 0,
+                        cooldown_until_ms: 0,
                     };
                     state.propose_meta_command(cmd).await?;
                     let snapshot = state.cluster_store.state();

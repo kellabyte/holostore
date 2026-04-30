@@ -12,7 +12,10 @@ use hashbrown::{HashMap, HashSet};
 use tokio::sync::oneshot;
 use tokio::time;
 
-use super::{Ballot, CommandKeys, NodeId, TxnId, TxnStatus};
+use super::{
+    txn_id_with_seq, txn_progress_key, txn_seq, Ballot, CommandKeys, NodeId, TxnId, TxnProgressKey,
+    TxnStatus,
+};
 
 type FastMap<K, V> = HashMap<K, V>;
 type FastSet<T> = HashSet<T>;
@@ -66,8 +69,8 @@ pub(super) struct State {
     pub(super) committed_dependents: FastMap<TxnId, FastSet<TxnId>>,
     /// Dependencies we registered per txn so we can unlink on removal.
     pub(super) committed_dep_links: FastMap<TxnId, Vec<TxnId>>,
-    pub(super) executed_prefix_by_node: FastMap<NodeId, u64>,
-    pub(super) reported_executed_prefix_by_peer: FastMap<NodeId, FastMap<NodeId, u64>>,
+    pub(super) executed_prefix_by_stream: FastMap<TxnProgressKey, u64>,
+    pub(super) reported_executed_prefix_by_peer: FastMap<NodeId, FastMap<TxnProgressKey, u64>>,
     pub(super) executed_out_of_order: FastSet<TxnId>,
     pub(super) executed_log: FastMap<TxnId, ExecutedLogEntry>,
     pub(super) executed_log_order: VecDeque<TxnId>,
@@ -95,6 +98,11 @@ pub(super) struct State {
 pub(super) struct ExecutedLogEntry {
     pub(super) command: Option<Bytes>,
     pub(super) command_digest: Option<[u8; 32]>,
+    /// Write keys affected by this executed transaction.
+    ///
+    /// These keys let executed-prefix GC retire conflict/read-barrier indexes
+    /// exactly when the transaction is known to be globally stable.
+    pub(super) keys: Vec<Vec<u8>>,
     pub(super) seq: u64,
     pub(super) deps: Vec<TxnId>,
     /// Whether the state-machine effects for this executed write are visible.
@@ -141,7 +149,7 @@ impl State {
             pending_committed_deps: HashMap::new(),
             committed_dependents: HashMap::new(),
             committed_dep_links: HashMap::new(),
-            executed_prefix_by_node: HashMap::new(),
+            executed_prefix_by_stream: HashMap::new(),
             reported_executed_prefix_by_peer: HashMap::new(),
             executed_out_of_order: HashSet::new(),
             executed_log: HashMap::new(),
@@ -167,34 +175,32 @@ impl State {
     }
 
     pub(super) fn is_executed(&self, txn_id: &TxnId) -> bool {
+        let stream = txn_progress_key(*txn_id);
         let prefix = self
-            .executed_prefix_by_node
-            .get(&txn_id.node_id)
+            .executed_prefix_by_stream
+            .get(&stream)
             .copied()
             .unwrap_or(0);
-        txn_id.counter <= prefix || self.executed_out_of_order.contains(txn_id)
+        txn_seq(*txn_id) <= prefix || self.executed_out_of_order.contains(txn_id)
     }
 
     pub(super) fn mark_executed(&mut self, txn_id: TxnId) {
-        let prefix = self
-            .executed_prefix_by_node
-            .entry(txn_id.node_id)
-            .or_insert(0);
+        let stream = txn_progress_key(txn_id);
+        let seq = txn_seq(txn_id);
+        let prefix = self.executed_prefix_by_stream.entry(stream).or_insert(0);
 
-        if txn_id.counter <= *prefix {
+        if seq <= *prefix {
             return;
         }
 
-        if txn_id.counter == *prefix + 1 {
+        if seq == *prefix + 1 {
             *prefix += 1;
             loop {
-                let next = TxnId {
-                    node_id: txn_id.node_id,
-                    counter: *prefix + 1,
-                };
-                if self.executed_out_of_order.remove(&next) {
-                    *prefix += 1;
-                    continue;
+                if let Some(next) = txn_id_with_seq(txn_id, *prefix + 1) {
+                    if self.executed_out_of_order.remove(&next) {
+                        *prefix += 1;
+                        continue;
+                    }
                 }
                 break;
             }
@@ -285,6 +291,9 @@ impl State {
         let new_deps = value.deps.len();
         if let Some(old) = self.executed_log.get(&txn_id) {
             value.visible |= old.visible;
+            if value.keys.is_empty() && !old.keys.is_empty() {
+                value.keys.clone_from(&old.keys);
+            }
         }
         if let Some(old) = self.executed_log.insert(txn_id, value) {
             let old_len = old.command.as_ref().map_or(0, Bytes::len);
@@ -309,15 +318,16 @@ impl State {
             if let Some((last_committed, committed_seq)) =
                 self.last_committed_write_by_key.get(key).copied()
             {
-                if last_committed != txn_id {
+                if last_committed != txn_id
+                    && !self.is_globally_stable_executed(config, last_committed)
+                {
                     deps.insert(last_committed);
                     max_seq = max_seq.max(committed_seq);
                 }
             }
             if let Some(last) = self.last_write_by_key.get(key).copied() {
                 if last != txn_id {
-                    let stable = self.global_stable_executed_prefix(config, last.node_id);
-                    if last.counter > stable {
+                    if !self.is_globally_stable_executed(config, last) {
                         deps.insert(last);
                         max_seq = max_seq.max(self.txn_seq_hint(&last));
                     }
@@ -349,12 +359,50 @@ impl State {
         (max_seq.saturating_add(1).max(1), deps)
     }
 
-    fn global_stable_executed_prefix(&self, config: &super::Config, origin: NodeId) -> u64 {
+    /// Retire per-key indexes that still point at a globally stable transaction.
+    ///
+    /// Inputs:
+    /// - `txn_id`: executed transaction being removed by prefix GC.
+    /// - `keys`: write keys from the executed command.
+    ///
+    /// Output:
+    /// - Number of index entries removed.
+    pub(super) fn remove_stable_key_indexes(&mut self, txn_id: TxnId, keys: &[Vec<u8>]) -> usize {
+        let mut removed = 0usize;
+        for key in keys {
+            if self
+                .last_write_by_key
+                .get(key)
+                .copied()
+                .is_some_and(|last| last == txn_id)
+            {
+                self.last_write_by_key.remove(key);
+                removed = removed.saturating_add(1);
+            }
+            if self
+                .last_committed_write_by_key
+                .get(key)
+                .copied()
+                .is_some_and(|(last, _)| last == txn_id)
+            {
+                self.last_committed_write_by_key.remove(key);
+                removed = removed.saturating_add(1);
+            }
+        }
+        removed
+    }
+
+    fn is_globally_stable_executed(&self, config: &super::Config, txn_id: TxnId) -> bool {
+        let stream = txn_progress_key(txn_id);
+        let seq = txn_seq(txn_id);
         let mut min_prefix = self
-            .executed_prefix_by_node
-            .get(&origin)
+            .executed_prefix_by_stream
+            .get(&stream)
             .copied()
             .unwrap_or(0);
+        if min_prefix < seq {
+            return false;
+        }
 
         for member in &config.members {
             let peer_id = member.id;
@@ -363,17 +411,17 @@ impl State {
             }
 
             let Some(peer_prefixes) = self.reported_executed_prefix_by_peer.get(&peer_id) else {
-                return 0;
+                return false;
             };
 
-            let reported = peer_prefixes.get(&origin).copied().unwrap_or(0);
+            let reported = peer_prefixes.get(&stream).copied().unwrap_or(0);
             min_prefix = min_prefix.min(reported);
-            if min_prefix == 0 {
-                return 0;
+            if min_prefix < seq {
+                return false;
             }
         }
 
-        min_prefix
+        true
     }
 
     fn txn_seq_hint(&self, txn_id: &TxnId) -> u64 {

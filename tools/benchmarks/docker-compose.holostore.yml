@@ -15,8 +15,12 @@ services:
       HOLO_COMMIT_DURABILITY_MODE: ${HOLO_COMMIT_DURABILITY_MODE:-sync_commit}
       HOLO_REDIS_SET_BATCH_MAX: ${HOLO_REDIS_SET_BATCH_MAX:-128}
       HOLO_REDIS_GET_BATCH_MAX: ${HOLO_REDIS_GET_BATCH_MAX:-256}
+      HOLO_BENCH_EVENTS_DIR: /bench-results
     volumes:
       - holostore1-data:/data
+      - type: bind
+        source: ${BENCH_RESULTS_DIR:-../../.tmp/benchmarks/results/manual}
+        target: /bench-results
     healthcheck:
       test: ["CMD-SHELL", "redis-cli -h 127.0.0.1 -p 6379 PING | grep -q PONG"]
       interval: 5s
@@ -39,8 +43,12 @@ services:
       HOLO_COMMIT_DURABILITY_MODE: ${HOLO_COMMIT_DURABILITY_MODE:-sync_commit}
       HOLO_REDIS_SET_BATCH_MAX: ${HOLO_REDIS_SET_BATCH_MAX:-128}
       HOLO_REDIS_GET_BATCH_MAX: ${HOLO_REDIS_GET_BATCH_MAX:-256}
+      HOLO_BENCH_EVENTS_DIR: /bench-results
     volumes:
       - holostore2-data:/data
+      - type: bind
+        source: ${BENCH_RESULTS_DIR:-../../.tmp/benchmarks/results/manual}
+        target: /bench-results
     depends_on:
       - holostore1
     healthcheck:
@@ -65,8 +73,12 @@ services:
       HOLO_COMMIT_DURABILITY_MODE: ${HOLO_COMMIT_DURABILITY_MODE:-sync_commit}
       HOLO_REDIS_SET_BATCH_MAX: ${HOLO_REDIS_SET_BATCH_MAX:-128}
       HOLO_REDIS_GET_BATCH_MAX: ${HOLO_REDIS_GET_BATCH_MAX:-256}
+      HOLO_BENCH_EVENTS_DIR: /bench-results
     volumes:
       - holostore3-data:/data
+      - type: bind
+        source: ${BENCH_RESULTS_DIR:-../../.tmp/benchmarks/results/manual}
+        target: /bench-results
     depends_on:
       - holostore1
     healthcheck:
