@@ -1,23 +1,26 @@
 //! Lightweight per-shard load tracking for range management.
 //!
-//! This is intentionally simple: it tracks a few counters per *shard index* so
-//! the (node-local) range manager can decide which range is "hot" and should
-//! be split.
+//! This is intentionally simple: it tracks physical shard-index counters plus
+//! descriptor-level logical counters for metadata-only split children.
 //!
 //! Notes:
 //! - Counters are best-effort and node-local. Today the range manager runs on
 //!   node 1, so it will only see load for traffic coordinated by node 1.
-//! - We track load by shard index (data group) rather than shard id (range
-//!   descriptor). In the current implementation each range is backed by one
-//!   shard index, so this is equivalent in practice.
+//! - Physical counters stay lock-free for the hot path.
+//! - Logical counters are merged once per client batch, keeping metadata-only
+//!   split telemetry cheap without duplicating the underlying storage group.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::kv;
 /// Bucket count used for sampled hot-key concentration approximation.
 pub const HOT_KEY_BUCKETS: usize = 32;
 const HOT_KEY_SAMPLE_MASK: u64 = 0x0f; // 1 / 16 sampling
+pub const LOGICAL_KEY_SAMPLE_CAP: usize = 128;
+const LOGICAL_KEY_DELTA_SAMPLE_CAP: usize = 16;
+const LOGICAL_KEY_SAMPLE_MASK: u64 = 0xff; // 1 / 256 sampling
 
 /// Snapshot of per-shard counters.
 ///
@@ -35,6 +38,104 @@ pub struct ShardLoadSnapshot {
     pub hot_key_concentration_bps: Vec<u32>,
     pub write_hot_buckets: Vec<Vec<u64>>,
     pub read_hot_buckets: Vec<Vec<u64>>,
+    pub logical_ranges: BTreeMap<u64, LogicalRangeLoadSnapshot>,
+}
+
+/// Point-in-time load counters for one logical range descriptor.
+#[derive(Clone, Debug, Default)]
+pub struct LogicalRangeLoadSnapshot {
+    pub set_ops: u64,
+    pub get_ops: u64,
+    pub write_bytes: u64,
+    pub write_tail_latency_ms: f64,
+    pub hot_key_concentration_bps: u32,
+    pub write_hot_buckets: Vec<u64>,
+    pub read_hot_buckets: Vec<u64>,
+    pub observed_min_key: Vec<u8>,
+    pub observed_max_key: Vec<u8>,
+    pub sampled_keys: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LogicalWriteDelta {
+    pub ops: u64,
+    pub bytes: u64,
+    pub write_hot_buckets: [u64; HOT_KEY_BUCKETS],
+    pub observed_min_key: Vec<u8>,
+    pub observed_max_key: Vec<u8>,
+    pub sampled_keys: Vec<Vec<u8>>,
+}
+
+impl LogicalWriteDelta {
+    pub fn record(&mut self, key: &[u8], value_len: usize) {
+        self.ops = self.ops.saturating_add(1);
+        self.bytes = self
+            .bytes
+            .saturating_add((key.len().saturating_add(value_len)) as u64);
+        if self.observed_min_key.is_empty() || key < self.observed_min_key.as_slice() {
+            self.observed_min_key = key.to_vec();
+        }
+        if self.observed_max_key.is_empty() || key > self.observed_max_key.as_slice() {
+            self.observed_max_key = key.to_vec();
+        }
+        if let Some(bucket) = sampled_hot_bucket(key) {
+            if let Some(counter) = self.write_hot_buckets.get_mut(bucket) {
+                *counter = counter.saturating_add(1);
+            }
+        }
+        if self.sampled_keys.len() < LOGICAL_KEY_DELTA_SAMPLE_CAP && sampled_logical_split_key(key)
+        {
+            self.sampled_keys.push(key.to_vec());
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LogicalReadDelta {
+    pub ops: u64,
+    pub read_hot_buckets: [u64; HOT_KEY_BUCKETS],
+}
+
+impl LogicalReadDelta {
+    pub fn record(&mut self, key: &[u8]) {
+        self.ops = self.ops.saturating_add(1);
+        if let Some(bucket) = sampled_hot_bucket(key) {
+            if let Some(counter) = self.read_hot_buckets.get_mut(bucket) {
+                *counter = counter.saturating_add(1);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LogicalRangeLoad {
+    set_ops: u64,
+    get_ops: u64,
+    write_bytes: u64,
+    write_tail_latency_us: u64,
+    write_hot_buckets: [u64; HOT_KEY_BUCKETS],
+    read_hot_buckets: [u64; HOT_KEY_BUCKETS],
+    observed_min_key: Vec<u8>,
+    observed_max_key: Vec<u8>,
+    sampled_keys: Vec<Vec<u8>>,
+    sampled_keys_seen: u64,
+}
+
+impl Default for LogicalRangeLoad {
+    fn default() -> Self {
+        Self {
+            set_ops: 0,
+            get_ops: 0,
+            write_bytes: 0,
+            write_tail_latency_us: 0,
+            write_hot_buckets: [0; HOT_KEY_BUCKETS],
+            read_hot_buckets: [0; HOT_KEY_BUCKETS],
+            observed_min_key: Vec::new(),
+            observed_max_key: Vec::new(),
+            sampled_keys: Vec::new(),
+            sampled_keys_seen: 0,
+        }
+    }
 }
 
 /// Tracks per-shard operation counters.
@@ -55,6 +156,7 @@ pub struct ShardLoadTracker {
     // Flattened [shard][bucket] sampled-key counters.
     write_hot_buckets: Arc<Vec<AtomicU64>>,
     read_hot_buckets: Arc<Vec<AtomicU64>>,
+    logical_ranges: Arc<Mutex<BTreeMap<u64, LogicalRangeLoad>>>,
 }
 
 impl ShardLoadTracker {
@@ -84,6 +186,7 @@ impl ShardLoadTracker {
             write_tail_latency_us: Arc::new(write_tail_latency_us),
             write_hot_buckets: Arc::new(write_hot_buckets),
             read_hot_buckets: Arc::new(read_hot_buckets),
+            logical_ranges: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -159,6 +262,60 @@ impl ShardLoadTracker {
             {
                 break;
             }
+        }
+    }
+
+    pub fn record_logical_write_delta(&self, shard_id: u64, delta: LogicalWriteDelta) {
+        if shard_id == 0 || delta.ops == 0 {
+            return;
+        }
+        let Ok(mut logical_ranges) = self.logical_ranges.lock() else {
+            return;
+        };
+        let entry = logical_ranges.entry(shard_id).or_default();
+        entry.set_ops = entry.set_ops.saturating_add(delta.ops);
+        entry.write_bytes = entry.write_bytes.saturating_add(delta.bytes);
+        if !delta.observed_min_key.is_empty()
+            && (entry.observed_min_key.is_empty()
+                || delta.observed_min_key < entry.observed_min_key)
+        {
+            entry.observed_min_key = delta.observed_min_key;
+        }
+        if !delta.observed_max_key.is_empty()
+            && (entry.observed_max_key.is_empty()
+                || delta.observed_max_key > entry.observed_max_key)
+        {
+            entry.observed_max_key = delta.observed_max_key;
+        }
+        for idx in 0..HOT_KEY_BUCKETS {
+            entry.write_hot_buckets[idx] =
+                entry.write_hot_buckets[idx].saturating_add(delta.write_hot_buckets[idx]);
+        }
+        for key in delta.sampled_keys {
+            entry.sampled_keys_seen = entry.sampled_keys_seen.saturating_add(1);
+            if entry.sampled_keys.len() < LOGICAL_KEY_SAMPLE_CAP {
+                entry.sampled_keys.push(key);
+                continue;
+            }
+            let replace_at = logical_sample_replace_index(&key, entry.sampled_keys_seen);
+            if replace_at < LOGICAL_KEY_SAMPLE_CAP {
+                entry.sampled_keys[replace_at] = key;
+            }
+        }
+    }
+
+    pub fn record_logical_read_delta(&self, shard_id: u64, delta: LogicalReadDelta) {
+        if shard_id == 0 || delta.ops == 0 {
+            return;
+        }
+        let Ok(mut logical_ranges) = self.logical_ranges.lock() else {
+            return;
+        };
+        let entry = logical_ranges.entry(shard_id).or_default();
+        entry.get_ops = entry.get_ops.saturating_add(delta.ops);
+        for idx in 0..HOT_KEY_BUCKETS {
+            entry.read_hot_buckets[idx] =
+                entry.read_hot_buckets[idx].saturating_add(delta.read_hot_buckets[idx]);
         }
     }
 
@@ -258,6 +415,47 @@ impl ShardLoadTracker {
             }
         }
 
+        let logical_ranges = self
+            .logical_ranges
+            .lock()
+            .ok()
+            .map(|logical_ranges| {
+                logical_ranges
+                    .iter()
+                    .map(|(shard_id, load)| {
+                        let mut total = 0u64;
+                        let mut max_bucket = 0u64;
+                        for idx in 0..HOT_KEY_BUCKETS {
+                            let combined = load.write_hot_buckets[idx]
+                                .saturating_add(load.read_hot_buckets[idx]);
+                            total = total.saturating_add(combined);
+                            max_bucket = max_bucket.max(combined);
+                        }
+                        let hot_key_concentration_bps = if total > 0 {
+                            ((max_bucket as u128 * 10_000u128) / total as u128) as u32
+                        } else {
+                            0
+                        };
+                        (
+                            *shard_id,
+                            LogicalRangeLoadSnapshot {
+                                set_ops: load.set_ops,
+                                get_ops: load.get_ops,
+                                write_bytes: load.write_bytes,
+                                write_tail_latency_ms: load.write_tail_latency_us as f64 / 1000.0,
+                                hot_key_concentration_bps,
+                                write_hot_buckets: load.write_hot_buckets.to_vec(),
+                                read_hot_buckets: load.read_hot_buckets.to_vec(),
+                                observed_min_key: load.observed_min_key.clone(),
+                                observed_max_key: load.observed_max_key.clone(),
+                                sampled_keys: load.sampled_keys.clone(),
+                            },
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
+
         ShardLoadSnapshot {
             set_ops,
             get_ops,
@@ -266,6 +464,7 @@ impl ShardLoadTracker {
             hot_key_concentration_bps,
             write_hot_buckets,
             read_hot_buckets,
+            logical_ranges,
         }
     }
 }
@@ -279,10 +478,26 @@ impl ShardLoadTracker {
 /// Output:
 /// - `Some(offset)` when the key is sampled, `None` when skipped by sampling mask.
 fn hot_bucket_offset(shard_index: usize, key: &[u8]) -> Option<usize> {
+    let bucket = sampled_hot_bucket(key)?;
+    Some((shard_index * HOT_KEY_BUCKETS) + bucket)
+}
+
+pub fn sampled_hot_bucket(key: &[u8]) -> Option<usize> {
     let hash = kv::hash_key(key);
     if (hash & HOT_KEY_SAMPLE_MASK) != 0 {
         return None;
     }
-    let bucket = ((hash >> 4) as usize) % HOT_KEY_BUCKETS;
-    Some((shard_index * HOT_KEY_BUCKETS) + bucket)
+    Some(((hash >> 4) as usize) % HOT_KEY_BUCKETS)
+}
+
+fn sampled_logical_split_key(key: &[u8]) -> bool {
+    (kv::hash_key(key) & LOGICAL_KEY_SAMPLE_MASK) == 0
+}
+
+fn logical_sample_replace_index(key: &[u8], seen: u64) -> usize {
+    if seen == 0 {
+        return usize::MAX;
+    }
+    let mixed = kv::hash_key(key) ^ seen.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ seen.rotate_left(17);
+    (mixed % seen) as usize
 }

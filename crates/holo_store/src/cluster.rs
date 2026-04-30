@@ -34,13 +34,35 @@ pub struct MemberInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardDesc {
     pub shard_id: u64,
+    /// Consensus group slot used to order this range's commands.
     pub shard_index: usize,
+    /// Local KV partition slot that stores this range's bytes.
+    ///
+    /// `None` means "same as `shard_index`" for descriptors written before
+    /// storage and consensus identity were split apart.
+    #[serde(default)]
+    pub storage_index: Option<usize>,
+    /// Optional read-through storage slot for bytes that still live in the
+    /// pre-split parent partition.
+    #[serde(default)]
+    pub fallback_storage_index: Option<usize>,
     pub start_hash: u64,
     pub end_hash: u64,
     pub start_key: Vec<u8>,
     pub end_key: Vec<u8>,
     pub replicas: Vec<NodeId>,
     pub leaseholder: NodeId,
+}
+
+impl ShardDesc {
+    pub fn storage_index(&self) -> usize {
+        self.storage_index.unwrap_or(self.shard_index)
+    }
+
+    pub fn fallback_storage_index(&self) -> Option<usize> {
+        self.fallback_storage_index
+            .filter(|idx| *idx != self.storage_index())
+    }
 }
 
 /// Role of a node for a specific shard during replica reconfiguration.
@@ -202,6 +224,8 @@ pub struct ClusterState {
     pub controller_leases: BTreeMap<ControllerDomain, ControllerLease>,
     #[serde(default)]
     pub meta_controller_lease: Option<ControllerLease>,
+    #[serde(default)]
+    pub range_split_cooldown_until_ms: u64,
 }
 
 /// Commands applied to the meta group state machine.
@@ -289,6 +313,10 @@ pub enum ClusterCommand {
         target_leaseholder: Option<NodeId>,
         #[serde(default)]
         skip_migration: bool,
+        #[serde(default)]
+        requested_at_ms: u64,
+        #[serde(default)]
+        cooldown_until_ms: u64,
     },
     MergeRange {
         left_shard_id: u64,
@@ -334,7 +362,7 @@ pub enum ClusterCommand {
     },
 }
 
-/// Coordinates local on-disk key movement for metadata-only range operations.
+/// Coordinates local on-disk key movement for physical range moves.
 pub trait RangeMigrator: Send + Sync + 'static {
     fn migrate(
         &self,
@@ -409,64 +437,84 @@ impl RangeMigrator for FjallRangeMigrator {
         let (from_versions, from_latest) = self.open_shard_partitions(from_shard)?;
         let (to_versions, to_latest) = self.open_shard_partitions(to_shard)?;
 
-        let start = start_key.to_vec();
-        let mut latest_entries = Vec::<(Vec<u8>, Vec<u8>)>::new();
-        let mut latest_iter: Box<dyn DoubleEndedIterator<Item = fjall::Result<fjall::KvPair>>> =
-            if end_key.is_empty() {
-                Box::new(from_latest.range(start..))
-            } else {
-                Box::new(from_latest.range(start..end_key.to_vec()))
-            };
-
-        // Snapshot the source range before mutating it. Deleting from a
-        // partition while iterating it can skip entries and cause key loss.
-        while let Some(item) = latest_iter.next() {
-            let (key, latest_val) = item?;
-            latest_entries.push((key.to_vec(), latest_val.to_vec()));
-        }
-        let removed_from_source = latest_entries.len() as u64;
+        let mut scan_start = start_key.to_vec();
+        let end = end_key.to_vec();
+        let mut removed_from_source = 0u64;
         let mut inserted_into_target = 0u64;
 
-        // Commit in chunks to keep batch sizes bounded.
+        // Snapshot and move bounded latest-key windows. Deleting while scanning
+        // the same partition can skip entries, so each window is collected
+        // first, then moved, and the next scan resumes at the last removed key.
+        const SCAN_KEYS: usize = 1024;
         const CHUNK_ITEMS: usize = 10_000;
         let mut batch = self.keyspace.batch();
         let mut queued = 0usize;
 
-        for (key_bytes, latest_val) in latest_entries {
-            // Snapshot all version rows for this key before mutating
-            // `from_versions` to avoid iterator invalidation.
-            let prefix = encode_key_prefix(&key_bytes);
-            let mut version_entries = Vec::<(Vec<u8>, Vec<u8>)>::new();
-            for ver_item in from_versions.prefix(prefix) {
-                let (ver_key, ver_val) = ver_item?;
-                version_entries.push((ver_key.to_vec(), ver_val.to_vec()));
+        loop {
+            let mut latest_entries = Vec::<(Vec<u8>, Vec<u8>)>::with_capacity(SCAN_KEYS);
+            {
+                let latest_iter: Box<dyn Iterator<Item = fjall::Result<fjall::KvPair>>> =
+                    if end.is_empty() {
+                        Box::new(from_latest.range(scan_start.clone()..))
+                    } else {
+                        Box::new(from_latest.range(scan_start.clone()..end.clone()))
+                    };
+
+                for item in latest_iter.take(SCAN_KEYS) {
+                    let (key, latest_val) = item?;
+                    latest_entries.push((key.to_vec(), latest_val.to_vec()));
+                }
             }
 
-            let existed_in_target = to_latest.get(key_bytes.as_slice())?.is_some();
-            // Copy latest index entry.
-            batch.insert(&to_latest, key_bytes.clone(), latest_val);
-            batch.remove(&from_latest, key_bytes.clone());
-            queued += 2;
-            if !existed_in_target {
-                inserted_into_target = inserted_into_target.saturating_add(1);
+            if latest_entries.is_empty() {
+                break;
             }
 
-            // Copy all version entries for this key.
-            for (ver_key, ver_val) in version_entries {
-                batch.insert(&to_versions, ver_key.clone(), ver_val);
-                batch.remove(&from_versions, ver_key);
+            let last_scanned_key = latest_entries
+                .last()
+                .map(|(key, _)| key.clone())
+                .unwrap_or_else(|| scan_start.clone());
+            removed_from_source = removed_from_source.saturating_add(latest_entries.len() as u64);
+
+            for (key_bytes, latest_val) in latest_entries {
+                // Snapshot all version rows for this key before mutating
+                // `from_versions` to avoid iterator invalidation.
+                let prefix = encode_key_prefix(&key_bytes);
+                let mut version_entries = Vec::<(Vec<u8>, Vec<u8>)>::new();
+                for ver_item in from_versions.prefix(prefix) {
+                    let (ver_key, ver_val) = ver_item?;
+                    version_entries.push((ver_key.to_vec(), ver_val.to_vec()));
+                }
+
+                let existed_in_target = to_latest.get(key_bytes.as_slice())?.is_some();
+                batch.insert(&to_latest, key_bytes.clone(), latest_val);
+                batch.remove(&from_latest, key_bytes.clone());
                 queued += 2;
+                if !existed_in_target {
+                    inserted_into_target = inserted_into_target.saturating_add(1);
+                }
+
+                for (ver_key, ver_val) in version_entries {
+                    batch.insert(&to_versions, ver_key.clone(), ver_val);
+                    batch.remove(&from_versions, ver_key);
+                    queued += 2;
+                    if queued >= CHUNK_ITEMS {
+                        batch.commit()?;
+                        batch = self.keyspace.batch();
+                        queued = 0;
+                    }
+                }
+
                 if queued >= CHUNK_ITEMS {
                     batch.commit()?;
                     batch = self.keyspace.batch();
                     queued = 0;
                 }
             }
-
-            if queued >= CHUNK_ITEMS {
-                batch.commit()?;
-                batch = self.keyspace.batch();
-                queued = 0;
+            scan_start = last_scanned_key;
+            scan_start.push(0);
+            if !end.is_empty() && scan_start >= end {
+                break;
             }
         }
 
@@ -533,6 +581,7 @@ impl ClusterStateStore {
             meta_rebalances: BTreeMap::new(),
             controller_leases: BTreeMap::new(),
             meta_controller_lease: None,
+            range_split_cooldown_until_ms: 0,
         };
         // Start with a single full-keyspace range (Cockroach-style bootstrap).
         let count = initial_ranges.max(1).min(256);
@@ -553,6 +602,8 @@ impl ClusterStateStore {
                 state.shards.push(ShardDesc {
                     shard_id: (idx as u64) + 1,
                     shard_index: idx,
+                    storage_index: Some(idx),
+                    fallback_storage_index: None,
                     start_hash: 0,
                     end_hash: 0,
                     start_key,
@@ -704,6 +755,74 @@ impl ClusterStateStore {
         self.shard_index_for_hash(hash_key(key))
     }
 
+    pub fn storage_index_for_key(&self, key: &[u8]) -> usize {
+        let state = self.state.read().unwrap();
+        if state.shards.len() == 1 {
+            return state.shards[0].storage_index();
+        }
+        let has_key_ranges = state
+            .shards
+            .iter()
+            .any(|s| !s.start_key.is_empty() || !s.end_key.is_empty());
+        if has_key_ranges {
+            for shard in &state.shards {
+                if key_in_range(key, &shard.start_key, &shard.end_key) {
+                    return shard.storage_index();
+                }
+            }
+            return 0;
+        }
+        let hash = hash_key(key);
+        let shard_index = state
+            .shards
+            .iter()
+            .find(|shard| hash >= shard.start_hash && hash <= shard.end_hash)
+            .map(|shard| shard.shard_index)
+            .unwrap_or(0);
+        state
+            .shards
+            .iter()
+            .find(|s| s.shard_index == shard_index)
+            .map(ShardDesc::storage_index)
+            .unwrap_or(shard_index)
+    }
+
+    pub fn fallback_storage_index_for_key(&self, key: &[u8]) -> Option<usize> {
+        let state = self.state.read().unwrap();
+        if state.shards.len() == 1 {
+            return state.shards[0].fallback_storage_index();
+        }
+        let has_key_ranges = state
+            .shards
+            .iter()
+            .any(|s| !s.start_key.is_empty() || !s.end_key.is_empty());
+        if has_key_ranges {
+            for shard in &state.shards {
+                if key_in_range(key, &shard.start_key, &shard.end_key) {
+                    return shard.fallback_storage_index();
+                }
+            }
+            return None;
+        }
+        let hash = hash_key(key);
+        state
+            .shards
+            .iter()
+            .find(|shard| hash >= shard.start_hash && hash <= shard.end_hash)
+            .and_then(ShardDesc::fallback_storage_index)
+    }
+
+    pub fn storage_index_for_shard_index(&self, shard_index: usize) -> usize {
+        self.state
+            .read()
+            .unwrap()
+            .shards
+            .iter()
+            .find(|s| s.shard_index == shard_index)
+            .map(ShardDesc::storage_index)
+            .unwrap_or(shard_index)
+    }
+
     pub fn meta_range_index_for_key(&self, key: &[u8]) -> usize {
         self.meta_range_index_for_hash(hash_key(key))
     }
@@ -780,6 +899,15 @@ impl ClusterStateStore {
             if shard.shard_index < limit {
                 used[shard.shard_index] = true;
             }
+            let storage_index = shard.storage_index();
+            if storage_index < limit {
+                used[storage_index] = true;
+            }
+            if let Some(fallback) = shard.fallback_storage_index() {
+                if fallback < limit {
+                    used[fallback] = true;
+                }
+            }
         }
         used.iter().position(|u| !*u)
     }
@@ -854,6 +982,23 @@ impl ClusterStateStore {
 
         let mut current = shard.replicas.clone();
         dedupe_nodes_in_place(&mut current);
+        let shared_physical_group = state
+            .shards
+            .iter()
+            .filter(|s| s.storage_index() == shard.storage_index())
+            .count()
+            > 1;
+        if shared_physical_group
+            && (!same_node_set(&desired, &current)
+                || leaseholder
+                    .map(|target| target != shard.leaseholder)
+                    .unwrap_or(false))
+        {
+            anyhow::bail!(
+                "shard {shard_id} shares storage_index {}; materialize or move all logical siblings before changing replicas or leaseholder",
+                shard.storage_index()
+            );
+        }
         let added = desired
             .iter()
             .copied()
@@ -1029,140 +1174,212 @@ impl ClusterStateStore {
         migrator: Option<&dyn RangeMigrator>,
         shard_limit: usize,
     ) -> anyhow::Result<()> {
+        self.apply_split_range_with_pacing(
+            split_key,
+            target_shard_index,
+            target_replicas,
+            target_leaseholder,
+            skip_migration,
+            migrator,
+            shard_limit,
+            0,
+            0,
+        )
+    }
+
+    pub fn apply_split_range_with_pacing(
+        &self,
+        split_key: Vec<u8>,
+        target_shard_index: usize,
+        target_replicas: Option<Vec<NodeId>>,
+        target_leaseholder: Option<NodeId>,
+        skip_migration: bool,
+        migrator: Option<&dyn RangeMigrator>,
+        shard_limit: usize,
+        requested_at_ms: u64,
+        cooldown_until_ms: u64,
+    ) -> anyhow::Result<()> {
         if target_shard_index >= shard_limit {
             anyhow::bail!(
                 "target_shard_index {target_shard_index} exceeds shard limit {shard_limit}"
             );
         }
 
-        // Block client request routing while we move keys and update descriptors.
-        let _split_guard = self.split_lock.write().unwrap();
-
-        let mut state = self.state.write().unwrap();
-
-        // Idempotent replay: a late-joining node may re-apply an already committed
-        // split command from the shard log. Treat the exact same split boundary as
-        // a no-op so metadata catch-up can continue.
-        if let Some(existing_idx) = state
-            .shards
-            .iter()
-            .position(|s| s.shard_index == target_shard_index)
         {
-            let existing = &state.shards[existing_idx];
-            let has_left_boundary = existing_idx > 0
-                && state
-                    .shards
-                    .get(existing_idx.saturating_sub(1))
-                    .map(|left| left.end_key == split_key)
-                    .unwrap_or(false);
-            if existing.start_key == split_key && has_left_boundary {
+            // Block client request routing only while descriptors are changed or
+            // while a legacy physical migration runs. Metadata-only splits hold
+            // this lock for a tiny in-memory cutover.
+            let _split_guard = self.split_lock.write().unwrap();
+            let mut state = self.state.write().unwrap();
+
+            // Idempotent replay: a late-joining node may re-apply an already
+            // committed split command. Treat an existing exact boundary as a
+            // no-op regardless of physical shard index.
+            if state
+                .shards
+                .windows(2)
+                .any(|pair| pair[0].end_key == split_key && pair[1].start_key == split_key)
+            {
                 return Ok(());
             }
-            anyhow::bail!("target shard index {target_shard_index} already in use");
-        }
 
-        let idx = state
-            .shards
-            .iter()
-            .position(|s| key_in_range(&split_key, &s.start_key, &s.end_key))
-            .ok_or_else(|| anyhow::anyhow!("split key does not map to any shard"))?;
-
-        let shard_snapshot = state.shards[idx].clone();
-        if !shard_snapshot.start_key.is_empty() && split_key <= shard_snapshot.start_key {
-            anyhow::bail!("split key must be greater than shard start");
-        }
-        if !shard_snapshot.end_key.is_empty() && split_key >= shard_snapshot.end_key {
-            anyhow::bail!("split key must be less than shard end");
-        }
-
-        let from_shard = shard_snapshot.shard_index;
-        let start = split_key.clone();
-        let end = shard_snapshot.end_key.clone();
-
-        // Move keys for the right-hand side before changing routing.
-        if !skip_migration {
-            if let Some(migrator) = migrator {
-                migrator.migrate(from_shard, target_shard_index, &start, &end)?;
-            }
-        }
-
-        let mut right_replicas = if let Some(explicit) = target_replicas.clone() {
-            let active_members = active_member_ids_from_state(&state);
-            let expected_replicas = state.replication_factor.min(active_members.len()).max(1);
-            let mut replicas = explicit;
-            dedupe_nodes_in_place(&mut replicas);
-            if replicas.is_empty() {
-                anyhow::bail!("split target replicas cannot be empty");
-            }
-            if replicas.len() != expected_replicas {
+            if requested_at_ms > 0 && state.range_split_cooldown_until_ms > requested_at_ms {
                 anyhow::bail!(
-                    "invalid target replica count for split: got {}, expected {} (rf={}, active={})",
-                    replicas.len(),
-                    expected_replicas,
-                    state.replication_factor,
-                    active_members.len()
+                    "range split cooldown active until {} (requested_at_ms={requested_at_ms})",
+                    state.range_split_cooldown_until_ms
                 );
             }
-            for id in &replicas {
-                let Some(member) = state.members.get(id) else {
-                    anyhow::bail!("split target replica node {id} does not exist");
+
+            let idx = state
+                .shards
+                .iter()
+                .position(|s| key_in_range(&split_key, &s.start_key, &s.end_key))
+                .ok_or_else(|| anyhow::anyhow!("split key does not map to any shard"))?;
+
+            let shard_snapshot = state.shards[idx].clone();
+            if !shard_snapshot.start_key.is_empty() && split_key <= shard_snapshot.start_key {
+                anyhow::bail!("split key must be greater than shard start");
+            }
+            if !shard_snapshot.end_key.is_empty() && split_key >= shard_snapshot.end_key {
+                anyhow::bail!("split key must be less than shard end");
+            }
+
+            let from_shard = shard_snapshot.storage_index();
+            let start = split_key.clone();
+            let end = shard_snapshot.end_key.clone();
+
+            let mut right_replicas = if let Some(explicit) = target_replicas.clone() {
+                let active_members = active_member_ids_from_state(&state);
+                let expected_replicas = state.replication_factor.min(active_members.len()).max(1);
+                let mut replicas = explicit;
+                dedupe_nodes_in_place(&mut replicas);
+                if replicas.is_empty() {
+                    anyhow::bail!("split target replicas cannot be empty");
+                }
+                if replicas.len() != expected_replicas {
+                    anyhow::bail!(
+                        "invalid target replica count for split: got {}, expected {} (rf={}, active={})",
+                        replicas.len(),
+                        expected_replicas,
+                        state.replication_factor,
+                        active_members.len()
+                    );
+                }
+                for id in &replicas {
+                    let Some(member) = state.members.get(id) else {
+                        anyhow::bail!("split target replica node {id} does not exist");
+                    };
+                    if member.state != MemberState::Active {
+                        anyhow::bail!("split target replica node {id} is not Active");
+                    }
+                }
+                replicas
+            } else {
+                shard_snapshot.replicas.clone()
+            };
+            dedupe_nodes_in_place(&mut right_replicas);
+            if right_replicas.is_empty() {
+                anyhow::bail!("split target replicas cannot be empty");
+            }
+            let mut right_leaseholder = target_leaseholder.unwrap_or(shard_snapshot.leaseholder);
+            if target_replicas.is_some() && !right_replicas.contains(&right_leaseholder) {
+                right_leaseholder = right_replicas.first().copied().unwrap_or(right_leaseholder);
+            }
+            if !right_replicas.contains(&right_leaseholder) {
+                anyhow::bail!(
+                    "split target leaseholder {} must be part of target replicas {:?}",
+                    right_leaseholder,
+                    right_replicas
+                );
+            }
+
+            let metadata_only_same_replicas = skip_migration
+                && same_node_set(&right_replicas, &shard_snapshot.replicas)
+                && right_leaseholder == shard_snapshot.leaseholder;
+            let right_shard_index = if metadata_only_same_replicas {
+                // Foreground metadata-only splits are virtual: they create a new
+                // logical descriptor and keep the same consensus/storage group.
+                // Physical materialization is a separate background operation.
+                shard_snapshot.shard_index
+            } else {
+                target_shard_index
+            };
+
+            if target_shard_index == shard_snapshot.shard_index {
+                anyhow::bail!(
+                    "split target shard_index {} already backs the source range",
+                    target_shard_index
+                );
+            }
+
+            if state
+                .shards
+                .iter()
+                .any(|s| s.shard_index == target_shard_index)
+            {
+                anyhow::bail!("target shard index {target_shard_index} already in use");
+            }
+            let (right_storage_index, right_fallback_storage_index) = if skip_migration {
+                if !metadata_only_same_replicas {
+                    anyhow::bail!(
+                        "metadata-only split must keep source replicas and leaseholder until range movement is implemented"
+                    );
+                }
+                (from_shard, None)
+            } else {
+                if state.shards.iter().any(|s| {
+                    s.storage_index() == target_shard_index
+                        || s.fallback_storage_index() == Some(target_shard_index)
+                }) {
+                    anyhow::bail!(
+                        "target storage index {target_shard_index} is already referenced"
+                    );
+                }
+                let Some(migrator) = migrator else {
+                    anyhow::bail!(
+                        "physical split to shard_index {target_shard_index} requires a range migrator"
+                    );
                 };
-                if member.state != MemberState::Active {
-                    anyhow::bail!("split target replica node {id} is not Active");
+                migrator.migrate(from_shard, target_shard_index, &start, &end)?;
+                (target_shard_index, None)
+            };
+
+            let left_roles = state
+                .shard_replica_roles
+                .entry(shard_snapshot.shard_id)
+                .or_insert_with(|| default_roles_for_replicas(&shard_snapshot.replicas))
+                .clone();
+            let mut right_roles = default_roles_for_replicas(&right_replicas);
+            if !left_roles.is_empty() {
+                for node_id in &right_replicas {
+                    if let Some(role) = left_roles.get(node_id) {
+                        right_roles.insert(*node_id, *role);
+                    }
                 }
             }
-            replicas
-        } else {
-            shard_snapshot.replicas.clone()
-        };
-        dedupe_nodes_in_place(&mut right_replicas);
-        if right_replicas.is_empty() {
-            anyhow::bail!("split target replicas cannot be empty");
-        }
-        let mut right_leaseholder = target_leaseholder.unwrap_or(shard_snapshot.leaseholder);
-        if target_replicas.is_some() && !right_replicas.contains(&right_leaseholder) {
-            right_leaseholder = right_replicas.first().copied().unwrap_or(right_leaseholder);
-        }
-        if !right_replicas.contains(&right_leaseholder) {
-            anyhow::bail!(
-                "split target leaseholder {} must be part of target replicas {:?}",
-                right_leaseholder,
-                right_replicas
-            );
+
+            let right_id = next_shard_id(&state.shards);
+            let right = ShardDesc {
+                shard_id: right_id,
+                shard_index: right_shard_index,
+                storage_index: Some(right_storage_index),
+                fallback_storage_index: right_fallback_storage_index,
+                start_hash: 0,
+                end_hash: 0,
+                start_key: start,
+                end_key: end.clone(),
+                replicas: right_replicas,
+                leaseholder: right_leaseholder,
+            };
+            state.shards[idx].end_key = right.start_key.clone();
+            state.shards.insert(idx + 1, right);
+            state.shard_replica_roles.insert(right_id, right_roles);
+            state.shard_rebalances.remove(&right_id);
+            state.range_split_cooldown_until_ms =
+                state.range_split_cooldown_until_ms.max(cooldown_until_ms);
+            state.epoch = state.epoch.saturating_add(1);
         }
 
-        let left_roles = state
-            .shard_replica_roles
-            .entry(shard_snapshot.shard_id)
-            .or_insert_with(|| default_roles_for_replicas(&shard_snapshot.replicas))
-            .clone();
-        let mut right_roles = default_roles_for_replicas(&right_replicas);
-        if !left_roles.is_empty() {
-            for node_id in &right_replicas {
-                if let Some(role) = left_roles.get(node_id) {
-                    right_roles.insert(*node_id, *role);
-                }
-            }
-        }
-
-        let right_id = next_shard_id(&state.shards);
-        let right = ShardDesc {
-            shard_id: right_id,
-            shard_index: target_shard_index,
-            start_hash: 0,
-            end_hash: 0,
-            start_key: start,
-            end_key: end.clone(),
-            replicas: right_replicas,
-            leaseholder: right_leaseholder,
-        };
-        state.shards[idx].end_key = right.start_key.clone();
-        state.shards.insert(idx + 1, right);
-        state.shard_replica_roles.insert(right_id, right_roles);
-        state.shard_rebalances.remove(&right_id);
-        state.epoch = state.epoch.saturating_add(1);
-
-        drop(state);
         self.persist()
     }
 
@@ -1239,19 +1456,20 @@ impl ClusterStateStore {
             anyhow::bail!("cannot merge while either shard has an in-flight merge");
         }
 
-        // When data lives in different physical shard partitions, merge requires
-        // moving right-hand keys into the left shard before descriptor cutover.
-        if left_snapshot.shard_index != right_snapshot.shard_index {
+        // When data lives in different physical storage partitions, merge
+        // requires moving right-hand keys into the left storage partition before
+        // descriptor cutover.
+        if left_snapshot.storage_index() != right_snapshot.storage_index() {
             let Some(migrator) = migrator else {
                 anyhow::bail!(
-                    "cannot merge shards with different shard_index (left={}, right={}) without a range migrator",
-                    left_snapshot.shard_index,
-                    right_snapshot.shard_index
+                    "cannot merge shards with different storage_index (left={}, right={}) without a range migrator",
+                    left_snapshot.storage_index(),
+                    right_snapshot.storage_index()
                 );
             };
             migrator.migrate(
-                right_snapshot.shard_index,
-                left_snapshot.shard_index,
+                right_snapshot.storage_index(),
+                left_snapshot.storage_index(),
                 &right_snapshot.start_key,
                 &right_snapshot.end_key,
             )?;
@@ -2360,6 +2578,23 @@ fn dedupe_nodes_in_place(nodes: &mut Vec<NodeId>) {
     *nodes = out;
 }
 
+/// Compare node sets independent of descriptor ordering.
+///
+/// Inputs:
+/// - Two node-id slices from shard descriptors or proposed placement.
+///
+/// Output:
+/// - `true` when both slices contain the same unique node ids.
+fn same_node_set(left: &[NodeId], right: &[NodeId]) -> bool {
+    let mut left = left.to_vec();
+    let mut right = right.to_vec();
+    left.sort_unstable();
+    left.dedup();
+    right.sort_unstable();
+    right.dedup();
+    left == right
+}
+
 fn normalize_meta_ranges(state: &mut ClusterState) {
     ensure_meta_ranges_initialized(state);
     state
@@ -2583,6 +2818,8 @@ mod tests {
             shards: vec![ShardDesc {
                 shard_id: 10,
                 shard_index: 0,
+                storage_index: Some(0),
+                fallback_storage_index: None,
                 start_hash: 0,
                 end_hash: 0,
                 start_key: vec![],
@@ -2607,6 +2844,7 @@ mod tests {
             meta_rebalances: BTreeMap::new(),
             controller_leases: BTreeMap::new(),
             meta_controller_lease: None,
+            range_split_cooldown_until_ms: 0,
         }
     }
 
@@ -2639,6 +2877,8 @@ mod tests {
             ShardDesc {
                 shard_id: 10,
                 shard_index: 0,
+                storage_index: Some(0),
+                fallback_storage_index: None,
                 start_hash: 0,
                 end_hash: 0,
                 start_key: vec![],
@@ -2649,6 +2889,8 @@ mod tests {
             ShardDesc {
                 shard_id: 11,
                 shard_index: 1,
+                storage_index: Some(1),
+                fallback_storage_index: None,
                 start_hash: 0,
                 end_hash: 0,
                 start_key: b"m".to_vec(),
@@ -2804,12 +3046,12 @@ mod tests {
         let split_key = b"key:050000".to_vec();
 
         store
-            .apply_split_range(split_key.clone(), 1, None, None, false, None, 8)
+            .apply_split_range(split_key.clone(), 1, None, None, true, None, 8)
             .expect("first split should apply");
         let epoch_after_first = store.state().epoch;
 
         store
-            .apply_split_range(split_key.clone(), 1, None, None, false, None, 8)
+            .apply_split_range(split_key.clone(), 1, None, None, true, None, 8)
             .expect("replayed split should be a no-op");
         let state = store.state();
         assert_eq!(
@@ -2821,8 +3063,65 @@ mod tests {
             2,
             "replayed split must not duplicate ranges"
         );
-        assert_eq!(state.shards[1].shard_index, 1);
+        assert_eq!(state.shards[1].shard_index, 0);
+        assert_eq!(state.shards[1].storage_index(), 0);
+        assert_eq!(state.shards[1].fallback_storage_index(), None);
         assert_eq!(state.shards[1].start_key, split_key);
+    }
+
+    #[test]
+    fn split_range_rejects_stale_proposal_inside_cluster_cooldown() {
+        let store = test_store(base_state());
+        let split_key = b"key:050000".to_vec();
+
+        store
+            .apply_split_range_with_pacing(split_key, 1, None, None, true, None, 8, 1_000, 61_000)
+            .expect("first split should apply");
+
+        let err = store
+            .apply_split_range_with_pacing(
+                b"key:025000".to_vec(),
+                2,
+                None,
+                None,
+                true,
+                None,
+                8,
+                2_000,
+                62_000,
+            )
+            .expect_err("second split proposed during cooldown should fail");
+
+        assert!(err.to_string().contains("range split cooldown active"));
+        let state = store.state();
+        assert_eq!(state.shards.len(), 2);
+        assert_eq!(state.range_split_cooldown_until_ms, 61_000);
+    }
+
+    #[test]
+    fn metadata_only_split_creates_virtual_descriptor_without_migrating_bytes() {
+        let store = test_store(base_state());
+        let migrator = MockMigrator::default();
+        let split_key = b"key:050000".to_vec();
+
+        store
+            .apply_split_range(split_key.clone(), 1, None, None, true, Some(&migrator), 8)
+            .expect("metadata-only split should apply");
+
+        let state = store.state();
+        assert_eq!(state.shards.len(), 2);
+        assert_eq!(state.shards[0].shard_index, 0);
+        assert_eq!(state.shards[1].shard_index, 0);
+        assert_eq!(state.shards[0].storage_index(), 0);
+        assert_eq!(state.shards[1].storage_index(), 0);
+        assert_eq!(state.shards[1].fallback_storage_index(), None);
+        assert_eq!(state.shards[0].end_key, split_key);
+        assert_eq!(state.shards[1].start_key, split_key);
+        assert_eq!(store.first_free_shard_index(8), Some(1));
+        assert!(
+            migrator.calls.lock().unwrap().is_empty(),
+            "metadata-only split must not move keys"
+        );
     }
 
     #[test]
@@ -2837,13 +3136,58 @@ mod tests {
         let split_key = b"key:050000".to_vec();
 
         store
-            .apply_split_range(split_key.clone(), 1, None, None, false, None, 8)
+            .apply_split_range(split_key.clone(), 1, None, None, true, None, 8)
             .expect("split without explicit placement should succeed");
 
         let state = store.state();
         assert_eq!(state.shards.len(), 2);
         assert_eq!(state.shards[0].replicas, vec![1, 2, 3]);
         assert_eq!(state.shards[1].replicas, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn metadata_only_split_reuses_parent_storage() {
+        let store = test_store(base_state());
+        let split_key = b"key:050000".to_vec();
+
+        store
+            .apply_split_range(split_key, 1, None, None, true, None, 8)
+            .expect("metadata-only split should apply");
+
+        assert_eq!(store.storage_index_for_key(b"key:075000"), 0);
+        assert_eq!(store.fallback_storage_index_for_key(b"key:075000"), None);
+        assert_eq!(store.storage_index_for_key(b"key:025000"), 0);
+        assert_eq!(store.fallback_storage_index_for_key(b"key:025000"), None);
+        assert_eq!(store.shard_index_for_key(b"key:075000"), 0);
+        assert_eq!(store.shard_index_for_key(b"key:025000"), 0);
+    }
+
+    #[test]
+    fn physical_split_requires_range_migrator() {
+        let store = test_store(base_state());
+
+        let err = store
+            .apply_split_range(b"key:050000".to_vec(), 1, None, None, false, None, 8)
+            .expect_err("physical split without migrator should fail");
+        assert!(err.to_string().contains("requires a range migrator"));
+    }
+
+    #[test]
+    fn physical_split_invokes_range_migrator() {
+        let store = test_store(base_state());
+        let migrator = MockMigrator::default();
+        let split_key = b"key:050000".to_vec();
+
+        store
+            .apply_split_range(split_key.clone(), 1, None, None, false, Some(&migrator), 8)
+            .expect("physical split should apply with migrator");
+
+        let calls = migrator.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let (from_shard, to_shard, start_key, end_key) = &calls[0];
+        assert_eq!((*from_shard, *to_shard), (0, 1));
+        assert_eq!(start_key, &split_key);
+        assert!(end_key.is_empty());
     }
 
     #[test]
@@ -3295,7 +3639,11 @@ fn key_in_range(key: &[u8], start: &[u8], end: &[u8]) -> bool {
 
 impl ShardRouter for ClusterStateStore {
     fn shard_for_key(&self, key: &[u8]) -> usize {
-        self.shard_index_for_key(key)
+        self.storage_index_for_key(key)
+    }
+
+    fn fallback_shard_for_key(&self, key: &[u8]) -> Option<usize> {
+        self.fallback_storage_index_for_key(key)
     }
 }
 
@@ -3303,9 +3651,11 @@ fn next_shard_id(shards: &[ShardDesc]) -> u64 {
     shards.iter().map(|s| s.shard_id).max().unwrap_or(0) + 1
 }
 
-// Note: shard_index values are stable across splits/merges for now; new ranges
-// inherit their parent's shard_index until we support creating/moving data
-// groups for new ranges.
+// Note: metadata-only splits allocate a fresh consensus `shard_index` while
+// keeping the child on the parent's `storage_index`. This mirrors a shared
+// node-local ordered KV layout: descriptors own logical spans, and background
+// materialization can later move or compact physical bytes without charging the
+// foreground split path.
 
 impl StateMachine for ClusterStateMachine {
     fn command_keys(&self, data: &[u8]) -> anyhow::Result<CommandKeys> {
@@ -3355,7 +3705,9 @@ impl StateMachine for ClusterStateMachine {
                     target_replicas,
                     target_leaseholder,
                     skip_migration,
-                } => self.store.apply_split_range(
+                    requested_at_ms,
+                    cooldown_until_ms,
+                } => self.store.apply_split_range_with_pacing(
                     split_key,
                     target_shard_index,
                     target_replicas,
@@ -3363,6 +3715,8 @@ impl StateMachine for ClusterStateMachine {
                     skip_migration,
                     self.migrator.as_deref(),
                     self.shard_limit,
+                    requested_at_ms,
+                    cooldown_until_ms,
                 ),
                 ClusterCommand::MergeRange { left_shard_id } => self
                     .store

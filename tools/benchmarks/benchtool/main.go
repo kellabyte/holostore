@@ -208,6 +208,7 @@ type summary struct {
 	ScheduledThroughputPerSecond   float64                 `json:"scheduled_throughput_per_second"`
 	CompletedThroughputPerSecond   float64                 `json:"completed_throughput_per_second"`
 	WallClockSeconds               float64                 `json:"wall_clock_seconds"`
+	ScheduledStartUnixMs           int64                   `json:"scheduled_start_unix_ms"`
 	CorrectedLatency               latencySummary          `json:"corrected_latency"`
 	ServiceLatency                 latencySummary          `json:"service_latency"`
 	StartLag                       latencySummary          `json:"start_lag"`
@@ -1483,6 +1484,7 @@ func buildSummary(cfg config, stats *runStats, metricsPath string, errorsPath st
 		ScheduledThroughputPerSecond:   float64(totalRequests) / cfg.Duration.Seconds(),
 		CompletedThroughputPerSecond:   safeDiv(float64(completed), wallSeconds),
 		WallClockSeconds:               wallSeconds,
+		ScheduledStartUnixMs:           stats.ScheduledStart.UnixMilli(),
 		CorrectedLatency:               correctedLatency,
 		ServiceLatency:                 serviceLatency,
 		StartLag:                       startLag,

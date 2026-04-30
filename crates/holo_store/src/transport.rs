@@ -119,6 +119,9 @@ pub struct RangeTelemetryStat {
     pub hot_key_concentration_bps: u32,
     pub write_hot_buckets: Vec<u64>,
     pub read_hot_buckets: Vec<u64>,
+    pub observed_min_key: Vec<u8>,
+    pub observed_max_key: Vec<u8>,
+    pub sampled_keys: Vec<Vec<u8>>,
 }
 
 /// Collect a batch of items from a channel with a size/time bound, reusing
@@ -1716,6 +1719,13 @@ impl GrpcTransport {
                         hot_key_concentration_bps: range.hot_key_concentration_bps,
                         write_hot_buckets: range.write_hot_buckets,
                         read_hot_buckets: range.read_hot_buckets,
+                        observed_min_key: range.observed_min_key.to_vec(),
+                        observed_max_key: range.observed_max_key.to_vec(),
+                        sampled_keys: range
+                            .sampled_keys
+                            .into_iter()
+                            .map(|key| key.to_vec())
+                            .collect(),
                     });
                 }
                 Ok(out)
@@ -4027,6 +4037,7 @@ fn from_rpc_recover(resp: rpc::RecoverResponse) -> RecoverResponse {
 fn to_rpc_executed_prefix(item: holo_accord::accord::ExecutedPrefix) -> rpc::ExecutedPrefix {
     rpc::ExecutedPrefix {
         node_id: item.node_id,
+        epoch: item.epoch,
         counter: item.counter,
     }
 }
@@ -4035,6 +4046,7 @@ fn to_rpc_executed_prefix(item: holo_accord::accord::ExecutedPrefix) -> rpc::Exe
 fn from_rpc_executed_prefix(item: rpc::ExecutedPrefix) -> ExecutedPrefix {
     ExecutedPrefix {
         node_id: item.node_id,
+        epoch: item.epoch,
         counter: item.counter,
     }
 }

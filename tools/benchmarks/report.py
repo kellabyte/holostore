@@ -21,6 +21,12 @@ GRAPH_AXES_FACE = "#111827"
 GRAPH_TEXT = "#f9fafb"
 GRAPH_GRID = "#374151"
 GRAPH_SPINE = "#6b7280"
+GRAPH_TARGET_LINE = "#9ca3af"
+GRAPH_SPLIT_MARKER = "#ef4444"
+GRAPH_LINEWIDTH = 1.0
+GRAPH_LINE_ALPHA = 0.82
+GRAPH_GRID_ALPHA = 0.18
+GRAPH_TARGET_LINEWIDTH = 1.0
 GRAPH_SERIES_COLORS = [
     "#60a5fa",
     "#f59e0b",
@@ -133,12 +139,15 @@ def load_run(run_dir: Path) -> dict[str, Any]:
             rows = list(csv.DictReader(handle))
     else:
         rows = []
+    events, event_files = load_events(run_dir, summary)
 
     label = f"{summary.get('target', run_dir.name)}:{summary.get('scenario', run_dir.name)}"
     return {
         "dir": run_dir,
         "summary": summary,
         "metrics": rows,
+        "events": events,
+        "event_files": event_files,
         "config": config,
         "failure": failure,
         "label": label,
@@ -159,6 +168,108 @@ def f(row: dict[str, str], key: str) -> float:
 def series(run: dict[str, Any], key: str) -> tuple[list[float], list[float]]:
     rows = run["metrics"]
     return [f(row, "second") for row in rows], [f(row, key) for row in rows]
+
+
+def load_events(run_dir: Path, summary: dict[str, Any]) -> tuple[list[dict[str, Any]], list[Path]]:
+    """Load optional benchmark timeline event CSVs and normalize them to seconds."""
+    event_files = sorted(
+        path
+        for pattern in ("events.csv", "events-*.csv")
+        for path in run_dir.glob(pattern)
+        if path.is_file()
+    )
+    scheduled_start_ms = as_float(summary.get("scheduled_start_unix_ms", 0))
+    events: list[dict[str, Any]] = []
+    for path in event_files:
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            for row in csv.DictReader(handle):
+                event = dict(row)
+                unix_ms = as_float(event.get("unix_ms", 0))
+                if scheduled_start_ms > 0 and unix_ms > 0:
+                    event["second"] = (unix_ms - scheduled_start_ms) / 1000.0
+                else:
+                    event["second"] = as_float(event.get("second", 0))
+                event["source_file"] = path.name
+                events.append(event)
+    events.sort(key=lambda event: as_float(event.get("second", 0)))
+    return events, event_files
+
+
+def split_events(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return split start/end events from metrics-bearing runs."""
+    events: list[dict[str, Any]] = []
+    for run in runs:
+        for event in run.get("events", []):
+            if event.get("event") in {"split_start", "split_end"}:
+                events.append(event)
+    return sorted(events, key=lambda event: as_float(event.get("second", 0)))
+
+
+def split_event_windows(runs: list[dict[str, Any]]) -> list[tuple[dict[str, Any], dict[str, Any] | None]]:
+    """Pair split_start events with same-operation split_end events when present."""
+    events = split_events(runs)
+    ends_by_operation: dict[str, list[dict[str, Any]]] = {}
+    for event in events:
+        if event.get("event") == "split_end":
+            ends_by_operation.setdefault(str(event.get("operation_id", "")), []).append(event)
+    for matches in ends_by_operation.values():
+        matches.sort(key=lambda event: as_float(event.get("second", 0)))
+
+    windows: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
+    for event in events:
+        if event.get("event") != "split_start":
+            continue
+        operation_id = str(event.get("operation_id", ""))
+        start_second = as_float(event.get("second", 0))
+        end_event = None
+        candidates = ends_by_operation.get(operation_id, [])
+        for index, candidate in enumerate(candidates):
+            if as_float(candidate.get("second", 0)) >= start_second:
+                end_event = candidate
+                del candidates[index]
+                break
+        windows.append((event, end_event))
+    return windows
+
+
+def add_split_event_markers(axis: Any, runs: list[dict[str, Any]]) -> None:
+    """Overlay split start/end markers on timeline charts when events are present."""
+    windows = split_event_windows(runs)
+    if not windows:
+        return
+
+    x_min, x_max = axis.get_xlim()
+    labels_used: set[str] = set()
+    for start, end in windows:
+        start_second = as_float(start.get("second", 0))
+        end_second = as_float(end.get("second", 0)) if end is not None else None
+        window_end = end_second if end_second is not None else start_second
+        if window_end < x_min or start_second > x_max:
+            continue
+        if x_min <= start_second <= x_max:
+            label = "split start" if "split start" not in labels_used else None
+            axis.axvline(
+                start_second,
+                color=GRAPH_SPLIT_MARKER,
+                linestyle=":",
+                linewidth=1.4,
+                alpha=0.95,
+                label=label,
+                zorder=5,
+            )
+            labels_used.add("split start")
+        if end_second is not None and x_min <= end_second <= x_max:
+            label = "split end" if "split end" not in labels_used else None
+            axis.axvline(
+                end_second,
+                color=GRAPH_SPLIT_MARKER,
+                linestyle=":",
+                linewidth=1.4,
+                alpha=0.95,
+                label=label,
+                zorder=5,
+            )
+            labels_used.add("split end")
 
 
 def series_color(index: int) -> str:
@@ -189,7 +300,7 @@ def throughput_line_specs(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "label": f"{run['label']} ok",
                 "color": color,
                 "linestyle": "-",
-                "linewidth": 1.9,
+                "linewidth": GRAPH_LINEWIDTH,
             }
         )
         specs.append(
@@ -199,10 +310,25 @@ def throughput_line_specs(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "label": f"{run['label']} errors",
                 "color": lighten_color(color),
                 "linestyle": ":",
-                "linewidth": 1.5,
+                "linewidth": GRAPH_LINEWIDTH,
             }
         )
     return specs
+
+
+def target_throughput_rates(runs: list[dict[str, Any]]) -> list[float]:
+    """Return distinct offered-throughput rates that should be drawn as guides."""
+    rates = {
+        as_float(
+            run["summary"].get(
+                "scheduled_throughput_per_second",
+                run["summary"].get("rate", 0),
+            )
+        )
+        for run in runs
+        if run.get("summary")
+    }
+    return sorted(rate for rate in rates if rate > 0)
 
 
 def dark_figure() -> tuple[Any, Any]:
@@ -221,7 +347,7 @@ def finish_dark_plot(axis: Any) -> None:
     axis.tick_params(axis="both", colors=GRAPH_TEXT)
     for spine in axis.spines.values():
         spine.set_color(GRAPH_SPINE)
-    axis.grid(True, color=GRAPH_GRID, alpha=0.45)
+    axis.grid(True, color=GRAPH_GRID, alpha=GRAPH_GRID_ALPHA)
     legend = axis.legend()
     if legend is not None:
         legend.get_frame().set_facecolor(GRAPH_AXES_FACE)
@@ -242,6 +368,16 @@ def save_plot(path: Path) -> None:
 def plot_throughput(runs: list[dict[str, Any]], graphs_dir: Path) -> Path:
     _, axis = dark_figure()
     path = graphs_dir / "throughput.png"
+    for target_rate in target_throughput_rates(runs):
+        axis.axhline(
+            target_rate,
+            label=f"target {target_rate:g}/s",
+            linewidth=GRAPH_TARGET_LINEWIDTH,
+            linestyle="--",
+            color=GRAPH_TARGET_LINE,
+            alpha=GRAPH_LINE_ALPHA,
+            zorder=1,
+        )
     for spec in throughput_line_specs(runs):
         x, y = series(spec["run"], spec["key"])
         axis.plot(
@@ -251,10 +387,13 @@ def plot_throughput(runs: list[dict[str, Any]], graphs_dir: Path) -> Path:
             linewidth=spec["linewidth"],
             linestyle=spec["linestyle"],
             color=spec["color"],
+            alpha=GRAPH_LINE_ALPHA,
+            zorder=2,
         )
     axis.set_title("Successful Throughput Over Time")
     axis.set_xlabel("Second")
     axis.set_ylabel("Operations / second")
+    add_split_event_markers(axis, runs)
     finish_dark_plot(axis)
     save_plot(path)
     return path
@@ -267,13 +406,28 @@ def plot_error_rate(runs: list[dict[str, Any]], graphs_dir: Path) -> Path | None
     path = graphs_dir / "errors.png"
     for index, run in enumerate(runs):
         x, y = series(run, "errors")
-        axis.plot(x, y, label=run["label"], linewidth=1.8, color=series_color(index))
+        axis.plot(
+            x,
+            y,
+            label=run["label"],
+            linewidth=GRAPH_LINEWIDTH,
+            color=series_color(index),
+            alpha=GRAPH_LINE_ALPHA,
+        )
     axis.set_title("Errors Over Time")
     axis.set_xlabel("Second")
     axis.set_ylabel("Errors / second")
+    add_split_event_markers(axis, runs)
     finish_dark_plot(axis)
     save_plot(path)
     return path
+
+
+def latency_percentile_label(percentile: str) -> str:
+    """Format a metrics percentile key for chart titles and legends."""
+    if percentile.endswith("_ms"):
+        percentile = percentile[:-3]
+    return percentile.replace("_", ".")
 
 
 def plot_compare_latency(runs: list[dict[str, Any]], graphs_dir: Path, percentile: str) -> Path:
@@ -281,10 +435,18 @@ def plot_compare_latency(runs: list[dict[str, Any]], graphs_dir: Path, percentil
     path = graphs_dir / f"compare_{percentile}.png"
     for index, run in enumerate(runs):
         x, y = series(run, percentile)
-        axis.plot(x, y, label=run["label"], linewidth=1.8, color=series_color(index))
-    axis.set_title(f"Corrected Latency {percentile.replace('_', '.')} Over Time")
+        axis.plot(
+            x,
+            y,
+            label=run["label"],
+            linewidth=GRAPH_LINEWIDTH,
+            color=series_color(index),
+            alpha=GRAPH_LINE_ALPHA,
+        )
+    axis.set_title(latency_percentile_label(percentile))
     axis.set_xlabel("Second")
     axis.set_ylabel("Milliseconds")
+    add_split_event_markers(axis, runs)
     finish_dark_plot(axis)
     save_plot(path)
     return path
@@ -301,10 +463,18 @@ def plot_compare_series(
     path = graphs_dir / filename
     for index, run in enumerate(runs):
         x, y = series(run, key)
-        axis.plot(x, y, label=run["label"], linewidth=1.8, color=series_color(index))
+        axis.plot(
+            x,
+            y,
+            label=run["label"],
+            linewidth=GRAPH_LINEWIDTH,
+            color=series_color(index),
+            alpha=GRAPH_LINE_ALPHA,
+        )
     axis.set_title(title)
     axis.set_xlabel("Second")
     axis.set_ylabel("Milliseconds")
+    add_split_event_markers(axis, runs)
     finish_dark_plot(axis)
     save_plot(path)
     return path
@@ -322,25 +492,69 @@ def plot_run_latency(run: dict[str, Any], graphs_dir: Path) -> Path:
         axis.plot(
             x,
             y,
-            label=percentile.replace("_", "."),
-            linewidth=1.5,
+            label=latency_percentile_label(percentile),
+            linewidth=GRAPH_LINEWIDTH,
             color=series_color(index),
+            alpha=GRAPH_LINE_ALPHA,
         )
     x, y = series(run, "max_ms")
     axis.plot(
         x,
         y,
         label="max",
-        linewidth=1.2,
+        linewidth=GRAPH_LINEWIDTH,
         linestyle="--",
         color=series_color(len(PERCENTILES)),
+        alpha=GRAPH_LINE_ALPHA,
     )
     axis.set_title(f"Corrected Latency Percentiles: {run['label']}")
     axis.set_xlabel("Second")
     axis.set_ylabel("Milliseconds")
+    add_split_event_markers(axis, [run])
     finish_dark_plot(axis)
     save_plot(path)
     return path
+
+
+def graph_description(graph_path: Path) -> str:
+    """Return a short reader-facing description for a generated graph."""
+    stem = graph_path.stem
+    split_marker_note = (
+        " When present, red dotted vertical markers show shard split start/end."
+    )
+    descriptions = {
+        "throughput": (
+            "Successful operations per second and failed operations per second "
+            "over time; the dashed line is the offered target rate."
+            + split_marker_note
+        ),
+        "compare_p99_ms": (
+            "Corrected p99 latency by one-second bucket. Corrected latency is "
+            "measured from scheduled start time, so it includes client queueing."
+            + split_marker_note
+        ),
+        "compare_p99_9_ms": (
+            "Corrected p99.9 latency by one-second bucket. This emphasizes "
+            "extreme tail latency and includes client queueing."
+            + split_marker_note
+        ),
+        "start_lag_p99": (
+            "p99 delay between when the benchmark scheduled an operation and "
+            "when a client worker actually started it. Spikes mean the load "
+            "generator briefly fell behind; corrected latency keeps those "
+            "delayed operations anchored to their scheduled time to avoid "
+            "hiding coordinated omission."
+            + split_marker_note
+        ),
+        "errors": "Failed operations per second by target." + split_marker_note,
+    }
+    if stem.startswith("latency_"):
+        return (
+            "Single-target corrected latency percentiles over time; max is the "
+            "slowest operation observed in each one-second bucket."
+            + split_marker_note
+        )
+    return descriptions.get(stem, "Benchmark metric over time.")
 
 
 def rel(path: Path, base: Path) -> str:
@@ -730,22 +944,15 @@ def write_report(runs: list[dict[str, Any]], out: Path, title: str) -> None:
         try:
             graph_paths = [
                 plot_throughput(metric_runs, graphs_dir),
+                plot_compare_series(
+                    metric_runs,
+                    graphs_dir,
+                    "start_lag_p99_ms",
+                    "Client Request Lag p99",
+                    "start_lag_p99.png",
+                ),
                 plot_compare_latency(metric_runs, graphs_dir, "p99_ms"),
                 plot_compare_latency(metric_runs, graphs_dir, "p99_9_ms"),
-                plot_compare_series(
-                    metric_runs,
-                    graphs_dir,
-                    "service_p95_ms",
-                    "Service Latency p95 Over Time",
-                    "service_p95.png",
-                ),
-                plot_compare_series(
-                    metric_runs,
-                    graphs_dir,
-                    "start_lag_p95_ms",
-                    "Client Start Lag p95 Over Time",
-                    "start_lag_p95.png",
-                ),
             ]
             error_graph = plot_error_rate(metric_runs, graphs_dir)
             if error_graph is not None:
@@ -802,6 +1009,8 @@ def write_report(runs: list[dict[str, Any]], out: Path, title: str) -> None:
         for graph_path in graph_paths:
             lines.append(f"![{graph_path.stem}]({rel(graph_path, out.parent)})")
             lines.append("")
+            lines.append(f"_{graph_description(graph_path)}_")
+            lines.append("")
     else:
         if graph_error:
             lines.append(graph_error)
@@ -825,6 +1034,8 @@ def write_report(runs: list[dict[str, Any]], out: Path, title: str) -> None:
                 lines.append(f"  - {label}: `{rel(artifact, out.parent)}`")
             elif is_failed(run) and filename in {"metrics.csv", "summary.json"}:
                 lines.append(f"  - {label}: missing")
+        for event_file in run.get("event_files", []):
+            lines.append(f"  - events: `{rel(event_file, out.parent)}`")
 
     out.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 

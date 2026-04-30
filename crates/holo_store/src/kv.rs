@@ -103,6 +103,10 @@ pub trait KvEngine: Send + Sync + 'static {
 /// Routing policy for selecting a shard given a key.
 pub trait ShardRouter: Send + Sync + 'static {
     fn shard_for_key(&self, key: &[u8]) -> usize;
+
+    fn fallback_shard_for_key(&self, _key: &[u8]) -> Option<usize> {
+        None
+    }
 }
 
 #[allow(dead_code)]
@@ -1423,17 +1427,29 @@ impl RoutedKvEngine {
         let idx = self.router.shard_for_key(key);
         idx.min(self.shards.len().saturating_sub(1))
     }
+
+    fn fallback_shard_for_key(&self, key: &[u8], primary: usize) -> Option<usize> {
+        let idx = self.router.fallback_shard_for_key(key)?;
+        let idx = idx.min(self.shards.len().saturating_sub(1));
+        (idx != primary).then_some(idx)
+    }
 }
 
 impl KvEngine for RoutedKvEngine {
     fn get(&self, key: &[u8], version: Version) -> Option<Vec<u8>> {
         let shard = self.shard_for_key(key);
-        self.shards[shard].get(key, version)
+        self.shards[shard].get(key, version).or_else(|| {
+            self.fallback_shard_for_key(key, shard)
+                .and_then(|fallback| self.shards[fallback].get(key, version))
+        })
     }
 
     fn get_latest(&self, key: &[u8]) -> Option<(Vec<u8>, Version)> {
         let shard = self.shard_for_key(key);
-        self.shards[shard].get_latest(key)
+        self.shards[shard].get_latest(key).or_else(|| {
+            self.fallback_shard_for_key(key, shard)
+                .and_then(|fallback| self.shards[fallback].get_latest(key))
+        })
     }
 
     fn get_latest_batch(&self, keys: &[&[u8]]) -> Vec<Option<(Vec<u8>, Version)>> {
@@ -1441,9 +1457,11 @@ impl KvEngine for RoutedKvEngine {
             return Vec::new();
         }
         let mut results = vec![None; keys.len()];
+        let mut primary_shards = vec![0usize; keys.len()];
         let mut by_shard: Vec<Vec<usize>> = vec![Vec::new(); self.shards.len()];
         for (idx, key) in keys.iter().enumerate() {
             let shard = self.shard_for_key(key);
+            primary_shards[idx] = shard;
             by_shard[shard].push(idx);
         }
         for (shard, indices) in by_shard.into_iter().enumerate() {
@@ -1457,6 +1475,31 @@ impl KvEngine for RoutedKvEngine {
             let shard_values = self.shards[shard].get_latest_batch(&shard_keys);
             for (idx, value) in indices.into_iter().zip(shard_values.into_iter()) {
                 results[idx] = value;
+            }
+        }
+
+        let mut fallback_by_shard: Vec<Vec<usize>> = vec![Vec::new(); self.shards.len()];
+        for (idx, key) in keys.iter().enumerate() {
+            if results[idx].is_some() {
+                continue;
+            }
+            if let Some(fallback) = self.fallback_shard_for_key(key, primary_shards[idx]) {
+                fallback_by_shard[fallback].push(idx);
+            }
+        }
+        for (shard, indices) in fallback_by_shard.into_iter().enumerate() {
+            if indices.is_empty() {
+                continue;
+            }
+            let mut shard_keys = Vec::with_capacity(indices.len());
+            for idx in &indices {
+                shard_keys.push(keys[*idx]);
+            }
+            let shard_values = self.shards[shard].get_latest_batch(&shard_keys);
+            for (idx, value) in indices.into_iter().zip(shard_values.into_iter()) {
+                if results[idx].is_none() {
+                    results[idx] = value;
+                }
             }
         }
         results
@@ -1521,7 +1564,14 @@ impl KvEngine for RoutedKvEngine {
 
     fn mark_visible(&self, key: &[u8], version: Version) -> anyhow::Result<bool> {
         let shard = self.shard_for_key(key);
-        self.shards[shard].mark_visible(key, version)
+        let inserted = self.shards[shard].mark_visible(key, version)?;
+        if inserted {
+            return Ok(true);
+        }
+        if let Some(fallback) = self.fallback_shard_for_key(key, shard) {
+            return self.shards[fallback].mark_visible(key, version);
+        }
+        Ok(false)
     }
 
     /// Batch visibility updates across routed shards.
@@ -1555,7 +1605,25 @@ impl KvEngine for RoutedKvEngine {
         }
 
         let mut inserted = 0u64;
+        let mut fallback_by_shard: Vec<Vec<usize>> = vec![Vec::new(); self.shards.len()];
         for (shard, indices) in by_shard.into_iter().enumerate() {
+            if indices.is_empty() {
+                continue;
+            }
+            let mut shard_keys = Vec::with_capacity(indices.len());
+            for idx in &indices {
+                shard_keys.push(keys[*idx]);
+            }
+            inserted = inserted
+                .saturating_add(self.shards[shard].mark_visible_batch(&shard_keys, version)?);
+            for idx in indices {
+                if let Some(fallback) = self.fallback_shard_for_key(keys[idx], shard) {
+                    fallback_by_shard[fallback].push(idx);
+                }
+            }
+        }
+
+        for (shard, indices) in fallback_by_shard.into_iter().enumerate() {
             if indices.is_empty() {
                 continue;
             }
@@ -2580,6 +2648,59 @@ mod tests {
                 counter,
             },
         }
+    }
+
+    struct OverlayRouter;
+
+    impl ShardRouter for OverlayRouter {
+        fn shard_for_key(&self, key: &[u8]) -> usize {
+            if key >= b"m".as_slice() {
+                1
+            } else {
+                0
+            }
+        }
+
+        fn fallback_shard_for_key(&self, key: &[u8]) -> Option<usize> {
+            (key >= b"m".as_slice()).then_some(0)
+        }
+    }
+
+    #[test]
+    fn routed_kv_engine_reads_fallback_and_writes_primary() {
+        let parent = Arc::new(KvStore::new());
+        let child = Arc::new(KvStore::new());
+        let old_version = test_version(1, 1);
+        parent
+            .apply_committed_batch(&[(b"n".as_slice(), b"old".as_slice(), old_version)])
+            .expect("seed fallback parent");
+        let engine =
+            RoutedKvEngine::new(vec![parent.clone(), child.clone()], Arc::new(OverlayRouter))
+                .expect("routed engine");
+
+        assert_eq!(
+            engine.get_latest(b"n"),
+            Some((b"old".to_vec(), old_version))
+        );
+        assert_eq!(
+            engine.get_latest_batch(&[b"n".as_slice()]),
+            vec![Some((b"old".to_vec(), old_version))]
+        );
+
+        let new_version = test_version(2, 2);
+        engine
+            .apply_committed_batch(&[(b"n".as_slice(), b"new".as_slice(), new_version)])
+            .expect("write child primary");
+
+        assert_eq!(child.get_latest(b"n"), Some((b"new".to_vec(), new_version)));
+        assert_eq!(
+            parent.get_latest(b"n"),
+            Some((b"old".to_vec(), old_version))
+        );
+        assert_eq!(
+            engine.get_latest(b"n"),
+            Some((b"new".to_vec(), new_version))
+        );
     }
 
     /// Build a worker request for direct combined-publish tests.

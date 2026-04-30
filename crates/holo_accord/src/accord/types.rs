@@ -15,6 +15,16 @@ pub type GroupId = u64;
 pub type NodeId = u64;
 /// Bit shift used to encode shard/group id in transaction counters.
 pub const TXN_COUNTER_SHARD_SHIFT: u32 = 48;
+/// Number of bits reserved for a node-local restart epoch inside the local counter.
+pub const TXN_COUNTER_EPOCH_BITS: u32 = 12;
+/// Number of bits reserved for dense proposal sequence inside the local counter.
+pub const TXN_COUNTER_SEQ_BITS: u32 = TXN_COUNTER_SHARD_SHIFT - TXN_COUNTER_EPOCH_BITS;
+/// Maximum epoch that can be encoded in the stable `TxnId.counter` wire format.
+pub const MAX_TXN_EPOCH: u64 = (1u64 << TXN_COUNTER_EPOCH_BITS) - 1;
+/// Maximum dense proposal sequence that can be allocated inside one epoch.
+pub const MAX_TXN_SEQ: u64 = (1u64 << TXN_COUNTER_SEQ_BITS) - 1;
+/// Maximum group id that can be encoded in `TxnId.counter`.
+pub const MAX_TXN_GROUP_ID: u64 = (1u64 << (64 - TXN_COUNTER_SHARD_SHIFT)) - 1;
 
 /// Unique transaction identifier scoped by node and a monotonically increasing counter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -23,12 +33,79 @@ pub struct TxnId {
     pub counter: u64,
 }
 
+/// Per-origin execution stream tracked by contiguous sequence prefix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TxnProgressKey {
+    pub node_id: NodeId,
+    pub epoch: u64,
+}
+
 /// Derive the Accord group id from a transaction id.
 pub fn txn_group_id(txn_id: TxnId) -> GroupId {
     if TXN_COUNTER_SHARD_SHIFT >= 64 {
         0
     } else {
         txn_id.counter >> TXN_COUNTER_SHARD_SHIFT
+    }
+}
+
+/// Return the encoded restart epoch for this transaction.
+pub fn txn_epoch(txn_id: TxnId) -> u64 {
+    (txn_local_counter(txn_id.counter) >> TXN_COUNTER_SEQ_BITS) & MAX_TXN_EPOCH
+}
+
+/// Return the dense per-epoch sequence for this transaction.
+pub fn txn_seq(txn_id: TxnId) -> u64 {
+    txn_local_counter(txn_id.counter) & MAX_TXN_SEQ
+}
+
+/// Return the execution-progress stream for this transaction.
+pub fn txn_progress_key(txn_id: TxnId) -> TxnProgressKey {
+    TxnProgressKey {
+        node_id: txn_id.node_id,
+        epoch: txn_epoch(txn_id),
+    }
+}
+
+/// Compose a transaction counter from group, epoch, and dense sequence.
+pub fn make_txn_counter(group_id: GroupId, epoch: u64, seq: u64) -> anyhow::Result<u64> {
+    anyhow::ensure!(
+        group_id <= MAX_TXN_GROUP_ID,
+        "group_id {} exceeds max {}",
+        group_id,
+        MAX_TXN_GROUP_ID
+    );
+    anyhow::ensure!(
+        epoch <= MAX_TXN_EPOCH,
+        "txn epoch {} exceeds max {}",
+        epoch,
+        MAX_TXN_EPOCH
+    );
+    anyhow::ensure!(seq > 0, "txn sequence must start at 1");
+    anyhow::ensure!(
+        seq <= MAX_TXN_SEQ,
+        "txn sequence {} exceeds max {}",
+        seq,
+        MAX_TXN_SEQ
+    );
+    Ok((group_id << TXN_COUNTER_SHARD_SHIFT) | (epoch << TXN_COUNTER_SEQ_BITS) | seq)
+}
+
+/// Rebuild a transaction id with the same group/origin/epoch and a new dense sequence.
+pub fn txn_id_with_seq(txn_id: TxnId, seq: u64) -> Option<TxnId> {
+    make_txn_counter(txn_group_id(txn_id), txn_epoch(txn_id), seq)
+        .ok()
+        .map(|counter| TxnId {
+            node_id: txn_id.node_id,
+            counter,
+        })
+}
+
+fn txn_local_counter(counter: u64) -> u64 {
+    if TXN_COUNTER_SHARD_SHIFT >= 64 {
+        counter
+    } else {
+        counter & ((1u64 << TXN_COUNTER_SHARD_SHIFT) - 1)
     }
 }
 
@@ -108,6 +185,8 @@ impl CommitDurabilityMode {
 pub struct Config {
     pub group_id: GroupId,
     pub node_id: NodeId,
+    /// Durable node-local epoch used to make dense sequences restart-safe.
+    pub txn_epoch: u64,
     pub members: Vec<Member>,
 
     /// Upper bound for point-to-point RPC waits used by protocol steps.
@@ -393,6 +472,8 @@ pub struct RecoverResponse {
 #[derive(Clone, Debug)]
 pub struct ExecutedPrefix {
     pub node_id: NodeId,
+    pub epoch: u64,
+    /// Dense contiguous executed sequence for `(node_id, epoch)`.
     pub counter: u64,
 }
 

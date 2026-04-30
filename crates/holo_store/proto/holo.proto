@@ -180,6 +180,7 @@ message FetchCommandResponse {
 message ExecutedPrefix {
   uint64 node_id = 1;
   uint64 counter = 2;
+  uint64 epoch = 3;
 }
 
 message ReportExecutedRequest {
@@ -351,6 +352,9 @@ message RangeStat {
   uint32 hot_key_concentration_bps = 10;
   repeated uint64 write_hot_buckets = 11;
   repeated uint64 read_hot_buckets = 12;
+  bytes observed_min_key = 13;
+  bytes observed_max_key = 14;
+  repeated bytes sampled_keys = 15;
 }
 
 message RangeStatsResponse {
