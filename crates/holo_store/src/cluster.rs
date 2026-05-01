@@ -10,6 +10,7 @@ use anyhow::Context;
 use holo_accord::accord::{CommandKeys, ExecMeta, NodeId, StateMachine};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use tokio::sync::Notify;
 
 use crate::kv::{encode_key_prefix, hash_key, ShardRouter};
 use fjall::{Keyspace, PartitionCreateOptions};
@@ -542,6 +543,7 @@ pub struct ClusterStateStore {
     path: PathBuf,
     split_lock: Arc<std::sync::RwLock<()>>,
     meta_ops: Arc<RwLock<BTreeMap<usize, u64>>>,
+    epoch_notify: Arc<Notify>,
 }
 
 impl ClusterStateStore {
@@ -560,6 +562,7 @@ impl ClusterStateStore {
                     path,
                     split_lock: Arc::new(std::sync::RwLock::new(())),
                     meta_ops: Arc::new(RwLock::new(BTreeMap::new())),
+                    epoch_notify: Arc::new(Notify::new()),
                 });
             }
         }
@@ -621,6 +624,7 @@ impl ClusterStateStore {
             path,
             split_lock: Arc::new(std::sync::RwLock::new(())),
             meta_ops: Arc::new(RwLock::new(BTreeMap::new())),
+            epoch_notify: Arc::new(Notify::new()),
         };
         store.persist()?;
         Ok(store)
@@ -662,6 +666,19 @@ impl ClusterStateStore {
 
     pub fn epoch(&self) -> u64 {
         self.state.read().unwrap().epoch
+    }
+
+    /// Return a notification source that fires after persisted cluster-state changes.
+    ///
+    /// Purpose:
+    /// - Lets split cutover waiters observe local descriptor visibility without
+    ///   sleeping in fixed 10ms polling intervals.
+    ///
+    /// Output:
+    /// - A shared notify handle cloned from the store. Callers must still
+    ///   re-read state after waking because notifications are coalesced.
+    pub fn epoch_notifier(&self) -> Arc<Notify> {
+        self.epoch_notify.clone()
     }
 
     pub fn frozen(&self) -> bool {
@@ -1206,10 +1223,17 @@ impl ClusterStateStore {
         }
 
         {
-            // Block client request routing only while descriptors are changed or
-            // while a legacy physical migration runs. Metadata-only splits hold
-            // this lock for a tiny in-memory cutover.
-            let _split_guard = self.split_lock.write().unwrap();
+            // Physical splits still need the global split lock because bytes can
+            // move between storage partitions. Metadata-only same-replica
+            // splits skip it: descriptors change atomically under `state`, and
+            // both logical ranges continue routing to the same storage/Accord
+            // group, so blocking KV apply/visibility work only adds tail
+            // latency without improving correctness.
+            let _split_guard = if skip_migration {
+                None
+            } else {
+                Some(self.split_lock.write().unwrap())
+            };
             let mut state = self.state.write().unwrap();
 
             // Idempotent replay: a late-joining node may re-apply an already
@@ -2426,8 +2450,11 @@ impl ClusterStateStore {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).context("create cluster state dir")?;
         }
-        let data = serde_json::to_vec_pretty(&*state).context("serialize cluster state")?;
+        // Cluster state is replicated through the meta log; this JSON is a
+        // local checkpoint. Keep the foreground apply path compact and cheap.
+        let data = serde_json::to_vec(&*state).context("serialize cluster state")?;
         fs::write(&self.path, data).context("write cluster state")?;
+        self.epoch_notify.notify_waiters();
         Ok(())
     }
 }
@@ -2782,8 +2809,8 @@ pub fn cluster_command_key(cmd: &ClusterCommand) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::{mpsc, Mutex};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn member(node_id: NodeId) -> MemberInfo {
         MemberInfo {
@@ -2800,6 +2827,7 @@ mod tests {
             state: Arc::new(RwLock::new(state)),
             split_lock: Arc::new(RwLock::new(())),
             meta_ops: Arc::new(RwLock::new(BTreeMap::new())),
+            epoch_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -3070,6 +3098,34 @@ mod tests {
     }
 
     #[test]
+    fn metadata_only_split_does_not_wait_for_global_split_lock() {
+        let store = test_store(base_state());
+        let split_key = b"key:050000".to_vec();
+        let split_lock = store.split_lock();
+        let read_guard = split_lock.read().expect("hold split read lock");
+        let store_for_thread = store.clone();
+        let (tx, rx) = mpsc::channel::<Result<(), String>>();
+
+        let handle = std::thread::spawn(move || {
+            let result = store_for_thread
+                .apply_split_range(split_key, 1, None, None, true, None, 8)
+                .map_err(|err| err.to_string());
+            let _ = tx.send(result);
+        });
+
+        let result = rx.recv_timeout(Duration::from_secs(1));
+        drop(read_guard);
+        handle.join().expect("split worker should not panic");
+        result
+            .expect("metadata-only split should not wait for split write lock")
+            .expect("metadata-only split should apply");
+        let state = store.state();
+        assert_eq!(state.shards.len(), 2);
+        assert_eq!(state.shards[1].shard_index, 0);
+        assert_eq!(state.shards[1].storage_index(), 0);
+    }
+
+    #[test]
     fn split_range_rejects_stale_proposal_inside_cluster_cooldown() {
         let store = test_store(base_state());
         let split_key = b"key:050000".to_vec();
@@ -3160,6 +3216,22 @@ mod tests {
         assert_eq!(store.fallback_storage_index_for_key(b"key:025000"), None);
         assert_eq!(store.shard_index_for_key(b"key:075000"), 0);
         assert_eq!(store.shard_index_for_key(b"key:025000"), 0);
+    }
+
+    #[tokio::test]
+    async fn persisted_cluster_state_change_notifies_epoch_waiters() {
+        let store = test_store(base_state());
+        let notifier = store.epoch_notifier();
+        let notified = notifier.notified();
+
+        store
+            .apply_command(ClusterCommand::SetFrozen { frozen: true })
+            .expect("set frozen should persist and notify");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+            .await
+            .expect("cluster epoch waiter should be notified");
+        assert!(store.frozen());
     }
 
     #[test]
