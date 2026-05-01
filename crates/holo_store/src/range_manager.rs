@@ -1168,16 +1168,39 @@ async fn maybe_split_once(
                 fence: current_range_controller_fence(state.as_ref())?,
                 command: Box::new(split_command),
             };
+            record_split_event(
+                state.as_ref(),
+                &split_decision,
+                &split_event_id,
+                "split_meta_propose_start",
+            );
             propose_meta(state.clone(), guarded_split).await?;
+            record_split_event(
+                state.as_ref(),
+                &split_decision,
+                &split_event_id,
+                "split_meta_propose_end",
+            );
             if let Some(started) = fence_phase_started {
                 split_fence_budget_remaining(started)?;
             }
+            record_split_event(
+                state.as_ref(),
+                &split_decision,
+                &split_event_id,
+                "split_local_visible_wait_start",
+            );
             let split_epoch =
                 wait_for_local_epoch(state.clone(), split_before_epoch, SPLIT_FENCE_SYNC_TIMEOUT)
                     .await?;
-            state
-                .cluster_store
-                .state()
+            record_split_event(
+                state.as_ref(),
+                &split_decision,
+                &split_event_id,
+                "split_local_visible",
+            );
+            let post_local_state = state.cluster_store.state();
+            post_local_state
                 .shards
                 .iter()
                 .find(|s| s.start_key == split_decision.split_key)
@@ -1187,16 +1210,39 @@ async fn maybe_split_once(
                         String::from_utf8_lossy(&split_decision.split_key)
                     )
                 })?;
-            let shard_count = state.cluster_store.state().shards.len();
-            wait_for_cluster_converged(
-                state.clone(),
-                split_epoch,
-                Some(shard_count),
-                &required_fences,
-                &[],
-                SPLIT_CLUSTER_SYNC_TIMEOUT,
-            )
-            .await?;
+            let shard_count = post_local_state.shards.len();
+            if metadata_only_split {
+                spawn_split_convergence_finalizer(
+                    state.clone(),
+                    split_decision.clone(),
+                    split_event_id.clone(),
+                    split_epoch,
+                    shard_count,
+                    required_fences.clone(),
+                );
+            } else {
+                record_split_event(
+                    state.as_ref(),
+                    &split_decision,
+                    &split_event_id,
+                    "split_cluster_converge_start",
+                );
+                wait_for_cluster_converged(
+                    state.clone(),
+                    split_epoch,
+                    Some(shard_count),
+                    &required_fences,
+                    &[],
+                    SPLIT_CLUSTER_SYNC_TIMEOUT,
+                )
+                .await?;
+                record_split_event(
+                    state.as_ref(),
+                    &split_decision,
+                    &split_event_id,
+                    "split_cluster_converge_end",
+                );
+            }
             Ok::<(), anyhow::Error>(())
         })
         .await;
@@ -1528,6 +1574,73 @@ fn csv_escape(value: &str) -> String {
     }
 }
 
+/// Continue split convergence checks after foreground metadata cutover.
+///
+/// Purpose:
+/// - Metadata-only same-replica splits are locally usable as soon as the
+///   descriptor is committed and visible. Remote convergence probes are still
+///   valuable, but keeping them in the foreground path turns network jitter
+///   into client tail latency.
+///
+/// Inputs:
+/// - Split operation identity, target epoch/shard count, and any fence state
+///   that must converge.
+///
+/// Output:
+/// - Emits benchmark events and logs late convergence failures without failing
+///   the already-visible local split.
+fn spawn_split_convergence_finalizer(
+    state: Arc<NodeState>,
+    decision: SplitDecision,
+    operation_id: String,
+    split_epoch: u64,
+    shard_count: usize,
+    required_fences: Vec<(u64, String)>,
+) {
+    tokio::spawn(async move {
+        record_split_event(
+            state.as_ref(),
+            &decision,
+            &operation_id,
+            "split_cluster_converge_start",
+        );
+        match wait_for_cluster_converged(
+            state.clone(),
+            split_epoch,
+            Some(shard_count),
+            &required_fences,
+            &[],
+            SPLIT_CLUSTER_SYNC_TIMEOUT,
+        )
+        .await
+        {
+            Ok(()) => {
+                record_split_event(
+                    state.as_ref(),
+                    &decision,
+                    &operation_id,
+                    "split_cluster_converge_end",
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    shard_id = decision.shard.shard_id,
+                    shard_index = decision.shard.shard_index,
+                    target_shard_index = decision.target_shard_index,
+                    error = ?err,
+                    "range split background convergence check failed"
+                );
+                record_split_event(
+                    state.as_ref(),
+                    &decision,
+                    &operation_id,
+                    "split_cluster_converge_failed",
+                );
+            }
+        }
+    });
+}
+
 fn current_range_controller_fence(state: &NodeState) -> anyhow::Result<ControllerFence> {
     let now_ms = now_unix_ms();
     let Some(lease) = state
@@ -1826,6 +1939,12 @@ async fn clear_split_fences(
 
 /// Wait for local cluster epoch to advance past a minimum epoch.
 ///
+/// Design:
+/// - Uses the cluster-store epoch notifier so metadata-only split cutover does
+///   not pay an artificial 10ms polling quantum after the meta command applies.
+/// - Re-checks state after every notification because notifications are
+///   coalesced and can wake unrelated epoch waiters.
+///
 /// Output:
 /// - New local epoch once observed, otherwise timeout error.
 async fn wait_for_local_epoch(
@@ -1834,7 +1953,9 @@ async fn wait_for_local_epoch(
     timeout: Duration,
 ) -> anyhow::Result<u64> {
     let deadline = Instant::now() + timeout;
+    let notifier = state.cluster_store.epoch_notifier();
     loop {
+        let notified = notifier.notified();
         ensure_range_controller_leader(state.clone()).await?;
         let local_epoch = state.cluster_store.epoch();
         if local_epoch > min_epoch {
@@ -1845,7 +1966,13 @@ async fn wait_for_local_epoch(
                 "timed out waiting for local cluster epoch to advance beyond {min_epoch} (now={local_epoch})"
             );
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if tokio::time::timeout(remaining, notified).await.is_err() {
+            let now_epoch = state.cluster_store.epoch();
+            anyhow::bail!(
+                "timed out waiting for local cluster epoch to advance beyond {min_epoch} (now={now_epoch})"
+            );
+        }
     }
 }
 
