@@ -326,11 +326,9 @@ impl State {
                 }
             }
             if let Some(last) = self.last_write_by_key.get(key).copied() {
-                if last != txn_id {
-                    if !self.is_globally_stable_executed(config, last) {
-                        deps.insert(last);
-                        max_seq = max_seq.max(self.txn_seq_hint(&last));
-                    }
+                if last != txn_id && !self.is_globally_stable_executed(config, last) {
+                    deps.insert(last);
+                    max_seq = max_seq.max(self.txn_seq_hint(&last));
                 }
             }
 
