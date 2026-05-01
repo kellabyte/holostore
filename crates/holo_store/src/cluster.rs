@@ -2110,17 +2110,21 @@ impl ClusterStateStore {
                 split_hash,
                 target_meta_index,
             } => {
+                if let Some(existing) = state
+                    .meta_ranges
+                    .iter()
+                    .find(|range| range.meta_index == target_meta_index)
+                {
+                    if existing.start_hash == split_hash {
+                        // Idempotent replay after the split was already persisted.
+                        return Ok(());
+                    }
+                    anyhow::bail!("target meta index {target_meta_index} already in use");
+                }
                 if !state.meta_rebalances.is_empty() {
                     anyhow::bail!(
                         "cannot split meta ranges while meta replica moves are in-flight"
                     );
-                }
-                let target_in_use = state
-                    .meta_ranges
-                    .iter()
-                    .any(|range| range.meta_index == target_meta_index);
-                if target_in_use {
-                    anyhow::bail!("target meta index {target_meta_index} already in use");
                 }
                 let idx = state
                     .meta_ranges
@@ -2170,7 +2174,17 @@ impl ClusterStateStore {
                 to_node,
                 target_leaseholder,
             } => {
-                if state.meta_rebalances.contains_key(&meta_range_id) {
+                if from_node == to_node {
+                    anyhow::bail!("from_node and to_node must differ");
+                }
+                if let Some(existing) = state.meta_rebalances.get(&meta_range_id) {
+                    if existing.from_node == from_node
+                        && existing.to_node == to_node
+                        && existing.target_leaseholder == target_leaseholder
+                    {
+                        // Idempotent replay of the same move intent.
+                        return Ok(());
+                    }
                     anyhow::bail!("meta range {meta_range_id} already has an in-flight move");
                 }
                 let idx = state
@@ -2185,15 +2199,20 @@ impl ClusterStateStore {
                 let desired = state.replication_factor.min(active_members.len()).max(1);
                 let now = unix_time_ms();
                 let replicas = state.meta_ranges[idx].replicas.clone();
+                if !replicas.contains(&from_node)
+                    && replicas.contains(&to_node)
+                    && target_leaseholder
+                        .is_none_or(|node| state.meta_ranges[idx].leaseholder == node)
+                {
+                    // Idempotent replay after the move already finalized.
+                    return Ok(());
+                }
                 if replicas.len() != desired {
                     anyhow::bail!(
                         "meta range {meta_range_id} replica count {} does not match desired {}",
                         replicas.len(),
                         desired
                     );
-                }
-                if from_node == to_node {
-                    anyhow::bail!("from_node and to_node must differ");
                 }
                 if !replicas.contains(&from_node) {
                     anyhow::bail!(
@@ -2305,9 +2324,9 @@ impl ClusterStateStore {
                         "leaseholder {leaseholder} must be a replica of meta range {meta_range_id}"
                     );
                 }
-                if range.leaseholder != leaseholder {
-                    range.leaseholder = leaseholder;
-                    if let Some(mv) = state.meta_rebalances.get_mut(&meta_range_id) {
+                range.leaseholder = leaseholder;
+                if let Some(mv) = state.meta_rebalances.get_mut(&meta_range_id) {
+                    if mv.phase == ReplicaMovePhase::JointConfig {
                         mv.phase = ReplicaMovePhase::LeaseTransferred;
                         mv.last_progress_unix_ms = unix_time_ms();
                     }
@@ -3013,6 +3032,114 @@ mod tests {
             target_meta_index: 2,
         };
         assert_eq!(store.meta_range_index_for_command(&cmd), Some(1));
+    }
+
+    #[test]
+    fn split_meta_range_replay_is_idempotent() {
+        let store = test_store(base_state());
+        let cmd = ClusterCommand::SplitMetaRange {
+            split_hash: 1_024,
+            target_meta_index: 1,
+        };
+
+        store.apply_command(cmd.clone()).unwrap();
+        let after_first = store.state();
+        store.apply_command(cmd).unwrap();
+        let after_replay = store.state();
+
+        assert_eq!(after_replay.meta_ranges.len(), 2);
+        assert_eq!(
+            serde_json::to_value(&after_replay.meta_ranges).unwrap(),
+            serde_json::to_value(&after_first.meta_ranges).unwrap()
+        );
+        assert_eq!(
+            after_replay.meta_replica_roles,
+            after_first.meta_replica_roles
+        );
+    }
+
+    #[test]
+    fn cluster_state_machine_empty_command_is_noop() {
+        let store = test_store(base_state());
+        let sm = ClusterStateMachine::new(store.clone(), None, 8);
+
+        let keys = sm.command_keys(&[]).unwrap();
+        assert!(keys.reads.is_empty());
+        assert!(keys.writes.is_empty());
+        sm.apply(
+            &[],
+            ExecMeta {
+                seq: 1,
+                txn_id: holo_accord::accord::TxnId {
+                    node_id: 1,
+                    counter: 1,
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(store.state().epoch, 1);
+    }
+
+    #[test]
+    fn begin_meta_replica_move_replay_is_idempotent() {
+        let store = test_store(base_state());
+        let cmd = ClusterCommand::BeginMetaReplicaMove {
+            meta_range_id: 1,
+            from_node: 1,
+            to_node: 4,
+            target_leaseholder: Some(2),
+        };
+
+        store.apply_command(cmd.clone()).unwrap();
+        let after_first = store.state();
+        store.apply_command(cmd).unwrap();
+        let after_replay = store.state();
+
+        assert_eq!(
+            serde_json::to_value(&after_replay.meta_rebalances).unwrap(),
+            serde_json::to_value(&after_first.meta_rebalances).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&after_replay.meta_ranges).unwrap(),
+            serde_json::to_value(&after_first.meta_ranges).unwrap()
+        );
+        assert_eq!(
+            after_replay.meta_replica_roles,
+            after_first.meta_replica_roles
+        );
+    }
+
+    #[test]
+    fn transfer_meta_range_lease_replay_advances_persisted_phase() {
+        let store = test_store(base_state());
+        store
+            .apply_command(ClusterCommand::BeginMetaReplicaMove {
+                meta_range_id: 1,
+                from_node: 1,
+                to_node: 4,
+                target_leaseholder: Some(2),
+            })
+            .unwrap();
+        store
+            .apply_command(ClusterCommand::PromoteMetaReplicaLearner { meta_range_id: 1 })
+            .unwrap();
+        {
+            let mut state = store.state.write().unwrap();
+            state.meta_ranges[0].leaseholder = 2;
+            state.meta_rebalances.get_mut(&1).unwrap().phase = ReplicaMovePhase::JointConfig;
+        }
+
+        store
+            .apply_command(ClusterCommand::TransferMetaRangeLease {
+                meta_range_id: 1,
+                leaseholder: 2,
+            })
+            .unwrap();
+
+        assert_eq!(
+            store.state().meta_rebalances[&1].phase,
+            ReplicaMovePhase::LeaseTransferred
+        );
     }
 
     #[test]
@@ -3731,6 +3858,9 @@ fn next_shard_id(shards: &[ShardDesc]) -> u64 {
 
 impl StateMachine for ClusterStateMachine {
     fn command_keys(&self, data: &[u8]) -> anyhow::Result<CommandKeys> {
+        if data.is_empty() {
+            return Ok(CommandKeys::default());
+        }
         let key = Self::decode_command(data)
             .map(|cmd| cluster_command_key(&cmd))
             .unwrap_or_else(|_| b"cluster".to_vec());
@@ -3741,6 +3871,9 @@ impl StateMachine for ClusterStateMachine {
     }
 
     fn apply(&self, data: &[u8], _meta: ExecMeta) -> anyhow::Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
         if let Ok(cmd) = Self::decode_command(data) {
             // Split/Merge need the state-machine migrator path. Unwrap guarded
             // commands here so guarded split/merge dispatches to the correct

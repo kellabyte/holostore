@@ -58,6 +58,11 @@ pub(super) struct State {
     pub(super) records: FastMap<TxnId, Record>,
     pub(super) frontier_by_key: FastMap<Vec<u8>, BTreeSet<TxnId>>,
     pub(super) last_write_by_key: FastMap<Vec<u8>, TxnId>,
+    /// Highest committed write observed per key.
+    ///
+    /// This is both a read-barrier hint and a sequence floor. Globally stable
+    /// entries no longer create dependencies, but retaining their sequence keeps
+    /// later writes on the same key above already-visible storage versions.
     pub(super) last_committed_write_by_key: FastMap<Vec<u8>, (TxnId, u64)>,
     /// All committed transactions, ordered by sequence for deterministic scans.
     pub(super) committed_queue: BTreeSet<(u64, TxnId)>,
@@ -318,11 +323,15 @@ impl State {
             if let Some((last_committed, committed_seq)) =
                 self.last_committed_write_by_key.get(key).copied()
             {
-                if last_committed != txn_id
-                    && !self.is_globally_stable_executed(config, last_committed)
-                {
-                    deps.insert(last_committed);
+                if last_committed != txn_id {
+                    // Always preserve the committed sequence as a floor. Stable
+                    // writes do not need dependencies anymore, but storage latest
+                    // ordering still requires later writes to receive a higher
+                    // sequence than any already-visible write on the key.
                     max_seq = max_seq.max(committed_seq);
+                    if !self.is_globally_stable_executed(config, last_committed) {
+                        deps.insert(last_committed);
+                    }
                 }
             }
             if let Some(last) = self.last_write_by_key.get(key).copied() {
@@ -357,14 +366,14 @@ impl State {
         (max_seq.saturating_add(1).max(1), deps)
     }
 
-    /// Retire per-key indexes that still point at a globally stable transaction.
+    /// Retire volatile per-key indexes that point at a globally stable transaction.
     ///
     /// Inputs:
     /// - `txn_id`: executed transaction being removed by prefix GC.
     /// - `keys`: write keys from the executed command.
     ///
     /// Output:
-    /// - Number of index entries removed.
+    /// - Number of volatile index entries removed.
     pub(super) fn remove_stable_key_indexes(&mut self, txn_id: TxnId, keys: &[Vec<u8>]) -> usize {
         let mut removed = 0usize;
         for key in keys {
@@ -375,15 +384,6 @@ impl State {
                 .is_some_and(|last| last == txn_id)
             {
                 self.last_write_by_key.remove(key);
-                removed = removed.saturating_add(1);
-            }
-            if self
-                .last_committed_write_by_key
-                .get(key)
-                .copied()
-                .is_some_and(|(last, _)| last == txn_id)
-            {
-                self.last_committed_write_by_key.remove(key);
                 removed = removed.saturating_add(1);
             }
         }

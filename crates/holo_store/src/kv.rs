@@ -2126,6 +2126,9 @@ impl StateMachine for KvStateMachine {
 
     /// Apply a single command to the KV engine.
     fn apply(&self, data: &[u8], meta: ExecMeta) -> anyhow::Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
         let _guard = self.split_lock.as_ref().map(|l| l.read().unwrap());
         match decode_membership_reconfig_command(data) {
             Ok(Some(reconfig)) => {
@@ -2473,7 +2476,9 @@ fn apply_kv_command(kv: &dyn KvEngine, data: &[u8], version: Version) -> anyhow:
 
 /// Extract the read/write key sets from a command for dependency tracking.
 fn command_keys(data: &[u8]) -> anyhow::Result<CommandKeys> {
-    anyhow::ensure!(!data.is_empty(), "empty command");
+    if data.is_empty() {
+        return Ok(CommandKeys::default());
+    }
     match data[0] {
         CMD_SET => {
             let mut offset = 1;
@@ -2754,6 +2759,25 @@ mod tests {
         let keys = command_keys(&payload).expect("command keys");
         assert!(keys.reads.is_empty());
         assert!(keys.writes.is_empty());
+    }
+
+    #[test]
+    fn kv_state_machine_empty_command_is_noop() {
+        let sm = KvStateMachine::new(Arc::new(KvStore::new()), None);
+        let keys = sm.command_keys(&[]).expect("empty command keys");
+        assert!(keys.reads.is_empty());
+        assert!(keys.writes.is_empty());
+        sm.apply(
+            &[],
+            ExecMeta {
+                seq: 1,
+                txn_id: TxnId {
+                    node_id: 1,
+                    counter: 1,
+                },
+            },
+        )
+        .expect("empty command apply");
     }
 
     #[test]

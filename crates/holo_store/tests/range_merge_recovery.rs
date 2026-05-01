@@ -42,8 +42,9 @@ fn merge_recovers_through_phase_restarts() {
         // Keep placement deterministic; merge phase progression still runs
         // even when balancing proposals are disabled.
         ("HOLO_REBALANCE_ENABLED", "false"),
-        // Slow down phase advancement enough for deterministic restart windows.
-        ("HOLO_REBALANCE_INTERVAL_MS", "200"),
+        // Slow down phase advancement enough for deterministic restart windows
+        // when the test observes phases through the persisted JSON checkpoint.
+        ("HOLO_REBALANCE_INTERVAL_MS", "1000"),
     ];
 
     let mut n1 = spawn_node_custom_env(
