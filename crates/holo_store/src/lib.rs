@@ -180,6 +180,7 @@ async fn wait_for_listeners(
 /// Simplified version metadata used by the public client API.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RpcVersion {
+    pub range_generation: u64,
     pub seq: u64,
     pub txn_node_id: u64,
     pub txn_counter: u64,
@@ -188,6 +189,7 @@ pub struct RpcVersion {
 impl RpcVersion {
     pub const fn zero() -> Self {
         Self {
+            range_generation: 0,
             seq: 0,
             txn_node_id: 0,
             txn_counter: 0,
@@ -964,6 +966,7 @@ async fn cluster_state_json_local(state: &NodeState) -> anyhow::Result<String> {
 
 fn to_rpc_version(version: RpcVersion) -> volo_gen::holo_store::rpc::Version {
     volo_gen::holo_store::rpc::Version {
+        range_generation: version.range_generation,
         seq: version.seq,
         txn_id: Some(volo_gen::holo_store::rpc::TxnId {
             node_id: version.txn_node_id,
@@ -981,6 +984,12 @@ fn from_rpc_version_required(
         .ok_or_else(|| anyhow::anyhow!("missing rpc version txn_id"))?;
 
     Ok(RpcVersion {
+        range_generation: rpc_range_generation_or_default(
+            version.range_generation,
+            version.seq,
+            txn_id.node_id,
+            txn_id.counter,
+        ),
         seq: version.seq,
         txn_node_id: txn_id.node_id,
         txn_counter: txn_id.counter,
@@ -989,6 +998,12 @@ fn from_rpc_version_required(
 
 fn to_kv_version(version: RpcVersion) -> kv::Version {
     kv::Version {
+        range_generation: rpc_range_generation_or_default(
+            version.range_generation,
+            version.seq,
+            version.txn_node_id,
+            version.txn_counter,
+        ),
         seq: version.seq,
         txn_id: TxnId {
             node_id: version.txn_node_id,
@@ -999,15 +1014,37 @@ fn to_kv_version(version: RpcVersion) -> kv::Version {
 
 fn from_kv_version(version: kv::Version) -> RpcVersion {
     RpcVersion {
+        range_generation: version.range_generation,
         seq: version.seq,
         txn_node_id: version.txn_id.node_id,
         txn_counter: version.txn_id.counter,
     }
 }
 
+fn rpc_range_generation_or_default(
+    range_generation: u64,
+    seq: u64,
+    txn_node_id: u64,
+    txn_counter: u64,
+) -> u64 {
+    if range_generation != 0 {
+        return range_generation;
+    }
+    if seq == 0 && txn_node_id == 0 && txn_counter == 0 {
+        0
+    } else {
+        kv::DEFAULT_RANGE_GENERATION
+    }
+}
+
 #[cfg(test)]
 mod lib_client_tests {
     use super::*;
+
+    #[test]
+    fn rpc_version_zero_preserves_kv_zero_sentinel() {
+        assert_eq!(to_kv_version(RpcVersion::zero()), kv::Version::zero());
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn embedded_client_uses_local_backend() -> anyhow::Result<()> {

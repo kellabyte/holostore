@@ -2096,6 +2096,7 @@ impl rpc::HoloRpc for RpcService {
 /// Convert a local version into its RPC representation.
 fn to_rpc_version(version: Version) -> rpc::Version {
     rpc::Version {
+        range_generation: version.range_generation,
         seq: version.seq,
         txn_id: Some(rpc::TxnId {
             node_id: version.txn_id.node_id,
@@ -2111,12 +2112,34 @@ fn from_rpc_version_required(version: Option<rpc::Version>) -> Result<Version, v
         .txn_id
         .ok_or_else(|| volo_grpc::Status::invalid_argument("missing version.txn_id"))?;
     Ok(Version {
+        range_generation: rpc_range_generation_or_default(
+            version.range_generation,
+            version.seq,
+            txn_id.node_id,
+            txn_id.counter,
+        ),
         seq: version.seq,
         txn_id: accord::TxnId {
             node_id: txn_id.node_id,
             counter: txn_id.counter,
         },
     })
+}
+
+fn rpc_range_generation_or_default(
+    range_generation: u64,
+    seq: u64,
+    txn_node_id: u64,
+    txn_counter: u64,
+) -> u64 {
+    if range_generation != 0 {
+        return range_generation;
+    }
+    if seq == 0 && txn_node_id == 0 && txn_counter == 0 {
+        0
+    } else {
+        crate::kv::DEFAULT_RANGE_GENERATION
+    }
 }
 
 /// Parse a 32-byte command digest from the wire format.

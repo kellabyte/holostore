@@ -3844,6 +3844,7 @@ fn to_rpc_version(version: Version) -> rpc::Version {
     rpc::Version {
         seq: version.seq,
         txn_id: Some(to_rpc_txn_id(version.txn_id)),
+        range_generation: version.range_generation,
     }
 }
 
@@ -3857,15 +3858,20 @@ fn to_rpc_ballot(ballot: Ballot) -> rpc::Ballot {
 
 /// Decode an RPC version into a local `Version`, supplying defaults if missing.
 fn from_rpc_version(version: Option<rpc::Version>) -> Version {
-    let version = version.unwrap_or(rpc::Version {
-        seq: 0,
-        txn_id: None,
-    });
+    let Some(version) = version else {
+        return Version::zero();
+    };
     let txn_id = version.txn_id.map(from_rpc_txn_id).unwrap_or(TxnId {
         node_id: 0,
         counter: 0,
     });
     Version {
+        range_generation: rpc_range_generation_or_default(
+            version.range_generation,
+            version.seq,
+            txn_id.node_id,
+            txn_id.counter,
+        ),
         seq: version.seq,
         txn_id,
     }
@@ -3878,9 +3884,31 @@ fn from_rpc_version_required(version: Option<rpc::Version>) -> anyhow::Result<Ve
         .txn_id
         .ok_or_else(|| anyhow::anyhow!("missing version.txn_id"))?;
     Ok(Version {
+        range_generation: rpc_range_generation_or_default(
+            version.range_generation,
+            version.seq,
+            txn_id.node_id,
+            txn_id.counter,
+        ),
         seq: version.seq,
         txn_id: from_rpc_txn_id(txn_id),
     })
+}
+
+fn rpc_range_generation_or_default(
+    range_generation: u64,
+    seq: u64,
+    txn_node_id: u64,
+    txn_counter: u64,
+) -> u64 {
+    if range_generation != 0 {
+        return range_generation;
+    }
+    if seq == 0 && txn_node_id == 0 && txn_counter == 0 {
+        0
+    } else {
+        crate::kv::DEFAULT_RANGE_GENERATION
+    }
 }
 
 /// Convert an RPC txn id into a local representation.
@@ -4911,6 +4939,7 @@ mod tests {
                             has_value: true,
                             value: req.key,
                             version: Some(rpc::Version {
+                                range_generation: crate::kv::DEFAULT_RANGE_GENERATION,
                                 seq: 1,
                                 txn_id: Some(rpc::TxnId {
                                     node_id: 7,
@@ -5022,6 +5051,7 @@ mod tests {
                     has_value: true,
                     value: Bytes::from_static(b"v0"),
                     version: Some(rpc::Version {
+                        range_generation: crate::kv::DEFAULT_RANGE_GENERATION,
                         seq: 1,
                         txn_id: Some(rpc::TxnId {
                             node_id: 1,

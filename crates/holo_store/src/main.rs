@@ -2289,6 +2289,8 @@ struct BatchSetWork {
     enqueued_at: Instant,
 }
 
+type VersionedSetItem = (Vec<u8>, Vec<u8>, u64);
+
 /// One batched SET response payload.
 type BatchSetReply = anyhow::Result<()>;
 
@@ -3724,7 +3726,7 @@ impl NodeState {
         &self,
         shard_index: usize,
         handle: accord::Handle,
-        chunks: Vec<Vec<(Vec<u8>, Vec<u8>)>>,
+        chunks: Vec<Vec<VersionedSetItem>>,
         pipeline_depth: usize,
     ) -> anyhow::Result<()> {
         if chunks.is_empty() {
@@ -3746,7 +3748,7 @@ impl NodeState {
             let shard_index_local = shard_index;
             inflight.push(Box::pin(async move {
                 let started = Instant::now();
-                let cmd = kv::encode_batch_set(chunk.as_slice());
+                let cmd = kv::encode_batch_set_with_generations(chunk.as_slice());
                 let res = state
                     .propose_timed_on(handle, ProposalKind::BatchSet, cmd)
                     .await;
@@ -3770,7 +3772,7 @@ impl NodeState {
                 let shard_index_local = shard_index;
                 inflight.push(Box::pin(async move {
                     let started = Instant::now();
-                    let cmd = kv::encode_batch_set(chunk.as_slice());
+                    let cmd = kv::encode_batch_set_with_generations(chunk.as_slice());
                     let res = state
                         .propose_timed_on(handle, ProposalKind::BatchSet, cmd)
                         .await;
@@ -3818,7 +3820,7 @@ impl NodeState {
         self.wait_until_keys_available(&keys, KeyFenceWaitMode::Write)
             .await;
         let _inflight_guard = self.enter_client_op();
-        let mut by_shard: Vec<Vec<(Vec<u8>, Vec<u8>)>> = vec![Vec::new(); self.data_shards];
+        let mut by_shard: Vec<Vec<VersionedSetItem>> = vec![Vec::new(); self.data_shards];
         let mut logical_deltas = BTreeMap::<u64, crate::load::LogicalWriteDelta>::new();
         {
             // Take split lock and range snapshot once for the whole routing pass.
@@ -3830,15 +3832,28 @@ impl NodeState {
             };
             let ranges = range_snapshot.as_deref();
             for (key, value) in items {
-                let shard = self.shard_for_key_with_snapshot(&key, ranges);
-                if let Some(ranges) = ranges {
-                    let shard_id = shard_id_for_key_in_ranges(&key, ranges);
+                let (shard, range_generation, logical_shard_id) = if let Some(ranges) = ranges {
+                    let desc = shard_desc_for_key_in_ranges(&key, ranges);
+                    let shard = desc.map(|s| s.shard_index).unwrap_or(0);
+                    let generation = desc
+                        .map(|s| s.generation)
+                        .unwrap_or(kv::DEFAULT_RANGE_GENERATION);
+                    let shard_id = desc.map(|s| s.shard_id).unwrap_or(0);
+                    (shard, generation, Some(shard_id))
+                } else {
+                    (
+                        self.shard_for_key_with_snapshot(&key, ranges),
+                        kv::DEFAULT_RANGE_GENERATION,
+                        None,
+                    )
+                };
+                if let Some(shard_id) = logical_shard_id {
                     logical_deltas
                         .entry(shard_id)
                         .or_default()
                         .record(&key, value.len());
                 }
-                by_shard[shard].push((key, value));
+                by_shard[shard].push((key, value, range_generation));
             }
         }
         for (shard_id, delta) in logical_deltas {
@@ -3857,7 +3872,7 @@ impl NodeState {
             // Track client-visible write load per shard (best-effort).
             self.shard_load.record_set_ops(shard, batch.len() as u64);
             let mut write_bytes = 0u64;
-            for (key, value) in &batch {
+            for (key, value, _) in &batch {
                 self.shard_load.record_write_key_sample(shard, key);
                 write_bytes = write_bytes.saturating_add((key.len() + value.len()) as u64);
             }
@@ -4445,62 +4460,41 @@ impl NodeState {
 
 /// Resolve a key to a shard index using an in-memory range snapshot.
 fn shard_index_for_key_in_ranges(key: &[u8], shards: &[ShardDesc]) -> usize {
+    shard_desc_for_key_in_ranges(key, shards)
+        .map(|shard| shard.shard_index)
+        .unwrap_or(0)
+}
+
+/// Resolve a key to a shard descriptor using an in-memory range snapshot.
+fn shard_desc_for_key_in_ranges<'a>(key: &[u8], shards: &'a [ShardDesc]) -> Option<&'a ShardDesc> {
     if shards.is_empty() {
-        return 0;
+        return None;
     }
     if shards.len() == 1 {
-        return shards[0].shard_index;
+        return shards.first();
     }
     let has_key_ranges = shards
         .iter()
         .any(|s| !s.start_key.is_empty() || !s.end_key.is_empty());
     if has_key_ranges {
-        for shard in shards {
+        return shards.iter().find(|shard| {
             let in_start = shard.start_key.is_empty() || key >= shard.start_key.as_slice();
             let in_end = shard.end_key.is_empty() || key < shard.end_key.as_slice();
-            if in_start && in_end {
-                return shard.shard_index;
-            }
-        }
-        return 0;
+            in_start && in_end
+        });
     }
     let hash = kv::hash_key(key);
-    for shard in shards {
-        if hash >= shard.start_hash && hash <= shard.end_hash {
-            return shard.shard_index;
-        }
-    }
-    0
+    shards
+        .iter()
+        .find(|shard| hash >= shard.start_hash && hash <= shard.end_hash)
+        .or_else(|| shards.first())
 }
 
 /// Resolve a key to a shard id using an in-memory range snapshot.
 fn shard_id_for_key_in_ranges(key: &[u8], shards: &[ShardDesc]) -> u64 {
-    if shards.is_empty() {
-        return 0;
-    }
-    if shards.len() == 1 {
-        return shards[0].shard_id;
-    }
-    let has_key_ranges = shards
-        .iter()
-        .any(|s| !s.start_key.is_empty() || !s.end_key.is_empty());
-    if has_key_ranges {
-        for shard in shards {
-            let in_start = shard.start_key.is_empty() || key >= shard.start_key.as_slice();
-            let in_end = shard.end_key.is_empty() || key < shard.end_key.as_slice();
-            if in_start && in_end {
-                return shard.shard_id;
-            }
-        }
-        return shards[0].shard_id;
-    }
-    let hash = kv::hash_key(key);
-    for shard in shards {
-        if hash >= shard.start_hash && hash <= shard.end_hash {
-            return shard.shard_id;
-        }
-    }
-    shards[0].shard_id
+    shard_desc_for_key_in_ranges(key, shards)
+        .map(|shard| shard.shard_id)
+        .unwrap_or(0)
 }
 
 /// Resolve voting members for a shard from staged replica-role metadata.
@@ -4794,17 +4788,17 @@ async fn collect_set_batch(
 }
 
 fn chunk_batch_set_items_by_limits(
-    batch: Vec<(Vec<u8>, Vec<u8>)>,
+    batch: Vec<VersionedSetItem>,
     max_ops_per_proposal: usize,
     max_bytes_per_proposal: usize,
-) -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
+) -> Vec<Vec<VersionedSetItem>> {
     let target = max_ops_per_proposal.max(1);
     let byte_cap = max_bytes_per_proposal.max(1);
     let mut chunks = Vec::new();
     let mut current = Vec::with_capacity(target);
     let mut current_bytes = 0usize;
 
-    for (key, value) in batch {
+    for (key, value, range_generation) in batch {
         let item_bytes = key.len().saturating_add(value.len());
         let exceeds_ops = current.len() >= target;
         let exceeds_bytes =
@@ -4815,7 +4809,7 @@ fn chunk_batch_set_items_by_limits(
             current.reserve(target);
         }
         current_bytes = current_bytes.saturating_add(item_bytes);
-        current.push((key, value));
+        current.push((key, value, range_generation));
     }
 
     if !current.is_empty() {
@@ -7892,6 +7886,20 @@ mod tests {
         TxnId { node_id, counter }
     }
 
+    /// Build a test storage version whose transaction id encodes an Accord
+    /// group id.
+    fn version_for_group(group_id: u64, seq: u64, counter_seq: u64) -> kv::Version {
+        kv::Version {
+            range_generation: group_id,
+            seq,
+            txn_id: TxnId {
+                node_id: 1,
+                counter: accord::make_txn_counter(group_id, 1, counter_seq)
+                    .expect("test txn counter"),
+            },
+        }
+    }
+
     /// Enumerate fixed-size subsets for small quorum model tests.
     ///
     /// Purpose:
@@ -8058,6 +8066,7 @@ mod tests {
     fn sample_shard() -> ShardDesc {
         ShardDesc {
             shard_id: 10,
+            generation: cluster::default_range_generation(),
             shard_index: 2,
             storage_index: Some(2),
             fallback_storage_index: None,
@@ -8206,6 +8215,19 @@ mod tests {
         ];
         let pending = read_barrier_pending_wait_targets(&wait_targets, &executed);
         assert_eq!(pending, vec![txn(2, 9)]);
+    }
+
+    #[test]
+    fn pick_latest_prefers_child_owner_over_late_parent_owner() {
+        let child_version = version_for_group(2, 1, 1);
+        let parent_version = version_for_group(1, 999, 999);
+
+        let latest = pick_latest(vec![
+            Some((b"child-new".to_vec(), child_version)),
+            Some((b"parent-old".to_vec(), parent_version)),
+        ]);
+
+        assert_eq!(latest, Some(b"child-new".to_vec()));
     }
 
     /// Verify progress-aware SET batch collection drains ready queue work up to
@@ -8716,7 +8738,13 @@ mod tests {
     #[test]
     fn chunk_batch_set_items_respects_op_limit() {
         let items = (0..5)
-            .map(|idx| (format!("k{idx}").into_bytes(), vec![idx as u8]))
+            .map(|idx| {
+                (
+                    format!("k{idx}").into_bytes(),
+                    vec![idx as u8],
+                    kv::DEFAULT_RANGE_GENERATION,
+                )
+            })
             .collect::<Vec<_>>();
         let chunks = chunk_batch_set_items_by_limits(items, 2, usize::MAX);
         let sizes = chunks.iter().map(Vec::len).collect::<Vec<_>>();
@@ -8726,9 +8754,9 @@ mod tests {
     #[test]
     fn chunk_batch_set_items_respects_byte_limit() {
         let items = vec![
-            (b"k1".to_vec(), vec![0; 7]), // 9 bytes
-            (b"k2".to_vec(), vec![1; 7]), // 9 bytes (would exceed 16 if grouped)
-            (b"k3".to_vec(), vec![2; 2]), // 4 bytes (fits with k2)
+            (b"k1".to_vec(), vec![0; 7], kv::DEFAULT_RANGE_GENERATION), // 9 bytes
+            (b"k2".to_vec(), vec![1; 7], kv::DEFAULT_RANGE_GENERATION), // 9 bytes (would exceed 16 if grouped)
+            (b"k3".to_vec(), vec![2; 2], kv::DEFAULT_RANGE_GENERATION), // 4 bytes (fits with k2)
         ];
         let chunks = chunk_batch_set_items_by_limits(items, 100, 16);
         let sizes = chunks.iter().map(Vec::len).collect::<Vec<_>>();
@@ -8738,8 +8766,8 @@ mod tests {
     #[test]
     fn chunk_batch_set_items_keeps_oversize_item_in_single_chunk() {
         let items = vec![
-            (b"k1".to_vec(), vec![0; 20]), // 22 bytes, larger than cap
-            (b"k2".to_vec(), vec![1; 2]),
+            (b"k1".to_vec(), vec![0; 20], kv::DEFAULT_RANGE_GENERATION), // 22 bytes, larger than cap
+            (b"k2".to_vec(), vec![1; 2], kv::DEFAULT_RANGE_GENERATION),
         ];
         let chunks = chunk_batch_set_items_by_limits(items, 100, 16);
         let sizes = chunks.iter().map(Vec::len).collect::<Vec<_>>();

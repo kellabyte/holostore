@@ -70,6 +70,27 @@ Current behavior:
 - Fjall can be configured to fsync periodically (`HOLO_FJALL_FSYNC_MS`), or disabled.
 - On restart, WAL replay repopulates fjall state.
 
+## Range Generations
+
+HoloStore's KV version is ordered as `(range_generation, seq, txn_id)`.
+`seq` is still the Accord execution sequence, but it is only meaningful inside
+the range/Accord group that produced it. `range_generation` is a durable
+range-ownership epoch that disambiguates writes across split and merge
+cutovers.
+
+Generations are not incremented on ordinary writes. They advance when range
+metadata creates a new ownership epoch:
+- A split assigns the child range a generation greater than all current ranges.
+- A merge assigns the merged range a generation greater than both inputs and
+  greater than the current maximum.
+- Existing/legacy data decodes as generation `1`; the zero version sentinel
+  remains generation `0`.
+
+This prevents an old parent range or retired group from replaying/applying a
+late command with a high group-local `seq` and overwriting a newer child-range
+value. The WAL command bytes carry the generation chosen at routing time so the
+same ordering is reconstructed during restart replay.
+
 ## Recovery
 
 Recovery uses three sources of truth:
