@@ -24,6 +24,8 @@ In this repository we implement:
 - A per partition Accord group with batched consensus RPCs.
 - A commit log (WAL) that persists committed entries and replays on restart.
 - An execution loop that applies committed commands to a state machine.
+- Range generation IDs that keep split/merge ownership changes safe during
+  apply and WAL replay.
 - A Redis protocol surface for easy benchmarking.
 
 **Documentation**

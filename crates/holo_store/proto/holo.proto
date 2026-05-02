@@ -64,6 +64,7 @@ message Ballot {
 message Version {
   uint64 seq = 1;
   TxnId txn_id = 2;
+  uint64 range_generation = 3;
 }
 
 message KvGetRequest {

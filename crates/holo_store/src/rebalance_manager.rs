@@ -1352,6 +1352,7 @@ mod tests {
     fn shard(shard_id: u64, replicas: Vec<NodeId>, leaseholder: NodeId) -> ShardDesc {
         ShardDesc {
             shard_id,
+            generation: crate::cluster::default_range_generation(),
             shard_index: (shard_id - 1) as usize,
             storage_index: Some((shard_id - 1) as usize),
             fallback_storage_index: None,

@@ -155,6 +155,14 @@ membership and Cockroach-style control-plane metadata.
   - `HOLO_RANGE_SPLIT_COOLDOWN_MS` (per-shard cooldown)
   You can also use manual pre-splits (Cockroach-style) to avoid initial hotspots.
 
+- Each range descriptor carries a durable `generation`. It is part of the KV
+  version ordering and advances only on ownership-epoch changes, not on every
+  write. Splitting gives the child range a generation greater than the current
+  maximum. Merging gives the merged descriptor a generation greater than both
+  merged inputs and the current maximum. This keeps late replay/apply from a
+  retired parent range from superseding values written by the new owner after
+  cutover.
+
 ## Admin Demo
 
 Run a cluster (for example with `scripts/start_cluster.sh`), then exercise

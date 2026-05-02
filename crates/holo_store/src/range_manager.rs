@@ -3108,6 +3108,7 @@ mod tests {
     ) -> ShardDesc {
         ShardDesc {
             shard_id,
+            generation: crate::cluster::default_range_generation(),
             shard_index,
             storage_index: Some(shard_index),
             fallback_storage_index: None,
@@ -3220,6 +3221,7 @@ mod tests {
 
         let shard = ShardDesc {
             shard_id: 1,
+            generation: crate::cluster::default_range_generation(),
             shard_index: 0,
             storage_index: Some(0),
             fallback_storage_index: None,
@@ -3370,6 +3372,7 @@ mod tests {
     fn observed_bounds_choose_split_without_storage_scan() {
         let shard = ShardDesc {
             shard_id: 1,
+            generation: crate::cluster::default_range_generation(),
             shard_index: 0,
             storage_index: Some(0),
             fallback_storage_index: None,
@@ -3397,6 +3400,7 @@ mod tests {
     fn sampled_keys_choose_balanced_split_without_storage_scan() {
         let shard = ShardDesc {
             shard_id: 1,
+            generation: crate::cluster::default_range_generation(),
             shard_index: 0,
             storage_index: Some(0),
             fallback_storage_index: None,

@@ -41,6 +41,22 @@ HoloStore uses **Fjall** (an LSM‑tree KV engine) as the backing store.
 We open a Fjall keyspace and use partitions for versions and latest values
 (`crates/holo_store/src/kv.rs`).
 
+KV versions include a range generation:
+
+```
+Version = (range_generation, seq, txn_id)
+```
+
+The generation is a range-ownership epoch, not a per-write counter. Normal
+writes reuse the generation from the routed range descriptor. Split and merge
+metadata create a new generation so writes from an old owner cannot outrank a
+new owner just because the old Accord group has a larger local sequence number.
+
+The versions partition, latest index, in-memory version-list encoding, and
+batch SET command encoding all persist the generation. Legacy rows/commands
+without a generation decode as generation `1`, while `Version::zero()` remains
+generation `0` for sentinel/conditional behavior.
+
 Fjall durability settings:
 - `manual_journal_persist` can be enabled to decouple persistence from every write.
 - `fsync_ms` can be used to control periodic fsync.
@@ -63,7 +79,7 @@ This means:
 
 On restart:
 1. WAL is replayed to recover committed commands.
-2. Commands are re‑applied to Fjall.
+2. Commands are re‑applied to Fjall with their persisted range generation.
 3. Any missing command bytes can be fetched from peers during recovery.
 
 The system also maintains an in‑memory executed log for lagging replicas. GC

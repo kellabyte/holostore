@@ -64,6 +64,13 @@ GET/SET workload, but changes routing or failure injection to stress different c
   and migrate keys between shards during the run.
 - **Expected result:** linearizability should hold across splits (no lost or duplicated committed writes).
 
+Targeted unit coverage also protects the split/replay ordering hazard directly:
+`latest_rejects_late_parent_group_write_after_child_owner_write` reproduces a
+late parent-range write arriving after the child range has written a newer
+value, and `state_machine_replay_uses_command_range_generation_for_latest_ordering`
+checks that WAL replay preserves the range generation needed for the child
+value to win.
+
 ### Range autosplit stress (non-gating)
 
 - **Operations:** same mixed GET/SET workload as autosplit.

@@ -35,6 +35,11 @@ pub struct MemberInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardDesc {
     pub shard_id: u64,
+    /// Durable range-ownership generation used in KV version ordering.
+    ///
+    /// This increments on split/merge/cutover, not on ordinary writes.
+    #[serde(default = "default_range_generation")]
+    pub generation: u64,
     /// Consensus group slot used to order this range's commands.
     pub shard_index: usize,
     /// Local KV partition slot that stores this range's bytes.
@@ -53,6 +58,10 @@ pub struct ShardDesc {
     pub end_key: Vec<u8>,
     pub replicas: Vec<NodeId>,
     pub leaseholder: NodeId,
+}
+
+pub fn default_range_generation() -> u64 {
+    crate::kv::DEFAULT_RANGE_GENERATION
 }
 
 impl ShardDesc {
@@ -604,6 +613,7 @@ impl ClusterStateStore {
                 };
                 state.shards.push(ShardDesc {
                     shard_id: (idx as u64) + 1,
+                    generation: default_range_generation(),
                     shard_index: idx,
                     storage_index: Some(idx),
                     fallback_storage_index: None,
@@ -827,6 +837,32 @@ impl ClusterStateStore {
             .iter()
             .find(|shard| hash >= shard.start_hash && hash <= shard.end_hash)
             .and_then(ShardDesc::fallback_storage_index)
+    }
+
+    pub fn range_generation_for_key(&self, key: &[u8]) -> u64 {
+        let state = self.state.read().unwrap();
+        if state.shards.len() == 1 {
+            return state.shards[0].generation;
+        }
+        let has_key_ranges = state
+            .shards
+            .iter()
+            .any(|s| !s.start_key.is_empty() || !s.end_key.is_empty());
+        if has_key_ranges {
+            for shard in &state.shards {
+                if key_in_range(key, &shard.start_key, &shard.end_key) {
+                    return shard.generation;
+                }
+            }
+            return default_range_generation();
+        }
+        let hash = hash_key(key);
+        state
+            .shards
+            .iter()
+            .find(|shard| hash >= shard.start_hash && hash <= shard.end_hash)
+            .map(|shard| shard.generation)
+            .unwrap_or_else(default_range_generation)
     }
 
     pub fn storage_index_for_shard_index(&self, shard_index: usize) -> usize {
@@ -1383,8 +1419,10 @@ impl ClusterStateStore {
             }
 
             let right_id = next_shard_id(&state.shards);
+            let right_generation = next_range_generation(&state.shards);
             let right = ShardDesc {
                 shard_id: right_id,
+                generation: right_generation,
                 shard_index: right_shard_index,
                 storage_index: Some(right_storage_index),
                 fallback_storage_index: right_fallback_storage_index,
@@ -1500,7 +1538,14 @@ impl ClusterStateStore {
         }
 
         let right = state.shards.remove(idx + 1);
+        let merged_generation = next_range_generation(&state.shards).max(
+            left_snapshot
+                .generation
+                .max(right_snapshot.generation)
+                .saturating_add(1),
+        );
         let left = &mut state.shards[idx];
+        left.generation = merged_generation;
         left.end_key = right.end_key.clone();
         state.shard_replica_roles.remove(&right.shard_id);
         state.shard_rebalances.remove(&right.shard_id);
@@ -2845,6 +2890,7 @@ mod tests {
             members,
             shards: vec![ShardDesc {
                 shard_id: 10,
+                generation: default_range_generation(),
                 shard_index: 0,
                 storage_index: Some(0),
                 fallback_storage_index: None,
@@ -2904,6 +2950,7 @@ mod tests {
         state.shards = vec![
             ShardDesc {
                 shard_id: 10,
+                generation: default_range_generation(),
                 shard_index: 0,
                 storage_index: Some(0),
                 fallback_storage_index: None,
@@ -2916,6 +2963,7 @@ mod tests {
             },
             ShardDesc {
                 shard_id: 11,
+                generation: default_range_generation() + 1,
                 shard_index: 1,
                 storage_index: Some(1),
                 fallback_storage_index: None,
@@ -3721,6 +3769,15 @@ impl ShardRouter for ClusterStateStore {
 
 fn next_shard_id(shards: &[ShardDesc]) -> u64 {
     shards.iter().map(|s| s.shard_id).max().unwrap_or(0) + 1
+}
+
+fn next_range_generation(shards: &[ShardDesc]) -> u64 {
+    shards
+        .iter()
+        .map(|s| s.generation)
+        .max()
+        .unwrap_or_else(default_range_generation)
+        .saturating_add(1)
 }
 
 // Note: metadata-only splits allocate a fresh consensus `shard_index` while
