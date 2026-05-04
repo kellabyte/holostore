@@ -50,6 +50,9 @@ const VERSION_LIST_V2_MARKER: u8 = 0xFF;
 pub trait KvEngine: Send + Sync + 'static {
     /// Read the newest visible value for `key` that is <= `version`.
     fn get(&self, key: &[u8], version: Version) -> Option<Vec<u8>>;
+    /// Read the newest visible value for `key` that is <= `version`, returning
+    /// the stored version as well as the value.
+    fn get_versioned(&self, key: &[u8], version: Version) -> Option<(Vec<u8>, Version)>;
     /// Read the latest visible value for `key` along with its version.
     fn get_latest(&self, key: &[u8]) -> Option<(Vec<u8>, Version)>;
     /// Batch variant of `get_latest` that preserves input ordering.
@@ -113,6 +116,10 @@ pub trait KvEngine: Send + Sync + 'static {
 pub trait ShardRouter: Send + Sync + 'static {
     fn shard_for_key(&self, key: &[u8]) -> usize;
 
+    fn may_have_fallback_shards(&self) -> bool {
+        true
+    }
+
     fn fallback_shard_for_key(&self, _key: &[u8]) -> Option<usize> {
         None
     }
@@ -137,9 +144,14 @@ impl KvStore {
 impl KvEngine for KvStore {
     /// Return the latest visible version <= `version` if present.
     fn get(&self, key: &[u8], version: Version) -> Option<Vec<u8>> {
+        self.get_versioned(key, version).map(|(value, _)| value)
+    }
+
+    /// Return the latest visible version <= `version` if present.
+    fn get_versioned(&self, key: &[u8], version: Version) -> Option<(Vec<u8>, Version)> {
         let guard = self.inner.read().ok()?;
         let versions = guard.get(key)?;
-        find_visible_version(versions, version).map(|v| v.value.clone())
+        find_visible_version(versions, version).map(|v| (v.value.clone(), v.version))
     }
 
     /// Return the most recently visible version for `key`.
@@ -1044,12 +1056,18 @@ impl KvEngine for FjallEngine {
     /// Read the latest visible value <= `version` by consulting the latest index
     /// first and falling back to a reverse scan of the versioned partition.
     fn get(&self, key: &[u8], version: Version) -> Option<Vec<u8>> {
+        self.get_versioned(key, version).map(|(value, _)| value)
+    }
+
+    /// Read the latest visible value <= `version` by consulting the latest index
+    /// first and falling back to a reverse scan of the versioned partition.
+    fn get_versioned(&self, key: &[u8], version: Version) -> Option<(Vec<u8>, Version)> {
         let _guard = self.lock.read().ok()?;
         if let Ok(Some(bytes)) = self.latest.get(key) {
             if let Ok((latest_version, latest_value)) = decode_latest_value(&bytes) {
                 // Fast path: latest value is already visible for this version.
                 if latest_version <= version {
-                    return Some(latest_value);
+                    return Some((latest_value, latest_version));
                 }
             }
         }
@@ -1065,7 +1083,7 @@ impl KvEngine for FjallEngine {
             }
             if let Ok((visible, value)) = decode_version_value(&entry_value) {
                 if visible {
-                    return Some(value);
+                    return Some((value, entry_version));
                 }
             }
         }
@@ -1413,6 +1431,39 @@ impl KvEngine for FjallEngine {
     }
 }
 
+/// Choose the newest value from two optional versioned read results.
+///
+/// Purpose:
+/// - Merge primary and fallback storage reads during deferred range
+///   materialization.
+///
+/// Design:
+/// - `Version` ordering is the correctness contract: newer range generations
+///   beat old-owner sequence numbers, and same-generation sequence ordering
+///   still handles delayed old-owner replays.
+///
+/// Inputs:
+/// - Primary and fallback latest values for the same key.
+///
+/// Outputs:
+/// - The latest visible value/version pair, or `None` if both are missing.
+fn latest_versioned_pair(
+    left: Option<(Vec<u8>, Version)>,
+    right: Option<(Vec<u8>, Version)>,
+) -> Option<(Vec<u8>, Version)> {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            if right.1 > left.1 {
+                Some(right)
+            } else {
+                Some(left)
+            }
+        }
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
 /// Sharded wrapper that routes keys to per-shard `KvEngine` instances.
 pub struct RoutedKvEngine {
     shards: Vec<Arc<dyn KvEngine>>,
@@ -1446,19 +1497,35 @@ impl RoutedKvEngine {
 
 impl KvEngine for RoutedKvEngine {
     fn get(&self, key: &[u8], version: Version) -> Option<Vec<u8>> {
+        self.get_versioned(key, version).map(|(value, _)| value)
+    }
+
+    fn get_versioned(&self, key: &[u8], version: Version) -> Option<(Vec<u8>, Version)> {
         let shard = self.shard_for_key(key);
-        self.shards[shard].get(key, version).or_else(|| {
-            self.fallback_shard_for_key(key, shard)
-                .and_then(|fallback| self.shards[fallback].get(key, version))
-        })
+        let primary = self.shards[shard].get_versioned(key, version);
+        let fallback = self
+            .router
+            .may_have_fallback_shards()
+            .then(|| {
+                self.fallback_shard_for_key(key, shard)
+                    .and_then(|fallback| self.shards[fallback].get_versioned(key, version))
+            })
+            .flatten();
+        latest_versioned_pair(primary, fallback)
     }
 
     fn get_latest(&self, key: &[u8]) -> Option<(Vec<u8>, Version)> {
         let shard = self.shard_for_key(key);
-        self.shards[shard].get_latest(key).or_else(|| {
-            self.fallback_shard_for_key(key, shard)
-                .and_then(|fallback| self.shards[fallback].get_latest(key))
-        })
+        let primary = self.shards[shard].get_latest(key);
+        let fallback = self
+            .router
+            .may_have_fallback_shards()
+            .then(|| {
+                self.fallback_shard_for_key(key, shard)
+                    .and_then(|fallback| self.shards[fallback].get_latest(key))
+            })
+            .flatten();
+        latest_versioned_pair(primary, fallback)
     }
 
     fn get_latest_batch(&self, keys: &[&[u8]]) -> Vec<Option<(Vec<u8>, Version)>> {
@@ -1486,12 +1553,12 @@ impl KvEngine for RoutedKvEngine {
                 results[idx] = value;
             }
         }
+        if !self.router.may_have_fallback_shards() {
+            return results;
+        }
 
         let mut fallback_by_shard: Vec<Vec<usize>> = vec![Vec::new(); self.shards.len()];
         for (idx, key) in keys.iter().enumerate() {
-            if results[idx].is_some() {
-                continue;
-            }
             if let Some(fallback) = self.fallback_shard_for_key(key, primary_shards[idx]) {
                 fallback_by_shard[fallback].push(idx);
             }
@@ -1506,9 +1573,7 @@ impl KvEngine for RoutedKvEngine {
             }
             let shard_values = self.shards[shard].get_latest_batch(&shard_keys);
             for (idx, value) in indices.into_iter().zip(shard_values.into_iter()) {
-                if results[idx].is_none() {
-                    results[idx] = value;
-                }
+                results[idx] = latest_versioned_pair(results[idx].take(), value);
             }
         }
         results
@@ -1516,7 +1581,13 @@ impl KvEngine for RoutedKvEngine {
 
     fn set(&self, key: &[u8], value: &[u8], version: Version) -> anyhow::Result<()> {
         let shard = self.shard_for_key(key);
-        self.shards[shard].set(key, value, version)
+        self.shards[shard].set(key, value, version)?;
+        if self.router.may_have_fallback_shards() {
+            if let Some(fallback) = self.fallback_shard_for_key(key, shard) {
+                self.shards[fallback].set(key, value, version)?;
+            }
+        }
+        Ok(())
     }
 
     fn set_batch(&self, items: &[(&[u8], &[u8], Version)]) -> anyhow::Result<()> {
@@ -1529,6 +1600,27 @@ impl KvEngine for RoutedKvEngine {
             by_shard[shard].push(idx);
         }
         for (shard, indices) in by_shard.into_iter().enumerate() {
+            if indices.is_empty() {
+                continue;
+            }
+            let mut batch = Vec::with_capacity(indices.len());
+            for idx in indices {
+                let (key, value, version) = items[idx];
+                batch.push((key, value, version));
+            }
+            self.shards[shard].set_batch(&batch)?;
+        }
+        if !self.router.may_have_fallback_shards() {
+            return Ok(());
+        }
+        let mut fallback_by_shard: Vec<Vec<usize>> = vec![Vec::new(); self.shards.len()];
+        for (idx, (key, _, _)) in items.iter().enumerate() {
+            let shard = self.shard_for_key(key);
+            if let Some(fallback) = self.fallback_shard_for_key(key, shard) {
+                fallback_by_shard[fallback].push(idx);
+            }
+        }
+        for (shard, indices) in fallback_by_shard.into_iter().enumerate() {
             if indices.is_empty() {
                 continue;
             }
@@ -1568,19 +1660,39 @@ impl KvEngine for RoutedKvEngine {
             }
             inserted = inserted.saturating_add(self.shards[shard].apply_committed_batch(&batch)?);
         }
+        if !self.router.may_have_fallback_shards() {
+            return Ok(inserted);
+        }
+        let mut fallback_by_shard: Vec<Vec<usize>> = vec![Vec::new(); self.shards.len()];
+        for (idx, (key, _, _)) in items.iter().enumerate() {
+            let shard = self.shard_for_key(key);
+            if let Some(fallback) = self.fallback_shard_for_key(key, shard) {
+                fallback_by_shard[fallback].push(idx);
+            }
+        }
+        for (shard, indices) in fallback_by_shard.into_iter().enumerate() {
+            if indices.is_empty() {
+                continue;
+            }
+            let mut batch = Vec::with_capacity(indices.len());
+            for idx in indices {
+                let (key, value, version) = items[idx];
+                batch.push((key, value, version));
+            }
+            let _ = self.shards[shard].apply_committed_batch(&batch)?;
+        }
         Ok(inserted)
     }
 
     fn mark_visible(&self, key: &[u8], version: Version) -> anyhow::Result<bool> {
         let shard = self.shard_for_key(key);
         let inserted = self.shards[shard].mark_visible(key, version)?;
-        if inserted {
-            return Ok(true);
+        if self.router.may_have_fallback_shards() {
+            if let Some(fallback) = self.fallback_shard_for_key(key, shard) {
+                let _ = self.shards[fallback].mark_visible(key, version)?;
+            }
         }
-        if let Some(fallback) = self.fallback_shard_for_key(key, shard) {
-            return self.shards[fallback].mark_visible(key, version);
-        }
-        Ok(false)
+        Ok(inserted)
     }
 
     /// Batch visibility updates across routed shards.
@@ -1614,7 +1726,12 @@ impl KvEngine for RoutedKvEngine {
         }
 
         let mut inserted = 0u64;
-        let mut fallback_by_shard: Vec<Vec<usize>> = vec![Vec::new(); self.shards.len()];
+        let use_fallbacks = self.router.may_have_fallback_shards();
+        let mut fallback_by_shard: Vec<Vec<usize>> = if use_fallbacks {
+            vec![Vec::new(); self.shards.len()]
+        } else {
+            Vec::new()
+        };
         for (shard, indices) in by_shard.into_iter().enumerate() {
             if indices.is_empty() {
                 continue;
@@ -1625,11 +1742,16 @@ impl KvEngine for RoutedKvEngine {
             }
             inserted = inserted
                 .saturating_add(self.shards[shard].mark_visible_batch(&shard_keys, version)?);
-            for idx in indices {
-                if let Some(fallback) = self.fallback_shard_for_key(keys[idx], shard) {
-                    fallback_by_shard[fallback].push(idx);
+            if use_fallbacks {
+                for idx in indices {
+                    if let Some(fallback) = self.fallback_shard_for_key(keys[idx], shard) {
+                        fallback_by_shard[fallback].push(idx);
+                    }
                 }
             }
+        }
+        if !use_fallbacks {
+            return Ok(inserted);
         }
 
         for (shard, indices) in fallback_by_shard.into_iter().enumerate() {
@@ -1640,8 +1762,7 @@ impl KvEngine for RoutedKvEngine {
             for idx in indices {
                 shard_keys.push(keys[idx]);
             }
-            inserted = inserted
-                .saturating_add(self.shards[shard].mark_visible_batch(&shard_keys, version)?);
+            let _ = self.shards[shard].mark_visible_batch(&shard_keys, version)?;
         }
         Ok(inserted)
     }
@@ -1672,8 +1793,13 @@ impl ShardedKvEngine {
 impl KvEngine for ShardedKvEngine {
     /// Delegate a versioned read to the chosen shard.
     fn get(&self, key: &[u8], version: Version) -> Option<Vec<u8>> {
+        self.get_versioned(key, version).map(|(value, _)| value)
+    }
+
+    /// Delegate a versioned read to the chosen shard.
+    fn get_versioned(&self, key: &[u8], version: Version) -> Option<(Vec<u8>, Version)> {
         let shard = self.shard_for_key(key);
-        self.shards[shard].get(key, version)
+        self.shards[shard].get_versioned(key, version)
     }
 
     /// Delegate a latest read to the chosen shard.
@@ -2199,8 +2325,16 @@ impl StateMachine for KvStateMachine {
                 return Err(err).context("failed to decode membership reconfiguration command")
             }
         }
-        let inserted_latest = apply_kv_command(self.kv.as_ref(), data, meta.into())?;
-        self.emit_visibility_delta(inserted_latest);
+        let version = Version::from(meta);
+        let writes = decode_write_items(data, version)?;
+        if !writes.is_empty() {
+            let sets = writes
+                .iter()
+                .map(|item| (item.key, item.value, item.version))
+                .collect::<Vec<_>>();
+            let inserted_latest = self.kv.apply_committed_batch(&sets)?;
+            self.emit_visibility_delta(inserted_latest);
+        }
         Ok(())
     }
 
@@ -2230,26 +2364,23 @@ impl StateMachine for KvStateMachine {
     fn read(&self, data: &[u8], meta: ExecMeta) -> anyhow::Result<Option<Vec<u8>>> {
         let _guard = self.split_lock.as_ref().map(|l| l.read().unwrap());
         anyhow::ensure!(!data.is_empty(), "empty command");
-        let _version = Version::from(meta);
+        let base_version = Version::from(meta);
         match data[0] {
-            CMD_BATCH_GET => {
-                let mut offset = 1;
-                let count = read_u32(data, &mut offset)? as usize;
-                let mut keys: Vec<&[u8]> = Vec::with_capacity(count);
-                for _ in 0..count {
-                    let key_len = read_u32(data, &mut offset)? as usize;
-                    anyhow::ensure!(offset + key_len <= data.len(), "short key");
-                    keys.push(&data[offset..offset + key_len]);
-                    offset += key_len;
-                }
-                let latest = self.kv.get_latest_batch(&keys);
+            CMD_BATCH_GET | CMD_BATCH_GET_V2 | CMD_BATCH_GET_V3 => {
+                let reads = decode_read_items(data)?;
+                let count = reads.len();
                 let mut out = Vec::with_capacity(4 + (count * 4));
                 out.extend_from_slice(&(count as u32).to_be_bytes());
-                for item in latest {
-                    match item {
+                for item in reads {
+                    let read_version = item
+                        .range_generation
+                        .map(|generation| base_version.with_range_generation(generation))
+                        .unwrap_or(base_version);
+                    let value = self.kv.get(item.key, read_version);
+                    match value {
                         // Encode missing keys as sentinel lengths.
                         None => out.extend_from_slice(&u32::MAX.to_be_bytes()),
-                        Some((v, _)) => {
+                        Some(v) => {
                             out.extend_from_slice(&(v.len() as u32).to_be_bytes());
                             out.extend_from_slice(&v);
                         }
@@ -2262,15 +2393,7 @@ impl StateMachine for KvStateMachine {
                 let key_len = read_u32(data, &mut offset)? as usize;
                 anyhow::ensure!(offset + key_len <= data.len(), "short key");
                 let key = &data[offset..offset + key_len];
-                // Reads return the latest visible value.
-                //
-                // In range mode, keys can migrate between Accord groups during
-                // splits. Group-local seq values are not globally comparable
-                // across groups, so filtering by `<= read_seq` can hide newer
-                // migrated versions and surface stale values. The read barrier
-                // in the coordinator guarantees required writes are executed
-                // before this read runs, so reading latest-visible here is safe.
-                Ok(self.kv.get_latest(key).map(|(v, _)| v))
+                Ok(self.kv.get(key, base_version))
             }
             CMD_MEMBERSHIP_RECONFIG => Ok(None),
             // Non-read commands are ignored by the read path.
@@ -2345,11 +2468,54 @@ const CMD_MEMBERSHIP_RECONFIG: u8 = 5;
 const CMD_SET_V2: u8 = 6;
 /// Command tag for a multi-key SET batch carrying per-key range generations.
 const CMD_BATCH_SET_V2: u8 = 7;
+/// Command tag for a multi-key GET batch carrying per-key range generations.
+const CMD_BATCH_GET_V2: u8 = 8;
+/// Command tag for a multi-key SET batch carrying one shared range generation.
+const CMD_BATCH_SET_V3: u8 = 9;
+/// Command tag for a multi-key GET batch carrying one shared range generation.
+const CMD_BATCH_GET_V3: u8 = 10;
 
 struct DecodedWrite<'a> {
     key: &'a [u8],
     value: &'a [u8],
     version: Version,
+}
+
+struct DecodedRead<'a> {
+    key: &'a [u8],
+    range_generation: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BatchGenerationShape {
+    Default,
+    Shared(u64),
+    Mixed,
+}
+
+fn observe_batch_generation(first: &mut Option<u64>, mixed: &mut bool, generation: u64) {
+    if *mixed {
+        return;
+    }
+    match *first {
+        Some(first_generation) if first_generation != generation => {
+            *mixed = true;
+        }
+        Some(_) => {}
+        None => {
+            *first = Some(generation);
+        }
+    }
+}
+
+fn batch_generation_shape(first: Option<u64>, mixed: bool) -> BatchGenerationShape {
+    if mixed {
+        return BatchGenerationShape::Mixed;
+    }
+    match first {
+        Some(DEFAULT_RANGE_GENERATION) | None => BatchGenerationShape::Default,
+        Some(generation) => BatchGenerationShape::Shared(generation),
+    }
 }
 
 /// Encode a single-key SET command.
@@ -2411,13 +2577,65 @@ pub fn encode_batch_set(items: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
 ///   replay reuses the original cutover epoch instead of consulting whatever
 ///   descriptor is current at replay time.
 pub fn encode_batch_set_with_generations(items: &[(Vec<u8>, Vec<u8>, u64)]) -> Vec<u8> {
-    let mut size = 1 + 4;
-    for (k, v, _) in items {
-        size += 8;
-        size += 4 + k.len();
-        size += 4 + v.len();
+    let mut first_generation = None;
+    let mut mixed_generations = false;
+    let mut compact_size = 1 + 4;
+    let mut shared_size = 1 + 8 + 4;
+    let mut per_key_size = 1 + 4;
+    for (key, value, generation) in items {
+        let item_size = 4 + key.len() + 4 + value.len();
+        compact_size += item_size;
+        shared_size += item_size;
+        per_key_size += 8 + item_size;
+        observe_batch_generation(&mut first_generation, &mut mixed_generations, *generation);
     }
 
+    match batch_generation_shape(first_generation, mixed_generations) {
+        BatchGenerationShape::Default => encode_batch_set_versioned_default(items, compact_size),
+        BatchGenerationShape::Shared(shared_generation) => {
+            encode_batch_set_with_shared_generation(items, shared_generation, shared_size)
+        }
+        BatchGenerationShape::Mixed => {
+            encode_batch_set_with_per_key_generations(items, per_key_size)
+        }
+    }
+}
+
+fn encode_batch_set_versioned_default(items: &[(Vec<u8>, Vec<u8>, u64)], size: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(size);
+    out.push(CMD_BATCH_SET);
+    out.extend_from_slice(&(items.len() as u32).to_be_bytes());
+    for (k, v, _) in items {
+        out.extend_from_slice(&(k.len() as u32).to_be_bytes());
+        out.extend_from_slice(k);
+        out.extend_from_slice(&(v.len() as u32).to_be_bytes());
+        out.extend_from_slice(v);
+    }
+    out
+}
+
+fn encode_batch_set_with_shared_generation(
+    items: &[(Vec<u8>, Vec<u8>, u64)],
+    range_generation: u64,
+    size: usize,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(size);
+    out.push(CMD_BATCH_SET_V3);
+    out.extend_from_slice(&range_generation.to_be_bytes());
+    out.extend_from_slice(&(items.len() as u32).to_be_bytes());
+    for (k, v, _) in items {
+        out.extend_from_slice(&(k.len() as u32).to_be_bytes());
+        out.extend_from_slice(k);
+        out.extend_from_slice(&(v.len() as u32).to_be_bytes());
+        out.extend_from_slice(v);
+    }
+    out
+}
+
+fn encode_batch_set_with_per_key_generations(
+    items: &[(Vec<u8>, Vec<u8>, u64)],
+    size: usize,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(size);
     out.push(CMD_BATCH_SET_V2);
     out.extend_from_slice(&(items.len() as u32).to_be_bytes());
@@ -2448,6 +2666,118 @@ pub fn encode_batch_get_slices(keys: &[&[u8]]) -> Vec<u8> {
     out.push(CMD_BATCH_GET);
     out.extend_from_slice(&(keys.len() as u32).to_be_bytes());
     for key in keys {
+        out.extend_from_slice(&(key.len() as u32).to_be_bytes());
+        out.extend_from_slice(key);
+    }
+    out
+}
+
+/// Encode a batch GET command with per-key routed range generations.
+///
+/// The generation preserves the logical route used by the coordinator so
+/// candidate-read compatibility checks can reason about ownership transitions.
+/// The current byte-returning read still returns the latest visible value, just
+/// like legacy batch GET, because group-local read sequence numbers are not a
+/// safe global cap while ranges can move between Accord groups.
+pub fn encode_batch_get_slices_with_generations(keys: &[(&[u8], u64)]) -> Vec<u8> {
+    let mut first_generation = None;
+    let mut mixed_generations = false;
+    let mut compact_size = 1 + 4;
+    let mut shared_size = 1 + 8 + 4;
+    let mut per_key_size = 1 + 4;
+    for (key, generation) in keys {
+        let item_size = 4 + key.len();
+        compact_size += item_size;
+        shared_size += item_size;
+        per_key_size += 8 + item_size;
+        observe_batch_generation(&mut first_generation, &mut mixed_generations, *generation);
+    }
+
+    match batch_generation_shape(first_generation, mixed_generations) {
+        BatchGenerationShape::Default => {
+            encode_batch_get_generation_items_default(keys, compact_size)
+        }
+        BatchGenerationShape::Shared(shared_generation) => {
+            encode_batch_get_generation_items_shared(keys, shared_generation, shared_size)
+        }
+        BatchGenerationShape::Mixed => {
+            encode_batch_get_slices_with_per_key_generations(keys, per_key_size)
+        }
+    }
+}
+
+/// Encode a batch GET command where all keys share one routed generation.
+///
+/// Purpose:
+/// - Preserve generation-capped reads for stable non-default ranges without
+///   paying an 8-byte generation field per key.
+///
+/// Inputs:
+/// - Borrowed keys routed to one logical generation.
+/// - `range_generation`: generation captured from the routing snapshot.
+///
+/// Outputs:
+/// - A compact internal read command decoded as a generation-aware batch GET.
+pub fn encode_batch_get_slices_with_shared_generation(
+    keys: &[&[u8]],
+    range_generation: u64,
+) -> Vec<u8> {
+    if range_generation == DEFAULT_RANGE_GENERATION {
+        return encode_batch_get_slices(keys);
+    }
+    let mut size = 1 + 8 + 4;
+    for key in keys {
+        size += 4 + key.len();
+    }
+
+    encode_batch_get_slices_shared(keys, range_generation, size)
+}
+
+fn encode_batch_get_slices_shared(keys: &[&[u8]], range_generation: u64, size: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(size);
+    out.push(CMD_BATCH_GET_V3);
+    out.extend_from_slice(&range_generation.to_be_bytes());
+    out.extend_from_slice(&(keys.len() as u32).to_be_bytes());
+    for key in keys {
+        out.extend_from_slice(&(key.len() as u32).to_be_bytes());
+        out.extend_from_slice(key);
+    }
+    out
+}
+
+fn encode_batch_get_generation_items_default(keys: &[(&[u8], u64)], size: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(size);
+    out.push(CMD_BATCH_GET);
+    out.extend_from_slice(&(keys.len() as u32).to_be_bytes());
+    for (key, _) in keys {
+        out.extend_from_slice(&(key.len() as u32).to_be_bytes());
+        out.extend_from_slice(key);
+    }
+    out
+}
+
+fn encode_batch_get_generation_items_shared(
+    keys: &[(&[u8], u64)],
+    range_generation: u64,
+    size: usize,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(size);
+    out.push(CMD_BATCH_GET_V3);
+    out.extend_from_slice(&range_generation.to_be_bytes());
+    out.extend_from_slice(&(keys.len() as u32).to_be_bytes());
+    for (key, _) in keys {
+        out.extend_from_slice(&(key.len() as u32).to_be_bytes());
+        out.extend_from_slice(key);
+    }
+    out
+}
+
+fn encode_batch_get_slices_with_per_key_generations(keys: &[(&[u8], u64)], size: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(size);
+    out.push(CMD_BATCH_GET_V2);
+    out.extend_from_slice(&(keys.len() as u32).to_be_bytes());
+    for (key, range_generation) in keys {
+        out.extend_from_slice(&range_generation.to_be_bytes());
         out.extend_from_slice(&(key.len() as u32).to_be_bytes());
         out.extend_from_slice(key);
     }
@@ -2526,9 +2856,9 @@ pub fn decode_batch_get_result(data: &[u8]) -> anyhow::Result<Vec<Option<Vec<u8>
 
 /// Decode write commands into borrowed key/value slices and stable versions.
 ///
-/// Legacy commands inherit `base_version`'s default generation. V2 commands
-/// override only `range_generation`, keeping Accord's committed `seq/txn_id`
-/// from the execution metadata.
+/// Legacy commands inherit `base_version`'s default generation. Generation-aware
+/// commands override only `range_generation`, keeping Accord's committed
+/// `seq/txn_id` from the execution metadata.
 fn decode_write_items<'a>(
     data: &'a [u8],
     base_version: Version,
@@ -2617,28 +2947,86 @@ fn decode_write_items<'a>(
             }
             Ok(sets)
         }
+        CMD_BATCH_SET_V3 => {
+            let mut offset = 1;
+            let range_generation = read_u64(data, &mut offset)?;
+            let version = base_version.with_range_generation(range_generation);
+            let count = read_u32(data, &mut offset)? as usize;
+            let mut sets = Vec::with_capacity(count);
+            for _ in 0..count {
+                let key_len = read_u32(data, &mut offset)? as usize;
+                anyhow::ensure!(offset + key_len <= data.len(), "short key");
+                let key = &data[offset..offset + key_len];
+                offset += key_len;
+
+                let value_len = read_u32(data, &mut offset)? as usize;
+                anyhow::ensure!(offset + value_len <= data.len(), "short value");
+                let value = &data[offset..offset + value_len];
+                offset += value_len;
+
+                sets.push(DecodedWrite {
+                    key,
+                    value,
+                    version,
+                });
+            }
+            Ok(sets)
+        }
         _ => Ok(Vec::new()),
     }
 }
 
-/// Apply a KV command to a `KvEngine` (write-only operations).
-fn apply_kv_command(kv: &dyn KvEngine, data: &[u8], version: Version) -> anyhow::Result<u64> {
+fn decode_read_items(data: &[u8]) -> anyhow::Result<Vec<DecodedRead<'_>>> {
     anyhow::ensure!(!data.is_empty(), "empty command");
     match data[0] {
-        CMD_SET | CMD_SET_V2 | CMD_BATCH_SET | CMD_BATCH_SET_V2 => {
-            let decoded = decode_write_items(data, version)?;
-            let sets = decoded
-                .iter()
-                .map(|item| (item.key, item.value, item.version))
-                .collect::<Vec<_>>();
-            kv.apply_committed_batch(&sets)
+        CMD_BATCH_GET | CMD_BATCH_GET_V2 => {
+            let mut offset = 1;
+            let count = read_u32(data, &mut offset)? as usize;
+            let mut reads = Vec::with_capacity(count);
+            for _ in 0..count {
+                let range_generation = if data[0] == CMD_BATCH_GET_V2 {
+                    Some(read_u64(data, &mut offset)?)
+                } else {
+                    None
+                };
+                let key_len = read_u32(data, &mut offset)? as usize;
+                anyhow::ensure!(offset + key_len <= data.len(), "short key");
+                let key = &data[offset..offset + key_len];
+                offset += key_len;
+                reads.push(DecodedRead {
+                    key,
+                    range_generation,
+                });
+            }
+            Ok(reads)
         }
-        // GET commands are no-ops for write application.
-        CMD_BATCH_GET => Ok(0),
-        CMD_GET => Ok(0),
-        CMD_MEMBERSHIP_RECONFIG => Ok(0),
-        // Reject unknown command tags to avoid corrupting state.
-        other => anyhow::bail!("unknown command tag {other}"),
+        CMD_BATCH_GET_V3 => {
+            let mut offset = 1;
+            let range_generation = Some(read_u64(data, &mut offset)?);
+            let count = read_u32(data, &mut offset)? as usize;
+            let mut reads = Vec::with_capacity(count);
+            for _ in 0..count {
+                let key_len = read_u32(data, &mut offset)? as usize;
+                anyhow::ensure!(offset + key_len <= data.len(), "short key");
+                let key = &data[offset..offset + key_len];
+                offset += key_len;
+                reads.push(DecodedRead {
+                    key,
+                    range_generation,
+                });
+            }
+            Ok(reads)
+        }
+        CMD_GET => {
+            let mut offset = 1;
+            let key_len = read_u32(data, &mut offset)? as usize;
+            anyhow::ensure!(offset + key_len <= data.len(), "short key");
+            Ok(vec![DecodedRead {
+                key: &data[offset..offset + key_len],
+                range_generation: None,
+            }])
+        }
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -2659,8 +3047,11 @@ fn command_keys(data: &[u8]) -> anyhow::Result<CommandKeys> {
                 writes: vec![key],
             })
         }
-        CMD_BATCH_SET | CMD_BATCH_SET_V2 => {
+        CMD_BATCH_SET | CMD_BATCH_SET_V2 | CMD_BATCH_SET_V3 => {
             let mut offset = 1;
+            if data[0] == CMD_BATCH_SET_V3 {
+                let _range_generation = read_u64(data, &mut offset)?;
+            }
             let count = read_u32(data, &mut offset)? as usize;
             let mut writes = Vec::with_capacity(count);
             for _ in 0..count {
@@ -2683,11 +3074,17 @@ fn command_keys(data: &[u8]) -> anyhow::Result<CommandKeys> {
                 writes,
             })
         }
-        CMD_BATCH_GET => {
+        CMD_BATCH_GET | CMD_BATCH_GET_V2 | CMD_BATCH_GET_V3 => {
             let mut offset = 1;
+            if data[0] == CMD_BATCH_GET_V3 {
+                let _range_generation = read_u64(data, &mut offset)?;
+            }
             let count = read_u32(data, &mut offset)? as usize;
             let mut reads = Vec::with_capacity(count);
             for _ in 0..count {
+                if data[0] == CMD_BATCH_GET_V2 {
+                    let _range_generation = read_u64(data, &mut offset)?;
+                }
                 let key_len = read_u32(data, &mut offset)? as usize;
                 anyhow::ensure!(offset + key_len <= data.len(), "short key");
                 let key = data[offset..offset + key_len].to_vec();
@@ -2871,7 +3268,7 @@ mod tests {
     }
 
     #[test]
-    fn routed_kv_engine_reads_fallback_and_writes_primary() {
+    fn routed_kv_engine_reads_fallback_and_mirrors_writes() {
         let parent = Arc::new(KvStore::new());
         let child = Arc::new(KvStore::new());
         let old_version = test_version(1, 1);
@@ -2894,16 +3291,50 @@ mod tests {
         let new_version = test_version(2, 2);
         engine
             .apply_committed_batch(&[(b"n".as_slice(), b"new".as_slice(), new_version)])
-            .expect("write child primary");
+            .expect("write child primary and fallback");
 
         assert_eq!(child.get_latest(b"n"), Some((b"new".to_vec(), new_version)));
         assert_eq!(
             parent.get_latest(b"n"),
-            Some((b"old".to_vec(), old_version))
+            Some((b"new".to_vec(), new_version))
         );
         assert_eq!(
             engine.get_latest(b"n"),
             Some((b"new".to_vec(), new_version))
+        );
+    }
+
+    #[test]
+    fn routed_kv_engine_picks_latest_across_primary_and_fallback() {
+        let parent = Arc::new(KvStore::new());
+        let child = Arc::new(KvStore::new());
+        let fallback_newer = test_version(10, 10);
+        let primary_older = test_version(2, 2);
+        parent
+            .apply_committed_batch(&[(
+                b"n".as_slice(),
+                b"fallback-newer".as_slice(),
+                fallback_newer,
+            )])
+            .expect("seed fallback parent");
+        child
+            .apply_committed_batch(&[(b"n".as_slice(), b"primary-older".as_slice(), primary_older)])
+            .expect("seed child primary");
+        let engine =
+            RoutedKvEngine::new(vec![parent.clone(), child.clone()], Arc::new(OverlayRouter))
+                .expect("routed engine");
+
+        assert_eq!(
+            engine.get_latest(b"n"),
+            Some((b"fallback-newer".to_vec(), fallback_newer))
+        );
+        assert_eq!(
+            engine.get_latest_batch(&[b"n".as_slice()]),
+            vec![Some((b"fallback-newer".to_vec(), fallback_newer))]
+        );
+        assert_eq!(
+            engine.get(b"n", test_version(20, 20)),
+            Some(b"fallback-newer".to_vec())
         );
     }
 
@@ -2948,12 +3379,235 @@ mod tests {
 
         sm.apply(&child_cmd, test_group_meta(2, 1, 1))
             .expect("child owner command should apply");
+        sm.mark_visible(&child_cmd, test_group_meta(2, 1, 1))
+            .expect("child owner command should become visible");
         sm.apply(&parent_cmd, test_group_meta(1, 999, 999))
             .expect("late parent owner command should apply as history");
+        sm.mark_visible(&parent_cmd, test_group_meta(1, 999, 999))
+            .expect("late parent owner command should become visible");
 
         assert_eq!(
             engine.get_latest(b"split-key"),
             Some((b"child-new".to_vec(), test_group_version(2, 1, 1)))
+        );
+    }
+
+    #[test]
+    fn default_generation_batch_set_uses_legacy_command() {
+        let cmd = encode_batch_set_with_generations(&[
+            (b"a".to_vec(), b"one".to_vec(), DEFAULT_RANGE_GENERATION),
+            (b"b".to_vec(), b"two".to_vec(), DEFAULT_RANGE_GENERATION),
+        ]);
+
+        assert_eq!(cmd[0], CMD_BATCH_SET);
+        let writes = decode_write_items(&cmd, test_version(42, 42))
+            .expect("default-generation batch set should decode");
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[0].version.range_generation, DEFAULT_RANGE_GENERATION);
+        assert_eq!(writes[1].version.range_generation, DEFAULT_RANGE_GENERATION);
+    }
+
+    #[test]
+    fn shared_generation_batch_set_replays_with_command_generation() {
+        let engine = Arc::new(KvStore::new());
+        let sm = KvStateMachine::new(engine.clone(), None);
+        let cmd = encode_batch_set_with_generations(&[
+            (b"a".to_vec(), b"one".to_vec(), 7),
+            (b"b".to_vec(), b"two".to_vec(), 7),
+        ]);
+
+        assert_eq!(cmd[0], CMD_BATCH_SET_V3);
+        sm.apply(&cmd, test_group_meta(7, 3, 3))
+            .expect("shared-generation batch should apply");
+        sm.mark_visible(&cmd, test_group_meta(7, 3, 3))
+            .expect("shared-generation batch should publish");
+
+        assert_eq!(
+            engine.get_latest(b"a").map(|(_, v)| v.range_generation),
+            Some(7)
+        );
+        assert_eq!(
+            engine.get_latest(b"b").map(|(_, v)| v.range_generation),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn mixed_generation_batch_set_uses_per_key_command() {
+        let cmd = encode_batch_set_with_generations(&[
+            (b"a".to_vec(), b"one".to_vec(), DEFAULT_RANGE_GENERATION),
+            (b"b".to_vec(), b"two".to_vec(), 2),
+        ]);
+
+        assert_eq!(cmd[0], CMD_BATCH_SET_V2);
+        let writes = decode_write_items(&cmd, test_version(42, 42))
+            .expect("mixed-generation batch set should decode");
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[0].version.range_generation, DEFAULT_RANGE_GENERATION);
+        assert_eq!(writes[1].version.range_generation, 2);
+    }
+
+    #[test]
+    fn default_generation_batch_get_uses_legacy_command() {
+        let payload = encode_batch_get_slices_with_generations(&[
+            (b"a".as_slice(), DEFAULT_RANGE_GENERATION),
+            (b"b".as_slice(), DEFAULT_RANGE_GENERATION),
+        ]);
+
+        assert_eq!(payload[0], CMD_BATCH_GET);
+        let reads =
+            decode_read_items(&payload).expect("default-generation batch get should decode");
+        assert_eq!(reads.len(), 2);
+        assert!(reads.iter().all(|read| read.range_generation.is_none()));
+    }
+
+    #[test]
+    fn mixed_generation_batch_get_uses_per_key_command() {
+        let payload = encode_batch_get_slices_with_generations(&[
+            (b"a".as_slice(), DEFAULT_RANGE_GENERATION),
+            (b"b".as_slice(), 2),
+        ]);
+
+        assert_eq!(payload[0], CMD_BATCH_GET_V2);
+        let reads = decode_read_items(&payload).expect("mixed-generation batch get should decode");
+        assert_eq!(reads.len(), 2);
+        assert_eq!(reads[0].range_generation, Some(DEFAULT_RANGE_GENERATION));
+        assert_eq!(reads[1].range_generation, Some(2));
+    }
+
+    #[test]
+    fn batch_get_v2_is_sequence_bounded_within_routed_generation() {
+        let engine = Arc::new(KvStore::new());
+        let sm = KvStateMachine::new(engine.clone(), None);
+        let old_version = test_version(10, 10);
+        let new_version = test_version(50, 50);
+
+        engine
+            .apply_committed_batch(&[(b"k".as_slice(), b"old".as_slice(), old_version)])
+            .expect("seed old visible value");
+        engine
+            .apply_committed_batch(&[(b"k".as_slice(), b"new".as_slice(), new_version)])
+            .expect("seed new visible value");
+
+        let payload = encode_batch_get_slices_with_generations(&[(
+            b"k".as_slice(),
+            DEFAULT_RANGE_GENERATION,
+        )]);
+        let result = sm
+            .read(
+                &payload,
+                ExecMeta {
+                    seq: 20,
+                    txn_id: TxnId {
+                        node_id: 1,
+                        counter: 20,
+                    },
+                },
+            )
+            .expect("batch get v2 should read")
+            .expect("batch get v2 should return bytes");
+
+        assert_eq!(
+            decode_batch_get_result(&result).expect("decode result"),
+            vec![Some(b"old".to_vec())]
+        );
+    }
+
+    #[test]
+    fn shared_generation_batch_get_is_read_only_and_generation_capped() {
+        let engine = Arc::new(KvStore::new());
+        let sm = KvStateMachine::new(engine.clone(), None);
+        let visible = Version {
+            range_generation: 9,
+            seq: 5,
+            txn_id: TxnId {
+                node_id: 1,
+                counter: 5,
+            },
+        };
+        engine
+            .apply_committed_batch(&[(b"k".as_slice(), b"visible".as_slice(), visible)])
+            .expect("seed shared-generation value");
+
+        let payload = encode_batch_get_slices_with_shared_generation(&[b"k".as_slice()], 9);
+        assert_eq!(payload[0], CMD_BATCH_GET_V3);
+        let keys = command_keys(&payload).expect("command keys");
+        assert_eq!(keys.reads, vec![b"k".to_vec()]);
+        assert!(keys.writes.is_empty());
+
+        let result = sm
+            .read(
+                &payload,
+                ExecMeta {
+                    seq: 10,
+                    txn_id: TxnId {
+                        node_id: 1,
+                        counter: 10,
+                    },
+                },
+            )
+            .expect("shared-generation batch get should read")
+            .expect("shared-generation batch get should return bytes");
+        assert_eq!(
+            decode_batch_get_result(&result).expect("decode result"),
+            vec![Some(b"visible".to_vec())]
+        );
+    }
+
+    #[test]
+    fn batch_get_v2_can_fall_back_to_older_generation_history() {
+        let engine = Arc::new(KvStore::new());
+        let sm = KvStateMachine::new(engine.clone(), None);
+        let old_owner_version = Version {
+            range_generation: 1,
+            seq: 999,
+            txn_id: TxnId {
+                node_id: 1,
+                counter: 999,
+            },
+        };
+        let future_child_version = Version {
+            range_generation: 2,
+            seq: 50,
+            txn_id: TxnId {
+                node_id: 1,
+                counter: 50,
+            },
+        };
+
+        engine
+            .apply_committed_batch(&[(
+                b"k".as_slice(),
+                b"parent-visible".as_slice(),
+                old_owner_version,
+            )])
+            .expect("seed old-owner visible value");
+        engine
+            .apply_committed_batch(&[(
+                b"k".as_slice(),
+                b"future-child".as_slice(),
+                future_child_version,
+            )])
+            .expect("seed future child visible value");
+
+        let payload = encode_batch_get_slices_with_generations(&[(b"k".as_slice(), 2)]);
+        let result = sm
+            .read(
+                &payload,
+                ExecMeta {
+                    seq: 20,
+                    txn_id: TxnId {
+                        node_id: 1,
+                        counter: 20,
+                    },
+                },
+            )
+            .expect("batch get v2 should read")
+            .expect("batch get v2 should return bytes");
+
+        assert_eq!(
+            decode_batch_get_result(&result).expect("decode result"),
+            vec![Some(b"parent-visible".to_vec())]
         );
     }
 
@@ -3011,6 +3665,17 @@ mod tests {
     }
 
     #[test]
+    fn generation_batch_get_is_read_only_for_accord_dependencies() {
+        let payload = encode_batch_get_slices_with_generations(&[
+            (b"k1".as_slice(), 7),
+            (b"k2".as_slice(), 8),
+        ]);
+        let keys = command_keys(&payload).expect("command keys");
+        assert_eq!(keys.reads, vec![b"k1".to_vec(), b"k2".to_vec()]);
+        assert!(keys.writes.is_empty());
+    }
+
+    #[test]
     fn kv_state_machine_applies_membership_hook() {
         let seen: Arc<Mutex<Vec<MembershipReconfig>>> = Arc::new(Mutex::new(Vec::new()));
         let seen_hook = seen.clone();
@@ -3047,6 +3712,8 @@ mod tests {
 
     #[derive(Default)]
     struct BatchTrackingEngine {
+        set_batch_calls: AtomicU64,
+        set_batch_items: AtomicU64,
         apply_committed_batch_calls: AtomicU64,
         apply_committed_batch_items: AtomicU64,
         mark_visible_calls: AtomicU64,
@@ -3059,6 +3726,10 @@ mod tests {
             None
         }
 
+        fn get_versioned(&self, _key: &[u8], _version: Version) -> Option<(Vec<u8>, Version)> {
+            None
+        }
+
         fn get_latest(&self, _key: &[u8]) -> Option<(Vec<u8>, Version)> {
             None
         }
@@ -3068,6 +3739,13 @@ mod tests {
         }
 
         fn set(&self, _key: &[u8], _value: &[u8], _version: Version) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn set_batch(&self, items: &[(&[u8], &[u8], Version)]) -> anyhow::Result<()> {
+            self.set_batch_calls.fetch_add(1, Ordering::Relaxed);
+            self.set_batch_items
+                .fetch_add(items.len() as u64, Ordering::Relaxed);
             Ok(())
         }
 
@@ -3094,7 +3772,7 @@ mod tests {
     }
 
     #[test]
-    fn kv_state_machine_apply_batch_uses_committed_publish_api() {
+    fn kv_state_machine_apply_batch_publishes_with_batch_api() {
         let engine = Arc::new(BatchTrackingEngine::default());
         let sm = KvStateMachine::new(engine.clone(), None);
         let payload = Bytes::from(encode_batch_set(&[
@@ -3114,6 +3792,8 @@ mod tests {
         )])
         .expect("apply batch");
 
+        assert_eq!(engine.set_batch_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(engine.set_batch_items.load(Ordering::Relaxed), 0);
         assert_eq!(
             engine.apply_committed_batch_calls.load(Ordering::Relaxed),
             1

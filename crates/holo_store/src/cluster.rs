@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -48,8 +49,12 @@ pub struct ShardDesc {
     /// storage and consensus identity were split apart.
     #[serde(default)]
     pub storage_index: Option<usize>,
-    /// Optional read-through storage slot for bytes that still live in the
-    /// pre-split parent partition.
+    /// Optional secondary storage slot consulted during materialization.
+    ///
+    /// During logical split cutover this is the future child storage slot while
+    /// `storage_index` still points at the shared parent slot. Reads consult
+    /// both and pick by `kv::Version`; writes continue to the shared parent
+    /// until materialization flips the primary storage index.
     #[serde(default)]
     pub fallback_storage_index: Option<usize>,
     pub start_hash: u64,
@@ -58,6 +63,39 @@ pub struct ShardDesc {
     pub end_key: Vec<u8>,
     pub replicas: Vec<NodeId>,
     pub leaseholder: NodeId,
+}
+
+/// Logical range storage placement derived from a shard descriptor.
+///
+/// Purpose:
+/// - Make the logical owner/storage split explicit without changing the
+///   persisted descriptor layout used by existing clusters.
+///
+/// Design:
+/// - `ShardDesc::{storage_index,fallback_storage_index}` remain the serialized
+///   compatibility fields.
+/// - This enum is the structured view used by new split/materialization code.
+///
+/// Inputs:
+/// - A `ShardDesc` with resolved primary and optional fallback storage indexes.
+///
+/// Outputs:
+/// - Primary-only or materializing placement for routing/materialization.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RangeStoragePlacement {
+    Primary {
+        storage_index: usize,
+    },
+    SharedParent {
+        parent_shard_id: u64,
+        parent_storage_index: usize,
+        boundary: Vec<u8>,
+    },
+    Materializing {
+        primary_storage_index: usize,
+        fallback_storage_index: usize,
+        materialization_epoch: u64,
+    },
 }
 
 pub fn default_range_generation() -> u64 {
@@ -72,6 +110,28 @@ impl ShardDesc {
     pub fn fallback_storage_index(&self) -> Option<usize> {
         self.fallback_storage_index
             .filter(|idx| *idx != self.storage_index())
+    }
+
+    /// Return the structured storage placement for this logical range.
+    ///
+    /// Purpose:
+    /// - Keep callers reasoning about logical ownership separately from where
+    ///   bytes may still be found during deferred materialization.
+    ///
+    /// Outputs:
+    /// - `Primary` for fully materialized ranges.
+    /// - `Materializing` while reads must consider a secondary partition.
+    pub fn storage_placement(&self) -> RangeStoragePlacement {
+        match self.fallback_storage_index() {
+            Some(fallback_storage_index) => RangeStoragePlacement::Materializing {
+                primary_storage_index: self.storage_index(),
+                fallback_storage_index,
+                materialization_epoch: self.generation,
+            },
+            None => RangeStoragePlacement::Primary {
+                storage_index: self.storage_index(),
+            },
+        }
     }
 }
 
@@ -328,6 +388,11 @@ pub enum ClusterCommand {
         #[serde(default)]
         cooldown_until_ms: u64,
     },
+    CompleteRangeMaterialization {
+        shard_id: u64,
+        primary_storage_index: usize,
+        fallback_storage_index: usize,
+    },
     MergeRange {
         left_shard_id: u64,
     },
@@ -553,6 +618,73 @@ pub struct ClusterStateStore {
     split_lock: Arc<std::sync::RwLock<()>>,
     meta_ops: Arc<RwLock<BTreeMap<usize, u64>>>,
     epoch_notify: Arc<Notify>,
+    fast_flags: Arc<ClusterStateFastFlags>,
+}
+
+/// Cached booleans for hot-path routing decisions.
+///
+/// Purpose:
+/// - Avoid cloning or scanning full cluster metadata for ordinary client
+///   requests when there are no fences, freezes, or fallback ranges.
+///
+/// Design:
+/// - The flags are derived from committed cluster metadata and refreshed after
+///   every persisted metadata update.
+/// - They are only used as a fast negative check. If any flag is set, callers
+///   still read the full metadata snapshot and apply the precise rule.
+///
+/// Inputs:
+/// - A `ClusterState` snapshot after normalization.
+///
+/// Outputs:
+/// - Atomic booleans safe for lock-free reads on GET/SET hot paths.
+#[derive(Debug)]
+struct ClusterStateFastFlags {
+    frozen: AtomicBool,
+    has_shard_fences: AtomicBool,
+    has_fallback_shards: AtomicBool,
+    single_primary_enabled: AtomicBool,
+    single_primary_epoch: AtomicU64,
+    single_primary_shard_index: AtomicUsize,
+    single_primary_shard_id: AtomicU64,
+    single_primary_generation: AtomicU64,
+}
+
+impl ClusterStateFastFlags {
+    fn new(state: &ClusterState) -> Self {
+        let route = single_primary_route_from_state(state);
+        Self {
+            frozen: AtomicBool::new(state.frozen),
+            has_shard_fences: AtomicBool::new(!state.shard_fences.is_empty()),
+            has_fallback_shards: AtomicBool::new(state_has_fallback_shards(state)),
+            single_primary_enabled: AtomicBool::new(route.is_some()),
+            single_primary_epoch: AtomicU64::new(route.map(|r| r.0).unwrap_or(0)),
+            single_primary_shard_index: AtomicUsize::new(route.map(|r| r.1).unwrap_or(0)),
+            single_primary_shard_id: AtomicU64::new(route.map(|r| r.2).unwrap_or(0)),
+            single_primary_generation: AtomicU64::new(route.map(|r| r.3).unwrap_or(0)),
+        }
+    }
+
+    fn refresh(&self, state: &ClusterState) {
+        let route = single_primary_route_from_state(state);
+        if let Some((epoch, shard_index, shard_id, generation)) = route {
+            self.single_primary_epoch.store(epoch, Ordering::Release);
+            self.single_primary_shard_index
+                .store(shard_index, Ordering::Release);
+            self.single_primary_shard_id
+                .store(shard_id, Ordering::Release);
+            self.single_primary_generation
+                .store(generation, Ordering::Release);
+            self.single_primary_enabled.store(true, Ordering::Release);
+        } else {
+            self.single_primary_enabled.store(false, Ordering::Release);
+        }
+        self.frozen.store(state.frozen, Ordering::Release);
+        self.has_shard_fences
+            .store(!state.shard_fences.is_empty(), Ordering::Release);
+        self.has_fallback_shards
+            .store(state_has_fallback_shards(state), Ordering::Release);
+    }
 }
 
 impl ClusterStateStore {
@@ -567,6 +699,7 @@ impl ClusterStateStore {
             if let Ok(mut state) = serde_json::from_slice::<ClusterState>(&data) {
                 normalize_replica_metadata(&mut state);
                 return Ok(Self {
+                    fast_flags: Arc::new(ClusterStateFastFlags::new(&state)),
                     state: Arc::new(RwLock::new(state)),
                     path,
                     split_lock: Arc::new(std::sync::RwLock::new(())),
@@ -630,6 +763,7 @@ impl ClusterStateStore {
         ensure_meta_ranges_initialized(&mut state);
 
         let store = Self {
+            fast_flags: Arc::new(ClusterStateFastFlags::new(&state)),
             state: Arc::new(RwLock::new(state)),
             path,
             split_lock: Arc::new(std::sync::RwLock::new(())),
@@ -654,6 +788,7 @@ impl ClusterStateStore {
             return Ok(());
         }
         *state = snapshot;
+        self.fast_flags.refresh(&state);
         drop(state);
         self.persist()
     }
@@ -676,6 +811,73 @@ impl ClusterStateStore {
 
     pub fn epoch(&self) -> u64 {
         self.state.read().unwrap().epoch
+    }
+
+    /// Return true when ordinary client requests may need full fence checks.
+    ///
+    /// Purpose:
+    /// - Keep no-fence GET/SET requests off the cluster-state clone path.
+    ///
+    /// Design:
+    /// - This is a conservative fast flag. `true` means "read metadata and
+    ///   check precisely"; `false` means there are currently no global freezes
+    ///   and no shard fences.
+    ///
+    /// Outputs:
+    /// - Boolean suitable for a fast negative check in client hot paths.
+    pub fn may_have_client_blockers(&self) -> bool {
+        self.fast_flags.frozen.load(Ordering::Acquire)
+            || self.fast_flags.has_shard_fences.load(Ordering::Acquire)
+    }
+
+    /// Return true when any descriptor has fallback storage.
+    ///
+    /// Purpose:
+    /// - Let KV routing skip fallback lookup/mirroring in the ordinary
+    ///   primary-only layout.
+    ///
+    /// Outputs:
+    /// - Cached boolean refreshed with committed metadata.
+    pub fn has_fallback_shards_fast(&self) -> bool {
+        self.fast_flags.has_fallback_shards.load(Ordering::Acquire)
+    }
+
+    /// Return the stable single-range route when the cluster has one primary range.
+    ///
+    /// Purpose:
+    /// - Avoid descriptor-vector cloning and per-key range searches for the
+    ///   common no-split benchmark and bootstrap layout.
+    ///
+    /// Design:
+    /// - Only returns a route for one materialized range with no fallback
+    ///   storage. The caller still validates the epoch after completing a read.
+    ///
+    /// Outputs:
+    /// - `(epoch, shard_index, shard_id, generation)` for the only range, or
+    ///   `None` when the precise routing path is required.
+    pub fn single_primary_range_route(&self) -> Option<(u64, usize, u64, u64)> {
+        if self.has_fallback_shards_fast() {
+            return None;
+        }
+        if !self
+            .fast_flags
+            .single_primary_enabled
+            .load(Ordering::Acquire)
+        {
+            return None;
+        }
+        Some((
+            self.fast_flags.single_primary_epoch.load(Ordering::Acquire),
+            self.fast_flags
+                .single_primary_shard_index
+                .load(Ordering::Acquire),
+            self.fast_flags
+                .single_primary_shard_id
+                .load(Ordering::Acquire),
+            self.fast_flags
+                .single_primary_generation
+                .load(Ordering::Acquire),
+        ))
     }
 
     /// Return a notification source that fires after persisted cluster-state changes.
@@ -1353,17 +1555,7 @@ impl ClusterStateStore {
                 );
             }
 
-            let metadata_only_same_replicas = skip_migration
-                && same_node_set(&right_replicas, &shard_snapshot.replicas)
-                && right_leaseholder == shard_snapshot.leaseholder;
-            let right_shard_index = if metadata_only_same_replicas {
-                // Foreground metadata-only splits are virtual: they create a new
-                // logical descriptor and keep the same consensus/storage group.
-                // Physical materialization is a separate background operation.
-                shard_snapshot.shard_index
-            } else {
-                target_shard_index
-            };
+            let right_shard_index = target_shard_index;
 
             if target_shard_index == shard_snapshot.shard_index {
                 anyhow::bail!(
@@ -1380,12 +1572,22 @@ impl ClusterStateStore {
                 anyhow::bail!("target shard index {target_shard_index} already in use");
             }
             let (right_storage_index, right_fallback_storage_index) = if skip_migration {
-                if !metadata_only_same_replicas {
+                if state.shards.iter().any(|s| {
+                    s.storage_index() == target_shard_index
+                        || s.fallback_storage_index() == Some(target_shard_index)
+                }) {
                     anyhow::bail!(
-                        "metadata-only split must keep source replicas and leaseholder until range movement is implemented"
+                        "target storage index {target_shard_index} is already referenced"
                     );
                 }
-                (from_shard, None)
+                // Logical splits cut over ownership before moving bytes.
+                // During the propagation window, stale routers may still send
+                // old-owner writes to the parent group. Keeping the shared
+                // parent partition as the primary physical placement ensures
+                // those writes remain readable and ordered by generation until
+                // background materialization atomically flips the child to its
+                // own storage partition.
+                (from_shard, Some(target_shard_index))
             } else {
                 if state.shards.iter().any(|s| {
                     s.storage_index() == target_shard_index
@@ -1419,7 +1621,8 @@ impl ClusterStateStore {
             }
 
             let right_id = next_shard_id(&state.shards);
-            let right_generation = next_range_generation(&state.shards);
+            let left_generation = next_range_generation(&state.shards);
+            let right_generation = left_generation.saturating_add(1);
             let right = ShardDesc {
                 shard_id: right_id,
                 generation: right_generation,
@@ -1434,6 +1637,7 @@ impl ClusterStateStore {
                 leaseholder: right_leaseholder,
             };
             state.shards[idx].end_key = right.start_key.clone();
+            state.shards[idx].generation = left_generation;
             state.shards.insert(idx + 1, right);
             state.shard_replica_roles.insert(right_id, right_roles);
             state.shard_rebalances.remove(&right_id);
@@ -2072,6 +2276,21 @@ impl ClusterStateStore {
                     state.epoch = state.epoch.saturating_add(1);
                 }
             }
+            ClusterCommand::CompleteRangeMaterialization {
+                shard_id,
+                primary_storage_index,
+                fallback_storage_index,
+            } => {
+                if let Some(shard) = state.shards.iter_mut().find(|s| s.shard_id == shard_id) {
+                    let matches_expected = shard.storage_index() == primary_storage_index
+                        && shard.fallback_storage_index() == Some(fallback_storage_index);
+                    if matches_expected {
+                        shard.storage_index = Some(fallback_storage_index);
+                        shard.fallback_storage_index = Some(primary_storage_index);
+                        state.epoch = state.epoch.saturating_add(1);
+                    }
+                }
+            }
             ClusterCommand::SetFrozen { frozen } => {
                 state.frozen = frozen;
                 state.epoch = state.epoch.saturating_add(1);
@@ -2492,6 +2711,7 @@ impl ClusterStateStore {
 
     fn persist(&self) -> anyhow::Result<()> {
         let state = self.state.read().unwrap();
+        self.fast_flags.refresh(&state);
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).context("create cluster state dir")?;
         }
@@ -2825,7 +3045,8 @@ pub fn cluster_command_key(cmd: &ClusterCommand) -> Vec<u8> {
             format!("merge/{left_shard_id:020}").into_bytes()
         }
         ClusterCommand::SetShardFence { shard_id, .. }
-        | ClusterCommand::GcRetiredRange { shard_id } => {
+        | ClusterCommand::GcRetiredRange { shard_id }
+        | ClusterCommand::CompleteRangeMaterialization { shard_id, .. } => {
             format!("range/{shard_id:020}").into_bytes()
         }
         ClusterCommand::SplitRange { split_key, .. } => {
@@ -2869,6 +3090,7 @@ mod tests {
     fn test_store(state: ClusterState) -> ClusterStateStore {
         ClusterStateStore {
             path: PathBuf::from("/tmp/cluster_state_test.json"),
+            fast_flags: Arc::new(ClusterStateFastFlags::new(&state)),
             state: Arc::new(RwLock::new(state)),
             split_lock: Arc::new(RwLock::new(())),
             meta_ops: Arc::new(RwLock::new(BTreeMap::new())),
@@ -2920,6 +3142,70 @@ mod tests {
             meta_controller_lease: None,
             range_split_cooldown_until_ms: 0,
         }
+    }
+
+    #[test]
+    fn cluster_state_machine_executes_empty_recovery_command_as_noop() {
+        let store = test_store(base_state());
+        let sm = ClusterStateMachine::new(store.clone(), None, 4);
+        let before = store.state();
+
+        let keys = sm.command_keys(&[]).expect("empty command keys");
+        assert!(keys.reads.is_empty());
+        assert!(keys.writes.is_empty());
+        sm.apply(
+            &[],
+            ExecMeta {
+                seq: 1,
+                txn_id: holo_accord::accord::TxnId {
+                    node_id: 1,
+                    counter: 1,
+                },
+            },
+        )
+        .expect("empty metadata command should be a no-op");
+
+        assert_eq!(store.state().epoch, before.epoch);
+        let after = store.state();
+        assert_eq!(after.shards.len(), before.shards.len());
+        assert_eq!(after.shards[0].shard_id, before.shards[0].shard_id);
+        assert_eq!(after.shards[0].generation, before.shards[0].generation);
+    }
+
+    #[test]
+    fn fast_flags_track_client_blockers_and_fallback_ranges() {
+        let store = test_store(base_state());
+
+        assert!(!store.may_have_client_blockers());
+        assert!(!store.has_fallback_shards_fast());
+        assert_eq!(
+            store.single_primary_range_route(),
+            Some((1, 0, 10, default_range_generation()))
+        );
+
+        store
+            .apply_command(ClusterCommand::SetFrozen { frozen: true })
+            .expect("set frozen");
+        assert!(store.may_have_client_blockers());
+
+        store
+            .apply_command(ClusterCommand::SetFrozen { frozen: false })
+            .expect("clear frozen");
+        assert!(!store.may_have_client_blockers());
+
+        store
+            .apply_split_range(
+                b"m".to_vec(),
+                1,
+                Some(vec![1, 2, 3]),
+                Some(1),
+                true,
+                None,
+                4,
+            )
+            .expect("logical split should create fallback range");
+        assert!(store.has_fallback_shards_fast());
+        assert!(store.single_primary_range_route().is_none());
     }
 
     #[derive(Default)]
@@ -3139,9 +3425,9 @@ mod tests {
             2,
             "replayed split must not duplicate ranges"
         );
-        assert_eq!(state.shards[1].shard_index, 0);
+        assert_eq!(state.shards[1].shard_index, 1);
         assert_eq!(state.shards[1].storage_index(), 0);
-        assert_eq!(state.shards[1].fallback_storage_index(), None);
+        assert_eq!(state.shards[1].fallback_storage_index(), Some(1));
         assert_eq!(state.shards[1].start_key, split_key);
     }
 
@@ -3169,8 +3455,9 @@ mod tests {
             .expect("metadata-only split should apply");
         let state = store.state();
         assert_eq!(state.shards.len(), 2);
-        assert_eq!(state.shards[1].shard_index, 0);
+        assert_eq!(state.shards[1].shard_index, 1);
         assert_eq!(state.shards[1].storage_index(), 0);
+        assert_eq!(state.shards[1].fallback_storage_index(), Some(1));
     }
 
     #[test]
@@ -3215,13 +3502,21 @@ mod tests {
         let state = store.state();
         assert_eq!(state.shards.len(), 2);
         assert_eq!(state.shards[0].shard_index, 0);
-        assert_eq!(state.shards[1].shard_index, 0);
+        assert_eq!(state.shards[1].shard_index, 1);
         assert_eq!(state.shards[0].storage_index(), 0);
         assert_eq!(state.shards[1].storage_index(), 0);
-        assert_eq!(state.shards[1].fallback_storage_index(), None);
+        assert_eq!(state.shards[1].fallback_storage_index(), Some(1));
+        assert_eq!(
+            state.shards[1].storage_placement(),
+            RangeStoragePlacement::Materializing {
+                primary_storage_index: 0,
+                fallback_storage_index: 1,
+                materialization_epoch: state.shards[1].generation,
+            }
+        );
         assert_eq!(state.shards[0].end_key, split_key);
         assert_eq!(state.shards[1].start_key, split_key);
-        assert_eq!(store.first_free_shard_index(8), Some(1));
+        assert_eq!(store.first_free_shard_index(8), Some(2));
         assert!(
             migrator.calls.lock().unwrap().is_empty(),
             "metadata-only split must not move keys"
@@ -3250,20 +3545,56 @@ mod tests {
     }
 
     #[test]
-    fn metadata_only_split_reuses_parent_storage() {
+    fn logical_split_routes_child_to_shared_parent_with_materialization_target() {
         let store = test_store(base_state());
         let split_key = b"key:050000".to_vec();
 
         store
             .apply_split_range(split_key, 1, None, None, true, None, 8)
-            .expect("metadata-only split should apply");
+            .expect("logical split should apply");
 
         assert_eq!(store.storage_index_for_key(b"key:075000"), 0);
-        assert_eq!(store.fallback_storage_index_for_key(b"key:075000"), None);
+        assert_eq!(store.fallback_storage_index_for_key(b"key:075000"), Some(1));
         assert_eq!(store.storage_index_for_key(b"key:025000"), 0);
         assert_eq!(store.fallback_storage_index_for_key(b"key:025000"), None);
-        assert_eq!(store.shard_index_for_key(b"key:075000"), 0);
+        assert_eq!(store.shard_index_for_key(b"key:075000"), 1);
         assert_eq!(store.shard_index_for_key(b"key:025000"), 0);
+    }
+
+    #[test]
+    fn completed_materialization_flips_primary_and_retains_fallback() {
+        let store = test_store(base_state());
+        let split_key = b"key:050000".to_vec();
+
+        store
+            .apply_split_range(split_key, 1, None, None, true, None, 8)
+            .expect("logical split should apply");
+        let child = store.state().shards[1].clone();
+
+        store
+            .apply_command(ClusterCommand::CompleteRangeMaterialization {
+                shard_id: child.shard_id,
+                primary_storage_index: child.storage_index(),
+                fallback_storage_index: child.fallback_storage_index().unwrap(),
+            })
+            .expect("materialization completion should apply");
+
+        assert_eq!(store.fallback_storage_index_for_key(b"key:075000"), Some(0));
+        assert_eq!(store.storage_index_for_key(b"key:075000"), 1);
+        assert_eq!(
+            store
+                .state()
+                .shards
+                .iter()
+                .find(|shard| shard.shard_id == child.shard_id)
+                .expect("child exists")
+                .storage_placement(),
+            RangeStoragePlacement::Materializing {
+                primary_storage_index: 1,
+                fallback_storage_index: 0,
+                materialization_epoch: child.generation
+            }
+        );
     }
 
     #[tokio::test]
@@ -3757,9 +4088,33 @@ fn key_in_range(key: &[u8], start: &[u8], end: &[u8]) -> bool {
     lower_ok && upper_ok
 }
 
+fn state_has_fallback_shards(state: &ClusterState) -> bool {
+    state
+        .shards
+        .iter()
+        .any(|shard| shard.fallback_storage_index().is_some())
+}
+
+fn single_primary_route_from_state(state: &ClusterState) -> Option<(u64, usize, u64, u64)> {
+    if state.shards.len() != 1 || state_has_fallback_shards(state) {
+        return None;
+    }
+    let shard = &state.shards[0];
+    Some((
+        state.epoch,
+        shard.shard_index,
+        shard.shard_id,
+        shard.generation,
+    ))
+}
+
 impl ShardRouter for ClusterStateStore {
     fn shard_for_key(&self, key: &[u8]) -> usize {
         self.storage_index_for_key(key)
+    }
+
+    fn may_have_fallback_shards(&self) -> bool {
+        self.has_fallback_shards_fast()
     }
 
     fn fallback_shard_for_key(&self, key: &[u8]) -> Option<usize> {
@@ -3788,9 +4143,10 @@ fn next_range_generation(shards: &[ShardDesc]) -> u64 {
 
 impl StateMachine for ClusterStateMachine {
     fn command_keys(&self, data: &[u8]) -> anyhow::Result<CommandKeys> {
-        let key = Self::decode_command(data)
-            .map(|cmd| cluster_command_key(&cmd))
-            .unwrap_or_else(|_| b"cluster".to_vec());
+        if data.is_empty() {
+            return Ok(CommandKeys::default());
+        }
+        let key = cluster_command_key(&Self::decode_command(data)?);
         Ok(CommandKeys {
             reads: Vec::new(),
             writes: vec![key],
@@ -3798,6 +4154,9 @@ impl StateMachine for ClusterStateMachine {
     }
 
     fn apply(&self, data: &[u8], _meta: ExecMeta) -> anyhow::Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
         if let Ok(cmd) = Self::decode_command(data) {
             // Split/Merge need the state-machine migrator path. Unwrap guarded
             // commands here so guarded split/merge dispatches to the correct
