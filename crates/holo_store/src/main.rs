@@ -2291,6 +2291,12 @@ struct BatchSetWork {
 
 type VersionedSetItem = (Vec<u8>, Vec<u8>, u64);
 
+#[derive(Clone, Debug)]
+struct RoutedReadEntry {
+    index: usize,
+    range_generation: u64,
+}
+
 /// One batched SET response payload.
 type BatchSetReply = anyhow::Result<()>;
 
@@ -3616,6 +3622,9 @@ impl NodeState {
     /// Outputs:
     /// - Returns after all relevant key routes are unfenced for this mode.
     async fn wait_until_keys_available(&self, keys: &[&[u8]], mode: KeyFenceWaitMode) {
+        if !self.cluster_store.may_have_client_blockers() {
+            return;
+        }
         if keys.is_empty() {
             self.wait_until_unfrozen().await;
             return;
@@ -3709,6 +3718,22 @@ impl NodeState {
         .await
     }
 
+    async fn propose_batch_set_chunk_on_shard(
+        &self,
+        shard_index: usize,
+        handle: accord::Handle,
+        chunk: Vec<VersionedSetItem>,
+    ) -> anyhow::Result<accord::ProposalResult> {
+        let started = Instant::now();
+        let cmd = kv::encode_batch_set_with_generations(chunk.as_slice());
+        let res = self
+            .propose_timed_on(handle, ProposalKind::BatchSet, cmd)
+            .await;
+        let dur_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        self.shard_load.record_write_latency_us(shard_index, dur_us);
+        res
+    }
+
     /// Applies one shard's chunked SET workload with bounded in-flight proposals.
     ///
     /// Input:
@@ -3732,6 +3757,12 @@ impl NodeState {
         if chunks.is_empty() {
             return Ok(());
         }
+        if chunks.len() == 1 {
+            let chunk = chunks.into_iter().next().expect("checked non-empty");
+            self.propose_batch_set_chunk_on_shard(shard_index, handle, chunk)
+                .await?;
+            return Ok(());
+        }
         let state = self.clone();
         let inflight_limit = pipeline_depth.max(1).min(chunks.len().max(1));
         let mut pending = chunks.into_iter().enumerate().collect::<VecDeque<_>>();
@@ -3747,16 +3778,9 @@ impl NodeState {
             let state = state.clone();
             let shard_index_local = shard_index;
             inflight.push(Box::pin(async move {
-                let started = Instant::now();
-                let cmd = kv::encode_batch_set_with_generations(chunk.as_slice());
-                let res = state
-                    .propose_timed_on(handle, ProposalKind::BatchSet, cmd)
-                    .await;
-                let dur_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
                 state
-                    .shard_load
-                    .record_write_latency_us(shard_index_local, dur_us);
-                res
+                    .propose_batch_set_chunk_on_shard(shard_index_local, handle, chunk)
+                    .await
             }));
         }
 
@@ -3771,16 +3795,9 @@ impl NodeState {
                 let state = state.clone();
                 let shard_index_local = shard_index;
                 inflight.push(Box::pin(async move {
-                    let started = Instant::now();
-                    let cmd = kv::encode_batch_set_with_generations(chunk.as_slice());
-                    let res = state
-                        .propose_timed_on(handle, ProposalKind::BatchSet, cmd)
-                        .await;
-                    let dur_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
                     state
-                        .shard_load
-                        .record_write_latency_us(shard_index_local, dur_us);
-                    res
+                        .propose_batch_set_chunk_on_shard(shard_index_local, handle, chunk)
+                        .await
                 }));
             }
         }
@@ -3820,6 +3837,36 @@ impl NodeState {
         self.wait_until_keys_available(&keys, KeyFenceWaitMode::Write)
             .await;
         let _inflight_guard = self.enter_client_op();
+        if matches!(self.routing_mode, RoutingMode::Range) {
+            if let Some((_epoch, shard, shard_id, range_generation)) =
+                self.cluster_store.single_primary_range_route()
+            {
+                let mut batch = Vec::with_capacity(items.len());
+                for (key, value) in items {
+                    batch.push((key, value, range_generation));
+                }
+                self.shard_load.record_single_range_write_batch(
+                    shard,
+                    shard_id,
+                    batch
+                        .iter()
+                        .map(|(key, value, _)| (key.as_slice(), value.len())),
+                );
+
+                let target = max_ops_per_proposal.max(1);
+                let max_bytes = max_bytes_per_proposal.max(1);
+                let pipeline_depth = proposal_pipeline_depth.max(1);
+                let chunks = chunk_batch_set_items_by_limits(batch, target, max_bytes);
+                return self
+                    .execute_batch_set_chunks_on_shard(
+                        shard,
+                        self.handle_for_shard(shard),
+                        chunks,
+                        pipeline_depth,
+                    )
+                    .await;
+            }
+        }
         let mut by_shard: Vec<Vec<VersionedSetItem>> = vec![Vec::new(); self.data_shards];
         let mut logical_deltas = BTreeMap::<u64, crate::load::LogicalWriteDelta>::new();
         {
@@ -3927,150 +3974,270 @@ impl NodeState {
             // Nothing to do.
             return Ok(Vec::new());
         }
-        let key_slices = keys.iter().map(|key| key.as_slice()).collect::<Vec<_>>();
-        self.wait_until_keys_available(&key_slices, KeyFenceWaitMode::Read)
-            .await;
         let keys = keys.into_iter().map(Bytes::from).collect::<Vec<_>>();
         let _inflight_guard = self.enter_client_op();
-        let mut by_shard: Vec<Vec<usize>> = vec![Vec::new(); self.data_shards];
-        let mut logical_read_deltas = BTreeMap::<u64, crate::load::LogicalReadDelta>::new();
-        {
-            // Take split lock and range snapshot once for the whole routing pass.
-            let _guard = self.split_lock.read().unwrap();
-            let range_snapshot = if matches!(self.routing_mode, RoutingMode::Range) {
-                Some(self.cluster_store.shards_snapshot())
-            } else {
-                None
-            };
-            let ranges = range_snapshot.as_deref();
-            for (idx, key) in keys.iter().enumerate() {
-                let shard = self.shard_for_key_with_snapshot(key.as_ref(), ranges);
-                if let Some(ranges) = ranges {
-                    let shard_id = shard_id_for_key_in_ranges(key.as_ref(), ranges);
-                    logical_read_deltas
-                        .entry(shard_id)
-                        .or_default()
-                        .record(key.as_ref());
-                }
-                by_shard[shard].push(idx);
-            }
-        }
-        for (shard_id, delta) in logical_read_deltas {
-            self.shard_load.record_logical_read_delta(shard_id, delta);
-        }
 
-        if matches!(self.read_mode, ReadMode::Local) {
-            let mut out = vec![None; keys.len()];
-            for (shard, indices) in by_shard.into_iter().enumerate() {
-                if indices.is_empty() {
-                    continue;
-                }
-                self.shard_load.record_get_ops(shard, indices.len() as u64);
-                let mut shard_keys = Vec::with_capacity(indices.len());
-                for idx in &indices {
-                    self.shard_load
-                        .record_read_key_sample(shard, keys[*idx].as_ref());
-                    shard_keys.push(keys[*idx].as_ref());
-                }
-                let values = self.kv_engine.get_latest_batch(&shard_keys);
-                for (idx, value) in indices.into_iter().zip(values.into_iter()) {
-                    out[idx] = value.map(|(v, _)| v);
-                }
-            }
-            return Ok(out);
-        }
+        if matches!(self.routing_mode, RoutingMode::Range) {
+            loop {
+                let Some((plan_epoch, shard, shard_id, range_generation)) =
+                    self.cluster_store.single_primary_range_route()
+                else {
+                    break;
+                };
 
-        let mut out = vec![None; keys.len()];
-        let mut futs = FuturesUnordered::new();
+                let key_slices = keys.iter().map(|key| key.as_ref()).collect::<Vec<_>>();
+                self.wait_until_keys_available(&key_slices, KeyFenceWaitMode::Read)
+                    .await;
 
-        for (shard, shard_indices) in by_shard.into_iter().enumerate() {
-            if shard_indices.is_empty() {
-                // Skip shards with no work.
-                continue;
-            }
-            // Track client-visible read load per shard (best-effort).
-            self.shard_load
-                .record_get_ops(shard, shard_indices.len() as u64);
-            let mut shard_keys = Vec::with_capacity(shard_indices.len());
-            for idx in &shard_indices {
-                let key = &keys[*idx];
-                self.shard_load.record_read_key_sample(shard, key.as_ref());
-                shard_keys.push(key.clone());
-            }
+                self.shard_load.record_single_range_read_batch(
+                    shard,
+                    shard_id,
+                    keys.iter().map(|key| key.as_ref()),
+                );
 
-            let handle = self.handle_for_shard(shard);
-            let read_mode = self.read_mode;
-            let fallback = self.read_barrier_fallback_quorum;
-            let this = self.clone();
-            futs.push(async move {
-                let values = match read_mode {
+                let values = match self.read_mode {
+                    ReadMode::Local => {
+                        let key_refs = keys.iter().map(|key| key.as_ref()).collect::<Vec<_>>();
+                        self.kv_engine
+                            .get_latest_batch(&key_refs)
+                            .into_iter()
+                            .map(|value| value.map(|(v, _)| v))
+                            .collect::<Vec<_>>()
+                    }
                     ReadMode::Accord => {
-                        // Accord reads: enforce read barriers before reading.
-                        let barrier_key_refs = shard_keys
-                            .iter()
-                            .map(|key| key.as_ref())
-                            .collect::<Vec<_>>();
-                        let deps = match this
-                            .ensure_read_barrier_shard(
-                                GROUP_DATA_BASE + shard as u64,
-                                &barrier_key_refs,
-                            )
+                        let key_refs = keys.iter().map(|key| key.as_ref()).collect::<Vec<_>>();
+                        let deps = match self
+                            .ensure_read_barrier_shard(GROUP_DATA_BASE + shard as u64, &key_refs)
                             .await
                         {
                             Ok(versions) => versions,
                             Err(err) => {
-                                // Optionally fall back to quorum reads on barrier failures.
-                                if fallback {
+                                if self.read_barrier_fallback_quorum {
                                     tracing::warn!(
                                         error = ?err,
                                         "read barrier failed; falling back to quorum batch get"
                                     );
-                                    return this
-                                        .quorum_batch_get_shard(shard_keys)
-                                        .await
-                                        .map(|vals| (shard_indices, vals));
+                                    let values = self.quorum_batch_get_shard(keys.clone()).await?;
+                                    if self.cluster_store.epoch() == plan_epoch {
+                                        return Ok(values);
+                                    }
+                                    tokio::task::yield_now().await;
+                                    continue;
+                                } else {
+                                    return Err(err);
                                 }
-                                return Err(err);
                             }
                         };
-                        let expected = barrier_key_refs.len();
-                        let cmd = kv::encode_batch_get_slices(&barrier_key_refs);
-                        let res = handle.propose_read_with_deps(cmd, deps).await?;
+                        let cmd = kv::encode_batch_get_slices_with_shared_generation(
+                            &key_refs,
+                            range_generation,
+                        );
+                        let res = self
+                            .handle_for_shard(shard)
+                            .propose_read_with_deps(cmd, deps)
+                            .await?;
                         let accord::ProposalResult::Read(value) = res else {
                             anyhow::bail!("BATCH_GET expected read result, got {res:?}");
                         };
                         let value = value.unwrap_or_default();
                         let decoded = kv::decode_batch_get_result(&value)?;
                         anyhow::ensure!(
-                            decoded.len() == expected,
-                            "batch get result count mismatch (expected {expected}, got {})",
+                            decoded.len() == keys.len(),
+                            "batch get result count mismatch (expected {}, got {})",
+                            keys.len(),
                             decoded.len()
                         );
                         decoded
                     }
-                    // Local reads use the local KV engine without barriers.
-                    ReadMode::Local => {
-                        unreachable!("local reads are handled by the zero-copy path")
-                    }
-                    // Quorum reads consult a quorum of peers and pick latest values.
-                    ReadMode::Quorum => this.quorum_batch_get_shard(shard_keys).await?,
+                    ReadMode::Quorum => self.quorum_batch_get_shard(keys.clone()).await?,
                 };
-                Ok::<_, anyhow::Error>((shard_indices, values))
-            });
-        }
 
-        while let Some(res) = futs.next().await {
-            let (indices, values) = res?;
-            anyhow::ensure!(
-                indices.len() == values.len(),
-                "batch get shard result mismatch"
-            );
-            for (idx, value) in indices.into_iter().zip(values.into_iter()) {
-                out[idx] = value;
+                if self.cluster_store.epoch() == plan_epoch {
+                    return Ok(values);
+                }
+                tokio::task::yield_now().await;
             }
         }
 
-        Ok(out)
+        loop {
+            let key_slices = keys.iter().map(|key| key.as_ref()).collect::<Vec<_>>();
+            self.wait_until_keys_available(&key_slices, KeyFenceWaitMode::Read)
+                .await;
+
+            let mut by_shard: Vec<Vec<RoutedReadEntry>> = vec![Vec::new(); self.data_shards];
+            let mut logical_read_deltas = BTreeMap::<u64, crate::load::LogicalReadDelta>::new();
+            let plan_epoch = if matches!(self.routing_mode, RoutingMode::Range) {
+                Some(self.cluster_store.epoch())
+            } else {
+                None
+            };
+            {
+                // Take split lock and range snapshot once for the whole routing pass.
+                let _guard = self.split_lock.read().unwrap();
+                let range_snapshot = if matches!(self.routing_mode, RoutingMode::Range) {
+                    Some(self.cluster_store.shards_snapshot())
+                } else {
+                    None
+                };
+                let ranges = range_snapshot.as_deref();
+                for (idx, key) in keys.iter().enumerate() {
+                    let (shard, range_generation, shard_id) = if let Some(ranges) = ranges {
+                        let desc = shard_desc_for_key_in_ranges(key.as_ref(), ranges);
+                        (
+                            desc.map(|s| s.shard_index).unwrap_or(0),
+                            desc.map(|s| s.generation)
+                                .unwrap_or(kv::DEFAULT_RANGE_GENERATION),
+                            desc.map(|s| s.shard_id),
+                        )
+                    } else {
+                        let shard = self.shard_for_key_with_snapshot(key.as_ref(), ranges);
+                        (shard, kv::DEFAULT_RANGE_GENERATION, None)
+                    };
+                    if let Some(shard_id) = shard_id {
+                        logical_read_deltas
+                            .entry(shard_id)
+                            .or_default()
+                            .record(key.as_ref());
+                    }
+                    by_shard[shard].push(RoutedReadEntry {
+                        index: idx,
+                        range_generation,
+                    });
+                }
+            }
+            for (shard_id, delta) in logical_read_deltas {
+                self.shard_load.record_logical_read_delta(shard_id, delta);
+            }
+
+            let mut out = vec![None; keys.len()];
+            if matches!(self.read_mode, ReadMode::Local) {
+                for (shard, entries) in by_shard.into_iter().enumerate() {
+                    if entries.is_empty() {
+                        continue;
+                    }
+                    self.shard_load.record_get_ops(shard, entries.len() as u64);
+                    let mut shard_keys = Vec::with_capacity(entries.len());
+                    for entry in &entries {
+                        self.shard_load
+                            .record_read_key_sample(shard, keys[entry.index].as_ref());
+                        shard_keys.push(keys[entry.index].as_ref());
+                    }
+                    let values = self.kv_engine.get_latest_batch(&shard_keys);
+                    for (entry, value) in entries.into_iter().zip(values.into_iter()) {
+                        out[entry.index] = value.map(|(v, _)| v);
+                    }
+                }
+            } else {
+                let mut futs = FuturesUnordered::new();
+
+                for (shard, shard_entries) in by_shard.into_iter().enumerate() {
+                    if shard_entries.is_empty() {
+                        // Skip shards with no work.
+                        continue;
+                    }
+                    // Track client-visible read load per shard (best-effort).
+                    self.shard_load
+                        .record_get_ops(shard, shard_entries.len() as u64);
+                    let mut shard_indices = Vec::with_capacity(shard_entries.len());
+                    let mut shard_keys = Vec::with_capacity(shard_entries.len());
+                    let mut shard_generations = Vec::with_capacity(shard_entries.len());
+                    for entry in &shard_entries {
+                        let key = &keys[entry.index];
+                        self.shard_load.record_read_key_sample(shard, key.as_ref());
+                        shard_indices.push(entry.index);
+                        shard_keys.push(key.clone());
+                        shard_generations.push(entry.range_generation);
+                    }
+
+                    let handle = self.handle_for_shard(shard);
+                    let read_mode = self.read_mode;
+                    let fallback = self.read_barrier_fallback_quorum;
+                    let this = self.clone();
+                    futs.push(async move {
+                        let values = match read_mode {
+                            ReadMode::Accord => {
+                                // Accord reads: enforce read barriers before reading.
+                                let expected = shard_keys.len();
+                                let barrier_key_refs = shard_keys
+                                    .iter()
+                                    .map(|key| key.as_ref())
+                                    .collect::<Vec<_>>();
+                                let deps = match this
+                                    .ensure_read_barrier_shard(
+                                        GROUP_DATA_BASE + shard as u64,
+                                        &barrier_key_refs,
+                                    )
+                                    .await
+                                {
+                                    Ok(versions) => versions,
+                                    Err(err) => {
+                                        // Optionally fall back to quorum reads on barrier failures.
+                                        if fallback {
+                                            tracing::warn!(
+                                                error = ?err,
+                                                "read barrier failed; falling back to quorum batch get"
+                                            );
+                                            return this
+                                                .quorum_batch_get_shard(shard_keys)
+                                                .await
+                                                .map(|vals| (shard_indices, vals));
+                                        }
+                                        return Err(err);
+                                    }
+                                };
+                                let read_items = barrier_key_refs
+                                    .iter()
+                                    .copied()
+                                    .zip(shard_generations.iter().copied())
+                                    .collect::<Vec<_>>();
+                                let cmd = kv::encode_batch_get_slices_with_generations(&read_items);
+                                let res = handle.propose_read_with_deps(cmd, deps).await?;
+                                let accord::ProposalResult::Read(value) = res else {
+                                    anyhow::bail!("BATCH_GET expected read result, got {res:?}");
+                                };
+                                let value = value.unwrap_or_default();
+                                let decoded = kv::decode_batch_get_result(&value)?;
+                                anyhow::ensure!(
+                                    decoded.len() == expected,
+                                    "batch get result count mismatch (expected {expected}, got {})",
+                                    decoded.len()
+                                );
+                                decoded
+                            }
+                            // Local reads use the local KV engine without barriers.
+                            ReadMode::Local => {
+                                unreachable!("local reads are handled by the zero-copy path")
+                            }
+                            // Quorum reads consult a quorum of peers and pick latest values.
+                            ReadMode::Quorum => this.quorum_batch_get_shard(shard_keys).await?,
+                        };
+                        Ok::<_, anyhow::Error>((shard_indices, values))
+                    });
+                }
+
+                while let Some(res) = futs.next().await {
+                    let (indices, values) = res?;
+                    anyhow::ensure!(
+                        indices.len() == values.len(),
+                        "batch get shard result mismatch"
+                    );
+                    for (idx, value) in indices.into_iter().zip(values.into_iter()) {
+                        out[idx] = value;
+                    }
+                }
+            }
+
+            if let Some(epoch) = plan_epoch {
+                if self.cluster_store.epoch() != epoch {
+                    // Strict first implementation: any routing epoch churn
+                    // during a range read invalidates the plan. Retrying
+                    // proves the read used one stable logical metadata view.
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+            }
+            return Ok(out);
+        }
     }
 
     /// Execute a single Redis operation by delegating to batching helpers.
@@ -7189,7 +7356,7 @@ where
         tracing::warn!(
             accord_member_count = accord_members.len(),
             read_barrier_fallback_quorum = args.read_barrier_fallback_quorum,
-            "Accord 1RTT fast-path ACKs disabled because read-barrier settings are not quorum-safe"
+            "Accord 1RTT fast-path ACKs disabled for KV data groups"
         );
     }
 
@@ -7373,7 +7540,6 @@ where
     }
 
     let member_ids = runtime_members.keys().copied().collect::<Vec<_>>();
-
     let client_batch_stats = Arc::new(ClientBatchStats::default());
     let meta_proposal_stats = Arc::new(MetaProposalStats::default());
     let recovery_checkpoint_stats = Arc::new(RecoveryCheckpointStats::default());
@@ -7712,21 +7878,6 @@ fn read_barrier_quorum_size(member_count: usize) -> usize {
 }
 
 /// Check whether a read-barrier quorum intersects every 1RTT fast quorum.
-///
-/// Purpose:
-/// - Encode the safety condition that lets KV use quorum read barriers instead
-///   of all-peer barriers while 1RTT Commit dissemination is asynchronous.
-///
-/// Design:
-/// - HoloStore currently uses majority fast quorums for Accord 1RTT writes.
-/// - Two quorums must intersect when their sizes sum to more than membership.
-/// - Empty membership is rejected explicitly rather than relying on arithmetic.
-///
-/// Inputs:
-/// - `member_count`: number of configured Accord members.
-///
-/// Outputs:
-/// - `true` when every read quorum intersects every fast write quorum.
 fn read_barrier_quorum_intersects_fast_quorum(member_count: usize) -> bool {
     let read_quorum = read_barrier_quorum_size(member_count);
     if read_quorum == 0 {
@@ -7956,10 +8107,11 @@ mod tests {
         out
     }
 
-    /// Verify the startup safety gate accepts quorum-safe read barriers.
+    /// Verify the startup safety gate keeps KV 1RTT ACKs disabled.
     ///
     /// Purpose:
-    /// - Ensure 1RTT KV writes no longer require all-peer read-barrier mode.
+    /// - Ensure KV writes do not ACK before normal Commit dissemination while
+    ///   reads use latest-visible storage values.
     ///
     /// Design:
     /// - Checks valid majority memberships and the explicit empty-membership

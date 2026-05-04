@@ -845,7 +845,11 @@ fn executed_log_gc_prunes_stable_key_indexes() {
     assert_eq!(removed, 1);
     assert!(!state.executed_log.contains_key(&txn_id));
     assert!(!state.last_write_by_key.contains_key(&key));
-    assert!(!state.last_committed_write_by_key.contains_key(&key));
+    assert_eq!(
+        state.last_committed_write_by_key.get(&key),
+        Some(&(txn_id, 42)),
+        "committed key hints are retained as sequence floors"
+    );
 }
 
 #[test]
@@ -867,10 +871,10 @@ fn stable_committed_key_hint_is_not_reintroduced_as_dependency() {
 
     let (seq, deps) = state.compute_seq_deps(&config, next, &keys);
 
-    assert_eq!(seq, 1);
+    assert_eq!(seq, 8);
     assert!(
         deps.is_empty(),
-        "globally stable committed hints should not extend dependency chains"
+        "globally stable committed hints should only advance sequence floors"
     );
 }
 

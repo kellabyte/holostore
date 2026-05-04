@@ -7,14 +7,15 @@
 //! - `SplitStrategyEngine` is the strategy interface boundary used by the loop.
 //! - `Loadops` preserves the original load-first/size-second behavior for baseline comparisons.
 //! - `Adaptive` consumes richer cluster telemetry (size/load/latency/hot-key signals),
-//!   selects weighted split points, and defaults to metadata-only split cutovers.
+//!   selects weighted split points, and defaults to logical split cutovers with
+//!   deferred physical materialization.
 //!
 //! Runtime safety model:
-//! - Metadata-only same-replica splits use a short descriptor cutover and avoid
-//!   foreground data movement.
-//! - Legacy physical split workflows are coordinated with shard fences in the
-//!   range controller domain.
-//! - Only affected shards are paused while metadata + migration converge.
+//! - Logical splits fence only the affected source range while ownership cuts
+//!   over to a child Accord group with fallback-readable parent storage.
+//! - Physical materialization is paced background work; client routing never
+//!   waits for it to finish.
+//! - Only affected shards are paused while metadata ownership converges.
 //! - Failure handling uses per-shard backoff and distinguishes transient lease-loss aborts.
 //! - Successful automatic splits enter a controller-wide pacing window so
 //!   foreground traffic does not pay for bursty split fanout.
@@ -28,7 +29,7 @@
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use fjall::{Keyspace, PartitionCreateOptions};
@@ -46,7 +47,7 @@ use crate::NodeState;
 const SPLIT_FENCE_PREFIX: &str = "split-op";
 const SPLIT_FENCE_STALE_TIMEOUT: Duration = Duration::from_secs(20);
 const SPLIT_FENCE_HOLD_BUDGET: Duration = Duration::from_secs(1);
-const SPLIT_SHARD_DRAIN_LOW_WATERMARK: u64 = 8;
+const SPLIT_SHARD_DRAIN_LOW_WATERMARK: u64 = 0;
 const SPLIT_SHARD_DRAIN_STABLE_FOR: Duration = Duration::from_millis(100);
 const SPLIT_SHARD_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const SPLIT_FENCE_SYNC_TIMEOUT: Duration = Duration::from_secs(15);
@@ -138,16 +139,16 @@ impl SplitDecision {
     /// Return whether this split is a descriptor-only cutover.
     ///
     /// Purpose:
-    /// - Keep high-percentile latency low by skipping fences, drains, snapshots,
-    ///   and physical key movement when the child range starts with the source
-    ///   replicas and storage index.
+    /// - Identify the legacy same-owner fast path. Logical splits with a fresh
+    ///   child Accord group still need the short write fence/drain window even
+    ///   though they skip physical movement.
     ///
     /// Output:
-    /// - `true` for the Cockroach-style split-only path; `false` for legacy
-    ///   physical movement/staged backfill paths.
+    /// - `true` only when no ownership handoff can occur.
     fn is_metadata_only(&self) -> bool {
         self.skip_migration
             && !self.staged_backfill
+            && self.target_shard_index == self.shard.shard_index
             && self
                 .target_replicas
                 .as_ref()
@@ -905,6 +906,8 @@ pub fn spawn(state: Arc<NodeState>, keyspace: Arc<Keyspace>, cfg: RangeManagerCo
             std::collections::BTreeMap::<u64, SplitFailureBackoff>::new();
         let mut merge_cooldown_until = std::collections::BTreeMap::<u64, std::time::Instant>::new();
         let mut merge_sustained = std::collections::BTreeMap::<u64, u8>::new();
+        let active_materializations =
+            Arc::new(Mutex::new(std::collections::BTreeSet::<u64>::new()));
         loop {
             ticker.tick().await;
             if !state
@@ -913,6 +916,7 @@ pub fn spawn(state: Arc<NodeState>, keyspace: Arc<Keyspace>, cfg: RangeManagerCo
             {
                 continue;
             }
+            spawn_pending_materializations(state.clone(), cfg, active_materializations.clone());
             if let Err(err) = recover_stale_split_fences(state.clone()).await {
                 tracing::warn!(error = ?err, "range manager stale split-fence recovery failed");
             }
@@ -2140,6 +2144,129 @@ async fn propose_meta(state: Arc<NodeState>, cmd: ClusterCommand) -> anyhow::Res
         .await
 }
 
+/// Start background materialization tasks for fallback-readable child ranges.
+///
+/// Purpose:
+/// - Resume or continue deferred physical materialization after logical split
+///   cutover, including after node restart.
+///
+/// Design:
+/// - Scans descriptors for child ranges with fallback storage.
+/// - Uses an in-memory active set to avoid launching duplicate workers on this
+///   node.
+/// - Workers copy latest rows out of the shared parent storage into the child
+///   materialization target and then publish a metadata update that flips the
+///   child primary storage.
+///
+/// Inputs:
+/// - Current node state, pacing config, and active-materialization set.
+///
+/// Outputs:
+/// - Spawns zero or more detached tasks; errors are logged and retried by a
+///   later range-manager tick.
+fn spawn_pending_materializations(
+    state: Arc<NodeState>,
+    cfg: RangeManagerConfig,
+    active: Arc<Mutex<std::collections::BTreeSet<u64>>>,
+) {
+    let snapshot = state.cluster_store.state();
+    for shard in snapshot.shards.iter().cloned() {
+        let Some(target_storage_index) = shard.fallback_storage_index() else {
+            continue;
+        };
+        if shard.storage_index() == shard.shard_index || target_storage_index != shard.shard_index {
+            continue;
+        }
+        let source_node = snapshot
+            .shards
+            .iter()
+            .find(|candidate| candidate.storage_index() == shard.storage_index())
+            .map(|candidate| candidate.leaseholder)
+            .unwrap_or(shard.leaseholder);
+        let should_spawn = {
+            let Ok(mut active) = active.lock() else {
+                return;
+            };
+            active.insert(shard.shard_id)
+        };
+        if !should_spawn {
+            continue;
+        }
+
+        let state_for_task = state.clone();
+        let active_for_task = active.clone();
+        tokio::spawn(async move {
+            let shard_id = shard.shard_id;
+            let result =
+                materialize_child_range(state_for_task.clone(), cfg, shard, source_node).await;
+            if let Err(err) = result {
+                tracing::warn!(
+                    shard_id,
+                    error = ?err,
+                    "range materialization worker failed; will retry"
+                );
+            }
+            if let Ok(mut active) = active_for_task.lock() {
+                active.remove(&shard_id);
+            }
+        });
+    }
+}
+
+/// Copy shared parent bytes into a child materialization target partition.
+///
+/// Purpose:
+/// - Complete physical materialization after logical split cutover without
+///   blocking client reads or writes.
+///
+/// Design:
+/// - Reuses the paged latest-row backfill path with the same throughput caps as
+///   staged split backfill.
+/// - The child keeps the shared parent as primary storage until completion, so
+///   stale old-owner writes remain readable while metadata converges.
+/// - Metadata completion is idempotent and clears the fallback only if the
+///   descriptor still matches the copied source/target storage pair.
+///
+/// Inputs:
+/// - Child descriptor, source leaseholder, and materialization pacing config.
+///
+/// Outputs:
+/// - `Ok(())` once fallback storage is no longer needed for this child range.
+async fn materialize_child_range(
+    state: Arc<NodeState>,
+    cfg: RangeManagerConfig,
+    shard: ShardDesc,
+    source_node: NodeId,
+) -> anyhow::Result<()> {
+    let target_storage_index = shard
+        .fallback_storage_index()
+        .ok_or_else(|| anyhow::anyhow!("range {} has no materialization target", shard.shard_id))?;
+    let source_storage_index = shard.storage_index();
+    staged_split_backfill(
+        state.clone(),
+        source_storage_index,
+        target_storage_index,
+        source_node,
+        shard.replicas.as_slice(),
+        shard.start_key.as_slice(),
+        shard.end_key.as_slice(),
+        cfg.adaptive_backfill_page_limit,
+        cfg.adaptive_backfill_max_pages,
+        cfg.adaptive_backfill_max_bps,
+    )
+    .await?;
+
+    propose_meta(
+        state,
+        ClusterCommand::CompleteRangeMaterialization {
+            shard_id: shard.shard_id,
+            primary_storage_index: source_storage_index,
+            fallback_storage_index: target_storage_index,
+        },
+    )
+    .await
+}
+
 /// Copy `[start_key, end_key)` latest rows into target shard replicas before cutover.
 ///
 /// Design:
@@ -3336,7 +3463,7 @@ mod tests {
     #[test]
     fn shard_drain_timeout_is_transient_failure() {
         let err = anyhow::anyhow!(
-            "timed out waiting for shard 0 low-watermark drain (pending=100, watermark=8)"
+            "timed out waiting for shard 0 low-watermark drain (pending=100, watermark=0)"
         );
         let reason = classify_split_failure(&err);
         assert_eq!(reason, "shard_drain_timeout");

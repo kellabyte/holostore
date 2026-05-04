@@ -319,6 +319,144 @@ impl ShardLoadTracker {
         }
     }
 
+    /// Record a routed single-range write batch in one pass.
+    ///
+    /// Purpose:
+    /// - Keep the no-split client SET fast path from paying separate physical
+    ///   and logical telemetry passes over the same keys.
+    ///
+    /// Design:
+    /// - Updates physical counters and logical range counters from one sampled
+    ///   hash per key.
+    /// - Preserves observed min/max and sampled split keys so automatic split
+    ///   planning still has boundary hints after starting from one range.
+    ///
+    /// Inputs:
+    /// - `shard_index`: physical shard index receiving the batch.
+    /// - `shard_id`: logical descriptor id receiving the batch.
+    /// - `items`: borrowed `(key, value_len)` pairs.
+    pub fn record_single_range_write_batch<'a, I>(
+        &self,
+        shard_index: usize,
+        shard_id: u64,
+        items: I,
+    ) where
+        I: IntoIterator<Item = (&'a [u8], usize)>,
+    {
+        let mut ops = 0u64;
+        let mut bytes = 0u64;
+        let mut write_hot_buckets = [0u64; HOT_KEY_BUCKETS];
+        let mut observed_min_key = Vec::new();
+        let mut observed_max_key = Vec::new();
+        let mut sampled_keys = Vec::new();
+
+        for (key, value_len) in items {
+            ops = ops.saturating_add(1);
+            bytes = bytes.saturating_add((key.len().saturating_add(value_len)) as u64);
+            if observed_min_key.is_empty() || key < observed_min_key.as_slice() {
+                observed_min_key = key.to_vec();
+            }
+            if observed_max_key.is_empty() || key > observed_max_key.as_slice() {
+                observed_max_key = key.to_vec();
+            }
+
+            let hash = kv::hash_key(key);
+            if let Some(bucket) = sampled_hot_bucket_from_hash(hash) {
+                if let Some(counter) = self
+                    .write_hot_buckets
+                    .get((shard_index * HOT_KEY_BUCKETS) + bucket)
+                {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+                write_hot_buckets[bucket] = write_hot_buckets[bucket].saturating_add(1);
+            }
+            if sampled_keys.len() < LOGICAL_KEY_DELTA_SAMPLE_CAP
+                && sampled_logical_split_key_from_hash(hash)
+            {
+                sampled_keys.push(key.to_vec());
+            }
+        }
+
+        self.record_set_ops(shard_index, ops);
+        self.record_set_bytes(shard_index, bytes);
+        if shard_id == 0 || ops == 0 {
+            return;
+        }
+        let Ok(mut logical_ranges) = self.logical_ranges.lock() else {
+            return;
+        };
+        let entry = logical_ranges.entry(shard_id).or_default();
+        entry.set_ops = entry.set_ops.saturating_add(ops);
+        entry.write_bytes = entry.write_bytes.saturating_add(bytes);
+        if !observed_min_key.is_empty()
+            && (entry.observed_min_key.is_empty() || observed_min_key < entry.observed_min_key)
+        {
+            entry.observed_min_key = observed_min_key;
+        }
+        if !observed_max_key.is_empty()
+            && (entry.observed_max_key.is_empty() || observed_max_key > entry.observed_max_key)
+        {
+            entry.observed_max_key = observed_max_key;
+        }
+        for (idx, count) in write_hot_buckets.into_iter().enumerate() {
+            entry.write_hot_buckets[idx] = entry.write_hot_buckets[idx].saturating_add(count);
+        }
+        for key in sampled_keys {
+            entry.sampled_keys_seen = entry.sampled_keys_seen.saturating_add(1);
+            if entry.sampled_keys.len() < LOGICAL_KEY_SAMPLE_CAP {
+                entry.sampled_keys.push(key);
+                continue;
+            }
+            let replace_at = logical_sample_replace_index(&key, entry.sampled_keys_seen);
+            if replace_at < LOGICAL_KEY_SAMPLE_CAP {
+                entry.sampled_keys[replace_at] = key;
+            }
+        }
+    }
+
+    /// Record a routed single-range read batch in one pass.
+    ///
+    /// Purpose:
+    /// - Keep no-split GET telemetry cheap while retaining logical read counters
+    ///   for the range manager.
+    ///
+    /// Inputs:
+    /// - `shard_index`: physical shard index serving the batch.
+    /// - `shard_id`: logical descriptor id serving the batch.
+    /// - `keys`: borrowed read keys.
+    pub fn record_single_range_read_batch<'a, I>(&self, shard_index: usize, shard_id: u64, keys: I)
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+    {
+        let mut ops = 0u64;
+        let mut read_hot_buckets = [0u64; HOT_KEY_BUCKETS];
+        for key in keys {
+            ops = ops.saturating_add(1);
+            let hash = kv::hash_key(key);
+            if let Some(bucket) = sampled_hot_bucket_from_hash(hash) {
+                if let Some(counter) = self
+                    .read_hot_buckets
+                    .get((shard_index * HOT_KEY_BUCKETS) + bucket)
+                {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+                read_hot_buckets[bucket] = read_hot_buckets[bucket].saturating_add(1);
+            }
+        }
+        self.record_get_ops(shard_index, ops);
+        if shard_id == 0 || ops == 0 {
+            return;
+        }
+        let Ok(mut logical_ranges) = self.logical_ranges.lock() else {
+            return;
+        };
+        let entry = logical_ranges.entry(shard_id).or_default();
+        entry.get_ops = entry.get_ops.saturating_add(ops);
+        for (idx, count) in read_hot_buckets.into_iter().enumerate() {
+            entry.read_hot_buckets[idx] = entry.read_hot_buckets[idx].saturating_add(count);
+        }
+    }
+
     /// Record one sampled write key for hot-key concentration tracking.
     ///
     /// Inputs:
@@ -484,6 +622,10 @@ fn hot_bucket_offset(shard_index: usize, key: &[u8]) -> Option<usize> {
 
 pub fn sampled_hot_bucket(key: &[u8]) -> Option<usize> {
     let hash = kv::hash_key(key);
+    sampled_hot_bucket_from_hash(hash)
+}
+
+fn sampled_hot_bucket_from_hash(hash: u64) -> Option<usize> {
     if (hash & HOT_KEY_SAMPLE_MASK) != 0 {
         return None;
     }
@@ -491,7 +633,11 @@ pub fn sampled_hot_bucket(key: &[u8]) -> Option<usize> {
 }
 
 fn sampled_logical_split_key(key: &[u8]) -> bool {
-    (kv::hash_key(key) & LOGICAL_KEY_SAMPLE_MASK) == 0
+    sampled_logical_split_key_from_hash(kv::hash_key(key))
+}
+
+fn sampled_logical_split_key_from_hash(hash: u64) -> bool {
+    (hash & LOGICAL_KEY_SAMPLE_MASK) == 0
 }
 
 fn logical_sample_replace_index(key: &[u8], seen: u64) -> usize {
@@ -500,4 +646,39 @@ fn logical_sample_replace_index(key: &[u8], seen: u64) -> usize {
     }
     let mixed = kv::hash_key(key) ^ seen.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ seen.rotate_left(17);
     (mixed % seen) as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ShardLoadTracker;
+
+    #[test]
+    fn single_range_write_batch_updates_physical_and_logical_counters() {
+        let tracker = ShardLoadTracker::new(2);
+        tracker.record_single_range_write_batch(
+            1,
+            42,
+            [(b"k1".as_slice(), 3usize), (b"k2".as_slice(), 5usize)],
+        );
+
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.set_ops[1], 2);
+        assert_eq!(snapshot.write_bytes[1], 12);
+        let logical = snapshot.logical_ranges.get(&42).expect("logical range");
+        assert_eq!(logical.set_ops, 2);
+        assert_eq!(logical.write_bytes, 12);
+        assert_eq!(logical.observed_min_key, b"k1".to_vec());
+        assert_eq!(logical.observed_max_key, b"k2".to_vec());
+    }
+
+    #[test]
+    fn single_range_read_batch_updates_physical_and_logical_counters() {
+        let tracker = ShardLoadTracker::new(2);
+        tracker.record_single_range_read_batch(1, 42, [b"k1".as_slice(), b"k2".as_slice()]);
+
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.get_ops[1], 2);
+        let logical = snapshot.logical_ranges.get(&42).expect("logical range");
+        assert_eq!(logical.get_ops, 2);
+    }
 }
