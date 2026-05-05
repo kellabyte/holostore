@@ -81,6 +81,84 @@ struct ExecSnapshot {
     executed_out_of_order: HashSet<TxnId>,
 }
 
+/// Pick ready committed transactions on the dependency path to a target.
+///
+/// Purpose:
+/// - Let `execute_until(target)` make progress on the target read/write without
+///   first draining unrelated committed work that happens to have a lower
+///   sequence number.
+///
+/// Design:
+/// - Walks the target's dependency graph depth-first.
+/// - Emits dependencies before dependents so one executor batch can apply a
+///   ready chain in dependency order.
+/// - Stops at missing, non-committed, executing, or cyclic dependencies and lets
+///   the normal scheduler/recovery path handle those cases.
+///
+/// Inputs:
+/// - `state`: locked group state.
+/// - `target`: transaction that a foreground caller is waiting on.
+/// - `limit`: maximum number of transaction ids to return.
+///
+/// Outputs:
+/// - A dependency-ordered list of committed transactions that can execute now.
+pub(super) fn pick_target_execution_path(state: &State, target: TxnId, limit: usize) -> Vec<TxnId> {
+    fn visit(
+        state: &State,
+        txn_id: TxnId,
+        limit: usize,
+        visiting: &mut HashSet<TxnId>,
+        selected: &mut HashSet<TxnId>,
+        out: &mut Vec<TxnId>,
+    ) {
+        if out.len() >= limit || state.is_executed(&txn_id) || selected.contains(&txn_id) {
+            return;
+        }
+        if !visiting.insert(txn_id) {
+            return;
+        }
+
+        let Some(rec) = state.records.get(&txn_id) else {
+            visiting.remove(&txn_id);
+            return;
+        };
+        if rec.status < Status::Committed {
+            visiting.remove(&txn_id);
+            return;
+        }
+
+        for dep in rec.deps.iter().copied() {
+            if state.is_executed(&dep) || selected.contains(&dep) {
+                continue;
+            }
+            visit(state, dep, limit, visiting, selected, out);
+            if out.len() >= limit {
+                visiting.remove(&txn_id);
+                return;
+            }
+        }
+
+        let deps_ready = rec
+            .deps
+            .iter()
+            .all(|dep| state.is_executed(dep) || selected.contains(dep));
+        if deps_ready && rec.status == Status::Committed && out.len() < limit {
+            selected.insert(txn_id);
+            out.push(txn_id);
+        }
+        visiting.remove(&txn_id);
+    }
+
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut visiting = HashSet::new();
+    let mut selected = HashSet::new();
+    let mut out = Vec::new();
+    visit(state, target, limit, &mut visiting, &mut selected, &mut out);
+    out
+}
+
 fn is_executed_snapshot(snapshot: &ExecSnapshot, txn_id: &TxnId) -> bool {
     let prefix = snapshot
         .executed_prefix_by_stream
@@ -800,7 +878,7 @@ impl Group {
                 return Ok(());
             }
 
-            let progress = self.execute_progress().await?;
+            let progress = self.execute_target_progress(target).await?;
             if self.is_executed(target).await {
                 return Ok(());
             }
@@ -927,7 +1005,32 @@ impl Group {
 
     pub(super) async fn execute_progress(&self) -> anyhow::Result<bool> {
         let start = time::Instant::now();
-        let res = self.execute_progress_inner().await;
+        let res = self.execute_progress_inner(None).await;
+        self.metrics
+            .record_exec_progress(start.elapsed(), res.as_ref().ok().copied());
+        res
+    }
+
+    /// Drive execution with a foreground target preference.
+    ///
+    /// Purpose:
+    /// - Keep linearizable reads from waiting behind unrelated committed writes
+    ///   when the read's own dependency path is already executable.
+    ///
+    /// Design:
+    /// - Shares the normal executor implementation and metrics.
+    /// - Supplies a priority target that is considered before the global
+    ///   sequence-ordered ready queue.
+    ///
+    /// Inputs:
+    /// - `target`: transaction whose caller is waiting.
+    ///
+    /// Outputs:
+    /// - `Ok(true)` when any transaction executed.
+    /// - `Ok(false)` when no safe progress was available.
+    async fn execute_target_progress(&self, target: TxnId) -> anyhow::Result<bool> {
+        let start = time::Instant::now();
+        let res = self.execute_progress_inner(Some(target)).await;
         self.metrics
             .record_exec_progress(start.elapsed(), res.as_ref().ok().copied());
         res
@@ -949,7 +1052,7 @@ impl Group {
         self.executor_notify.notify_one();
     }
 
-    async fn execute_progress_inner(&self) -> anyhow::Result<bool> {
+    async fn execute_progress_inner(&self, priority_target: Option<TxnId>) -> anyhow::Result<bool> {
         let _guard = self.execute_lock.lock().await;
 
         let mut to_apply = Vec::<ApplyItem>::new();
@@ -965,8 +1068,43 @@ impl Group {
                 return Ok(false);
             }
 
+            if let Some(target) = priority_target {
+                let target_path = pick_target_execution_path(&state, target, exec_batch_max);
+                for id in &target_path {
+                    let Some(rec) = state.records.get_mut(id) else {
+                        continue;
+                    };
+                    if rec.status != Status::Committed {
+                        continue;
+                    }
+
+                    let (cmd, keys, seq) = {
+                        rec.status = Status::Executing;
+                        rec.updated_at = time::Instant::now();
+                        let cmd = rec
+                            .command
+                            .clone()
+                            .context("missing command bytes for committed txn")?;
+                        let keys = rec.keys.clone().unwrap_or_default();
+                        (cmd, keys, rec.seq)
+                    };
+
+                    state.remove_committed(*id, seq);
+                    to_apply.push(ApplyItem {
+                        id: *id,
+                        command: cmd,
+                        keys,
+                        seq: seq.max(1),
+                    });
+                }
+                if !to_apply.is_empty() {
+                    picked = target_path;
+                    used_ready = true;
+                }
+            }
+
             // Fast-path: consume ready-to-execute commits without scanning.
-            if !state.committed_ready.is_empty() {
+            if !used_ready && !state.committed_ready.is_empty() {
                 let ready_ids: Vec<TxnId> = state
                     .committed_ready
                     .iter()

@@ -1464,6 +1464,81 @@ fn latest_versioned_pair(
     }
 }
 
+/// Decode one committed write command as a versioned value candidate for a key.
+///
+/// Purpose:
+/// - Give future Accord-owned read paths a reusable way to inspect committed
+///   write bytes after consensus has established the read's visibility point.
+///
+/// Design:
+/// - Uses the same command decoding and generation override rules as normal KV
+///   apply, then returns the newest write in the command for `key`.
+/// - Unknown or malformed commands return an error so callers can fail closed
+///   to the ordinary execution wait path.
+///
+/// Inputs:
+/// - `data`: committed KV command bytes.
+/// - `meta`: Accord execution metadata for the committed transaction.
+/// - `key`: key being read.
+///
+/// Outputs:
+/// - The committed value/version for `key`, or `None` if the command does not
+///   write that key.
+pub fn committed_write_value_for_key(
+    data: &[u8],
+    meta: ExecMeta,
+    key: &[u8],
+) -> anyhow::Result<Option<(Vec<u8>, Version)>> {
+    let mut values = committed_write_values_for_keys(data, meta, &[key])?;
+    Ok(values.pop().unwrap_or(None))
+}
+
+/// Decode one committed write command as versioned value candidates for many keys.
+///
+/// Purpose:
+/// - Serve a read batch from committed command bytes without reparsing the same
+///   command once per requested key.
+///
+/// Design:
+/// - Builds a borrowed key-index map for the requested read keys.
+/// - Decodes the command once, then fills all matching output slots using the
+///   same version ordering as normal latest-value reads.
+///
+/// Inputs:
+/// - `data`: committed KV command bytes.
+/// - `meta`: Accord execution metadata for the committed transaction.
+/// - `keys`: read keys in requested output order.
+///
+/// Outputs:
+/// - One optional committed value/version per input key, preserving order.
+pub fn committed_write_values_for_keys(
+    data: &[u8],
+    meta: ExecMeta,
+    keys: &[&[u8]],
+) -> anyhow::Result<Vec<Option<(Vec<u8>, Version)>>> {
+    let mut out = vec![None; keys.len()];
+    if keys.is_empty() {
+        return Ok(out);
+    }
+
+    let mut key_indices: HashMap<&[u8], Vec<usize>> = HashMap::with_capacity(keys.len());
+    for (idx, key) in keys.iter().copied().enumerate() {
+        key_indices.entry(key).or_default().push(idx);
+    }
+
+    let base_version = Version::from(meta);
+    for item in decode_write_items(data, base_version)? {
+        let Some(indices) = key_indices.get(item.key) else {
+            continue;
+        };
+        for idx in indices.iter().copied() {
+            let next = Some((item.value.to_vec(), item.version));
+            out[idx] = latest_versioned_pair(out[idx].take(), next);
+        }
+    }
+    Ok(out)
+}
+
 /// Sharded wrapper that routes keys to per-shard `KvEngine` instances.
 pub struct RoutedKvEngine {
     shards: Vec<Arc<dyn KvEngine>>,
@@ -3445,6 +3520,62 @@ mod tests {
         assert_eq!(writes.len(), 2);
         assert_eq!(writes[0].version.range_generation, DEFAULT_RANGE_GENERATION);
         assert_eq!(writes[1].version.range_generation, 2);
+    }
+
+    #[test]
+    fn committed_write_value_decodes_generation_aware_batch() {
+        let cmd = encode_batch_set_with_generations(&[
+            (b"a".to_vec(), b"one".to_vec(), 7),
+            (b"b".to_vec(), b"two".to_vec(), 7),
+        ]);
+        let value = committed_write_value_for_key(&cmd, test_group_meta(7, 5, 5), b"b")
+            .expect("committed decode should succeed")
+            .expect("key should be present");
+
+        assert_eq!(value.0, b"two".to_vec());
+        assert_eq!(value.1, test_group_version(7, 5, 5));
+        assert!(
+            committed_write_value_for_key(&cmd, test_group_meta(7, 5, 5), b"missing")
+                .expect("committed decode should succeed")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn committed_write_values_preserve_read_order_and_duplicates() {
+        let cmd = encode_batch_set_with_generations(&[
+            (b"a".to_vec(), b"one".to_vec(), 4),
+            (b"b".to_vec(), b"two".to_vec(), 4),
+            (b"a".to_vec(), b"three".to_vec(), 5),
+        ]);
+        let values = committed_write_values_for_keys(
+            &cmd,
+            test_group_meta(4, 9, 9),
+            &[
+                b"b".as_slice(),
+                b"missing".as_slice(),
+                b"a".as_slice(),
+                b"a".as_slice(),
+            ],
+        )
+        .expect("committed decode should succeed");
+
+        assert_eq!(
+            values[0].as_ref().map(|(value, _)| value.as_slice()),
+            Some(b"two".as_slice())
+        );
+        assert!(values[1].is_none());
+        assert_eq!(
+            values[2].as_ref().map(|(value, _)| value.as_slice()),
+            Some(b"three".as_slice())
+        );
+        assert_eq!(values[2], values[3]);
+        assert_eq!(
+            values[2]
+                .as_ref()
+                .map(|(_, version)| version.range_generation),
+            Some(5)
+        );
     }
 
     #[test]
