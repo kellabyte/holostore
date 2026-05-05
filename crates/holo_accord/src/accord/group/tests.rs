@@ -665,6 +665,91 @@ fn encoded_txn(node_id: NodeId, epoch: u64, seq: u64) -> TxnId {
     }
 }
 
+fn committed_record(seq: u64, deps: &[TxnId], keys: CommandKeys) -> Record {
+    Record {
+        promised: Ballot::zero(),
+        accepted_ballot: Some(Ballot::initial(1)),
+        command: Some(Bytes::from_static(b"test-command")),
+        command_digest: None,
+        keys: Some(keys),
+        seq,
+        deps: deps.iter().copied().collect(),
+        status: Status::Committed,
+        updated_at: time::Instant::now(),
+    }
+}
+
+/// Verify foreground execution can bypass unrelated ready backlog.
+///
+/// Purpose:
+/// - Protect read-tail behavior: a committed read waiting in `execute_until`
+///   should execute its own dependency path before unrelated lower-sequence
+///   ready writes.
+///
+/// Design:
+/// - Builds one unrelated committed write and one read target that depends on a
+///   committed write for its key.
+/// - Asserts the target picker returns the key dependency and target, not the
+///   unrelated backlog item.
+///
+/// Outputs:
+/// - Assertion failure if target-priority execution would drain unrelated work.
+#[test]
+fn target_execution_path_skips_unrelated_ready_backlog() {
+    let mut state = State::new();
+    let unrelated = encoded_txn(1, 7, 1);
+    let key_dep = encoded_txn(2, 7, 2);
+    let target = encoded_txn(3, 7, 3);
+
+    state.records.insert(
+        unrelated,
+        committed_record(
+            1,
+            &[],
+            CommandKeys {
+                reads: Vec::new(),
+                writes: vec![b"unrelated".to_vec()],
+            },
+        ),
+    );
+    state.insert_committed(unrelated, 1);
+
+    state.records.insert(
+        key_dep,
+        committed_record(
+            2,
+            &[],
+            CommandKeys {
+                reads: Vec::new(),
+                writes: vec![b"target-key".to_vec()],
+            },
+        ),
+    );
+    state.insert_committed(key_dep, 2);
+
+    state.records.insert(
+        target,
+        committed_record(
+            3,
+            &[key_dep],
+            CommandKeys {
+                reads: vec![b"target-key".to_vec()],
+                writes: Vec::new(),
+            },
+        ),
+    );
+    state.insert_committed(target, 3);
+
+    assert_eq!(
+        super::execution::pick_target_execution_path(&state, target, 8),
+        vec![key_dep, target]
+    );
+    assert_eq!(
+        super::execution::pick_target_execution_path(&state, target, 1),
+        vec![key_dep]
+    );
+}
+
 /// Ensure direct-published executed writes are visible to GC bookkeeping.
 ///
 /// Purpose:
