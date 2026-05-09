@@ -909,6 +909,7 @@ struct NodeState {
     read_barrier_timeout: Duration,
     read_barrier_fallback_quorum: bool,
     read_barrier_all_peers: bool,
+    read_frontier_stats: Arc<ReadFrontierStats>,
     proposal_stats: Arc<ProposalStats>,
     proposal_stats_enabled: bool,
     meta_proposal_stats: Arc<MetaProposalStats>,
@@ -2006,6 +2007,75 @@ struct ClientBatchStatsSnapshot {
     get_collect_reason_closed_batches: u64,
 }
 
+/// Aggregated read-frontier authorization stats.
+///
+/// Purpose:
+/// - Explain whether Accord-mode reads are spending time in quorum frontier
+///   collection, local visibility waits, Accord read proposals, or local
+///   storage reads.
+///
+/// Design:
+/// - Counters are atomics so GET hot paths can update them without sharing a
+///   lock with Redis stats rendering or periodic logging.
+/// - Snapshot methods mirror the existing batch/proposal stats style: cumulative
+///   snapshots support `HOLOSTATS`, and reset snapshots support interval logs.
+///
+/// Inputs:
+/// - One successful no-dependency local-frontier read, one dependency-carrying
+///   Accord read proposal, one quorum fallback, or one barrier error per shard
+///   GET batch.
+///
+/// Outputs:
+/// - `ReadFrontierStatsSnapshot` for runtime logs and stats commands.
+#[derive(Default)]
+struct ReadFrontierStats {
+    batches: AtomicU64,
+    keys: AtomicU64,
+    local_authorized_batches: AtomicU64,
+    proposal_batches: AtomicU64,
+    quorum_fallback_batches: AtomicU64,
+    barrier_error_batches: AtomicU64,
+    collect_total_us: AtomicU64,
+    collect_max_us: AtomicU64,
+    wait_total_us: AtomicU64,
+    wait_max_us: AtomicU64,
+    local_read_total_us: AtomicU64,
+    local_read_max_us: AtomicU64,
+    proposal_total_us: AtomicU64,
+    proposal_max_us: AtomicU64,
+    deps_total: AtomicU64,
+    wait_targets_total: AtomicU64,
+    pending_waits_total: AtomicU64,
+    max_deps: AtomicU64,
+    max_wait_targets: AtomicU64,
+    max_pending_waits: AtomicU64,
+}
+
+/// Point-in-time read-frontier stats.
+#[derive(Default, Debug, Clone)]
+struct ReadFrontierStatsSnapshot {
+    batches: u64,
+    keys: u64,
+    local_authorized_batches: u64,
+    proposal_batches: u64,
+    quorum_fallback_batches: u64,
+    barrier_error_batches: u64,
+    collect_total_us: u64,
+    collect_max_us: u64,
+    wait_total_us: u64,
+    wait_max_us: u64,
+    local_read_total_us: u64,
+    local_read_max_us: u64,
+    proposal_total_us: u64,
+    proposal_max_us: u64,
+    deps_total: u64,
+    wait_targets_total: u64,
+    pending_waits_total: u64,
+    max_deps: u64,
+    max_wait_targets: u64,
+    max_pending_waits: u64,
+}
+
 impl ClientBatchStats {
     /// Record a completed SET batch with item count and queue wait time.
     fn record_set(&self, items: u64, wait_us: u64) {
@@ -2195,6 +2265,177 @@ impl ClientBatchStats {
     }
 }
 
+impl ReadFrontierStats {
+    /// Record the shared barrier-shape fields for any successful frontier path.
+    ///
+    /// Inputs:
+    /// - `barrier`: collected quorum frontier and wait timing.
+    ///
+    /// Outputs:
+    /// - Updates timing and dependency aggregates used to diagnose read tails.
+    fn record_barrier_shape(&self, barrier: &ReadBarrierOutcome) {
+        self.collect_total_us
+            .fetch_add(barrier.collect_us, Ordering::Relaxed);
+        self.collect_max_us
+            .fetch_max(barrier.collect_us, Ordering::Relaxed);
+        self.wait_total_us
+            .fetch_add(barrier.wait_us, Ordering::Relaxed);
+        self.wait_max_us
+            .fetch_max(barrier.wait_us, Ordering::Relaxed);
+        self.deps_total
+            .fetch_add(barrier.deps.len() as u64, Ordering::Relaxed);
+        self.wait_targets_total
+            .fetch_add(barrier.wait_targets as u64, Ordering::Relaxed);
+        self.pending_waits_total
+            .fetch_add(barrier.pending_waits as u64, Ordering::Relaxed);
+        self.max_deps
+            .fetch_max(barrier.deps.len() as u64, Ordering::Relaxed);
+        self.max_wait_targets
+            .fetch_max(barrier.wait_targets as u64, Ordering::Relaxed);
+        self.max_pending_waits
+            .fetch_max(barrier.pending_waits as u64, Ordering::Relaxed);
+    }
+
+    /// Record one successful Accord-owned local read-frontier authorization.
+    ///
+    /// Purpose:
+    /// - Attribute a GET batch to the read-index style path where Accord proved
+    ///   the requested key frontier was locally visible.
+    ///
+    /// Inputs:
+    /// - `keys`: number of keys in the shard-local GET batch.
+    /// - `barrier`: collected quorum frontier and wait timing.
+    /// - `local_read_us`: time spent reading local MVCC storage after
+    ///   authorization.
+    ///
+    /// Outputs:
+    /// - Updates success counters and timing aggregates.
+    fn record_local_authorized(
+        &self,
+        keys: usize,
+        barrier: &ReadBarrierOutcome,
+        local_read_us: u64,
+    ) {
+        self.batches.fetch_add(1, Ordering::Relaxed);
+        self.keys.fetch_add(keys as u64, Ordering::Relaxed);
+        self.local_authorized_batches
+            .fetch_add(1, Ordering::Relaxed);
+        self.local_read_total_us
+            .fetch_add(local_read_us, Ordering::Relaxed);
+        self.local_read_max_us
+            .fetch_max(local_read_us, Ordering::Relaxed);
+        self.record_barrier_shape(barrier);
+    }
+
+    /// Record one Accord read proposal selected by the read-frontier gate.
+    ///
+    /// Purpose:
+    /// - Attribute hot or recently written keys to the conservative path where
+    ///   the read keeps an explicit transaction in Accord's dependency graph.
+    ///
+    /// Inputs:
+    /// - `keys`: number of keys in the shard-local GET batch.
+    /// - `barrier`: collected quorum frontier and wait timing.
+    /// - `proposal_us`: time spent proposing/executing the Accord read.
+    ///
+    /// Outputs:
+    /// - Updates proposal counters, timing aggregates, and barrier-shape data.
+    fn record_proposal(&self, keys: usize, barrier: &ReadBarrierOutcome, proposal_us: u64) {
+        self.batches.fetch_add(1, Ordering::Relaxed);
+        self.keys.fetch_add(keys as u64, Ordering::Relaxed);
+        self.proposal_batches.fetch_add(1, Ordering::Relaxed);
+        self.proposal_total_us
+            .fetch_add(proposal_us, Ordering::Relaxed);
+        self.proposal_max_us
+            .fetch_max(proposal_us, Ordering::Relaxed);
+        self.record_barrier_shape(barrier);
+    }
+
+    /// Record one shard GET batch that fell back to quorum reads.
+    ///
+    /// Inputs:
+    /// - `keys`: number of keys in the shard-local GET batch.
+    ///
+    /// Outputs:
+    /// - Updates fallback counters without attributing local frontier timing.
+    fn record_quorum_fallback(&self, keys: usize) {
+        self.batches.fetch_add(1, Ordering::Relaxed);
+        self.keys.fetch_add(keys as u64, Ordering::Relaxed);
+        self.quorum_fallback_batches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one read-frontier barrier failure.
+    ///
+    /// Inputs:
+    /// - `keys`: number of keys in the shard-local GET batch.
+    ///
+    /// Outputs:
+    /// - Updates error counters for diagnosing read-tail fallback behavior.
+    fn record_barrier_error(&self, keys: usize) {
+        self.batches.fetch_add(1, Ordering::Relaxed);
+        self.keys.fetch_add(keys as u64, Ordering::Relaxed);
+        self.barrier_error_batches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Snapshot and reset interval counters.
+    ///
+    /// Output:
+    /// - Counters since the previous reset.
+    fn snapshot_and_reset(&self) -> ReadFrontierStatsSnapshot {
+        ReadFrontierStatsSnapshot {
+            batches: self.batches.swap(0, Ordering::Relaxed),
+            keys: self.keys.swap(0, Ordering::Relaxed),
+            local_authorized_batches: self.local_authorized_batches.swap(0, Ordering::Relaxed),
+            proposal_batches: self.proposal_batches.swap(0, Ordering::Relaxed),
+            quorum_fallback_batches: self.quorum_fallback_batches.swap(0, Ordering::Relaxed),
+            barrier_error_batches: self.barrier_error_batches.swap(0, Ordering::Relaxed),
+            collect_total_us: self.collect_total_us.swap(0, Ordering::Relaxed),
+            collect_max_us: self.collect_max_us.swap(0, Ordering::Relaxed),
+            wait_total_us: self.wait_total_us.swap(0, Ordering::Relaxed),
+            wait_max_us: self.wait_max_us.swap(0, Ordering::Relaxed),
+            local_read_total_us: self.local_read_total_us.swap(0, Ordering::Relaxed),
+            local_read_max_us: self.local_read_max_us.swap(0, Ordering::Relaxed),
+            proposal_total_us: self.proposal_total_us.swap(0, Ordering::Relaxed),
+            proposal_max_us: self.proposal_max_us.swap(0, Ordering::Relaxed),
+            deps_total: self.deps_total.swap(0, Ordering::Relaxed),
+            wait_targets_total: self.wait_targets_total.swap(0, Ordering::Relaxed),
+            pending_waits_total: self.pending_waits_total.swap(0, Ordering::Relaxed),
+            max_deps: self.max_deps.swap(0, Ordering::Relaxed),
+            max_wait_targets: self.max_wait_targets.swap(0, Ordering::Relaxed),
+            max_pending_waits: self.max_pending_waits.swap(0, Ordering::Relaxed),
+        }
+    }
+
+    /// Snapshot cumulative counters without resetting.
+    ///
+    /// Output:
+    /// - Point-in-time counters for `HOLOSTATS`.
+    fn snapshot(&self) -> ReadFrontierStatsSnapshot {
+        ReadFrontierStatsSnapshot {
+            batches: self.batches.load(Ordering::Relaxed),
+            keys: self.keys.load(Ordering::Relaxed),
+            local_authorized_batches: self.local_authorized_batches.load(Ordering::Relaxed),
+            proposal_batches: self.proposal_batches.load(Ordering::Relaxed),
+            quorum_fallback_batches: self.quorum_fallback_batches.load(Ordering::Relaxed),
+            barrier_error_batches: self.barrier_error_batches.load(Ordering::Relaxed),
+            collect_total_us: self.collect_total_us.load(Ordering::Relaxed),
+            collect_max_us: self.collect_max_us.load(Ordering::Relaxed),
+            wait_total_us: self.wait_total_us.load(Ordering::Relaxed),
+            wait_max_us: self.wait_max_us.load(Ordering::Relaxed),
+            local_read_total_us: self.local_read_total_us.load(Ordering::Relaxed),
+            local_read_max_us: self.local_read_max_us.load(Ordering::Relaxed),
+            proposal_total_us: self.proposal_total_us.load(Ordering::Relaxed),
+            proposal_max_us: self.proposal_max_us.load(Ordering::Relaxed),
+            deps_total: self.deps_total.load(Ordering::Relaxed),
+            wait_targets_total: self.wait_targets_total.load(Ordering::Relaxed),
+            pending_waits_total: self.pending_waits_total.load(Ordering::Relaxed),
+            max_deps: self.max_deps.load(Ordering::Relaxed),
+            max_wait_targets: self.max_wait_targets.load(Ordering::Relaxed),
+            max_pending_waits: self.max_pending_waits.load(Ordering::Relaxed),
+        }
+    }
+}
+
 impl ClientBatchStatsSnapshot {
     /// Compute a saturating delta against an earlier cumulative snapshot.
     fn saturating_delta(&self, older: &Self) -> Self {
@@ -2255,6 +2496,58 @@ impl ClientBatchStatsSnapshot {
             get_collect_reason_closed_batches: self
                 .get_collect_reason_closed_batches
                 .saturating_sub(older.get_collect_reason_closed_batches),
+        }
+    }
+}
+
+impl ReadFrontierStatsSnapshot {
+    /// Compute a saturating delta against an earlier cumulative snapshot.
+    ///
+    /// Purpose:
+    /// - Let interval logs report read-frontier activity without resetting the
+    ///   cumulative counters used by `HOLOSTATS`.
+    ///
+    /// Inputs:
+    /// - `older`: previous cumulative snapshot from the same process.
+    ///
+    /// Outputs:
+    /// - Delta counters with max fields kept from the newer snapshot.
+    fn saturating_delta(&self, older: &Self) -> Self {
+        Self {
+            batches: self.batches.saturating_sub(older.batches),
+            keys: self.keys.saturating_sub(older.keys),
+            local_authorized_batches: self
+                .local_authorized_batches
+                .saturating_sub(older.local_authorized_batches),
+            proposal_batches: self.proposal_batches.saturating_sub(older.proposal_batches),
+            quorum_fallback_batches: self
+                .quorum_fallback_batches
+                .saturating_sub(older.quorum_fallback_batches),
+            barrier_error_batches: self
+                .barrier_error_batches
+                .saturating_sub(older.barrier_error_batches),
+            collect_total_us: self.collect_total_us.saturating_sub(older.collect_total_us),
+            collect_max_us: self.collect_max_us,
+            wait_total_us: self.wait_total_us.saturating_sub(older.wait_total_us),
+            wait_max_us: self.wait_max_us,
+            local_read_total_us: self
+                .local_read_total_us
+                .saturating_sub(older.local_read_total_us),
+            local_read_max_us: self.local_read_max_us,
+            proposal_total_us: self
+                .proposal_total_us
+                .saturating_sub(older.proposal_total_us),
+            proposal_max_us: self.proposal_max_us,
+            deps_total: self.deps_total.saturating_sub(older.deps_total),
+            wait_targets_total: self
+                .wait_targets_total
+                .saturating_sub(older.wait_targets_total),
+            pending_waits_total: self
+                .pending_waits_total
+                .saturating_sub(older.pending_waits_total),
+            max_deps: self.max_deps,
+            max_wait_targets: self.max_wait_targets,
+            max_pending_waits: self.max_pending_waits,
         }
     }
 }
@@ -3593,9 +3886,19 @@ impl NodeState {
         self.client_batch_stats.snapshot_and_reset()
     }
 
+    /// Snapshot and reset read-frontier stats.
+    fn read_frontier_stats_snapshot(&self) -> ReadFrontierStatsSnapshot {
+        self.read_frontier_stats.snapshot_and_reset()
+    }
+
     /// Snapshot client batch stats without resetting counters.
     fn client_batch_stats_snapshot_cumulative(&self) -> ClientBatchStatsSnapshot {
         self.client_batch_stats.snapshot()
+    }
+
+    /// Snapshot read-frontier stats without resetting counters.
+    fn read_frontier_stats_snapshot_cumulative(&self) -> ReadFrontierStatsSnapshot {
+        self.read_frontier_stats.snapshot()
     }
 
     /// Block client request execution while range operations are in progress.
@@ -4006,17 +4309,19 @@ impl NodeState {
                     }
                     ReadMode::Accord => {
                         let key_refs = keys.iter().map(|key| key.as_ref()).collect::<Vec<_>>();
-                        let deps = match self
+                        let barrier = match self
                             .ensure_read_barrier_shard(GROUP_DATA_BASE + shard as u64, &key_refs)
                             .await
                         {
                             Ok(versions) => versions,
                             Err(err) => {
+                                self.read_frontier_stats.record_barrier_error(keys.len());
                                 if self.read_barrier_fallback_quorum {
                                     tracing::warn!(
                                         error = ?err,
                                         "read barrier failed; falling back to quorum batch get"
                                     );
+                                    self.read_frontier_stats.record_quorum_fallback(keys.len());
                                     let values = self.quorum_batch_get_shard(keys.clone()).await?;
                                     if self.cluster_store.epoch() == plan_epoch {
                                         return Ok(values);
@@ -4028,26 +4333,39 @@ impl NodeState {
                                 }
                             }
                         };
-                        let cmd = kv::encode_batch_get_slices_with_shared_generation(
-                            &key_refs,
-                            range_generation,
-                        );
-                        let res = self
-                            .handle_for_shard(shard)
-                            .propose_read_with_deps(cmd, deps)
-                            .await?;
-                        let accord::ProposalResult::Read(value) = res else {
-                            anyhow::bail!("BATCH_GET expected read result, got {res:?}");
-                        };
-                        let value = value.unwrap_or_default();
-                        let decoded = kv::decode_batch_get_result(&value)?;
-                        anyhow::ensure!(
-                            decoded.len() == keys.len(),
-                            "batch get result count mismatch (expected {}, got {})",
-                            keys.len(),
-                            decoded.len()
-                        );
-                        decoded
+                        if barrier.allows_local_frontier_read() {
+                            let generations = vec![range_generation; key_refs.len()];
+                            let read_start = Instant::now();
+                            let decoded =
+                                self.local_batch_get_at_generations(&key_refs, &generations)?;
+                            let local_read_us =
+                                read_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                            self.read_frontier_stats.record_local_authorized(
+                                keys.len(),
+                                &barrier,
+                                local_read_us,
+                            );
+                            decoded
+                        } else {
+                            let cmd = kv::encode_batch_get_slices_with_shared_generation(
+                                &key_refs,
+                                range_generation,
+                            );
+                            let (decoded, proposal_us) = self
+                                .propose_batch_get_with_deps(
+                                    shard,
+                                    cmd,
+                                    barrier.deps.clone(),
+                                    keys.len(),
+                                )
+                                .await?;
+                            self.read_frontier_stats.record_proposal(
+                                keys.len(),
+                                &barrier,
+                                proposal_us,
+                            );
+                            decoded
+                        }
                     }
                     ReadMode::Quorum => self.quorum_batch_get_shard(keys.clone()).await?,
                 };
@@ -4149,7 +4467,6 @@ impl NodeState {
                         shard_generations.push(entry.range_generation);
                     }
 
-                    let handle = self.handle_for_shard(shard);
                     let read_mode = self.read_mode;
                     let fallback = self.read_barrier_fallback_quorum;
                     let this = self.clone();
@@ -4162,7 +4479,7 @@ impl NodeState {
                                     .iter()
                                     .map(|key| key.as_ref())
                                     .collect::<Vec<_>>();
-                                let deps = match this
+                                let barrier = match this
                                     .ensure_read_barrier_shard(
                                         GROUP_DATA_BASE + shard as u64,
                                         &barrier_key_refs,
@@ -4171,12 +4488,16 @@ impl NodeState {
                                 {
                                     Ok(versions) => versions,
                                     Err(err) => {
+                                        this.read_frontier_stats
+                                            .record_barrier_error(shard_keys.len());
                                         // Optionally fall back to quorum reads on barrier failures.
                                         if fallback {
                                             tracing::warn!(
                                                 error = ?err,
                                                 "read barrier failed; falling back to quorum batch get"
                                             );
+                                            this.read_frontier_stats
+                                                .record_quorum_fallback(shard_keys.len());
                                             return this
                                                 .quorum_batch_get_shard(shard_keys)
                                                 .await
@@ -4185,24 +4506,46 @@ impl NodeState {
                                         return Err(err);
                                     }
                                 };
-                                let read_items = barrier_key_refs
-                                    .iter()
-                                    .copied()
-                                    .zip(shard_generations.iter().copied())
-                                    .collect::<Vec<_>>();
-                                let cmd = kv::encode_batch_get_slices_with_generations(&read_items);
-                                let res = handle.propose_read_with_deps(cmd, deps).await?;
-                                let accord::ProposalResult::Read(value) = res else {
-                                    anyhow::bail!("BATCH_GET expected read result, got {res:?}");
-                                };
-                                let value = value.unwrap_or_default();
-                                let decoded = kv::decode_batch_get_result(&value)?;
-                                anyhow::ensure!(
-                                    decoded.len() == expected,
-                                    "batch get result count mismatch (expected {expected}, got {})",
-                                    decoded.len()
-                                );
-                                decoded
+                                if barrier.allows_local_frontier_read() {
+                                    let read_start = Instant::now();
+                                    let decoded = this.local_batch_get_at_generations(
+                                        &barrier_key_refs,
+                                        &shard_generations,
+                                    )?;
+                                    let local_read_us = read_start
+                                        .elapsed()
+                                        .as_micros()
+                                        .min(u128::from(u64::MAX))
+                                        as u64;
+                                    this.read_frontier_stats.record_local_authorized(
+                                        expected,
+                                        &barrier,
+                                        local_read_us,
+                                    );
+                                    decoded
+                                } else {
+                                    let read_items = barrier_key_refs
+                                        .iter()
+                                        .copied()
+                                        .zip(shard_generations.iter().copied())
+                                        .collect::<Vec<_>>();
+                                    let cmd =
+                                        kv::encode_batch_get_slices_with_generations(&read_items);
+                                    let (decoded, proposal_us) = this
+                                        .propose_batch_get_with_deps(
+                                            shard,
+                                            cmd,
+                                            barrier.deps.clone(),
+                                            expected,
+                                        )
+                                        .await?;
+                                    this.read_frontier_stats.record_proposal(
+                                        expected,
+                                        &barrier,
+                                        proposal_us,
+                                    );
+                                    decoded
+                                }
                             }
                             // Local reads use the local KV engine without barriers.
                             ReadMode::Local => {
@@ -4238,6 +4581,50 @@ impl NodeState {
             }
             return Ok(out);
         }
+    }
+
+    /// Read local MVCC storage at an Accord-authorized generation ceiling.
+    ///
+    /// Purpose:
+    /// - Execute the storage part of a read-index style GET after
+    ///   `ensure_read_barrier_shard` has proved all prior write targets are
+    ///   locally visible.
+    ///
+    /// Design:
+    /// - Uses one version ceiling per key so range-generation routing remains
+    ///   equivalent to the existing proposed read command.
+    /// - Holds the same split read lock used by the KV state-machine read path
+    ///   while consulting storage.
+    /// - Keeps storage visibility bounded by `(generation, u64::MAX, max_txn)`
+    ///   instead of using an unbounded latest read across logical ownership
+    ///   generations.
+    ///
+    /// Inputs:
+    /// - `keys`: borrowed key slices in output order.
+    /// - `generations`: range generation for each key.
+    ///
+    /// Outputs:
+    /// - One optional value per key, preserving input order.
+    fn local_batch_get_at_generations(
+        &self,
+        keys: &[&[u8]],
+        generations: &[u64],
+    ) -> anyhow::Result<Vec<Option<Vec<u8>>>> {
+        anyhow::ensure!(
+            keys.len() == generations.len(),
+            "local read generation count mismatch (keys={}, generations={})",
+            keys.len(),
+            generations.len()
+        );
+        let _guard = self.split_lock.read().unwrap();
+        let mut out = Vec::with_capacity(keys.len());
+        for (key, generation) in keys.iter().copied().zip(generations.iter().copied()) {
+            out.push(
+                self.kv_engine
+                    .get(key, read_ceiling_for_generation(generation)),
+            );
+        }
+        Ok(out)
     }
 
     /// Execute a single Redis operation by delegating to batching helpers.
@@ -4282,6 +4669,60 @@ impl NodeState {
         res
     }
 
+    /// Propose one shard-local batch GET with explicit Accord dependencies.
+    ///
+    /// Purpose:
+    /// - Keep hot or recently written keys in Accord's read dependency graph
+    ///   instead of authorizing a direct local MVCC read from frontier hints
+    ///   alone.
+    ///
+    /// Design:
+    /// - Uses `propose_read_with_deps` so the read receives an Accord txn id,
+    ///   sequence, dependency set, execution point, and decoded state-machine
+    ///   result.
+    /// - Records proposal timing in the existing proposal stats when enabled;
+    ///   read-frontier stats record the same duration unconditionally at the
+    ///   call site.
+    ///
+    /// Inputs:
+    /// - `shard`: routed physical data shard.
+    /// - `command`: encoded batch GET command.
+    /// - `deps`: dependency floor collected from the read barrier.
+    /// - `expected`: expected decoded value count.
+    ///
+    /// Outputs:
+    /// - Decoded batch GET values plus proposal duration in microseconds.
+    async fn propose_batch_get_with_deps(
+        &self,
+        shard: usize,
+        command: Vec<u8>,
+        deps: Vec<(TxnId, u64)>,
+        expected: usize,
+    ) -> anyhow::Result<(Vec<Option<Vec<u8>>>, u64)> {
+        let start = Instant::now();
+        let res = self
+            .handle_for_shard(shard)
+            .propose_read_with_deps(command, deps)
+            .await;
+        let dur_us = start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        if self.proposal_stats_enabled {
+            self.proposal_stats
+                .record(ProposalKind::BatchGet, dur_us, res.is_ok());
+        }
+        let res = res?;
+        let accord::ProposalResult::Read(value) = res else {
+            anyhow::bail!("BATCH_GET expected read result, got {res:?}");
+        };
+        let value = value.unwrap_or_default();
+        let decoded = kv::decode_batch_get_result(&value)?;
+        anyhow::ensure!(
+            decoded.len() == expected,
+            "batch get result count mismatch (expected {expected}, got {})",
+            decoded.len()
+        );
+        Ok((decoded, dur_us))
+    }
+
     /// Ensure a shard-level read barrier before proposing one accord read batch.
     ///
     /// Purpose:
@@ -4300,37 +4741,59 @@ impl NodeState {
     /// - `keys`: borrowed key slices contained in one shard GET batch.
     ///
     /// Outputs:
-    /// - Dependency vector for `propose_read_with_deps`.
+    /// - `ReadBarrierOutcome` proving all prior known write targets for these
+    ///   keys are locally executed.
     async fn ensure_read_barrier_shard(
         &self,
         group_id: GroupId,
         keys: &[&[u8]],
-    ) -> anyhow::Result<Vec<(TxnId, u64)>> {
+    ) -> anyhow::Result<ReadBarrierOutcome> {
         if keys.is_empty() {
             // No keys means no barrier required.
-            return Ok(Vec::new());
+            return Ok(ReadBarrierOutcome {
+                deps: Vec::new(),
+                wait_targets: 0,
+                pending_waits: 0,
+                collect_us: 0,
+                wait_us: 0,
+            });
         }
+        let collect_start = Instant::now();
         let barrier = self
             .collect_read_barrier_state_shard(group_id, keys)
             .await?;
+        let collect_us = collect_start
+            .elapsed()
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
         let deps = read_barrier_deps_from_max_by_key(&barrier.max_by_key);
-        if deps.is_empty() {
-            // No outstanding commits to wait for.
-            return Ok(Vec::new());
+        let wait_targets = barrier.wait_targets.len();
+        if wait_targets == 0 {
+            return Ok(ReadBarrierOutcome {
+                deps,
+                wait_targets,
+                pending_waits: 0,
+                collect_us,
+                wait_us: 0,
+            });
         }
         let group = self
             .group(group_id)
             .ok_or_else(|| anyhow::anyhow!("data group missing"))?;
-        group
-            .observe_last_committed_slices(keys, &barrier.max_by_key)
-            .await;
+        if !deps.is_empty() {
+            group
+                .observe_last_committed_slices(keys, &barrier.max_by_key)
+                .await;
+        }
 
         let executed = group.executed_prefixes().await;
         let pending = read_barrier_pending_wait_targets(&barrier.wait_targets, &executed);
+        let pending_waits = pending.len();
 
         // Only wait for targets not already covered by local executed prefixes.
         // This avoids per-batch waiter churn when barrier visibility is already
         // satisfied, and intentionally does not skip dependency propagation.
+        let wait_start = Instant::now();
         for txn_id in pending {
             match tokio::time::timeout(self.read_barrier_timeout, group.wait_executed(txn_id)).await
             {
@@ -4344,7 +4807,14 @@ impl NodeState {
                 }
             }
         }
-        Ok(deps)
+        let wait_us = wait_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        Ok(ReadBarrierOutcome {
+            deps,
+            wait_targets,
+            pending_waits,
+            collect_us,
+            wait_us,
+        })
     }
 
     /// Collect merged read-barrier state for one shard batch.
@@ -5780,6 +6250,56 @@ struct ReadBarrierShardState {
     wait_targets: HashMap<accord::TxnProgressKey, TxnId>,
 }
 
+/// Accord-owned read-frontier authorization result for one shard GET batch.
+///
+/// Purpose:
+/// - Carry both the correctness proof and the timing data for a read-index
+///   style local read.
+///
+/// Design:
+/// - `deps` remains available for diagnostics and compatibility with the
+///   proposal path, but a successful outcome means every dependency target is
+///   locally executed before the caller reads storage.
+/// - `collect_us` covers quorum `last_committed` collection.
+/// - `wait_us` covers local execution waits for dependency targets that were
+///   not already covered by executed-prefixes.
+///
+/// Inputs:
+/// - Built by `ensure_read_barrier_shard` after quorum collection and local
+///   execution waits.
+///
+/// Outputs:
+/// - Consumed by Accord-mode GETs to authorize local MVCC reads and record
+///   frontier observability.
+#[derive(Debug)]
+struct ReadBarrierOutcome {
+    deps: Vec<(TxnId, u64)>,
+    wait_targets: usize,
+    pending_waits: usize,
+    collect_us: u64,
+    wait_us: u64,
+}
+
+impl ReadBarrierOutcome {
+    /// Return whether this barrier permits a direct local MVCC read.
+    ///
+    /// Purpose:
+    /// - Keep the new fast path limited to quiescent keys where the read
+    ///   frontier found no prior write target that needs an Accord read
+    ///   transaction for ordering.
+    ///
+    /// Design:
+    /// - Requires both the compact dependency vector and the raw wait-target
+    ///   set to be empty. This is intentionally stricter than "waits completed":
+    ///   hot or previously written keys still use `propose_read_with_deps`.
+    ///
+    /// Outputs:
+    /// - `true` only for no-frontier/no-dependency read batches.
+    fn allows_local_frontier_read(&self) -> bool {
+        self.deps.is_empty() && self.wait_targets == 0
+    }
+}
+
 /// Merge one replica's `last_committed` vector into barrier accumulators.
 ///
 /// Purpose:
@@ -5840,13 +6360,14 @@ fn merge_last_committed_replica_checked(
 /// Build forced read dependencies from merged per-key barrier maxima.
 ///
 /// Purpose:
-/// - Produce a compact dependency set for `propose_read_with_deps`.
+/// - Produce a compact dependency set for read-frontier observability and the
+///   compatibility proposal path.
 ///
 /// Design:
 /// - Deduplicates by transaction id.
 /// - Retains the highest observed sequence per transaction.
-/// - Intentionally excludes non-maximal per-key entries to minimize forced-deps
-///   materialization overhead in the read proposal hot path.
+/// - Intentionally excludes non-maximal per-key entries to minimize dependency
+///   materialization overhead in the read hot path.
 ///
 /// Inputs:
 /// - `max_by_key`: merged highest-seq barrier item for each key.
@@ -5910,6 +6431,33 @@ fn read_barrier_pending_wait_targets(
         }
     }
     pending
+}
+
+/// Build the maximum MVCC read version for one logical range generation.
+///
+/// Purpose:
+/// - Let read-frontier local reads preserve the same generation ceiling that
+///   encoded Accord read commands used before the fast path.
+///
+/// Design:
+/// - Uses maximum sequence and transaction id values within the generation, so
+///   every visible write in that generation or lower can be returned while
+///   writes from a newer logical owner remain excluded.
+///
+/// Inputs:
+/// - `range_generation`: logical range generation selected by routing.
+///
+/// Outputs:
+/// - A `kv::Version` ceiling for storage reads.
+fn read_ceiling_for_generation(range_generation: u64) -> kv::Version {
+    kv::Version {
+        range_generation,
+        seq: u64::MAX,
+        txn_id: TxnId {
+            node_id: u64::MAX,
+            counter: u64::MAX,
+        },
+    }
 }
 
 /// Log aggregated RPC stats from the transport layer.
@@ -6181,6 +6729,49 @@ fn log_client_batch_stats(snap: &ClientBatchStatsSnapshot) {
         get_collect_reason_idle = snap.get_collect_reason_idle_batches,
         get_collect_reason_closed = snap.get_collect_reason_closed_batches,
         "client batch stats"
+    );
+}
+
+/// Log aggregated read-frontier authorization stats for one interval.
+fn log_read_frontier_stats(snap: &ReadFrontierStatsSnapshot) {
+    if snap.batches == 0 {
+        return;
+    }
+    let avg_keys = snap.keys as f64 / snap.batches as f64;
+    let frontier_batches = (snap.local_authorized_batches + snap.proposal_batches).max(1);
+    let local_batches = snap.local_authorized_batches.max(1);
+    let proposal_batches = snap.proposal_batches.max(1);
+    let collect_avg_us = snap.collect_total_us as f64 / frontier_batches as f64;
+    let wait_avg_us = snap.wait_total_us as f64 / frontier_batches as f64;
+    let local_read_avg_us = snap.local_read_total_us as f64 / local_batches as f64;
+    let proposal_avg_us = snap.proposal_total_us as f64 / proposal_batches as f64;
+    let avg_deps = snap.deps_total as f64 / frontier_batches as f64;
+    let avg_wait_targets = snap.wait_targets_total as f64 / frontier_batches as f64;
+    let avg_pending_waits = snap.pending_waits_total as f64 / frontier_batches as f64;
+
+    tracing::info!(
+        batches = snap.batches,
+        keys = snap.keys,
+        avg_keys = avg_keys,
+        local_authorized = snap.local_authorized_batches,
+        proposal = snap.proposal_batches,
+        quorum_fallback = snap.quorum_fallback_batches,
+        barrier_errors = snap.barrier_error_batches,
+        collect_avg_us = collect_avg_us,
+        collect_max_us = snap.collect_max_us,
+        wait_avg_us = wait_avg_us,
+        wait_max_us = snap.wait_max_us,
+        local_read_avg_us = local_read_avg_us,
+        local_read_max_us = snap.local_read_max_us,
+        proposal_avg_us = proposal_avg_us,
+        proposal_max_us = snap.proposal_max_us,
+        deps_avg = avg_deps,
+        deps_max = snap.max_deps,
+        wait_targets_avg = avg_wait_targets,
+        wait_targets_max = snap.max_wait_targets,
+        pending_waits_avg = avg_pending_waits,
+        pending_waits_max = snap.max_pending_waits,
+        "read frontier stats"
     );
 }
 
@@ -7541,6 +8132,7 @@ where
 
     let member_ids = runtime_members.keys().copied().collect::<Vec<_>>();
     let client_batch_stats = Arc::new(ClientBatchStats::default());
+    let read_frontier_stats = Arc::new(ReadFrontierStats::default());
     let meta_proposal_stats = Arc::new(MetaProposalStats::default());
     let recovery_checkpoint_stats = Arc::new(RecoveryCheckpointStats::default());
     let recovery_checkpoint_controller = if args.recovery_checkpoint_enabled {
@@ -7599,6 +8191,7 @@ where
         read_barrier_timeout: Duration::from_millis(args.read_barrier_timeout_ms.max(1)),
         read_barrier_fallback_quorum: args.read_barrier_fallback_quorum,
         read_barrier_all_peers: args.read_barrier_all_peers,
+        read_frontier_stats: read_frontier_stats.clone(),
         proposal_stats,
         proposal_stats_enabled,
         meta_proposal_stats,
@@ -7732,12 +8325,18 @@ where
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             let mut prev = ClientBatchStatsSnapshot::default();
+            let mut prev_read_frontier = ReadFrontierStatsSnapshot::default();
             loop {
                 ticker.tick().await;
                 let current = state.client_batch_stats_snapshot_cumulative();
                 let delta = current.saturating_delta(&prev);
                 prev = current;
                 log_client_batch_stats(&delta);
+                let current_read_frontier = state.read_frontier_stats_snapshot_cumulative();
+                let read_frontier_delta =
+                    current_read_frontier.saturating_delta(&prev_read_frontier);
+                prev_read_frontier = current_read_frontier;
+                log_read_frontier_stats(&read_frontier_delta);
             }
         });
     }
@@ -8367,6 +8966,141 @@ mod tests {
         ];
         let pending = read_barrier_pending_wait_targets(&wait_targets, &executed);
         assert_eq!(pending, vec![txn(2, 9)]);
+    }
+
+    /// Verify local read-frontier ceilings preserve range-generation bounds.
+    ///
+    /// Purpose:
+    /// - Ensure the local read-index path cannot read from a newer logical
+    ///   owner generation than routing selected.
+    ///
+    /// Design:
+    /// - Compares synthetic versions against the generated ceiling.
+    ///
+    /// Inputs:
+    /// - One lower-generation, one same-generation, and one newer-generation
+    ///   version.
+    ///
+    /// Outputs:
+    /// - Assertion failure if version ordering no longer enforces the ceiling.
+    #[test]
+    fn read_ceiling_for_generation_excludes_newer_generation() {
+        let ceiling = read_ceiling_for_generation(7);
+        let lower = kv::Version {
+            range_generation: 6,
+            seq: u64::MAX,
+            txn_id: TxnId {
+                node_id: u64::MAX,
+                counter: u64::MAX,
+            },
+        };
+        let same = version_for_group(7, 99, 99);
+        let newer = kv::Version {
+            range_generation: 8,
+            seq: 1,
+            txn_id: txn(1, 1),
+        };
+
+        assert!(lower <= ceiling);
+        assert!(same <= ceiling);
+        assert!(newer > ceiling);
+    }
+
+    /// Verify local-frontier authorization remains limited to no-dependency reads.
+    ///
+    /// Purpose:
+    /// - Prevent future changes from bypassing Accord read proposals for hot or
+    ///   recently written keys.
+    ///
+    /// Design:
+    /// - Compares an empty barrier with barriers containing compact deps or raw
+    ///   wait targets.
+    ///
+    /// Outputs:
+    /// - Assertion failure if the local fast-path gate becomes too permissive.
+    #[test]
+    fn read_barrier_outcome_allows_local_only_without_frontier_targets() {
+        let empty = ReadBarrierOutcome {
+            deps: Vec::new(),
+            wait_targets: 0,
+            pending_waits: 0,
+            collect_us: 0,
+            wait_us: 0,
+        };
+        assert!(empty.allows_local_frontier_read());
+
+        let with_deps = ReadBarrierOutcome {
+            deps: vec![(txn(1, 5), 5)],
+            wait_targets: 1,
+            pending_waits: 0,
+            collect_us: 0,
+            wait_us: 0,
+        };
+        assert!(!with_deps.allows_local_frontier_read());
+
+        let with_wait_target = ReadBarrierOutcome {
+            deps: Vec::new(),
+            wait_targets: 1,
+            pending_waits: 0,
+            collect_us: 0,
+            wait_us: 0,
+        };
+        assert!(!with_wait_target.allows_local_frontier_read());
+    }
+
+    /// Verify read-frontier stats include local and proposal attribution.
+    ///
+    /// Purpose:
+    /// - Protect observability for the no-dependency local path and the
+    ///   dependency-carrying Accord proposal path.
+    ///
+    /// Design:
+    /// - Records one synthetic local read and one synthetic proposal read, then
+    ///   inspects cumulative and delta snapshots.
+    ///
+    /// Inputs:
+    /// - One empty barrier outcome and one outcome with two deps.
+    ///
+    /// Outputs:
+    /// - Assertion failure if read-frontier counters drift.
+    #[test]
+    fn read_frontier_stats_record_authorized_path() {
+        let stats = ReadFrontierStats::default();
+        let empty = ReadBarrierOutcome {
+            deps: Vec::new(),
+            wait_targets: 0,
+            pending_waits: 0,
+            collect_us: 3,
+            wait_us: 0,
+        };
+        let outcome = ReadBarrierOutcome {
+            deps: vec![(txn(1, 5), 5), (txn(2, 7), 7)],
+            wait_targets: 2,
+            pending_waits: 1,
+            collect_us: 11,
+            wait_us: 13,
+        };
+
+        stats.record_local_authorized(1, &empty, 17);
+        stats.record_proposal(3, &outcome, 19);
+        let snap = stats.snapshot();
+        assert_eq!(snap.batches, 2);
+        assert_eq!(snap.keys, 4);
+        assert_eq!(snap.local_authorized_batches, 1);
+        assert_eq!(snap.proposal_batches, 1);
+        assert_eq!(snap.deps_total, 2);
+        assert_eq!(snap.max_deps, 2);
+        assert_eq!(snap.wait_targets_total, 2);
+        assert_eq!(snap.pending_waits_total, 1);
+        assert_eq!(snap.collect_total_us, 14);
+        assert_eq!(snap.wait_total_us, 13);
+        assert_eq!(snap.local_read_total_us, 17);
+        assert_eq!(snap.proposal_total_us, 19);
+
+        let delta = snap.saturating_delta(&ReadFrontierStatsSnapshot::default());
+        assert_eq!(delta.batches, 2);
+        assert_eq!(delta.proposal_batches, 1);
+        assert_eq!(delta.deps_total, 2);
     }
 
     #[test]
