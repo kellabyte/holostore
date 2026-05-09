@@ -300,6 +300,7 @@ async fn handle_conn(socket: TcpStream, state: Arc<NodeState>) -> anyhow::Result
                 let stats = stats_opt.ok_or_else(|| anyhow::anyhow!("missing data groups"))?;
                 let rpc_stats = state.transport.stats().snapshot_and_reset();
                 let client_batch = state.client_batch_stats_snapshot();
+                let read_frontier = state.read_frontier_stats_snapshot();
                 let pre_accept_avg_batch = if rpc_stats.pre_accept_batches == 0 {
                     // Avoid divide-by-zero when there are no batches.
                     0.0
@@ -588,6 +589,48 @@ async fn handle_conn(socket: TcpStream, state: Arc<NodeState>) -> anyhow::Result
                     wal_batch_avg_bytes,
                     wal_stats.batch_max_bytes,
                 );
+                let read_frontier_frontier_batches = (read_frontier.local_authorized_batches
+                    + read_frontier.proposal_batches)
+                    .max(1);
+                let read_frontier_local_batches = read_frontier.local_authorized_batches.max(1);
+                let read_frontier_proposal_batches = read_frontier.proposal_batches.max(1);
+                let read_frontier_avg_collect_us =
+                    read_frontier.collect_total_us as f64 / read_frontier_frontier_batches as f64;
+                let read_frontier_avg_wait_us =
+                    read_frontier.wait_total_us as f64 / read_frontier_frontier_batches as f64;
+                let read_frontier_avg_local_read_us =
+                    read_frontier.local_read_total_us as f64 / read_frontier_local_batches as f64;
+                let read_frontier_avg_proposal_us =
+                    read_frontier.proposal_total_us as f64 / read_frontier_proposal_batches as f64;
+                let read_frontier_avg_deps =
+                    read_frontier.deps_total as f64 / read_frontier_frontier_batches as f64;
+                let read_frontier_avg_wait_targets =
+                    read_frontier.wait_targets_total as f64 / read_frontier_frontier_batches as f64;
+                let read_frontier_avg_pending_waits = read_frontier.pending_waits_total as f64
+                    / read_frontier_frontier_batches as f64;
+                msg.push_str(&format!(
+                    " read_frontier.batches={} read_frontier.keys={} read_frontier.local_authorized={} read_frontier.proposal={} read_frontier.quorum_fallback={} read_frontier.barrier_errors={} read_frontier.collect.avg_us={:.2} read_frontier.collect.max_us={} read_frontier.wait.avg_us={:.2} read_frontier.wait.max_us={} read_frontier.local_read.avg_us={:.2} read_frontier.local_read.max_us={} read_frontier.proposal.avg_us={:.2} read_frontier.proposal.max_us={} read_frontier.deps.avg={:.2} read_frontier.deps.max={} read_frontier.wait_targets.avg={:.2} read_frontier.wait_targets.max={} read_frontier.pending_waits.avg={:.2} read_frontier.pending_waits.max={}",
+                    read_frontier.batches,
+                    read_frontier.keys,
+                    read_frontier.local_authorized_batches,
+                    read_frontier.proposal_batches,
+                    read_frontier.quorum_fallback_batches,
+                    read_frontier.barrier_error_batches,
+                    read_frontier_avg_collect_us,
+                    read_frontier.collect_max_us,
+                    read_frontier_avg_wait_us,
+                    read_frontier.wait_max_us,
+                    read_frontier_avg_local_read_us,
+                    read_frontier.local_read_max_us,
+                    read_frontier_avg_proposal_us,
+                    read_frontier.proposal_max_us,
+                    read_frontier_avg_deps,
+                    read_frontier.max_deps,
+                    read_frontier_avg_wait_targets,
+                    read_frontier.max_wait_targets,
+                    read_frontier_avg_pending_waits,
+                    read_frontier.max_pending_waits,
+                ));
                 let shard_load = state.shard_load.snapshot();
                 let shard_set_ops = shard_load
                     .set_ops
